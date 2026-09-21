@@ -25,6 +25,7 @@ type Server struct {
 	stopping        bool
 	stopped         bool
 	done            chan struct{}
+	doneOnce        sync.Once
 	wg              sync.WaitGroup
 	cleanupMu       cleanupGate
 	cleanupErr      error
@@ -37,6 +38,7 @@ type Export struct {
 	share     Share
 	key       string
 	refs      int
+	trees     int
 	active    int
 	stopping  bool
 	published bool
@@ -59,7 +61,7 @@ func interfaceNil(value any) bool {
 // New validates all dependencies and bounds without acquiring credentials or
 // starting background work.
 func New(config Config) (*Server, error) {
-	if interfaceNil(config.Authenticator) || interfaceNil(config.Authorize) {
+	if interfaceNil(config.Authenticator) || interfaceNil(config.AuthorizeIdentity) || interfaceNil(config.Authorize) {
 		return nil, ErrConfig
 	}
 	if err := config.Limits.check(); err != nil {
@@ -135,7 +137,7 @@ func (e *Export) Unpublish(ctx context.Context) error {
 		s.mu.Unlock()
 		return nil
 	}
-	if e.active != 0 {
+	if e.trees != 0 || e.active != 0 {
 		s.mu.Unlock()
 		return ErrBusy
 	}
@@ -217,10 +219,12 @@ func (s *Server) Serve(ctx context.Context, listener net.Listener) error {
 	cancel()
 	s.cleanupFailure(err)
 	s.mu.Lock()
-	s.stopped = true
 	s.listener = nil
-	close(s.done)
+	if err == nil && len(s.connections) == 0 && len(s.exports) == 0 {
+		s.stopped = true
+	}
 	s.mu.Unlock()
+	s.doneOnce.Do(func() { close(s.done) })
 	return errors.Join(serveErr, err)
 }
 
@@ -248,10 +252,6 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	s.stop()
 	s.mu.Lock()
 	started, stopped := s.started, s.stopped
-	if !started && !stopped {
-		s.stopped = true
-		close(s.done)
-	}
 	s.mu.Unlock()
 	if started && !stopped {
 		select {
@@ -262,6 +262,16 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	}
 	err := s.retryCleanup(ctx)
 	s.cleanupFailure(err)
+	if err == nil {
+		s.mu.Lock()
+		if len(s.connections) == 0 && len(s.exports) == 0 {
+			s.stopped = true
+		}
+		s.mu.Unlock()
+	}
+	if !started {
+		s.doneOnce.Do(func() { close(s.done) })
+	}
 	return err
 }
 

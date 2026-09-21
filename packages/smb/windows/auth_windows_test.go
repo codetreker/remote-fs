@@ -184,6 +184,65 @@ func TestAuthenticationCloseRetriesTemporaryNativeCleanup(t *testing.T) {
 	})
 }
 
+func TestAuthenticationCloseAttemptsEveryIndependentOwner(t *testing.T) {
+	failure := errors.New("cleanup failed")
+	var bufferCalls, tokenCalls, securityCalls, credentialCalls int
+	fail := true
+	a := &authentication{
+		credentials:    securityHandle{1, 2},
+		security:       securityHandle{3, 4},
+		pendingBuffers: []unsafe.Pointer{unsafe.Pointer(new(byte)), unsafe.Pointer(new(byte))},
+		pendingTokens:  []win.Token{1, 2},
+		freeBuffer: func(unsafe.Pointer) error {
+			bufferCalls++
+			if fail && bufferCalls == 1 {
+				return failure
+			}
+			return nil
+		},
+		closeToken: func(win.Token) error {
+			tokenCalls++
+			if fail && tokenCalls == 1 {
+				return failure
+			}
+			return nil
+		},
+		deleteSecurity: func(*securityHandle) error {
+			securityCalls++
+			if fail {
+				return failure
+			}
+			return nil
+		},
+		freeCredential: func(*securityHandle) error {
+			credentialCalls++
+			if fail {
+				return failure
+			}
+			return nil
+		},
+	}
+	if err := a.Close(); !errors.Is(err, failure) {
+		t.Fatalf("first close = %v", err)
+	}
+	if bufferCalls != 2 || tokenCalls != 2 || securityCalls != 1 || credentialCalls != 1 {
+		t.Fatalf("cleanup calls buffers=%d tokens=%d security=%d credentials=%d", bufferCalls, tokenCalls, securityCalls, credentialCalls)
+	}
+	if len(a.pendingBuffers) != 1 || len(a.pendingTokens) != 1 || !a.security.valid() || !a.credentials.valid() {
+		t.Fatalf("failed ownership was not retained: buffers=%d tokens=%d security=%v credentials=%v", len(a.pendingBuffers), len(a.pendingTokens), a.security, a.credentials)
+	}
+	fail = false
+	if err := a.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if bufferCalls != 3 || tokenCalls != 3 || securityCalls != 2 || credentialCalls != 2 {
+		t.Fatalf("retry calls buffers=%d tokens=%d security=%d credentials=%d", bufferCalls, tokenCalls, securityCalls, credentialCalls)
+	}
+	if len(a.pendingBuffers) != 0 || len(a.pendingTokens) != 0 || a.security.valid() || a.credentials.valid() {
+		t.Fatal("successful retry retained native ownership")
+	}
+}
+
 func nativeClientStep(t *testing.T, a *authentication, input []byte) ([]byte, bool) {
 	t.Helper()
 	proc := securityDLL.NewProc("InitializeSecurityContextW")

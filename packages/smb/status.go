@@ -12,7 +12,7 @@ func statusError(err error) uint32 {
 	if err == nil {
 		return statusOK
 	}
-	if errors.Is(err, authz.ErrDenied) {
+	if errors.Is(err, authz.ErrDenied) || errors.Is(err, ErrIdentityDenied) {
 		return statusDenied
 	}
 	switch storage.ErrnoOf(err) {

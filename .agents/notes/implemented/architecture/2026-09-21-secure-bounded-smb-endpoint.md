@@ -18,19 +18,19 @@ SMB frame、compound request、authentication token、connection、session、tre
 
 Direct TCP payload 在分配前受 byte bound 限制。SMB2 header、compound offset/alignment、command count、negotiate context、UTF-16 和变长字段使用严格 decoder；解析结果借用一份被请求生命周期持有的 bounded frame。compound request 保留每个 command 的原始 bytes、MessageId、SessionId、TreeId 与 related 关系，协议层不把后续文件命令压成一个无上下文 callback。
 
-端点只协商 SMB 3.1.1、SHA-512 preauthentication integrity 与 AES-CMAC signing。preauthentication transcript 使用实际收发的 wire bytes；SSPI session key 通过 SMB 3.1.1 KDF 派生 signing key。认证完成后的 request 必须验签，response 必须签名；replay／DFS flag 不被静默接受。session retirement 等到所有已经登记的 response 完成签名后才销毁 key。
+端点只协商 SMB 3.1.1、SHA-512 preauthentication integrity 与 AES-CMAC signing。preauthentication transcript 使用实际收发的 wire bytes；SSPI session key 通过 SMB 3.1.1 KDF 派生 signing key。携带 SessionId 的 request 必须先验签；unsigned session request 的拒绝保持 unsigned，带 signed flag 但 MAC 错误或已建立 session 的 malformed reauthentication 得到 signed 拒绝。replay／DFS flag 不被静默接受。session retirement 等到所有已经登记的 response 完成签名后才销毁 key。
 
 ### SSPI 身份同时绑定用户与登录会话
 
 `packages/smb/windows` 每次 Begin 使用 Windows SSPI `Negotiate` 建立独立 inbound authentication exchange。完成结果必须提供 integrity、非 null session、当前有效的 security-context expiry、可用 session key，以及 context token 的用户 SID 与 `TOKEN_STATISTICS.AuthenticationId`。AuthenticationId 编码为固定 16 位小写十六进制 logon-session ID。
 
-`Principal` 的 authority identity 是 `(SID, LogonSessionID)`；display name 只用于诊断。标准组合使用 `CurrentIdentity` 读取宿主进程 token，再以 `AllowIdentity` 只接受完全相同的二元组，并拒绝 anonymous、Guest、LocalSystem、LocalService 与 NetworkService。相同 SID 的另一登录会话不能替换 previous session 或取得它的 tree。token、session key 与 authentication buffer 在使用后清零，日志只记录 protocol state 和 opaque connection/session/tree 编号。
+`Principal` 的 authority identity 是 `(SID, LogonSessionID)`；display name 只用于诊断。`Config.AuthorizeIdentity` 是本地身份的强制准入点，在初始 authentication 和 reauthentication 安装 principal／signer 或替换 expiry 前执行。标准组合使用 `CurrentIdentity` 读取宿主进程 token，再以 `AllowIdentity` 只接受完全相同的二元组，并拒绝 anonymous、Guest、LocalSystem、LocalService 与 NetworkService。相同 SID 的另一登录会话不能替换 previous session 或取得它的 tree。token、session key 与 authentication buffer 在使用后清零，日志只记录 protocol state 和 opaque connection/session/tree 编号。
 
-SSPI 身份只保护本机入口。Share 仍携带 host-selected volume identity 与调用方提供的 FileStorage；endpoint 的 Authorizer 对该可信 volume 和实际 FileSession operation 作决定。backing remote storage 的远端身份和 credential 继续由调用方拥有，本机 SID 不被解释为远端业务身份。
+SSPI 身份只保护本机入口。Share 仍携带 host-selected volume identity 与调用方提供的 FileStorage；独立的 `Config.Authorize` 对该可信 volume 和实际 FileSession operation 作决定。backing remote storage 的远端身份和 credential 继续由调用方拥有，本机 SID 不被解释为远端业务身份。
 
 ### owner 层级决定清理顺序
 
-Server 拥有 loopback listener、export registry、connection 和全局 session capacity。listener 只有在确认本地地址为 loopback 后才转移所有权；accepted peer 另行核对 loopback。Publish 校验 FileStorage 能力但不取得 backend 所有权。Unpublish 在 connect／request 已取得 export 时以 busy 保留原状态；其它情况先 fence 新连接，再清理该 export 上由 endpoint 建立的 tree 与 FileSession，只有引用和 active count 都归零才移除 export。
+Server 拥有 loopback listener、export registry、connection 和全局 session capacity。listener 只有在确认本地地址为 loopback 后才转移所有权；accepted peer 另行核对 loopback。Publish 校验 FileStorage 能力但不取得 backend 所有权。非强制 Unpublish 在任何 live tree 或 connect／request 已取得 export 时以 busy 保留原 mapping 和资源；没有使用者时才进入清理并移除 export。Server shutdown 另行强制 fence 新工作、清理 tree／FileSession，并只移除已经静止且确认释放的 export。
 
 connection 拥有 negotiate transcript、credit、pending request 和本连接的 session table；全局 registry 另外持有 session charge。authenticated session 拥有 SSPI identity、signer、tree 和每个 export 的 authority session。同一 session 连接同一 export 的多个 tree 共享一份 FileSession，tree 只是 SMB alias，不成为第二个远端 owner。
 
@@ -40,9 +40,9 @@ TREE_DISCONNECT 取消已经登记到该 tree 的 pending request 并关闭一�
 
 ### 每种累积资源独立有界
 
-`Limits` 分开约束 export、connection、session、tree、pending request、compound command、negotiate context、frame bytes、I/O bytes、authentication token、handshake、request 和 cleanup 时间；authority FileSession 继续使用自己的文件、operation、waiter、owner、range 与 action-history 上限。调用方显式选择 defaults，单个零值不表示关闭限制。
+`Limits` 分开约束 export、connection、session、tree、pending request、compound command、negotiate context、frame bytes、I/O bytes、authentication token、handshake、request 和 cleanup 时间。协商后的 request 另受 `MaxIOBytes + fixed envelope` 约束；control command 固定不超过 68 KiB 且只用一个 credit，数据 command 按每 64 KiB payload 至少消耗一个 credit。authority FileSession 继续使用自己的文件、operation、waiter、owner、range 与 action-history 上限。调用方显式选择 defaults，单个零值不表示关闭限制。
 
-frame bound 在读取 payload 前检查，token 和 context 在保留前检查，compound 和 request admission 在 dispatch 前检查。connection 饱和不分配第二份状态；session 的全局 charge 直到 native/authentication 资源与已登记 response frame 都退休才释放。Status 分别报告 identity-expired session、cleanup-only connection、fenced authority 与 cleanup failure，使本机身份到期、远端 FileSession 失去连续性及“协议条目已移除但资源仍被拥有”保持可区分。
+frame bound 在读取 payload 前检查，token 和 context 在保留前检查，compound 和 request admission 在 dispatch 前检查。connection 饱和不分配第二份状态；session 的全局 charge 直到 native/authentication 资源与已登记 response frame 都退休才释放。Status 分别报告 identity-expired session、cleanup-only connection、已经拒绝新用途但仍被 owner 保留的 fenced authority，以及 cleanup failure，使本机身份到期与未完成的 authority retirement 保持可区分。
 
 authentication exchange 有独立 expiry watcher。新的 reauthentication generation 复用同一 watcher；过期 generation 不能关闭后来的 exchange。已建立 identity 到期后，普通命令返回 signed session-expired 状态，signer、session 与 tree 保留以接受 signed SESSION_SETUP；同一身份重新认证成功才解除 fence，LOGOFF 仍可清理。provider 不响应取消时，Stop 和断线仍等待它离开，不能遗弃 native context 后报告 cleanup 成功。
 

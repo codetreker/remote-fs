@@ -20,7 +20,7 @@
 
 ## CI 工具链与缓存
 
-两个作业使用[共享 setup action](../.github/actions/setup-go/action.yml)固定 Go 1.26.8，并按作业、工具链、依赖和源码 SHA 保存 module／编译缓存；同作业前缀及经校验的旧快照可作为种子。缓存复用编译工作，`-count=1` 仍使每次调用实际执行测试。包分配、race、覆盖率和严格 verdict 门禁不变。缓存上传也消耗时间与空间，净收益须看完整作业；原因与兼容边界见[缓存决定](../.agents/notes/implemented/process/2026-09-09-refresh-ci-go-build-caches.md)。
+三个作业使用[共享 setup action](../.github/actions/setup-go/action.yml)固定 Go 1.26.8，并按作业、工具链、依赖和源码 SHA 保存 module／编译缓存；同作业前缀及经校验的旧快照可作为种子。两个 Linux 作业继续分担普通与挂载测试，Windows 作业只运行 native SSPI package 的 race test 与 vet。缓存复用编译工作，`-count=1` 仍使每次调用实际执行测试。包分配、race、覆盖率和严格 verdict 门禁不变。缓存上传也消耗时间与空间，净收益须看完整作业；原因与兼容边界见[缓存决定](../.agents/notes/implemented/process/2026-09-09-refresh-ci-go-build-caches.md)。
 
 ## CI 执行预算
 
@@ -309,13 +309,13 @@ Pending 用例先占满 authority 的申请队列，随后确认 HTTP control ad
 
 SMB 的协议 primitive 与 endpoint lifecycle 分层验证。`packages/smb/internal/wire` 直接覆盖 SMB2 header、Direct TCP payload、compound alignment、UTF-16、negotiate context、SESSION_SETUP 与 TREE_CONNECT shape；畸形 offset、重复唯一 context、混合 related compound、超量 command/context 和截断 body 必须在消费受控状态前失败。`packages/smb/internal/signing` 使用 CMAC 标准向量核对 SP800-108 key derivation、SHA-512 preauthentication transcript、packet sign/verify，以及 signer destroy 与并发 sign 的互斥。
 
-`packages/smb` 的真实 TCP transcript 从 NEGOTIATE、两轮 SESSION_SETUP、ECHO 到 volume TREE_CONNECT／TREE_DISCONNECT／LOGOFF，逐帧验证签名和状态。协商只接受 SMB 3.1.1、SHA-512 与 AES-CMAC；client 未发送 signing-capabilities context 时 response 不虚构该 context，显式发送时只回显实际选择。认证后的 unsigned、tampered、错误 session/tree、unsupported flag 与已识别但未实现的 file/directory command 都在 backing 之前拒绝；后者的用例同时核对 `STATUS_NOT_SUPPORTED` 与 backend data call 为零。CANCEL、未知 command 和畸形 request 的 fail-closed 用例断言连接终止且没有受控效果，不要求一个协议不定义的响应。
+`packages/smb` 的真实 TCP transcript 从 NEGOTIATE、两轮 SESSION_SETUP、ECHO 到 volume TREE_CONNECT／TREE_DISCONNECT／LOGOFF，逐帧验证签名和状态。协商只接受 SMB 3.1.1、SHA-512 与 AES-CMAC；client 未发送 signing-capabilities context 时 response 不虚构该 context，显式发送时只回显实际选择。unsigned session request 的拒绝保持 unsigned；带 signed flag 的坏 MAC 和已建立 session 的 malformed reauthentication 得到 signed denial，旧 session 仍可继续使用。sessionless ECHO 在 authentication 前后均不借用另一 session 的 signer。错误 session/tree、unsupported flag 与已识别但未实现的 file/directory command 都在 backing 之前拒绝；后者的用例同时核对 `STATUS_NOT_SUPPORTED` 与 backend data call 为零。CANCEL、未知 command 和畸形 request 的 fail-closed 用例断言连接终止且没有受控效果，不要求一个协议不定义的响应。
 
-frame、I/O、token、compound、context、connection、session、tree、export 与 pending request 的配置都在构造或对应 decoder 中验证。frame/compound、export、session/tree 和 pending request 另有运行时边界或 `maximum+1` 用例：Direct TCP 的 over-limit prefix 在分配 body 前关闭连接，request admission 饱和返回资源错误，已有 request 完成后容量可复用。多个上限不得用同一项更紧的配置代替，Status 必须分别报告 identity-expired session、cleanup-only connection、fenced authority 和 pending work。
+frame、I/O、token、compound、context、connection、session、tree、export 与 pending request 的配置都在构造或对应 decoder 中验证。frame/compound、export、session/tree 和 pending request 另有运行时边界或 `maximum+1` 用例：Direct TCP 的 over-limit prefix 在分配 body 前关闭连接；协商后的 request 在 `MaxIOBytes + envelope` 精确边界成功，超过一字节即关闭；oversized 或 multi-credit control command 被拒绝，数据 command 的不足 credit charge 同样在 dispatch 前失败。request admission 饱和返回资源错误，已有 request 完成后容量可复用。多个上限不得用同一项更紧的配置代替，Status 必须分别报告 identity-expired session、cleanup-only connection、fenced authority 和 pending work。
 
 session lifecycle 用例专门覆盖四条不能由普通成功 transcript 推出的顺序：未完成 secondary authentication 到期后自主回收且不损伤已建立身份；同 SID 不同登录会话的 reauthentication 被拒绝；identity expiry 使普通命令得到 signed session-expired，而同一身份 reauthentication 与 LOGOFF 保持可用；并发 TREE_CONNECT 在 LOGOFF 发布 retirement 后不能安装迟到的 authority/tree 或泄漏 global session charge。session retirement 还必须把最后一份 response frame 纳入 signer ownership，完成签名之前不能销毁 key，完成后必须释放。认证 provider 的 Close 失败、FileSession Close 失败与续期失败均保留 owner 和容量，cleanup 使用新 context 重试。
 
-`packages/smb/windows` 的平台无关测试核对 canonical SID／logon-session、同 SID 不同登录会话的拒绝、anonymous／Guest／service account 拒绝、context cancellation 和 secret-free `SECURITY_STATUS`。Windows build 的 native 用例使用真实 SSPI Negotiate exchange，核对 current token 的 SID、`TOKEN_STATISTICS.AuthenticationId`、session key、security-context expiry，以及取消后 credential/context/token/buffer 的清理；其它平台必须明确返回不支持，不能用假的身份通过。
+`packages/smb/windows` 的平台无关测试核对 canonical SID／logon-session、同 SID 不同登录会话的拒绝、anonymous／Guest／service account 拒绝、context cancellation 和 secret-free `SECURITY_STATUS`。SMB session 用例另验证 `AuthorizeIdentity` 在 signer/principal 安装前执行，明确拒绝与无法决定分别映射为 access denied 和 I/O failure，并且失败的 reauthentication 不改变旧身份或 expiry。`windows-2025` CI job 在 Windows Server 2025 runner 上以 race detector 执行 native SSPI Negotiate exchange，核对 current token 的 SID、`TOKEN_STATISTICS.AuthenticationId`、session key、security-context expiry，以及取消后 credential/context/token/buffer 的清理，并单独运行 vet。该 runner 验证 Windows API 与 SSPI ownership，不是 R-INT-8 所要求的 Windows 11 24H2 redirector/WNet 环境；其它平台仍须明确返回不支持，不能用假的身份通过。
 
 这些用例只证明 secure bounded endpoint 与 Windows SSPI package。它们不构成 Windows redirector、WNet 映射、文件命令、目录浏览、共享模式、通知、缓存一致性或最终 network-drive 支持证据；对应结论必须由后续真实 Windows 入口验收给出。
 
@@ -360,7 +360,7 @@ session lifecycle 用例专门覆盖四条不能由普通成功 transcript 推�
 
 ### Azure Blob
 
-`packages/storage/objectstore/azblob` 对一个真的 Blob 端点跑，那个端点是 Azurite。它定义在 [`deployments/azurite.yml`](../deployments/azurite.yml)：本地 `make azurite` 起、`make azurite-down` 停；CI 的两个 job 各自在依赖 Blob 的测试之前启动同一模拟器，并等待它能够回答请求。挂载 job 的真实 Azure 二进制锁与重启用例依赖该端点，因此启动步骤位于对拍和端到端测试之前；后面的全 module 覆盖率闸门继续使用这份模拟器。
+`packages/storage/objectstore/azblob` 对一个真的 Blob 端点跑，那个端点是 Azurite。它定义在 [`deployments/azurite.yml`](../deployments/azurite.yml)：本地 `make azurite` 起、`make azurite-down` 停；CI 的两个 Linux job 各自在依赖 Blob 的测试之前启动同一模拟器，并等待它能够回答请求。挂载 job 的真实 Azure 二进制锁与重启用例依赖该端点，因此启动步骤位于对拍和端到端测试之前；后面的全 module 覆盖率闸门继续使用这份模拟器。
 
 **够不到模拟器时这一层失败，不跳过。** 依赖缺席是一个必须报出来的事实，不是一个可以让用例自己消失的条件。
 

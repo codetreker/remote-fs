@@ -115,12 +115,14 @@ func (s *endpointStorage) NewFileSession(context.Context, storage.FileSessionOpt
 }
 
 type endpointFileSession struct {
-	mu       sync.Mutex
-	status   storage.FileSessionStatus
-	renewFn  func(context.Context, int) (storage.FileSessionStatus, error)
-	closeErr error
-	renewals int
-	closes   int
+	mu           sync.Mutex
+	status       storage.FileSessionStatus
+	renewFn      func(context.Context, int) (storage.FileSessionStatus, error)
+	closeErr     error
+	renewals     int
+	closes       int
+	closeEntered chan struct{}
+	closeRelease chan struct{}
 }
 
 func newEndpointFileSession() *endpointFileSession {
@@ -156,17 +158,34 @@ func (s *endpointFileSession) Status(context.Context) (storage.FileSessionStatus
 	defer s.mu.Unlock()
 	return s.status, nil
 }
-func (s *endpointFileSession) Close(context.Context) error {
+func (s *endpointFileSession) Close(ctx context.Context) error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.closes++
-	return s.closeErr
+	entered, release, err := s.closeEntered, s.closeRelease, s.closeErr
+	s.mu.Unlock()
+	if entered != nil {
+		select {
+		case <-entered:
+		default:
+			close(entered)
+		}
+	}
+	if release != nil {
+		select {
+		case <-release:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return err
 }
 
 func endpointConfig() Config {
 	return Config{
-		Authenticator: endpointAuthenticator{}, Authorize: authz.AuthorizerFunc(func(context.Context, authz.AccessRequest) error { return nil }),
-		Limits: DefaultLimits(),
+		Authenticator:     endpointAuthenticator{},
+		AuthorizeIdentity: IdentityAuthorizerFunc(func(context.Context, Principal) error { return nil }),
+		Authorize:         authz.AuthorizerFunc(func(context.Context, authz.AccessRequest) error { return nil }),
+		Limits:            DefaultLimits(),
 	}
 }
 
@@ -176,11 +195,12 @@ func TestEndpointConfigurationAndExportReservation(t *testing.T) {
 		t.Fatal(err)
 	}
 	for name, change := range map[string]func(*Config){
-		"authenticator": func(c *Config) { c.Authenticator = nil },
-		"authorizer":    func(c *Config) { c.Authorize = nil },
-		"frame":         func(c *Config) { c.Limits.MaxFrameBytes = c.Limits.MaxIOBytes },
-		"sessions":      func(c *Config) { c.Limits.MaxSessions = 0 },
-		"timeout":       func(c *Config) { c.Limits.CleanupTimeout = 0 },
+		"authenticator":       func(c *Config) { c.Authenticator = nil },
+		"identity authorizer": func(c *Config) { c.AuthorizeIdentity = nil },
+		"authorizer":          func(c *Config) { c.Authorize = nil },
+		"frame":               func(c *Config) { c.Limits.MaxFrameBytes = c.Limits.MaxIOBytes },
+		"sessions":            func(c *Config) { c.Limits.MaxSessions = 0 },
+		"timeout":             func(c *Config) { c.Limits.CleanupTimeout = 0 },
 	} {
 		t.Run(name, func(t *testing.T) {
 			broken := config

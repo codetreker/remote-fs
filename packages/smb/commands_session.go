@@ -23,6 +23,15 @@ func (c *connection) dispatch(ctx context.Context, request, original wire.Reques
 	if request.Header.Command == wire.SessionSetup {
 		return c.sessionSetup(ctx, request, header)
 	}
+	if request.Header.Command == wire.Echo && request.Header.SessionID == 0 {
+		if original.Header.Flags&(wire.FlagReplay|wire.FlagDFS) != 0 {
+			return nil, statusUnsupported, nil
+		}
+		if request.Header.TreeID != 0 || original.Header.Flags != 0 || request.Empty() != nil {
+			return nil, statusInvalid, nil
+		}
+		return wire.EmptyResponseBody(), statusOK, nil
+	}
 
 	c.mu.Lock()
 	s := c.sessions[request.Header.SessionID]
@@ -34,8 +43,14 @@ func (c *connection) dispatch(ctx context.Context, request, original wire.Reques
 	s.identityMu.RLock()
 	signer, principal := s.signer, s.principal
 	s.identityMu.RUnlock()
-	if signer == nil || signer.Verify(original.Packet) != nil {
+	if signer == nil {
 		return nil, statusDenied, nil
+	}
+	if original.Header.Flags&wire.FlagSigned == 0 {
+		return nil, statusDenied, nil
+	}
+	if signer.Verify(original.Packet) != nil {
+		return nil, statusDenied, signer
 	}
 	ctx = WithPrincipal(ctx, principal)
 	if request.Header.Flags&(wire.FlagReplay|wire.FlagDFS) != 0 {
@@ -200,24 +215,67 @@ func (c *connection) negotiate(request wire.Request) ([]byte, uint32) {
 }
 
 func (c *connection) sessionSetup(ctx context.Context, request wire.Request, header *wire.Header) (body []byte, status uint32, key *signing.Session) {
+	flags := request.Header.Flags
+	var verifiedSigner *signing.Session
+	if request.Header.SessionID == 0 {
+		if flags&(wire.FlagReplay|wire.FlagDFS) != 0 {
+			return nil, statusUnsupported, nil
+		}
+		if flags != 0 {
+			return nil, statusInvalid, nil
+		}
+	} else {
+		c.mu.Lock()
+		existingSession := c.sessions[request.Header.SessionID]
+		c.retainSessionFrameLocked(existingSession, ctx, request.Header.MessageID)
+		c.mu.Unlock()
+		if existingSession == nil {
+			return nil, statusSessionDeleted, nil
+		}
+		existingSession.identityMu.RLock()
+		existingSigner := existingSession.signer
+		existingSession.identityMu.RUnlock()
+		if existingSigner == nil {
+			if flags&(wire.FlagReplay|wire.FlagDFS) != 0 {
+				return nil, statusUnsupported, nil
+			}
+			if flags != 0 {
+				return nil, statusInvalid, nil
+			}
+		} else {
+			if flags&wire.FlagSigned == 0 {
+				return nil, statusDenied, nil
+			}
+			if existingSigner.Verify(request.Packet) != nil {
+				return nil, statusDenied, existingSigner
+			}
+			if flags&(wire.FlagReplay|wire.FlagDFS) != 0 {
+				return nil, statusUnsupported, existingSigner
+			}
+			if flags != wire.FlagSigned {
+				return nil, statusInvalid, existingSigner
+			}
+			verifiedSigner = existingSigner
+		}
+	}
 	setup, err := request.SessionSetup()
 	if err != nil || setup.Flags&^byte(1) != 0 || len(setup.Token) > c.server.config.Limits.MaxTokenBytes {
-		return nil, statusInvalid, nil
+		return nil, statusInvalid, verifiedSigner
 	}
 	if setup.Flags&1 != 0 {
-		return nil, statusRequestNotAccepted, nil
+		return nil, statusRequestNotAccepted, verifiedSigner
 	}
 	c.mu.Lock()
 	if c.closing || c.disconnected || c.ctx.Err() != nil {
 		c.mu.Unlock()
-		return nil, statusSessionDeleted, nil
+		return nil, statusSessionDeleted, verifiedSigner
 	}
 	s := c.sessions[request.Header.SessionID]
 	created := false
 	if request.Header.SessionID == 0 {
 		s = &session{
 			preauth: c.preauth, trees: make(map[uint32]*tree),
-			authDeadline: time.Now().Add(c.server.config.Limits.HandshakeTimeout),
+			authDeadline: time.Now().Add(c.server.config.Limits.HandshakeTimeout), cleanedDone: make(chan struct{}),
 		}
 		if err := c.server.sessions.add(c, s); err != nil {
 			c.mu.Unlock()
@@ -237,7 +295,7 @@ func (c *connection) sessionSetup(ctx context.Context, request wire.Request, hea
 	}
 	c.mu.Unlock()
 	if s == nil {
-		return nil, statusSessionDeleted, nil
+		return nil, statusSessionDeleted, verifiedSigner
 	}
 
 	s.authMu.Lock()
@@ -257,18 +315,27 @@ func (c *connection) sessionSetup(ctx context.Context, request wire.Request, hea
 	retired, finalizing := s.retired, s.finalizing
 	s.mu.Unlock()
 	if retired {
-		return nil, statusSessionDeleted, nil
+		return nil, statusSessionDeleted, verifiedSigner
 	}
 	if finalizing {
-		return nil, statusRequestNotAccepted, nil
+		return nil, statusRequestNotAccepted, verifiedSigner
 	}
 	header.SessionID = s.id
 	s.identityMu.RLock()
 	existing, previousPrincipal := s.signer, s.principal
 	s.identityMu.RUnlock()
 	if existing != nil {
-		if existing.Verify(request.Packet) != nil {
+		if request.Header.Flags&wire.FlagSigned == 0 {
 			return nil, statusDenied, nil
+		}
+		if existing.Verify(request.Packet) != nil {
+			return nil, statusDenied, existing
+		}
+		if request.Header.Flags&(wire.FlagReplay|wire.FlagDFS) != 0 {
+			return nil, statusUnsupported, existing
+		}
+		if request.Header.Flags != wire.FlagSigned {
+			return nil, statusInvalid, existing
 		}
 		if s.authExpired && s.auth != nil {
 			if err := s.closeAuthenticationLocked(); err != nil {
@@ -281,6 +348,8 @@ func (c *connection) sessionSetup(ctx context.Context, request wire.Request, hea
 				return nil, statusResources, existing
 			}
 		}
+	} else if request.Header.Flags != 0 {
+		return nil, statusInvalid, nil
 	}
 	closeAttempted := false
 	defer func() {
@@ -342,6 +411,9 @@ func (c *connection) sessionSetup(ctx context.Context, request wire.Request, hea
 		!result.ExpiresAt.IsZero() && !time.Now().Before(result.ExpiresAt) {
 		return nil, statusDenied, existing
 	}
+	if err := c.server.config.AuthorizeIdentity.AuthorizeIdentity(ctx, result.Principal); err != nil {
+		return nil, identityAuthorizationStatus(err), existing
+	}
 	if existing == nil {
 		key, err = signing.NewSession(s.preauth, result.SessionKey)
 		if err != nil {
@@ -365,6 +437,7 @@ func (c *connection) sessionSetup(ctx context.Context, request wire.Request, hea
 	}
 	s.mu.Lock()
 	s.finalizing = true
+	s.finalizationDone = make(chan struct{})
 	s.mu.Unlock()
 	err = func() error {
 		s.authMu.Unlock()
@@ -374,6 +447,8 @@ func (c *connection) sessionSetup(ctx context.Context, request wire.Request, hea
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.finalizing = false
+	close(s.finalizationDone)
+	s.finalizationDone = nil
 	c.mu.Lock()
 	unavailable := s.retired || c.closing || c.disconnected || c.ctx.Err() != nil || c.sessions[s.id] != s
 	c.mu.Unlock()

@@ -6,7 +6,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/codetreker/remote-fs/packages/authz"
 	"github.com/codetreker/remote-fs/packages/smb"
 )
 
@@ -17,25 +16,25 @@ func TestSIDPolicyUsesVerifiedIdentityAndPreservesCancellation(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, test := range []struct {
-		name string
-		ctx  context.Context
-		want error
+		name      string
+		principal smb.Principal
+		want      error
 	}{
-		{"verified with another display name", smb.WithPrincipal(t.Context(), smb.Principal{SID: identity.SID, LogonSession: identity.LogonSession, Name: "renamed"}), nil},
-		{"missing identity", t.Context(), authz.ErrDenied},
-		{"same user from another logon", smb.WithPrincipal(t.Context(), smb.Principal{SID: identity.SID, LogonSession: "fedcba9876543210", Name: identity.Name}), authz.ErrDenied},
-		{"different user", smb.WithPrincipal(t.Context(), smb.Principal{SID: "S-1-5-21-10-20-30-1002", LogonSession: identity.LogonSession, Name: identity.Name}), authz.ErrDenied},
-		{"name is not identity", smb.WithPrincipal(t.Context(), smb.Principal{Name: identity.SID}), authz.ErrDenied},
+		{"verified with another display name", smb.Principal{SID: identity.SID, LogonSession: identity.LogonSession, Name: "renamed"}, nil},
+		{"missing identity", smb.Principal{}, ErrIdentityNotAllowed},
+		{"same user from another logon", smb.Principal{SID: identity.SID, LogonSession: "fedcba9876543210", Name: identity.Name}, ErrIdentityNotAllowed},
+		{"different user", smb.Principal{SID: "S-1-5-21-10-20-30-1002", LogonSession: identity.LogonSession, Name: identity.Name}, ErrIdentityNotAllowed},
+		{"name is not identity", smb.Principal{Name: identity.SID}, ErrIdentityNotAllowed},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			if err := policy.Authorize(test.ctx, authz.AccessRequest{}); !errors.Is(err, test.want) {
+			if err := policy.AuthorizeIdentity(t.Context(), test.principal); !errors.Is(err, test.want) {
 				t.Fatalf("Authorize = %v, want %v", err, test.want)
 			}
 		})
 	}
-	ctx, cancel := context.WithCancel(smb.WithPrincipal(t.Context(), identity))
+	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
-	if err := policy.Authorize(ctx, authz.AccessRequest{}); err != context.Canceled {
+	if err := policy.AuthorizeIdentity(ctx, identity); err != context.Canceled {
 		t.Fatalf("canceled authorization = %v", err)
 	}
 }

@@ -10,6 +10,7 @@ import (
 	"math"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/codetreker/remote-fs/packages/smb/internal/signing"
@@ -31,6 +32,11 @@ const (
 	statusCancelled             uint32 = 0xc0000120
 	statusRequestNotAccepted    uint32 = 0xc00000d0
 	statusNetworkSessionExpired uint32 = 0xc000035c
+)
+
+const (
+	requestEnvelopeBytes = 256
+	maxControlFrameBytes = 68 << 10
 )
 
 type connection struct {
@@ -81,9 +87,11 @@ type session struct {
 	resourcesClosed              bool
 	retired                      bool
 	finalizing                   bool
+	finalizationDone             chan struct{}
 	logoffMu                     sync.Mutex
 	cleanup                      cleanupGate
 	cleaned                      bool
+	cleanedDone                  chan struct{}
 	mu                           sync.Mutex
 	identityMu                   sync.RWMutex
 	authMu                       sync.Mutex
@@ -92,7 +100,7 @@ type session struct {
 	auth                         Authentication
 	authGeneration               uint64
 	authArmed, authExpired       bool
-	identityExpired              bool
+	identityExpired              atomic.Bool
 	authWake, authStop, authDone chan struct{}
 	authStopOnce                 sync.Once
 	signer                       *signing.Session
@@ -170,6 +178,15 @@ func (c *connection) run() error {
 		requests, err := wire.ParseFrame(packet, wire.Limits{MaxBytes: limits.MaxFrameBytes, MaxCommands: limits.MaxCompound, MaxContexts: limits.MaxContexts})
 		if err != nil {
 			return err
+		}
+		if err := checkReceivedRequests(requests, len(packet), c.negotiated, limits); err != nil {
+			return err
+		}
+		for _, request := range requests {
+			if request.Header.Command == wire.Negotiate &&
+				(c.negotiated || request.Header.Flags&(wire.FlagAsync|wire.FlagReplay|wire.FlagDFS) != 0) {
+				return wire.ErrMalformed
+			}
 		}
 		if len(requests) > 1 {
 			for _, request := range requests {
@@ -367,7 +384,7 @@ func (c *connection) process(requests []wire.Request) error {
 			body = wire.ErrorResponseBody()
 		}
 		inheritedSession, inheritedTree, previousStatus = header.SessionID, header.TreeID, header.Status
-		if index > 0 {
+		if request.Header.Flags&wire.FlagRelated != 0 {
 			header.Flags |= wire.FlagRelated
 		}
 		if index+1 < len(requests) {
@@ -404,7 +421,35 @@ func (c *connection) process(requests []wire.Request) error {
 	return c.writeFinal(output, requests)
 }
 
-func requiredCredits(wire.Request) int { return 1 }
+func controlCommand(command uint16) bool {
+	switch command {
+	case wire.Negotiate, wire.SessionSetup, wire.Logoff, wire.TreeConnect, wire.TreeDisconnect, wire.Cancel, wire.Echo:
+		return true
+	default:
+		return false
+	}
+}
+
+func checkReceivedRequests(requests []wire.Request, frameBytes int, negotiated bool, limits Limits) error {
+	if negotiated && frameBytes > limits.MaxIOBytes+requestEnvelopeBytes {
+		return wire.ErrMalformed
+	}
+	for _, request := range requests {
+		if controlCommand(request.Header.Command) {
+			if len(request.Packet) > maxControlFrameBytes || request.Header.CreditCharge > 1 {
+				return wire.ErrMalformed
+			}
+		}
+	}
+	return nil
+}
+
+func requiredCredits(request wire.Request) int {
+	if controlCommand(request.Header.Command) {
+		return 1
+	}
+	return max(1, (len(request.Packet)+65535)/65536)
+}
 
 func (c *connection) grantCredits(requested uint16) uint16 {
 	c.mu.Lock()
@@ -535,11 +580,9 @@ func (c *connection) addStatus(status *Status) {
 	c.mu.Unlock()
 	status.Sessions += len(sessions)
 	for _, session := range sessions {
-		session.authMu.Lock()
-		if session.identityExpired {
+		if session.identityExpired.Load() {
 			status.ExpiredSessions++
 		}
-		session.authMu.Unlock()
 		session.mu.Lock()
 		status.Trees += len(session.trees) + session.openingTrees
 		authorities := make([]*authoritySession, 0, len(session.authorities))
@@ -548,7 +591,7 @@ func (c *connection) addStatus(status *Status) {
 		}
 		session.mu.Unlock()
 		for _, authority := range authorities {
-			if authority.isStopping() && !authority.isClosed() {
+			if authority.isStopping() {
 				status.FencedAuthorities++
 			}
 		}

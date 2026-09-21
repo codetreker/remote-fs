@@ -213,7 +213,26 @@ func (request Request) TreePath() (string, error) {
 func (request Request) Empty() error {
 	switch request.Header.Command {
 	case Logoff, TreeDisconnect, Cancel, Echo:
-		return request.fixed(request.Header.Command, 4, 4)
+		if err := request.fixed(request.Header.Command, 4, 4); err != nil {
+			return err
+		}
+		padding := request.Body[4:]
+		if request.Header.NextCommand == 0 {
+			if len(padding) != 0 {
+				return ErrMalformed
+			}
+			return nil
+		}
+		want := (-(HeaderSize + 4)) & 7
+		if len(padding) != want {
+			return ErrMalformed
+		}
+		for _, value := range padding {
+			if value != 0 {
+				return ErrMalformed
+			}
+		}
+		return nil
 	default:
 		return ErrMalformed
 	}

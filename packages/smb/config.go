@@ -16,10 +16,11 @@ var (
 )
 
 type Config struct {
-	Authenticator Authenticator
-	Authorize     authz.Authorizer
-	Limits        Limits
-	Logger        *slog.Logger
+	Authenticator     Authenticator
+	AuthorizeIdentity IdentityAuthorizer
+	Authorize         authz.Authorizer
+	Limits            Limits
+	Logger            *slog.Logger
 }
 
 // Limits bounds every resource retained by the endpoint. Callers select the

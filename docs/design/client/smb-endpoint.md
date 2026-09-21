@@ -6,7 +6,7 @@
 
 ## 一、嵌入与发布
 
-`smb.New` 接受 `Config{Authenticator, Authorize, Limits, Logger}`。构造函数先验证依赖和全部资源上限，不取得 Windows credential、不启动 goroutine，也不打开 listener。`packages/smb/windows` 提供 SSPI `Authenticator`、读取进程身份的 `CurrentIdentity` 和只允许该确切身份的 `AllowIdentity`；非 Windows 构建保留同一 API，并在实际取得平台能力时返回不支持。
+`smb.New` 接受 `Config{Authenticator, AuthorizeIdentity, Authorize, Limits, Logger}`。构造函数先验证两个授权接口、认证 provider 和全部资源上限，不取得 Windows credential、不启动 goroutine，也不打开 listener。`packages/smb/windows` 提供 SSPI `Authenticator`、读取进程身份的 `CurrentIdentity` 和只允许该确切身份的 `AllowIdentity`；非 Windows 构建保留同一 API，并在实际取得平台能力时返回不支持。
 
 一个 `Server` 可以发布有限个 `Share`。每个 share 由不区分大小写的 SMB 名字、可信的 host-selected volume identity 和一份调用方拥有的 `storage.FileStorage` 组成。发布时执行 `CheckFileStorage`，但不建立 FileSession，也不接管 backend 的关闭责任。名字为空、过长、含 SMB 分隔／保留字符、前后空白或与 `IPC$` 冲突时拒绝。
 
@@ -34,21 +34,21 @@ Server ── connection ── authenticated session ── tree
 
 SMB2 compound frame 在一个有界 payload 中解析。每项保存自己的 header、body 和用于签名的完整 command bytes；related compound 只继承同一 frame 中前一项的 SessionId 与 TreeId。混用 related 与 unrelated 风格、把 `NEGOTIATE` 或 `SESSION_SETUP` 放入 compound、非法 offset／alignment、非法 credit 或重复 MessageId 都拒绝。response 逐项保留对应状态，related 前项失败时后项不执行受控效果。
 
-认证完成后，每个请求都必须使用该 session 的 AES-CMAC signing key 验证，response 也由同一 key 签名。unsigned、被篡改、未知 session、已经退役的 session、replay/DFS flag 与失效的身份上下文均在访问 tree 或 backing 前失败。session key 只用于派生 signing key，临时 token 与 key buffer 在使用后清零；日志不写入 token、key、SID 或显示名。
+认证完成后，每个携带 SessionId 的请求都必须使用该 session 的 AES-CMAC signing key 验证，合法请求及能够归属该 signer 的错误 response 也由同一 key 签名。unsigned session request 的拒绝保持 unsigned；带 signed flag 但 MAC 错误的请求得到 signed access-denied。已建立 session 的 reauthentication 在解码 token 前先验签，畸形或被篡改的 exchange 不能得到 unsigned 旁路。sessionless ECHO 可以在 negotiate 后使用，并且不继承其它 session 的 signer。未知或已经退役的 session、replay/DFS flag 与失效身份均在访问 tree 或 backing 前失败。session key 只用于派生 signing key，临时 token 与 key buffer 在使用后清零；日志不写入 token、key、SID 或显示名。
 
 ## 三、Windows 身份与授权
 
 `packages/smb/windows` 通过 SSPI `Negotiate` 接受 SPNEGO token。每次 authentication exchange 独立取得 inbound credential；`AcceptSecurityContext` 必须建立 integrity-capable、非 null session 的 security context。完成后从 context token 读取用户 SID 与 `TOKEN_STATISTICS.AuthenticationId`，把二者组成授权身份；account display name 只用于诊断，不参与相等比较或准入。
 
-标准组合先用 `CurrentIdentity` 捕获宿主进程 token 的 SID 与 logon-session ID，再把结果交给 `AllowIdentity` 只允许精确匹配。anonymous、Guest、LocalSystem、LocalService 与 NetworkService 明确拒绝。同一个 SID 的另一次登录不是同一身份，不能接管 `PreviousSessionId`、复用 session 或访问它的 tree。
+标准组合先用 `CurrentIdentity` 捕获宿主进程 token 的 SID 与 logon-session ID，再把结果交给 `AllowIdentity` 作为 `Config.AuthorizeIdentity`，只允许精确匹配。每次初始 authentication 和 reauthentication 都在安装 principal／signer 或替换 expiry 前调用它；明确拒绝产生 access denied，无法决定产生 I/O failure。anonymous、Guest、LocalSystem、LocalService 与 NetworkService 明确拒绝。同一个 SID 的另一次登录不是同一身份，不能接管 `PreviousSessionId`、复用 session 或访问它的 tree。
 
-SMB 本机身份与远端业务身份是两层独立保护。端点把经过 SSPI 验证的 `Principal` 放进 request context，并用 `Config.Authorize` 对 trusted volume 与实际 FileSession 操作作准入；`TREE_CONNECT` 依次授权 `file.session-open` 与 `file.status`，后台续期授权 `file.renew`，显式 tree/session 清理授权 `file.session-close`。backing remote storage 继续使用调用方为远端 authority 配置的身份和凭据，SMB SID 不替代它。
+SMB 本机身份与远端业务身份是两层独立保护。`AuthorizeIdentity` 决定一个已验证的操作系统主体能否建立或刷新 SMB session；端点随后把该 `Principal` 放进 request context，并用独立的 `Config.Authorize` 对 trusted volume 与实际 FileSession 操作作准入。`TREE_CONNECT` 依次授权 `file.session-open` 与 `file.status`，后台续期授权 `file.renew`，显式 tree/session 清理授权 `file.session-close`。backing remote storage 继续使用调用方为远端 authority 配置的身份和凭据，SMB SID 不替代它。
 
 authentication exchange 受 `HandshakeTimeout` 约束，完成后的 identity 另受 provider 返回的 security-context expiry 约束。未完成的 exchange 到期后自主关闭，不等待下一次 `SESSION_SETUP` 才回收；reauthentication 使用新的 generation，旧 timer 不能关闭新的 exchange。identity 到期后，普通命令收到 signed `STATUS_NETWORK_SESSION_EXPIRED`，session、signer 与 tree 保留以允许 signed SESSION_SETUP 重新认证；只有同一 SID 与登录会话的成功 reauthentication 才更新 expiry 并恢复工作，LOGOFF 始终可以清理该 session。
 
 ## 四、资源与所有权
 
-`Limits` 分别限制 export、connection、authenticated/preauthenticated session、tree、pending request、compound command、negotiate context、frame、I/O 与 authentication token。`FileSessionOptions` 继续限制 authority session 自己的文件、owner、range、等待与动作历史。所有值必须显式选择；零值不表示无界。
+`Limits` 分别限制 export、connection、authenticated/preauthenticated session、tree、pending request、compound command、negotiate context、frame、I/O 与 authentication token。`MaxIOBytes` 同时成为协商公布的 transact/read/write 上限；协商后完整 request 不能超过它加固定协议 envelope，control command 另受 68 KiB 上限且只能消耗一个 credit，数据命令的 credit charge 至少覆盖每个 64 KiB payload 单元。`FileSessionOptions` 继续限制 authority session 自己的文件、owner、range、等待与动作历史。所有值必须显式选择；零值不表示无界。
 
 一次 connection 持有自己的 negotiate transcript、credit 集合、pending requests 和 session table。全局 session registry 另外限制所有 connection 的 session 总数；只从某个 connection map 删除 session 不释放这份全局 charge。TreeId 与 SessionId 单调分配并检查耗尽，已退休的 ID 不重新绑定新对象。
 
@@ -60,9 +60,9 @@ authentication exchange 受 `HandshakeTimeout` 约束，完成后的 identity �
 
 `TREE_DISCONNECT` 取消已经登记到该 tree 的 pending request，再关闭它持有的 authority ref；同一 export 的最后一个 tree 关闭共享 FileSession。这份清理只覆盖现有 control request 和 authority ownership，不构成文件工作的 per-tree admission fence。`LOGOFF` 先发布 session retirement，取消除当前 LOGOFF 外的请求，关闭 authentication、全部 tree 和 orphan authority session，最后等待 response frame 释放。连接断开执行相同的无授权清理路径，不能把断线理解为资源已经释放。
 
-`Export.Unpublish` 在 connect／request 正在取得该 export 时返回 busy，原 export 保持可用；否则先标记 stopping，清理它的 idle tree 与共享 FileSession，并只在引用和 active count 都归零后移除 export。进入清理后的失败由同一个 Export 保留，可使用新的 context 重试。`Server.Shutdown` 永久停止 listener 和新工作，等待 connection 退出，移除已经静止并完成清理的 export，并保留失败者供重试。调用方提供的 backend 始终由调用方拥有，server 只关闭自己建立的 FileSession。
+`Export.Unpublish` 对任何 live tree 或正在取得该 export 的 connect／request 返回 busy，原 mapping、tree 与 FileSession 保持有效；只有没有使用者时才进入清理并移除 export。`Server.Shutdown` 另行永久停止 listener 和新工作，等待 connection 退出，强制清理 tree／FileSession，移除已经静止并确认释放的 export，并保留失败者供重试。调用方提供的 backend 始终由调用方拥有，server 只关闭自己建立的 FileSession。
 
-`Status` 报告 serving/stopping/stopped、仍发布或正在停止的 export、活跃及 cleanup-only connection、session、identity-expired session、tree、pending request、fenced authority session 与累计 cleanup failure。identity expiry 表示本机认证需要重新建立，fenced authority 表示远端 FileSession 连续性已失去；两者不能互相代替。状态报告实际仍被拥有的资源，不以协议表项已经删除代替 native cleanup 完成。
+`Status` 报告 serving/stopping/stopped、仍发布或正在停止的 export、活跃及 cleanup-only connection、session、identity-expired session、tree、pending request、fenced authority session 与累计 cleanup failure。identity expiry 表示本机认证需要重新建立；fenced authority 表示它已拒绝新用途但仍被 owner 保留，可能正在排空、等待 cleanup，也可能 native FileSession 已关闭而其它引用尚未释放。两者不能互相代替。状态报告实际仍被拥有的资源，不以协议表项已经删除代替 native cleanup 完成。
 
 ## 六、命令边界
 

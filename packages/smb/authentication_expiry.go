@@ -74,7 +74,7 @@ func (c *connection) watchAuthentication(s *session) {
 		s.authMu.Lock()
 		armed, generation := s.authArmed, s.authGeneration
 		deadline := time.Time{}
-		if !s.identityExpired {
+		if !s.identityExpired.Load() {
 			deadline = s.identityDeadline
 		}
 		if armed && (deadline.IsZero() || s.authDeadline.Before(deadline)) {
@@ -122,14 +122,14 @@ func (c *connection) expireAuthentication(s *session, generation uint64) bool {
 		return true
 	}
 	now := time.Now()
-	identityExpired := !s.identityExpired && !s.identityDeadline.IsZero() && !now.Before(s.identityDeadline)
+	identityExpired := !s.identityExpired.Load() && !s.identityDeadline.IsZero() && !now.Before(s.identityDeadline)
 	authExpired := s.authArmed && s.authGeneration == generation && !now.Before(s.authDeadline)
 	if !identityExpired && !authExpired {
 		s.authMu.Unlock()
 		return false
 	}
 	if identityExpired {
-		s.identityExpired = true
+		s.identityExpired.Store(true)
 		s.identityDeadline = time.Time{}
 		s.wakeAuthenticationLocked()
 		s.authMu.Unlock()
@@ -158,7 +158,7 @@ func (s *session) setIdentityDeadlineLocked(deadline time.Time) error {
 		return syscall.EACCES
 	}
 	s.identityDeadline = deadline
-	s.identityExpired = false
+	s.identityExpired.Store(false)
 	s.wakeAuthenticationLocked()
 	return nil
 }
@@ -166,12 +166,12 @@ func (s *session) setIdentityDeadlineLocked(deadline time.Time) error {
 func (s *session) expiredIdentity() bool {
 	s.authMu.Lock()
 	defer s.authMu.Unlock()
-	if !s.identityExpired && !s.identityDeadline.IsZero() && !time.Now().Before(s.identityDeadline) {
-		s.identityExpired = true
+	if !s.identityExpired.Load() && !s.identityDeadline.IsZero() && !time.Now().Before(s.identityDeadline) {
+		s.identityExpired.Store(true)
 		s.identityDeadline = time.Time{}
 		s.wakeAuthenticationLocked()
 	}
-	return s.identityExpired
+	return s.identityExpired.Load()
 }
 
 func (s *session) waitAuthenticationWatcher(ctx context.Context) error {

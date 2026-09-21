@@ -78,6 +78,9 @@ func (c *connection) cleanSession(ctx context.Context, s *session, explicit bool
 
 		current, _ := ctx.Value(pendingFrameKey{}).(requestFrame)
 		c.retireSessionRequests(s, current)
+		if err := s.synchronizeFinalization(ctx); err != nil {
+			return err
+		}
 		var errs []error
 		s.authMu.Lock()
 		s.disarmAuthenticationLocked(true)
@@ -118,8 +121,51 @@ func (c *connection) cleanSession(ctx context.Context, s *session, explicit bool
 		}
 		s.mu.Unlock()
 		c.finishSessionRetirement(s)
-		return errors.Join(errs...)
+		if err := errors.Join(errs...); err != nil {
+			return err
+		}
+		return s.waitCleaned(ctx)
 	})
+}
+
+func (s *session) synchronizeFinalization(ctx context.Context) error {
+	for {
+		// Crossing authMu prevents cleanup from missing SESSION_SETUP just before
+		// it publishes finalization. Never retain authMu while waiting: the
+		// finalizer must reacquire it after retiring PreviousSessionId.
+		s.authMu.Lock()
+		s.mu.Lock()
+		finalizing, done := s.finalizing, s.finalizationDone
+		s.mu.Unlock()
+		s.authMu.Unlock()
+		if !finalizing {
+			return nil
+		}
+		select {
+		case <-done:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+func (s *session) waitCleaned(ctx context.Context) error {
+	s.mu.Lock()
+	if s.cleaned {
+		s.mu.Unlock()
+		return nil
+	}
+	if s.cleanedDone == nil {
+		s.cleanedDone = make(chan struct{})
+	}
+	done := s.cleanedDone
+	s.mu.Unlock()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func (c *connection) closeTree(tree *tree) error {
@@ -186,6 +232,7 @@ func (c *connection) closeTreeContext(ctx context.Context, tree *tree) error {
 		tree.closed = true
 		c.server.mu.Lock()
 		tree.export.refs--
+		tree.export.trees--
 		c.server.mu.Unlock()
 		return nil
 	})
@@ -311,7 +358,12 @@ func (c *connection) finishSessionRetirement(s *session) {
 	complete := s.retired && !s.finalizing && s.auth == nil && watcherDone &&
 		s.openingTrees == 0 && len(s.trees) == 0 && len(s.authorities) == 0
 	if complete {
-		s.cleaned = true
+		if !s.cleaned {
+			s.cleaned = true
+			if s.cleanedDone != nil {
+				close(s.cleanedDone)
+			}
+		}
 	}
 	s.mu.Unlock()
 	s.authMu.Unlock()

@@ -328,6 +328,9 @@ func (c *connection) connectVolume(ctx context.Context, s *session, key string, 
 	authority.mu.Lock()
 	authority.refs++
 	authority.mu.Unlock()
+	server.mu.Lock()
+	export.trees++
+	server.mu.Unlock()
 	s.trees[id] = tree
 	s.mu.Unlock()
 	authority.installMu.RUnlock()

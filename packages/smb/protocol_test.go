@@ -16,7 +16,10 @@ import (
 	"github.com/codetreker/remote-fs/packages/storage"
 )
 
-type protocolAuthenticator struct{ closed atomic.Int32 }
+type protocolAuthenticator struct {
+	begins atomic.Int32
+	closed atomic.Int32
+}
 
 type protocolAuthentication struct {
 	owner *protocolAuthenticator
@@ -24,6 +27,7 @@ type protocolAuthentication struct {
 }
 
 func (a *protocolAuthenticator) Begin(context.Context) (Authentication, error) {
+	a.begins.Add(1)
 	return &protocolAuthentication{owner: a}, nil
 }
 
@@ -50,7 +54,8 @@ func startProtocolServer(t *testing.T, limits Limits) (*Server, *endpointStorage
 	t.Helper()
 	authenticator := &protocolAuthenticator{}
 	config := Config{
-		Authenticator: authenticator,
+		Authenticator:     authenticator,
+		AuthorizeIdentity: IdentityAuthorizerFunc(func(context.Context, Principal) error { return nil }),
 		Authorize: authz.AuthorizerFunc(func(ctx context.Context, _ authz.AccessRequest) error {
 			principal, ok := PrincipalFromContext(ctx)
 			if !ok || !principal.SameIdentity(testPrincipal("0123456789abcdef")) {
@@ -287,6 +292,37 @@ func TestMultiProtocolBootstrapAdvertisesOnlySMB2Negotiation(t *testing.T) {
 	}
 }
 
+func TestNegotiateStateViolationsFailClosed(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		flags  uint32
+		repeat bool
+	}{
+		{name: "async", flags: wire.FlagAsync},
+		{name: "replay", flags: wire.FlagReplay},
+		{name: "DFS", flags: wire.FlagDFS},
+		{name: "repeated", repeat: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, _, connection := startProtocolServer(t, DefaultLimits())
+			if test.repeat {
+				sendFrame(t, connection, negotiatePacket())
+				_ = readFrame(t, connection)
+			}
+			packet := negotiatePacket()
+			binary.LittleEndian.PutUint32(packet[16:20], test.flags)
+			if test.repeat {
+				binary.LittleEndian.PutUint64(packet[24:32], 1)
+			}
+			sendFrame(t, connection, packet)
+			var one [1]byte
+			if _, err := connection.Read(one[:]); err == nil {
+				t.Fatal("invalid NEGOTIATE received a response")
+			}
+		})
+	}
+}
+
 func signedRequest(t *testing.T, key *signing.Session, header wire.Header, body []byte) []byte {
 	t.Helper()
 	packet := requestPacket(header, body)
@@ -294,6 +330,21 @@ func signedRequest(t *testing.T, key *signing.Session, header wire.Header, body 
 		t.Fatal(err)
 	}
 	return packet
+}
+
+func connectProtocolTree(t *testing.T, connection net.Conn, key *signing.Session, sessionID, message uint64, share string) uint32 {
+	t.Helper()
+	packet := treeConnectPacket(message, sessionID, `\\localhost\`+share)
+	if err := key.Sign(packet); err != nil {
+		t.Fatal(err)
+	}
+	sendFrame(t, connection, packet)
+	response := readFrame(t, connection)
+	header, _ := wire.ParseHeader(response)
+	if header.Status != statusOK || header.TreeID == 0 || key.Verify(response) != nil {
+		t.Fatalf("tree connect = %+v", header)
+	}
+	return header.TreeID
 }
 
 func compoundRequest(t *testing.T, key *signing.Session, headers []wire.Header, bodies [][]byte, related bool) []byte {
@@ -424,11 +475,12 @@ func TestAuthenticatedControlTranscriptAndUnsupportedCommands(t *testing.T) {
 
 func TestUnsignedAndTamperedPostAuthenticationRequestsAreRejected(t *testing.T) {
 	for _, test := range []struct {
-		name   string
-		mutate func([]byte)
+		name           string
+		mutate         func([]byte)
+		responseSigned bool
 	}{
 		{name: "unsigned", mutate: func([]byte) {}},
-		{name: "tampered", mutate: func(packet []byte) { packet[len(packet)-1] ^= 1 }},
+		{name: "tampered", mutate: func(packet []byte) { packet[len(packet)-1] ^= 1 }, responseSigned: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			_, _, connection := startProtocolServer(t, DefaultLimits())
@@ -443,8 +495,161 @@ func TestUnsignedAndTamperedPostAuthenticationRequestsAreRejected(t *testing.T) 
 			sendFrame(t, connection, packet)
 			response := readFrame(t, connection)
 			header, _ := wire.ParseHeader(response)
-			if header.Status != statusDenied {
+			if header.Status != statusDenied || (header.Flags&wire.FlagSigned != 0) != test.responseSigned {
 				t.Fatalf("response = %+v", header)
+			}
+			if test.responseSigned && key.Verify(response) != nil {
+				t.Fatal("tampered request denial was not signed")
+			}
+		})
+	}
+}
+
+func TestTamperedReauthenticationGetsSignedDenial(t *testing.T) {
+	_, _, connection := startProtocolServer(t, DefaultLimits())
+	sessionID, key := authenticateProtocol(t, connection)
+	packet := signedRequest(t, key, wire.Header{Command: wire.SessionSetup, MessageID: 3, SessionID: sessionID, Credits: 1}, setupPacket(0, 0, "initial")[wire.HeaderSize:])
+	packet[len(packet)-1] ^= 1
+	sendFrame(t, connection, packet)
+	response := readFrame(t, connection)
+	header, _ := wire.ParseHeader(response)
+	if header.Status != statusDenied || key.Verify(response) != nil {
+		t.Fatalf("tampered reauthentication = %+v", header)
+	}
+	echo := signedRequest(t, key, wire.Header{Command: wire.Echo, MessageID: 4, SessionID: sessionID, Credits: 1}, wire.EmptyResponseBody())
+	sendFrame(t, connection, echo)
+	response = readFrame(t, connection)
+	header, _ = wire.ParseHeader(response)
+	if header.Status != statusOK || key.Verify(response) != nil {
+		t.Fatalf("old session after tampered reauthentication = %+v", header)
+	}
+}
+
+func TestSignedMalformedReauthenticationGetsSignedInvalidParameter(t *testing.T) {
+	_, _, connection := startProtocolServer(t, DefaultLimits())
+	sessionID, key := authenticateProtocol(t, connection)
+	packet := setupPacket(3, sessionID, "initial")
+	binary.LittleEndian.PutUint16(packet[wire.HeaderSize+12:], wire.HeaderSize+8)
+	if err := key.Sign(packet); err != nil {
+		t.Fatal(err)
+	}
+	sendFrame(t, connection, packet)
+	response := readFrame(t, connection)
+	header, _ := wire.ParseHeader(response)
+	if header.Status != statusInvalid || key.Verify(response) != nil {
+		t.Fatalf("malformed reauthentication = %+v", header)
+	}
+}
+
+func TestSessionlessEchoSucceedsBeforeAndAfterAuthentication(t *testing.T) {
+	t.Run("after negotiate", func(t *testing.T) {
+		_, _, connection := startProtocolServer(t, DefaultLimits())
+		sendFrame(t, connection, negotiatePacket())
+		_ = readFrame(t, connection)
+		packet := requestPacket(wire.Header{Command: wire.Echo, MessageID: 1, Credits: 1}, wire.EmptyResponseBody())
+		sendFrame(t, connection, packet)
+		response := readFrame(t, connection)
+		header, _ := wire.ParseHeader(response)
+		if header.Status != statusOK || header.Flags&wire.FlagSigned != 0 {
+			t.Fatalf("sessionless echo = %+v", header)
+		}
+	})
+	t.Run("with another session established", func(t *testing.T) {
+		_, _, connection := startProtocolServer(t, DefaultLimits())
+		_, _ = authenticateProtocol(t, connection)
+		packet := requestPacket(wire.Header{Command: wire.Echo, MessageID: 3, Credits: 1}, wire.EmptyResponseBody())
+		sendFrame(t, connection, packet)
+		response := readFrame(t, connection)
+		header, _ := wire.ParseHeader(response)
+		if header.Status != statusOK || header.Flags&wire.FlagSigned != 0 {
+			t.Fatalf("sessionless echo = %+v", header)
+		}
+	})
+}
+
+func TestSessionlessEchoDoesNotBypassHeaderFlagValidation(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		flags  uint32
+		status uint32
+	}{
+		{name: "replay", flags: wire.FlagReplay, status: statusUnsupported},
+		{name: "DFS", flags: wire.FlagDFS, status: statusUnsupported},
+		{name: "signed without session", flags: wire.FlagSigned, status: statusInvalid},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, _, connection := startProtocolServer(t, DefaultLimits())
+			sendFrame(t, connection, negotiatePacket())
+			_ = readFrame(t, connection)
+			packet := requestPacket(wire.Header{Command: wire.Echo, MessageID: 1, Credits: 1, Flags: test.flags}, wire.EmptyResponseBody())
+			sendFrame(t, connection, packet)
+			response := readFrame(t, connection)
+			header, _ := wire.ParseHeader(response)
+			if header.Status != test.status || header.Flags&wire.FlagSigned != 0 {
+				t.Fatalf("response = %+v", header)
+			}
+		})
+	}
+}
+
+func TestInitialSessionSetupRejectsForbiddenFlagsBeforeAuthentication(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		flags  uint32
+		status uint32
+	}{
+		{name: "signed", flags: wire.FlagSigned, status: statusInvalid},
+		{name: "replay", flags: wire.FlagReplay, status: statusUnsupported},
+		{name: "DFS", flags: wire.FlagDFS, status: statusUnsupported},
+		{name: "async", flags: wire.FlagAsync, status: statusInvalid},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			server, _, connection := startProtocolServer(t, DefaultLimits())
+			sendFrame(t, connection, negotiatePacket())
+			_ = readFrame(t, connection)
+			packet := setupPacket(1, 0, "initial")
+			binary.LittleEndian.PutUint32(packet[16:20], test.flags)
+			sendFrame(t, connection, packet)
+			response := readFrame(t, connection)
+			header, _ := wire.ParseHeader(response)
+			if header.Status != test.status || header.SessionID != 0 {
+				t.Fatalf("response = %+v", header)
+			}
+			authenticator := server.config.Authenticator.(*protocolAuthenticator)
+			if authenticator.begins.Load() != 0 || server.Status().Sessions != 0 {
+				t.Fatalf("forbidden setup reached authentication: begins=%d status=%+v", authenticator.begins.Load(), server.Status())
+			}
+		})
+	}
+}
+
+func TestCompoundResponsesPreserveRequestRelatedStyle(t *testing.T) {
+	for _, related := range []bool{false, true} {
+		name := "unrelated"
+		if related {
+			name = "related"
+		}
+		t.Run(name, func(t *testing.T) {
+			_, _, connection := startProtocolServer(t, DefaultLimits())
+			sessionID, key := authenticateProtocol(t, connection)
+			headers := []wire.Header{
+				{Command: wire.Echo, MessageID: 3, SessionID: sessionID, Credits: 1},
+				{Command: wire.Echo, MessageID: 4, SessionID: sessionID, Credits: 1},
+			}
+			packet := compoundRequest(t, key, headers, [][]byte{wire.EmptyResponseBody(), wire.EmptyResponseBody()}, related)
+			sendFrame(t, connection, packet)
+			response := readFrame(t, connection)
+			first, err := wire.ParseHeader(response)
+			if err != nil || first.NextCommand == 0 || first.Flags&wire.FlagRelated != 0 {
+				t.Fatalf("first response = %+v, %v", first, err)
+			}
+			offset := int(first.NextCommand)
+			second, err := wire.ParseHeader(response[offset:])
+			if err != nil || (second.Flags&wire.FlagRelated != 0) != related {
+				t.Fatalf("second response = %+v, %v", second, err)
+			}
+			if key.Verify(response[:offset]) != nil || key.Verify(response[offset:]) != nil {
+				t.Fatal("compound response signature failed")
 			}
 		})
 	}
@@ -490,6 +695,79 @@ func TestDirectTCPFrameBoundsCloseTheConnection(t *testing.T) {
 	}
 }
 
+func TestNegotiatedRequestBoundsAreEnforcedBeforeDispatch(t *testing.T) {
+	t.Run("MaxIO plus envelope exact", func(t *testing.T) {
+		limits := DefaultLimits()
+		limits.MaxIOBytes = 65536
+		limits.MaxFrameBytes = 131072
+		_, backend, connection := startProtocolServer(t, limits)
+		sessionID, key := authenticateProtocol(t, connection)
+		treeID := connectProtocolTree(t, connection, key, sessionID, 3, "IPC$")
+		body := make([]byte, limits.MaxIOBytes+requestEnvelopeBytes-wire.HeaderSize)
+		packet := signedRequest(t, key, wire.Header{
+			Command: wire.Create, MessageID: 4, SessionID: sessionID, TreeID: treeID, Credits: 1, CreditCharge: 2,
+		}, body)
+		sendFrame(t, connection, packet)
+		response := readFrame(t, connection)
+		header, _ := wire.ParseHeader(response)
+		if header.Status != statusUnsupported || key.Verify(response) != nil {
+			t.Fatalf("exact request boundary = %+v", header)
+		}
+		if backend.dataCalls.Load() != 0 {
+			t.Fatal("exact unsupported request reached backing")
+		}
+	})
+	t.Run("MaxIO plus envelope plus one", func(t *testing.T) {
+		limits := DefaultLimits()
+		limits.MaxIOBytes = 65536
+		limits.MaxFrameBytes = 131072
+		_, backend, connection := startProtocolServer(t, limits)
+		sessionID, key := authenticateProtocol(t, connection)
+		treeID := connectProtocolTree(t, connection, key, sessionID, 3, "IPC$")
+		body := make([]byte, limits.MaxIOBytes+requestEnvelopeBytes-wire.HeaderSize+1)
+		packet := signedRequest(t, key, wire.Header{
+			Command: wire.Create, MessageID: 4, SessionID: sessionID, TreeID: treeID, Credits: 1, CreditCharge: 2,
+		}, body)
+		sendFrame(t, connection, packet)
+		var one [1]byte
+		if _, err := connection.Read(one[:]); err == nil {
+			t.Fatal("request one byte above negotiated receive bound remained open")
+		}
+		if backend.dataCalls.Load() != 0 || backend.sessionOpens.Load() != 0 {
+			t.Fatal("over-limit request reached backing")
+		}
+	})
+	t.Run("control envelope and credit charge", func(t *testing.T) {
+		for _, test := range []struct {
+			name   string
+			length int
+			charge uint16
+		}{
+			{name: "oversized", length: maxControlFrameBytes + 1, charge: 1},
+			{name: "multicredit", length: wire.HeaderSize + len(wire.EmptyResponseBody()), charge: 2},
+		} {
+			t.Run(test.name, func(t *testing.T) {
+				_, backend, connection := startProtocolServer(t, DefaultLimits())
+				sessionID, key := authenticateProtocol(t, connection)
+				treeID := connectProtocolTree(t, connection, key, sessionID, 3, "IPC$")
+				body := make([]byte, test.length-wire.HeaderSize)
+				copy(body, wire.EmptyResponseBody())
+				packet := signedRequest(t, key, wire.Header{
+					Command: wire.Echo, MessageID: 4, SessionID: sessionID, TreeID: treeID, Credits: 1, CreditCharge: test.charge,
+				}, body)
+				sendFrame(t, connection, packet)
+				var one [1]byte
+				if _, err := connection.Read(one[:]); err == nil {
+					t.Fatal("invalid control request remained open")
+				}
+				if backend.dataCalls.Load() != 0 {
+					t.Fatal("invalid control request reached backing")
+				}
+			})
+		}
+	})
+}
+
 func TestRequestLimitRejectsMaxPlusOneAndRecovers(t *testing.T) {
 	limits := DefaultLimits()
 	limits.MaxRequests = 1
@@ -498,7 +776,8 @@ func TestRequestLimitRejectsMaxPlusOneAndRecovers(t *testing.T) {
 	release := make(chan struct{})
 	authenticator := &protocolAuthenticator{}
 	config := Config{
-		Authenticator: authenticator,
+		Authenticator:     authenticator,
+		AuthorizeIdentity: IdentityAuthorizerFunc(func(context.Context, Principal) error { return nil }),
 		Authorize: authz.AuthorizerFunc(func(ctx context.Context, request authz.AccessRequest) error {
 			principal, ok := PrincipalFromContext(ctx)
 			if !ok || !principal.SameIdentity(testPrincipal("0123456789abcdef")) {

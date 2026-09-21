@@ -81,16 +81,18 @@ Azurite release moves the highest `x-ms-version` its blob service will accept, a
 pinned SDK sits exactly on that ceiling.
 
 [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs those same commands on every
-pull request and on every commit that reaches `main`, in two jobs: one for the layers that
-need no mountpoint, one that mounts filesystems. They are split because a mount can wedge,
-and a wedged job should not take the rest of the answer down with it. Exhaustive coverage
-is that run's job, and it starts itself. Both jobs bring up the same emulator through
+pull request and on every commit that reaches `main`. Two Linux jobs divide the layers that
+need no mountpoint from the ones that mount filesystems. They are split because a mount can
+wedge, and a wedged job should not take the rest of the answer down with it. A focused
+Windows Server 2025 job runs the native SSPI package tests and vet; it validates the Windows
+API implementation, not Windows 11 redirector or WNet behavior. Exhaustive coverage is the
+Linux run's job, and it starts itself. Both Linux jobs bring up the same emulator through
 [`deployments/ci/docker-compose.yml`](deployments/ci/docker-compose.yml) before their
 Blob-dependent tests, waiting for it to answer requests. The mounted job needs it for
 the real Azure binary lock and restart tests; its later module-wide coverage gate uses
 the same running emulator.
 
-Both jobs use [the shared Go setup action](.github/actions/setup-go/action.yml), which
+All three jobs use [the shared Go setup action](.github/actions/setup-go/action.yml), which
 pins Go 1.26.8 and owns a combined module/build cache for each job, toolchain,
 dependency hash and source SHA. A same-job prefix and a verified legacy archive
 can seed new snapshots. This cache reuses compilation work; every test still runs

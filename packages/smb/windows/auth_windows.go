@@ -74,6 +74,8 @@ type authentication struct {
 	pendingTokens         []win.Token
 	freeBuffer            func(unsafe.Pointer) error
 	closeToken            func(win.Token) error
+	deleteSecurity        func(*securityHandle) error
+	freeCredential        func(*securityHandle) error
 }
 
 // Pointer arguments must escape before Find can grow the Go stack. Keeping this
@@ -267,22 +269,37 @@ func (a *authentication) Close() error {
 
 func (a *authentication) closeLocked() error {
 	a.closed = true
+	var errs []error
 	if err := a.retryTemporaryCleanup(); err != nil {
-		return err
+		errs = append(errs, err)
 	}
 	if a.security.valid() {
-		if err := nativeSecurityCall(deleteContext, uintptr(unsafe.Pointer(&a.security))); err != nil {
-			return err
+		remove := a.deleteSecurity
+		if remove == nil {
+			remove = func(handle *securityHandle) error {
+				return nativeSecurityCall(deleteContext, uintptr(unsafe.Pointer(handle)))
+			}
 		}
-		a.security = invalidSecurityHandle()
+		if err := remove(&a.security); err != nil {
+			errs = append(errs, err)
+		} else {
+			a.security = invalidSecurityHandle()
+		}
 	}
 	if a.credentials.valid() {
-		if err := nativeSecurityCall(freeCredentials, uintptr(unsafe.Pointer(&a.credentials))); err != nil {
-			return err
+		free := a.freeCredential
+		if free == nil {
+			free = func(handle *securityHandle) error {
+				return nativeSecurityCall(freeCredentials, uintptr(unsafe.Pointer(handle)))
+			}
 		}
-		a.credentials = invalidSecurityHandle()
+		if err := free(&a.credentials); err != nil {
+			errs = append(errs, err)
+		} else {
+			a.credentials = invalidSecurityHandle()
+		}
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 func (a *authentication) releaseBuffer(buffer unsafe.Pointer) error {
@@ -321,25 +338,30 @@ func (a *authentication) retryTemporaryCleanup() error {
 			return nativeSecurityCall(freeSecurityBuffer, uintptr(pointer))
 		}
 	}
-	for len(a.pendingBuffers) > 0 {
-		if err := free(a.pendingBuffers[0]); err != nil {
-			return err
+	remainingBuffers := a.pendingBuffers[:0]
+	var errs []error
+	for _, buffer := range a.pendingBuffers {
+		if err := free(buffer); err != nil {
+			errs = append(errs, err)
+			remainingBuffers = append(remainingBuffers, buffer)
 		}
-		a.pendingBuffers[0] = nil
-		a.pendingBuffers = a.pendingBuffers[1:]
 	}
+	clear(a.pendingBuffers[len(remainingBuffers):])
+	a.pendingBuffers = remainingBuffers
 	closeToken := a.closeToken
 	if closeToken == nil {
 		closeToken = func(token win.Token) error { return token.Close() }
 	}
-	for len(a.pendingTokens) > 0 {
-		if err := closeToken(a.pendingTokens[0]); err != nil {
-			return err
+	remainingTokens := a.pendingTokens[:0]
+	for _, token := range a.pendingTokens {
+		if err := closeToken(token); err != nil {
+			errs = append(errs, err)
+			remainingTokens = append(remainingTokens, token)
 		}
-		a.pendingTokens[0] = 0
-		a.pendingTokens = a.pendingTokens[1:]
 	}
-	return nil
+	clear(a.pendingTokens[len(remainingTokens):])
+	a.pendingTokens = remainingTokens
+	return errors.Join(errs...)
 }
 
 func securityExpiry(value securityTimestamp) (time.Time, error) {

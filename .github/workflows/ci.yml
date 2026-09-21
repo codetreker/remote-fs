@@ -16,8 +16,8 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
-  # The layers that mount a filesystem, named once. The two jobs below divide the suite
-  # on exactly this line: the second runs these, the first runs everything else.
+  # The layers that mount a filesystem, named once. The two Linux jobs below divide the
+  # suite on exactly this line: the second runs these, the first runs everything else.
   MOUNTING_PACKAGES: ./packages/fuse/... ./cmd/...
 
 jobs:
@@ -172,3 +172,22 @@ jobs:
           [ -z "$survivors" ] || report "fusermount processes survived the run:" "$survivors"
 
           exit "$leaked"
+
+  windows-sspi:
+    name: native Windows SSPI tests
+    # This hosted label is Windows Server 2025. It exercises the native SSPI API,
+    # not the Windows 11 redirector or WNet acceptance owned by later work.
+    # https://github.com/actions/runner-images/blob/9d7eec51794bb688d6c7ce00550cda5a134c88a3/README.md#available-images
+    runs-on: windows-2025
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-go
+
+      - name: Test the native SSPI adapter
+        run: go test -count=1 -race ./packages/smb/windows
+
+      - name: Vet the native SSPI adapter
+        run: go vet ./packages/smb/windows

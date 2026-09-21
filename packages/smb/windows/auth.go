@@ -10,7 +10,6 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/codetreker/remote-fs/packages/authz"
 	"github.com/codetreker/remote-fs/packages/smb"
 )
 
@@ -45,7 +44,7 @@ func CurrentIdentity() (smb.Principal, error) { return currentIdentity() }
 
 // AllowIdentity accepts only requests carrying this exact SSPI-verified user and
 // logon-session identity. The diagnostic display name is not an authority fact.
-func AllowIdentity(identity smb.Principal) (authz.Authorizer, error) {
+func AllowIdentity(identity smb.Principal) (smb.IdentityAuthorizer, error) {
 	if !canonicalSID(identity.SID) {
 		return nil, ErrInvalidSID
 	}
@@ -55,13 +54,12 @@ func AllowIdentity(identity smb.Principal) (authz.Authorizer, error) {
 	if !canonicalLogonSession(identity.LogonSession) {
 		return nil, ErrInvalidLogonSession
 	}
-	return authz.AuthorizerFunc(func(ctx context.Context, _ authz.AccessRequest) error {
+	return smb.IdentityAuthorizerFunc(func(ctx context.Context, principal smb.Principal) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		principal, ok := smb.PrincipalFromContext(ctx)
-		if !ok || principal.SID != identity.SID || principal.LogonSession != identity.LogonSession {
-			return authz.ErrDenied
+		if !principal.SameIdentity(identity) {
+			return errors.Join(ErrIdentityNotAllowed, smb.ErrIdentityDenied)
 		}
 		return nil
 	}), nil

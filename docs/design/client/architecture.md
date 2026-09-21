@@ -12,7 +12,7 @@ volume 的使用者。持有一份 remote storage，把 volume 呈现为 Linux �
 | **显式锁控制** | HTTP client 实现锁 Service，调用方保留 Session / Owner 与原动作身份，以 `WithScope` 构造独立、不可变的修改 proof 集合。控制请求具有独立预算。 | R-CC-3、R-CC-6 至 R-CC-11、R-INT-3 |
 | **本地副本** `packages/storage/replicated` | 一个 storage 装饰器：按路径 `Stat` 走本地 SQLite，公开 `List` / `ListBounded` 与身份目录／名字观察在确认副本健康后回源 authority，其余操作也走远端。副本由 v4 变更流喂着，并为自己的目录树维护不可作为 authority 证据的本地 revision。 | R-CON-1~4、R-ERR-1、R-ERR-2、R-INT-3、R-SEC-3 |
 | **挂载呈现层** `packages/fuse` | 把一份 storage 呈现为本地目录。持有 FileSession、已打开目录的 NodeReference、普通 File、UseOwner 与内核 owner 的映射；以父 NodeID 执行子项操作，目录 handle 以 Scope 捕获一次完整 Readdir，文件以 direct I/O 逐次读写。仅 Linux。 | R-FS-1、R-FS-5、R-FS-6、R-FS-8、R-CON-1~3、R-ERR-1、R-ERR-2、R-CC-12、R-CC-13、R-WS-5、R-INT-3、R-INT-8 |
-| **本机 SMB 端点** `packages/smb`、`packages/smb/windows` | 接受 loopback 上的 Windows SMB client，执行 SMB 3.1.1 协商、SSPI 身份验证、强制消息签名以及 connection/session/tree/export 生命周期；每个 authenticated session 与 export 共享一份 FileSession。文件与目录命令返回不支持。 | R-INT-1~3、R-INT-10、R-SEC-1、R-SEC-4、R-WIN-1、R-WIN-9、R-WIN-10 |
+| **本机 SMB 端点** `packages/smb`、`packages/smb/windows` | 接受 loopback 上的 Windows SMB client，执行 SMB 3.1.1 协商、SSPI 身份验证、强制消息签名以及 connection/session/tree/export 生命周期；每个 authenticated session 与 export 共享一份 FileSession。文件与目录命令返回不支持。 | R-INT-1~3、R-INT-10、R-SEC-1、R-SEC-4、R-SEC-5、R-WIN-1、R-WIN-9、R-WIN-10 |
 | **生命周期** | Linux mount 与 SMB Server／Export 的建立、停止和清理重试。 | R-WS-2、R-WIN-10 |
 
 Linux mount 的数据路径如下；Windows endpoint 的内部层次见[本机 SMB 端点](smb-endpoint.md)。

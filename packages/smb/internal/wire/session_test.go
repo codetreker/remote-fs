@@ -169,6 +169,18 @@ func TestSessionSetupAndTree(t *testing.T) {
 		if err := parseOne(t, requestPacket(command, 4, 4)).Empty(); err != nil {
 			t.Fatal(err)
 		}
+		trailing := requestPacket(command, 4, 5)
+		if err := parseOne(t, trailing).Empty(); err == nil {
+			t.Fatalf("command %d accepted meaningful trailing data", command)
+		}
+		compound := Request{Header: Header{Command: command, NextCommand: 72}, Body: []byte{4, 0, 0, 0, 0, 0, 0, 0}}
+		if err := compound.Empty(); err != nil {
+			t.Fatalf("command %d rejected required compound padding: %v", command, err)
+		}
+		compound.Body[len(compound.Body)-1] = 1
+		if err := compound.Empty(); err == nil {
+			t.Fatalf("command %d accepted nonzero compound padding", command)
+		}
 	}
 	if err := parseOne(t, requestPacket(Create, 4, 4)).Empty(); err == nil {
 		t.Fatal("nonempty command accepted as fixed empty body")

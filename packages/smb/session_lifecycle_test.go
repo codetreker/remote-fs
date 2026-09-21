@@ -2,6 +2,7 @@ package smb
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"net"
 	"syscall"
@@ -43,6 +44,9 @@ func registerSession(t *testing.T, server *Server, connection *connection, sessi
 	t.Helper()
 	if session.trees == nil {
 		session.trees = make(map[uint32]*tree)
+	}
+	if session.cleanedDone == nil {
+		session.cleanedDone = make(chan struct{})
 	}
 	if err := server.sessions.add(connection, session); err != nil {
 		t.Fatal(err)
@@ -99,6 +103,71 @@ func TestReauthenticationRejectsSameSIDFromDifferentLogonSession(t *testing.T) {
 	s.identityMu.RUnlock()
 	if !principal.SameIdentity(original) {
 		t.Fatalf("rejected authentication changed identity: %+v", principal)
+	}
+}
+
+func TestIdentityAdmissionRejectsInitialSessionWithoutRetainingCapacity(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		policy error
+		status uint32
+	}{
+		{name: "denied", policy: ErrIdentityDenied, status: statusDenied},
+		{name: "policy fault", policy: errors.New("identity policy unavailable"), status: statusIO},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			limits := DefaultLimits()
+			limits.MaxSessions = 1
+			server, connection := testConnection(t, limits)
+			server.config.Authenticator = immediateIdentityAuthenticator{principal: testPrincipal("0123456789abcdef")}
+			server.config.AuthorizeIdentity = IdentityAuthorizerFunc(func(context.Context, Principal) error { return test.policy })
+			request := setupRequest(t, 1, 0, "proof")
+			header := request.Header
+			if _, status, signer := connection.sessionSetup(t.Context(), request, &header); status != test.status || signer != nil {
+				t.Fatalf("identity admission = %#x signer=%p", status, signer)
+			}
+			if state := server.Status(); state.Sessions != 0 || state.Trees != 0 {
+				t.Fatalf("rejected identity retained resources: %+v", state)
+			}
+			server.config.AuthorizeIdentity = IdentityAuthorizerFunc(func(context.Context, Principal) error { return nil })
+			request = setupRequest(t, 2, 0, "proof")
+			header = request.Header
+			if _, status, signer := connection.sessionSetup(t.Context(), request, &header); status != statusOK || signer == nil {
+				t.Fatalf("reused identity capacity = %#x signer=%p", status, signer)
+			}
+			accepted := server.sessions.get(header.SessionID).session
+			if accepted == nil {
+				t.Fatal("accepted identity has no session owner")
+			}
+			if err := connection.cleanSession(WithPrincipal(t.Context(), testPrincipal("0123456789abcdef")), accepted, false); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestRejectedReauthenticationPreservesExistingSession(t *testing.T) {
+	server, connection := testConnection(t, DefaultLimits())
+	key, err := signing.NewSession([64]byte{}, []byte("0123456789abcdef"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	principal := testPrincipal("0123456789abcdef")
+	s := &session{signer: key, principal: principal, trees: make(map[uint32]*tree), identityDeadline: time.Now().Add(time.Hour)}
+	registerSession(t, server, connection, s)
+	server.config.Authenticator = immediateIdentityAuthenticator{principal: principal}
+	server.config.AuthorizeIdentity = IdentityAuthorizerFunc(func(context.Context, Principal) error { return ErrIdentityDenied })
+	request := signedParsedRequest(t, key, setupPacket(1, s.id, "proof"))
+	header := request.Header
+	if _, status, signer := connection.sessionSetup(t.Context(), request, &header); status != statusDenied || signer != key {
+		t.Fatalf("reauthentication policy = %#x signer=%p", status, signer)
+	}
+	if owner := server.sessions.get(s.id); owner.session != s {
+		t.Fatal("rejected reauthentication retired established session")
+	}
+	packet := wire.EncodeResponse(wire.Header{}, wire.EmptyResponseBody())
+	if err := key.Sign(packet); err != nil {
+		t.Fatalf("rejected reauthentication destroyed old signer: %v", err)
 	}
 }
 
@@ -278,6 +347,47 @@ func TestNativeIdentityExpiryFencesWorkAndAllowsReauthentication(t *testing.T) {
 	header = echo.Header
 	if _, status, signer := connection.dispatch(t.Context(), echo, echo, &header); status != statusOK || signer != key {
 		t.Fatalf("reauthenticated request = %#x signer=%p", status, signer)
+	}
+}
+
+func TestStatusDoesNotWaitForBlockedAuthenticationProvider(t *testing.T) {
+	server, connection := testConnection(t, DefaultLimits())
+	s := &session{trees: make(map[uint32]*tree)}
+	s.identityExpired.Store(true)
+	registerSession(t, server, connection, s)
+	s.authMu.Lock()
+	defer s.authMu.Unlock()
+	done := make(chan Status, 1)
+	go func() { done <- server.Status() }()
+	select {
+	case status := <-done:
+		if status.ExpiredSessions != 1 {
+			t.Fatalf("status = %+v", status)
+		}
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("Status waited for a blocked authentication provider")
+	}
+}
+
+func TestSessionCleanupCompletionWaitIsBounded(t *testing.T) {
+	already := &session{cleaned: true}
+	if err := already.waitCleaned(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	waiting := &session{cleanedDone: make(chan struct{})}
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if err := waiting.waitCleaned(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled wait = %v", err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- waiting.waitCleaned(context.Background()) }()
+	waiting.mu.Lock()
+	waiting.cleaned = true
+	close(waiting.cleanedDone)
+	waiting.mu.Unlock()
+	if err := <-done; err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -490,6 +600,79 @@ func TestLogoffRacingTreeConnectCannotInstallLateAuthority(t *testing.T) {
 	}
 }
 
+func TestLogoffWaitsForPreviousSessionFinalization(t *testing.T) {
+	server, currentConnection := testConnection(t, DefaultLimits())
+	left, right := net.Pipe()
+	defer left.Close()
+	defer right.Close()
+	oldConnection := newConnection(server, left)
+	server.mu.Lock()
+	server.connections[oldConnection] = struct{}{}
+	server.mu.Unlock()
+	closeEntered, closeRelease := make(chan struct{}), make(chan struct{})
+	backend := &endpointStorage{session: newEndpointFileSession()}
+	backend.session.closeEntered, backend.session.closeRelease = closeEntered, closeRelease
+	export, err := server.Publish(Share{Name: "data", Volume: "volume", Backend: backend})
+	if err != nil {
+		t.Fatal(err)
+	}
+	principal := testPrincipal("0123456789abcdef")
+	old := &session{principal: principal, trees: make(map[uint32]*tree)}
+	registerSession(t, server, oldConnection, old)
+	if _, status := oldConnection.connectVolume(WithPrincipal(t.Context(), principal), old, export.key, &wire.Header{}); status != statusOK {
+		t.Fatalf("old tree connect = %#x", status)
+	}
+	key, err := signing.NewSession([64]byte{}, []byte("0123456789abcdef"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	current := &session{signer: key, principal: principal, trees: make(map[uint32]*tree), identityDeadline: time.Now().Add(time.Hour)}
+	registerSession(t, server, currentConnection, current)
+	server.config.Authenticator = immediateIdentityAuthenticator{principal: principal}
+	requestPacket := setupPacket(1, current.id, "proof")
+	binary.LittleEndian.PutUint64(requestPacket[wire.HeaderSize+16:], old.id)
+	request := signedParsedRequest(t, key, requestPacket)
+	reauthenticated := make(chan uint32, 1)
+	go func() {
+		header := request.Header
+		_, status, _ := currentConnection.sessionSetup(context.Background(), request, &header)
+		reauthenticated <- status
+	}()
+	<-closeEntered
+	loggedOff := make(chan error, 1)
+	go func() {
+		loggedOff <- currentConnection.cleanSession(WithPrincipal(context.Background(), principal), current, true)
+	}()
+	deadline := time.Now().Add(time.Second)
+	for {
+		current.mu.Lock()
+		retired := current.retired
+		current.mu.Unlock()
+		if retired {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("LOGOFF did not publish retirement")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	select {
+	case err := <-loggedOff:
+		t.Fatalf("LOGOFF returned while session finalization remained blocked: %v", err)
+	default:
+	}
+	close(closeRelease)
+	if status := <-reauthenticated; status != statusSessionDeleted {
+		t.Fatalf("late reauthentication = %#x", status)
+	}
+	if err := <-loggedOff; err != nil {
+		t.Fatal(err)
+	}
+	if owner := server.sessions.get(current.id); owner.session != nil {
+		t.Fatal("LOGOFF left current session capacity owned")
+	}
+}
+
 func TestShutdownRetainsFailedCleanupAndRetries(t *testing.T) {
 	server, connection := testConnection(t, DefaultLimits())
 	cause := errors.New("close outcome unknown")
@@ -511,7 +694,7 @@ func TestShutdownRetainsFailedCleanupAndRetries(t *testing.T) {
 	if err := server.Shutdown(t.Context()); !errors.Is(err, cause) {
 		t.Fatalf("first shutdown = %v", err)
 	}
-	if state := server.Status(); state.Sessions != 1 || state.Connections != 1 || state.Trees != 1 || state.CleanupFailures == 0 {
+	if state := server.Status(); !state.Stopping || state.Stopped || state.Sessions != 1 || state.Connections != 1 || state.Trees != 1 || state.CleanupFailures == 0 {
 		t.Fatalf("failed cleanup lost ownership: %+v", state)
 	}
 	backend.session.closeErr = nil
@@ -523,11 +706,9 @@ func TestShutdownRetainsFailedCleanupAndRetries(t *testing.T) {
 	}
 }
 
-func TestUnpublishClosesIdleTreesAndRetriesUnknownCleanup(t *testing.T) {
+func TestUnpublishRefusesAnIdleLiveTreeWithoutChangingIt(t *testing.T) {
 	server, connection := testConnection(t, DefaultLimits())
-	cause := errors.New("file session close unknown")
 	backend := &endpointStorage{session: newEndpointFileSession()}
-	backend.session.closeErr = cause
 	export, err := server.Publish(Share{Name: "data", Volume: "volume", Backend: backend})
 	if err != nil {
 		t.Fatal(err)
@@ -538,30 +719,20 @@ func TestUnpublishClosesIdleTreesAndRetriesUnknownCleanup(t *testing.T) {
 	if _, status := connection.connectVolume(WithPrincipal(t.Context(), principal), s, export.key, &wire.Header{}); status != statusOK {
 		t.Fatalf("tree connect = %#x", status)
 	}
-	if err := export.Unpublish(t.Context()); !errors.Is(err, cause) {
-		t.Fatalf("first unpublish = %v", err)
+	if err := export.Unpublish(t.Context()); !errors.Is(err, ErrBusy) {
+		t.Fatalf("unpublish with live tree = %v", err)
 	}
-	if state := server.Status(); state.Exports != 1 || state.Trees != 1 || state.FencedAuthorities != 1 {
-		t.Fatalf("failed unpublish lost ownership: %+v", state)
+	if state := server.Status(); state.Exports != 1 || state.StoppingExports != 0 || state.Trees != 1 || state.FencedAuthorities != 0 {
+		t.Fatalf("busy unpublish changed ownership: %+v", state)
 	}
-	backend.session.closeErr = nil
-	if err := export.Unpublish(t.Context()); err != nil {
-		t.Fatal(err)
-	}
-	if state := server.Status(); state.Exports != 0 || state.Trees != 0 || state.FencedAuthorities != 0 {
-		t.Fatalf("unpublish retry did not settle: %+v", state)
-	}
-	backend.session.mu.Lock()
-	closes := backend.session.closes
-	backend.session.mu.Unlock()
-	if closes != 2 {
-		t.Fatalf("file session close attempts = %d", closes)
+	if backend.session.closes != 0 {
+		t.Fatal("busy unpublish started cleanup")
 	}
 }
 
 func TestAuthorityRenewalFailureFencesAndClosesSession(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		server, _ := testConnection(t, DefaultLimits())
+		server, connection := testConnection(t, DefaultLimits())
 		failure := errors.New("renew failed")
 		raw := newEndpointFileSession()
 		raw.status.Remaining = 9 * time.Second
@@ -580,6 +751,8 @@ func TestAuthorityRenewalFailureFencesAndClosesSession(t *testing.T) {
 			revision: raw.status.Revision, actionEpoch: raw.status.ActionEpoch,
 			deadline: time.Now().Add(raw.status.Remaining),
 		}
+		s := &session{trees: make(map[uint32]*tree), authorities: map[*Export]*authoritySession{export: authority}}
+		registerSession(t, server, connection, s)
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 		authority.cancel = cancel
@@ -605,7 +778,7 @@ func TestAuthorityRenewalFailureFencesAndClosesSession(t *testing.T) {
 		raw.mu.Lock()
 		closes := raw.closes
 		raw.mu.Unlock()
-		if !authority.isClosed() || closes != 1 || server.Status().CleanupFailures == 0 {
+		if !authority.isClosed() || closes != 1 || server.Status().CleanupFailures == 0 || server.Status().FencedAuthorities != 1 {
 			t.Fatalf("renewal failure state: closed=%v closes=%d status=%+v", authority.isClosed(), closes, server.Status())
 		}
 	})
@@ -641,6 +814,7 @@ func TestStatusErrorPreservesClosedFailureVocabulary(t *testing.T) {
 		want uint32
 	}{
 		{nil, statusOK}, {authz.ErrDenied, statusDenied}, {syscall.EINTR, statusCancelled},
+		{ErrIdentityDenied, statusDenied},
 		{syscall.EINVAL, statusInvalid}, {syscall.EACCES, statusDenied},
 		{syscall.ENOMEM, statusResources}, {syscall.EOPNOTSUPP, statusUnsupported},
 		{syscall.ESTALE, statusSessionDeleted}, {errors.New("unknown"), statusIO},
