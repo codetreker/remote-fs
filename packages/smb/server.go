@@ -135,7 +135,7 @@ func (e *Export) Unpublish(ctx context.Context) error {
 		s.mu.Unlock()
 		return nil
 	}
-	if e.refs != 0 || e.active != 0 {
+	if e.active != 0 {
 		s.mu.Unlock()
 		return ErrBusy
 	}
@@ -286,7 +286,13 @@ func (s *Server) retryCleanup(ctx context.Context) error {
 		for _, export := range exports {
 			if err := export.close(ctx); err != nil {
 				errs = append(errs, err)
+				continue
 			}
+			s.mu.Lock()
+			if s.exports[export.key] == export && export.refs == 0 && export.active == 0 {
+				delete(s.exports, export.key)
+			}
+			s.mu.Unlock()
 		}
 		return errors.Join(errs...)
 	})

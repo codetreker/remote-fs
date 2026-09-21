@@ -518,8 +518,44 @@ func TestShutdownRetainsFailedCleanupAndRetries(t *testing.T) {
 	if err := server.Shutdown(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	if state := server.Status(); state.Sessions != 0 || state.Connections != 0 || state.Trees != 0 {
+	if state := server.Status(); state.Sessions != 0 || state.Connections != 0 || state.Trees != 0 || state.Exports != 0 || state.StoppingExports != 0 {
 		t.Fatalf("retry did not settle ownership: %+v", state)
+	}
+}
+
+func TestUnpublishClosesIdleTreesAndRetriesUnknownCleanup(t *testing.T) {
+	server, connection := testConnection(t, DefaultLimits())
+	cause := errors.New("file session close unknown")
+	backend := &endpointStorage{session: newEndpointFileSession()}
+	backend.session.closeErr = cause
+	export, err := server.Publish(Share{Name: "data", Volume: "volume", Backend: backend})
+	if err != nil {
+		t.Fatal(err)
+	}
+	principal := testPrincipal("0123456789abcdef")
+	s := &session{principal: principal, trees: make(map[uint32]*tree)}
+	registerSession(t, server, connection, s)
+	if _, status := connection.connectVolume(WithPrincipal(t.Context(), principal), s, export.key, &wire.Header{}); status != statusOK {
+		t.Fatalf("tree connect = %#x", status)
+	}
+	if err := export.Unpublish(t.Context()); !errors.Is(err, cause) {
+		t.Fatalf("first unpublish = %v", err)
+	}
+	if state := server.Status(); state.Exports != 1 || state.Trees != 1 || state.FencedAuthorities != 1 {
+		t.Fatalf("failed unpublish lost ownership: %+v", state)
+	}
+	backend.session.closeErr = nil
+	if err := export.Unpublish(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if state := server.Status(); state.Exports != 0 || state.Trees != 0 || state.FencedAuthorities != 0 {
+		t.Fatalf("unpublish retry did not settle: %+v", state)
+	}
+	backend.session.mu.Lock()
+	closes := backend.session.closes
+	backend.session.mu.Unlock()
+	if closes != 2 {
+		t.Fatalf("file session close attempts = %d", closes)
 	}
 }
 

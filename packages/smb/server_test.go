@@ -234,6 +234,26 @@ func TestPublishFailureDoesNotConsumeCapacity(t *testing.T) {
 	}
 }
 
+func TestShutdownRemovesQuiescentExportsWithoutTakingBackendOwnership(t *testing.T) {
+	server, err := New(endpointConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend := &endpointStorage{}
+	if _, err := server.Publish(Share{Name: "data", Volume: "volume", Backend: backend}); err != nil {
+		t.Fatal(err)
+	}
+	if err := server.Shutdown(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if status := server.Status(); !status.Stopped || status.Exports != 0 || status.StoppingExports != 0 {
+		t.Fatalf("shutdown status = %+v", status)
+	}
+	if backend.sessionOpens.Load() != 0 {
+		t.Fatal("quiescent export shutdown opened or closed a backend session")
+	}
+}
+
 func TestServeAcceptsOnlyLoopbackAndStopsIncompleteConnections(t *testing.T) {
 	server, err := New(endpointConfig())
 	if err != nil {
