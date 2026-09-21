@@ -30,7 +30,7 @@ SSPI 身份只保护本机入口。Share 仍携带 host-selected volume identity
 
 ### owner 层级决定清理顺序
 
-Server 拥有 loopback listener、export registry、connection 和全局 session capacity。listener 只有在确认本地地址为 loopback 后才转移所有权；accepted peer 另行核对 loopback。Publish 校验 FileStorage 能力但不取得 backend 所有权，Unpublish 只清理该 export 上由 endpoint 建立的资源。
+Server 拥有 loopback listener、export registry、connection 和全局 session capacity。listener 只有在确认本地地址为 loopback 后才转移所有权；accepted peer 另行核对 loopback。Publish 校验 FileStorage 能力但不取得 backend 所有权。Unpublish 在 connect／request 已取得 export 时以 busy 保留原状态；其它情况先 fence 新连接，再清理该 export 上由 endpoint 建立的 tree 与 FileSession，只有引用和 active count 都归零才移除 export。
 
 connection 拥有 negotiate transcript、credit、pending request 和本连接的 session table；全局 registry 另外持有 session charge。authenticated session 拥有 SSPI identity、signer、tree 和每个 export 的 authority session。同一 session 连接同一 export 的多个 tree 共享一份 FileSession，tree 只是 SMB alias，不成为第二个远端 owner。
 
