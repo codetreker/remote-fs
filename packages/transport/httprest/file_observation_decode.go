@@ -89,6 +89,9 @@ func validateCanonicalBase64(encoded []byte, maximum int, nonempty bool) (int64,
 		}
 	}
 	decoded := int64(len(encoded)/4*3 - padding)
+	if decoded > int64(maximum) {
+		return 0, errors.New("bytes are outside their canonical base64 bound")
+	}
 	if nonempty && decoded == 0 {
 		return 0, syscall.EINVAL
 	}

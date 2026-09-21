@@ -370,6 +370,26 @@ func TestObservationDecoderRejectsInvalidRawLeavesBeforeCallerBudget(t *testing.
 	}
 }
 
+func TestObservationDecoderRejectsDecodedRawLeafBeyondBound(t *testing.T) {
+	attr, err := json.Marshal(AttrOf(storage.Attr{ID: 3, Kind: storage.NodeRegular}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	encodedLeaf := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{'x'}, storage.MaxLeafBytes+2))
+	body := []byte(`{"epoch":1,"data":"","directory":{"observation":{"parentId":2,"revision":"AQ=="},"entries":[{"rawLeaf":"` + encodedLeaf + `","attr":` + string(attr) + `}]}}`)
+	target := storage.DirectoryTarget{NodeID: 2}
+	result, err := storage.NewListResult(1<<20, 0, func(int, int64, int64, storage.Attr) (int64, error) {
+		return 1, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = decodeObservedFileResponse(withDirectoryResponseCollector(t.Context(), result, false), fileRequest{Op: storage.OpFileReadDirNode, Directory: &target}, body)
+	if err == nil {
+		t.Fatal("raw leaf whose decoded length exceeds the bound was accepted")
+	}
+}
+
 func TestObservationBudgetErrorReportsAndPreservesCause(t *testing.T) {
 	cause := errors.New("caller result budget at entry 7")
 	failure := budgetObservationError(cause)
