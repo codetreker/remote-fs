@@ -271,6 +271,69 @@ func TestServeAcceptsOnlyLoopbackAndStopsIncompleteConnections(t *testing.T) {
 	}
 }
 
+func TestConnectionLimitRejectsMaxPlusOneAndRecovers(t *testing.T) {
+	config := endpointConfig()
+	config.Limits.MaxConnections = 1
+	server, err := New(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- server.Serve(ctx, listener) }()
+	first, err := net.Dial("tcp", listener.Addr().String())
+	if err != nil {
+		cancel()
+		t.Fatal(err)
+	}
+	waitConnections := func(want int) {
+		t.Helper()
+		deadline := time.Now().Add(time.Second)
+		for server.Status().Connections != want && time.Now().Before(deadline) {
+			time.Sleep(time.Millisecond)
+		}
+		if got := server.Status().Connections; got != want {
+			t.Fatalf("connections = %d, want %d", got, want)
+		}
+	}
+	waitConnections(1)
+	second, err := net.Dial("tcp", listener.Addr().String())
+	if err != nil {
+		cancel()
+		_ = first.Close()
+		t.Fatal(err)
+	}
+	_ = second.SetReadDeadline(time.Now().Add(time.Second))
+	var one [1]byte
+	if _, err := second.Read(one[:]); err == nil {
+		t.Fatal("connection max+1 remained open")
+	}
+	_ = second.Close()
+	waitConnections(1)
+	_ = first.Close()
+	waitConnections(0)
+	third, err := net.Dial("tcp", listener.Addr().String())
+	if err != nil {
+		cancel()
+		t.Fatal(err)
+	}
+	waitConnections(1)
+	_ = third.Close()
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Serve did not stop")
+	}
+}
+
 type nonTCPListener struct{ net.Listener }
 
 func (nonTCPListener) Addr() net.Addr { return endpointAddr("local") }
