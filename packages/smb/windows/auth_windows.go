@@ -389,26 +389,28 @@ func principalFromToken(token win.Token) (smb.Principal, error) {
 	if forbiddenAccountSID(sidText) {
 		return smb.Principal{}, ErrIdentityNotAllowed
 	}
-	// A local/domain Guest account may have been renamed. Its RID and Guests
-	// membership are identity facts; a displayed account name is not a security check.
-	count := uint32(sid.SubAuthorityCount())
-	if sid.IdentifierAuthority() == (win.SidIdentifierAuthority{Value: [6]byte{0, 0, 0, 0, 0, 5}}) &&
-		count >= 2 && sid.SubAuthority(0) == 21 && sid.SubAuthority(count-1) == 501 {
-		return smb.Principal{}, errors.New("Windows guest authentication is not accepted")
-	}
-	groups, err := token.GetTokenGroups()
-	if err != nil {
-		return smb.Principal{}, err
-	}
-	for _, group := range groups.AllGroups() {
-		if group.Sid == nil || !group.Sid.IsValid() {
-			return smb.Principal{}, errors.New("Windows authentication returned an invalid group SID")
+	// CheckTokenMembership asks Windows to inspect the context token directly.
+	// Avoid the x/sys SID subauthority and TOKEN_GROUPS pointer walkers here:
+	// race builds enable checkptr, and those wrappers cannot preserve the native
+	// buffer provenance returned by GetTokenInformation.
+	for _, membership := range []struct {
+		sidType win.WELL_KNOWN_SID_TYPE
+		err     error
+	}{
+		{win.WinBuiltinGuestsSid, errors.New("Windows guest authentication is not accepted")},
+		{win.WinServiceSid, errors.New("Windows service authentication is not accepted")},
+	} {
+		group, err := win.CreateWellKnownSid(membership.sidType)
+		if err != nil {
+			return smb.Principal{}, err
 		}
-		if group.Sid.IsWellKnown(win.WinBuiltinGuestsSid) {
-			return smb.Principal{}, errors.New("Windows guest authentication is not accepted")
+		member, err := token.IsMember(group)
+		runtime.KeepAlive(group)
+		if err != nil {
+			return smb.Principal{}, err
 		}
-		if group.Sid.IsWellKnown(win.WinServiceSid) {
-			return smb.Principal{}, errors.New("Windows service authentication is not accepted")
+		if member {
+			return smb.Principal{}, membership.err
 		}
 	}
 	principal := smb.Principal{SID: sidText}
