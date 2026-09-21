@@ -370,23 +370,46 @@ func TestObservationDecoderRejectsInvalidRawLeavesBeforeCallerBudget(t *testing.
 	}
 }
 
-func TestObservationDecoderRejectsDecodedRawLeafBeyondBound(t *testing.T) {
+func TestObservationDecoderRejectsDecodedRawLeavesBeyondBound(t *testing.T) {
 	attr, err := json.Marshal(AttrOf(storage.Attr{ID: 3, Kind: storage.NodeRegular}))
 	if err != nil {
 		t.Fatal(err)
 	}
-	encodedLeaf := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{'x'}, storage.MaxLeafBytes+2))
-	body := []byte(`{"epoch":1,"data":"","directory":{"observation":{"parentId":2,"revision":"AQ=="},"entries":[{"rawLeaf":"` + encodedLeaf + `","attr":` + string(attr) + `}]}}`)
 	target := storage.DirectoryTarget{NodeID: 2}
-	result, err := storage.NewListResult(1<<20, 0, func(int, int64, int64, storage.Attr) (int64, error) {
-		return 1, nil
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, err = decodeObservedFileResponse(withDirectoryResponseCollector(t.Context(), result, false), fileRequest{Op: storage.OpFileReadDirNode, Directory: &target}, body)
-	if err == nil {
-		t.Fatal("raw leaf whose decoded length exceeds the bound was accepted")
+	for _, test := range []struct {
+		name    string
+		excess  int
+		padding int
+	}{
+		{name: "one-padding-byte", excess: 1, padding: 1},
+		{name: "no-padding", excess: 2},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			encodedLeaf := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{'x'}, storage.MaxLeafBytes+test.excess))
+			if len(encodedLeaf) != base64.StdEncoding.EncodedLen(storage.MaxLeafBytes) || strings.Count(encodedLeaf, "=") != test.padding {
+				t.Fatalf("test leaf does not exercise the encoded-length boundary: encoded=%d padding=%d", len(encodedLeaf), strings.Count(encodedLeaf, "="))
+			}
+			nameBody := []byte(`{"epoch":1,"data":"","nameObservation":{"nodeId":2,"state":2,"parentId":1,"rawLeaf":"` + encodedLeaf + `"}}`)
+			if _, err := decodeObservedFileResponse(t.Context(), fileRequest{Op: storage.OpFileObserveName}, nameBody); err == nil {
+				t.Fatal("standalone name observation accepted a raw leaf whose decoded length exceeds the bound")
+			}
+
+			directoryBody := []byte(`{"epoch":1,"data":"","directory":{"observation":{"parentId":2,"revision":"AQ=="},"entries":[{"rawLeaf":"` + encodedLeaf + `","attr":` + string(attr) + `}]}}`)
+			result, err := storage.NewListResult(1<<20, 0, func(int, int64, int64, storage.Attr) (int64, error) {
+				return 1, nil
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			request := fileRequest{
+				Op:                storage.OpFileObserveDirectoryMetadata,
+				Directory:         &target,
+				DirectoryMetadata: directoryMetadataOptionsOf(storage.DirectoryMetadataOptions{}),
+			}
+			if _, err := decodeObservedFileResponse(withDirectoryResponseCollector(t.Context(), result, false), request, directoryBody); err == nil {
+				t.Fatal("directory metadata observation accepted a raw leaf whose decoded length exceeds the bound")
+			}
+		})
 	}
 }
 
