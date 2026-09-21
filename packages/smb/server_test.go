@@ -46,9 +46,10 @@ func (a *endpointAuthentication) Close() error {
 }
 
 type endpointStorage struct {
-	checkErr  error
-	session   *endpointFileSession
-	dataCalls atomic.Int32
+	checkErr     error
+	session      *endpointFileSession
+	sessionOpens atomic.Int32
+	dataCalls    atomic.Int32
 }
 
 func (s *endpointStorage) Stat(context.Context, string) (storage.Attr, error) {
@@ -106,6 +107,7 @@ func (s *endpointStorage) ReadBounded(context.Context, string, int64) ([]byte, e
 }
 func (s *endpointStorage) CheckFileStorage() error { return s.checkErr }
 func (s *endpointStorage) NewFileSession(context.Context, storage.FileSessionOptions) (storage.FileSession, error) {
+	s.sessionOpens.Add(1)
 	if s.session == nil {
 		s.session = newEndpointFileSession()
 	}

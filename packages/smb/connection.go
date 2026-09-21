@@ -171,6 +171,13 @@ func (c *connection) run() error {
 		if err != nil {
 			return err
 		}
+		if len(requests) > 1 {
+			for _, request := range requests {
+				if request.Header.Command == wire.Negotiate || request.Header.Command == wire.SessionSetup {
+					return wire.ErrMalformed
+				}
+			}
+		}
 		if bootstrap {
 			if len(requests) != 1 || requests[0].Header.Command != wire.Negotiate {
 				return wire.ErrMalformed
@@ -220,9 +227,6 @@ func (c *connection) run() error {
 				return err
 			}
 			continue
-		}
-		if requests[0].Header.Command == wire.SessionSetup && len(requests) != 1 {
-			return wire.ErrMalformed
 		}
 		if requests[0].Header.Command == wire.Negotiate {
 			if len(requests) != 1 {

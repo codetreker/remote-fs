@@ -296,6 +296,70 @@ func signedRequest(t *testing.T, key *signing.Session, header wire.Header, body 
 	return packet
 }
 
+func compoundRequest(t *testing.T, key *signing.Session, headers []wire.Header, bodies [][]byte, related bool) []byte {
+	t.Helper()
+	var frame []byte
+	for index := range headers {
+		body := append([]byte(nil), bodies[index]...)
+		if index+1 < len(headers) {
+			padding := (-(wire.HeaderSize + len(body))) & 7
+			body = append(body, make([]byte, padding)...)
+			headers[index].NextCommand = uint32(wire.HeaderSize + len(body))
+		}
+		if related && index > 0 {
+			headers[index].Flags |= wire.FlagRelated
+		}
+		packet := requestPacket(headers[index], body)
+		if err := key.Sign(packet); err != nil {
+			t.Fatal(err)
+		}
+		frame = append(frame, packet...)
+	}
+	return frame
+}
+
+func TestHandshakeCommandsInAnyCompoundPositionFailBeforeDispatch(t *testing.T) {
+	for _, command := range []uint16{wire.Negotiate, wire.SessionSetup} {
+		for _, position := range []int{1, 2} {
+			for _, related := range []bool{false, true} {
+				name := map[uint16]string{wire.Negotiate: "negotiate", wire.SessionSetup: "session-setup"}[command]
+				style := "unrelated"
+				if related {
+					style = "related"
+				}
+				t.Run(name+"-position-"+string(rune('1'+position))+"-"+style, func(t *testing.T) {
+					_, backend, connection := startProtocolServer(t, DefaultLimits())
+					sessionID, key := authenticateProtocol(t, connection)
+					commands := []uint16{wire.TreeConnect, command}
+					bodies := [][]byte{treeConnectPacket(0, 0, `\\localhost\data`)[wire.HeaderSize:], nil}
+					if command == wire.Negotiate {
+						bodies[1] = negotiatePacket()[wire.HeaderSize:]
+					} else {
+						bodies[1] = setupPacket(0, 0, "initial")[wire.HeaderSize:]
+					}
+					if position == 2 {
+						commands = []uint16{wire.Echo, wire.TreeConnect, command}
+						bodies = [][]byte{wire.EmptyResponseBody(), bodies[0], bodies[1]}
+					}
+					headers := make([]wire.Header, len(commands))
+					for index, current := range commands {
+						headers[index] = wire.Header{Command: current, MessageID: uint64(3 + index), SessionID: sessionID, Credits: 1}
+					}
+					packet := compoundRequest(t, key, headers, bodies, related)
+					sendFrame(t, connection, packet)
+					var one [1]byte
+					if _, err := connection.Read(one[:]); err == nil {
+						t.Fatal("handshake compound received a response")
+					}
+					if opens := backend.sessionOpens.Load(); opens != 0 {
+						t.Fatalf("handshake compound dispatched %d tree opens", opens)
+					}
+				})
+			}
+		}
+	}
+}
+
 func TestAuthenticatedControlTranscriptAndUnsupportedCommands(t *testing.T) {
 	server, backend, connection := startProtocolServer(t, DefaultLimits())
 	sessionID, key := authenticateProtocol(t, connection)
