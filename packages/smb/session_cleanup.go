@@ -379,33 +379,100 @@ func (c *connection) closeOwnedExport(ctx context.Context, export *Export) error
 				session.mu.Unlock()
 			}
 		}
-		session.mu.Lock()
-		if err := c.closeOrphansLocked(ctx, session, export); err != nil {
-			errs = append(errs, err)
-		}
-		session.mu.Unlock()
-		if err := c.finishSessionRetirementContext(ctx, session); err != nil {
+		if err := c.closeExportAuthority(ctx, session, export); err != nil {
 			errs = append(errs, err)
 		}
 	}
 	return errors.Join(errs...)
 }
 
-// Completion only records already-known cleanup. It never retries native work.
-func (c *connection) finishSessionRetirement(s *session) {
-	_ = c.finishSessionRetirementContext(context.Background(), s)
+// Native closure does not surrender the final export owner of a retired
+// session. Its authority entry and export ref remain the retry receipt until
+// the bounded authentication wait succeeds and retirement is committed.
+func (c *connection) closeExportAuthority(ctx context.Context, s *session, export *Export) error {
+	s.mu.Lock()
+	authority := s.authorities[export]
+	s.mu.Unlock()
+	if authority == nil {
+		return nil
+	}
+	select {
+	case <-authority.ready:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	if err := authority.treeCloseMu.lock(ctx); err != nil {
+		return err
+	}
+	defer authority.treeCloseMu.unlock()
+	authority.mu.Lock()
+	empty := authority.refs == 0
+	authority.mu.Unlock()
+	if !empty {
+		return ErrBusy
+	}
+	if err := authority.close(ctx); err != nil {
+		return err
+	}
+	if err := authority.wait(ctx); err != nil {
+		return err
+	}
+
+	s.mu.Lock()
+	if s.authorities[export] != authority {
+		s.mu.Unlock()
+		return nil
+	}
+	if !s.retired || len(s.authorities) > 1 {
+		delete(s.authorities, export)
+		s.mu.Unlock()
+		authority.releaseExport()
+		return nil
+	}
+	s.mu.Unlock()
+	if err := s.authMu.lock(ctx); err != nil {
+		return err
+	}
+	watcherDone := s.authDone == nil
+	if !watcherDone {
+		select {
+		case <-s.authDone:
+			watcherDone = true
+		default:
+		}
+	}
+	s.mu.Lock()
+	complete := s.authorities[export] == authority && s.retired && !s.finalizing &&
+		s.auth == nil && watcherDone && s.openingTrees == 0 && len(s.trees) == 0 &&
+		len(s.authorities) == 1
+	if !complete {
+		s.mu.Unlock()
+		s.authMu.unlock()
+		return ErrBusy
+	}
+	delete(s.authorities, export)
+	if !s.cleaned {
+		s.cleaned = true
+		if s.cleanedDone != nil {
+			close(s.cleanedDone)
+		}
+	}
+	s.mu.Unlock()
+	s.authMu.unlock()
+	authority.releaseExport()
+	c.recordSessionResourcesClosed(s)
+	return nil
 }
 
-func (c *connection) finishSessionRetirementContext(ctx context.Context, s *session) error {
+// Completion only records already-known cleanup. It never retries native work.
+func (c *connection) finishSessionRetirement(s *session) {
 	s.mu.Lock()
 	retired := s.retired
 	s.mu.Unlock()
 	if !retired {
-		return nil
+		return
 	}
-	if err := s.authMu.lock(ctx); err != nil {
-		return err
-	}
+	s.authMu.Lock()
 	watcherDone := s.authDone == nil
 	if !watcherDone {
 		select {
@@ -426,10 +493,14 @@ func (c *connection) finishSessionRetirementContext(ctx context.Context, s *sess
 		}
 	}
 	s.mu.Unlock()
-	s.authMu.unlock()
+	s.authMu.Unlock()
 	if !complete {
-		return nil
+		return
 	}
+	c.recordSessionResourcesClosed(s)
+}
+
+func (c *connection) recordSessionResourcesClosed(s *session) {
 	s.retirementMu.Lock()
 	s.resourcesClosed = true
 	s.retirementMu.Unlock()
@@ -437,7 +508,6 @@ func (c *connection) finishSessionRetirementContext(ctx context.Context, s *sess
 	c.pruneRetiredSessionsLocked()
 	c.mu.Unlock()
 	c.releaseDisconnected()
-	return nil
 }
 
 func (c *connection) retireSessionRequests(s *session, except requestFrame) {

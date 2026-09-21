@@ -954,6 +954,176 @@ func TestUnpublishRetiredOwnerAuthenticationWaitHonorsContext(t *testing.T) {
 	}
 }
 
+func TestUnpublishRetryCompletesRetirementAfterNativeCloseDeadline(t *testing.T) {
+	limits := DefaultLimits()
+	limits.MaxSessions = 1
+	server, connection := testConnection(t, limits)
+	export, err := server.Publish(Share{Name: "target", Volume: "target", Backend: &endpointStorage{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ready := make(chan struct{})
+	close(ready)
+	done := make(chan struct{})
+	close(done)
+	authority := &authoritySession{
+		export: export, principal: testPrincipal("0123456789abcdef"), orphan: true,
+		ready: ready, done: done,
+	}
+	key, err := signing.NewSession([64]byte{}, []byte("0123456789abcdef"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	packet := wire.EncodeResponse(wire.Header{}, wire.EmptyResponseBody())
+	if err := key.Sign(packet); err != nil {
+		t.Fatal(err)
+	}
+	s := &session{
+		retired: true, signer: key, principal: testPrincipal("0123456789abcdef"),
+		trees: map[uint32]*tree{}, authorities: map[*Export]*authoritySession{export: authority},
+	}
+	registerSession(t, server, connection, s)
+	server.mu.Lock()
+	export.refs++
+	server.mu.Unlock()
+	connection.mu.Lock()
+	connection.disconnected = true
+	connection.mu.Unlock()
+
+	s.authMu.Lock()
+	locked := true
+	t.Cleanup(func() {
+		if locked {
+			s.authMu.Unlock()
+		}
+	})
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
+	if err := export.Unpublish(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		cancel()
+		t.Fatalf("retirement bookkeeping wait = %v", err)
+	}
+	cancel()
+	if !authority.isClosed() {
+		t.Fatal("deadline returned before native authority cleanup completed")
+	}
+	s.mu.Lock()
+	retained := s.authorities[export] == authority
+	s.mu.Unlock()
+	if !retained {
+		t.Fatal("closed authority was removed before retirement commit")
+	}
+	s.authMu.Unlock()
+	locked = false
+	s.retirementMu.Lock()
+	resourcesClosed := s.resourcesClosed
+	s.retirementMu.Unlock()
+	if resourcesClosed {
+		t.Fatal("canceled retirement bookkeeping reported resources closed")
+	}
+	if state := server.Status(); state.Exports != 1 || state.StoppingExports != 1 ||
+		state.Sessions != 1 || state.Connections != 1 || state.RetainedConnections != 1 {
+		t.Fatalf("canceled retirement lost retry ownership: %+v", state)
+	}
+
+	if err := export.Unpublish(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if owner := server.sessions.get(s.id); owner.session != nil {
+		t.Fatal("retirement retry retained global session ownership")
+	}
+	if err := key.Verify(packet); !errors.Is(err, signing.ErrDestroyed) {
+		t.Fatalf("retirement retry retained signer: %v", err)
+	}
+	if state := server.Status(); state.Exports != 0 || state.StoppingExports != 0 ||
+		state.Sessions != 0 || state.Connections != 0 || state.RetainedConnections != 0 {
+		t.Fatalf("retirement retry retained resources: %+v", state)
+	}
+	replacement := &session{}
+	if err := server.sessions.add(connection, replacement); err != nil {
+		t.Fatalf("retirement retry retained global capacity: %v", err)
+	}
+	server.sessions.remove(replacement)
+}
+
+func TestUnpublishRetiredSessionKeepsOtherExportIndependent(t *testing.T) {
+	server, connection := testConnection(t, DefaultLimits())
+	target, err := server.Publish(Share{Name: "target", Volume: "target", Backend: &endpointStorage{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	remaining, err := server.Publish(Share{Name: "remaining", Volume: "remaining", Backend: &endpointStorage{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	closedChannel := func() chan struct{} {
+		channel := make(chan struct{})
+		close(channel)
+		return channel
+	}
+	targetAuthority := &authoritySession{
+		export: target, principal: testPrincipal("0123456789abcdef"), orphan: true,
+		ready: closedChannel(), done: closedChannel(),
+	}
+	remainingAuthority := &authoritySession{
+		export: remaining, principal: testPrincipal("0123456789abcdef"), orphan: true,
+		ready: closedChannel(), done: closedChannel(),
+	}
+	key, err := signing.NewSession([64]byte{}, []byte("0123456789abcdef"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	packet := wire.EncodeResponse(wire.Header{}, wire.EmptyResponseBody())
+	if err := key.Sign(packet); err != nil {
+		t.Fatal(err)
+	}
+	s := &session{
+		retired: true, signer: key, principal: testPrincipal("0123456789abcdef"),
+		trees: map[uint32]*tree{}, authorities: map[*Export]*authoritySession{
+			target: targetAuthority, remaining: remainingAuthority,
+		},
+	}
+	registerSession(t, server, connection, s)
+	server.mu.Lock()
+	target.refs++
+	remaining.refs++
+	server.mu.Unlock()
+	connection.mu.Lock()
+	connection.disconnected = true
+	connection.mu.Unlock()
+
+	s.authMu.Lock()
+	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	err = target.Unpublish(ctx)
+	cancel()
+	s.authMu.Unlock()
+	if err != nil {
+		t.Fatalf("target unpublish waited for unrelated retirement: %v", err)
+	}
+	s.mu.Lock()
+	targetOwned := s.authorities[target] != nil
+	remainingOwned := s.authorities[remaining] == remainingAuthority
+	s.mu.Unlock()
+	if targetOwned || !remainingOwned || remainingAuthority.isClosed() {
+		t.Fatalf("target cleanup changed remaining authority: target=%v remaining=%v closed=%v",
+			targetOwned, remainingOwned, remainingAuthority.isClosed())
+	}
+	if state := server.Status(); state.Exports != 1 || state.StoppingExports != 0 ||
+		state.Sessions != 1 || state.Connections != 1 || state.RetainedConnections != 1 {
+		t.Fatalf("target cleanup changed unrelated ownership: %+v", state)
+	}
+
+	if err := remaining.Unpublish(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if err := key.Verify(packet); !errors.Is(err, signing.ErrDestroyed) {
+		t.Fatalf("final export cleanup retained signer: %v", err)
+	}
+	if state := server.Status(); state.Exports != 0 || state.Sessions != 0 ||
+		state.Connections != 0 || state.RetainedConnections != 0 {
+		t.Fatalf("final export cleanup retained resources: %+v", state)
+	}
+}
+
 func TestCloseExportCleanupSerializationHonorsContext(t *testing.T) {
 	server, connection := testConnection(t, DefaultLimits())
 	export := &Export{server: server, share: Share{Volume: "target"}}
