@@ -116,6 +116,33 @@ func TestCompoundNextCommandDoesNotOverlapHeaders(t *testing.T) {
 	}
 }
 
+func TestCompoundStyleCannotChangeWithinAFrame(t *testing.T) {
+	compound := func(flags ...uint32) []byte {
+		var packet []byte
+		for index, flag := range flags {
+			command := requestPacket(Echo, 4, 8)
+			le.PutUint32(command[16:20], flag)
+			if index+1 < len(flags) {
+				le.PutUint32(command[20:24], uint32(len(command)))
+			} else {
+				command = command[:HeaderSize+4]
+			}
+			packet = append(packet, command...)
+		}
+		return packet
+	}
+	for _, flags := range [][]uint32{{0, 0, 0}, {0, FlagRelated, FlagRelated}} {
+		if requests, err := ParseFrame(compound(flags...), testLimits); err != nil || len(requests) != 3 {
+			t.Fatalf("valid compound style %x: %d %v", flags, len(requests), err)
+		}
+	}
+	for _, flags := range [][]uint32{{0, FlagRelated, 0}, {0, 0, FlagRelated}} {
+		if _, err := ParseFrame(compound(flags...), testLimits); err == nil {
+			t.Fatalf("accepted mixed compound style %x", flags)
+		}
+	}
+}
+
 func TestResponseHeader(t *testing.T) {
 	body := []byte{4, 0, 0, 0}
 	packet := EncodeResponse(Header{Command: Echo, MessageID: 99}, body)

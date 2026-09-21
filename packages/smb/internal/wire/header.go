@@ -138,12 +138,19 @@ func ParseFrame(packet []byte, limits Limits) ([]Request, error) {
 	}
 	requests := make([]Request, 0, min(limits.MaxCommands, 4))
 	remaining := packet
+	compoundRelated := false
 	for {
 		if len(requests) >= limits.MaxCommands {
 			return nil, ErrMalformed
 		}
 		header, err := ParseHeader(remaining)
-		if err != nil || header.Flags&FlagResponse != 0 || len(requests) == 0 && header.Flags&FlagRelated != 0 {
+		related := header.Flags&FlagRelated != 0
+		if err != nil || header.Flags&FlagResponse != 0 || len(requests) == 0 && related {
+			return nil, ErrMalformed
+		}
+		if len(requests) == 1 {
+			compoundRelated = related
+		} else if len(requests) > 1 && related != compoundRelated {
 			return nil, ErrMalformed
 		}
 		commandBytes := len(remaining)
