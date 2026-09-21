@@ -74,7 +74,7 @@ authentication exchange 受 `HandshakeTimeout` 约束，完成后的 identity �
 
 ## 七、需求对应
 
-- package、无进程级副作用和独立 Windows 依赖对应 R-INT-1、R-INT-2 与 R-INT-10；
+- package、无进程级副作用和独立 Windows 依赖对应 R-INT-1 与 R-INT-2；
 - 逐项资源上限、状态和 cleanup ownership 对应 R-INT-3、R-ERR-4 与 R-WIN-10 的 endpoint 部分；
 - loopback、SSPI identity、强制 signing、逐 FileSession 操作授权与 secret-free diagnostics 对应 R-SEC-1、R-SEC-4、R-SEC-5、R-WIN-1 与 R-WIN-9 的本机入口部分；
 - 未实现命令的 fail-closed 边界对应 R-WIN-2 与 R-ERR-1、R-ERR-2。

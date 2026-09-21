@@ -694,14 +694,14 @@ func TestShutdownRetainsFailedCleanupAndRetries(t *testing.T) {
 	if err := server.Shutdown(t.Context()); !errors.Is(err, cause) {
 		t.Fatalf("first shutdown = %v", err)
 	}
-	if state := server.Status(); !state.Stopping || state.Stopped || state.Sessions != 1 || state.Connections != 1 || state.Trees != 1 || state.CleanupFailures == 0 {
+	if state := server.Status(); !state.Stopping || state.Stopped || state.Sessions != 1 || state.Connections != 1 || state.RetainedConnections != 1 || state.Trees != 1 || state.CleanupFailures == 0 {
 		t.Fatalf("failed cleanup lost ownership: %+v", state)
 	}
 	backend.session.closeErr = nil
 	if err := server.Shutdown(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	if state := server.Status(); state.Sessions != 0 || state.Connections != 0 || state.Trees != 0 || state.Exports != 0 || state.StoppingExports != 0 {
+	if state := server.Status(); state.Sessions != 0 || state.Connections != 0 || state.RetainedConnections != 0 || state.Trees != 0 || state.Exports != 0 || state.StoppingExports != 0 {
 		t.Fatalf("retry did not settle ownership: %+v", state)
 	}
 }

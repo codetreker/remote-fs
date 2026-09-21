@@ -36,7 +36,7 @@ connection 拥有 negotiate transcript、credit、pending request 和本连接�
 
 authority session 在 `file.session-open`、`file.status`、`file.renew` 与 `file.session-close` 的当前授权下建立、核对、续期和清理。它只接受同一 epoch 中单调前进的 status revision，以 response receipt time 消耗 Remaining；过期、fenced、retired 或 identity 改变都使它停止。续期失败先 fence 新 tree/work，再以独立 cleanup context 关闭；未知 cleanup 继续占用 export 与 session capacity。
 
-TREE_DISCONNECT 取消已经登记到该 tree 的 pending request 并关闭一个 tree；同一 authority 的最后一个 tree 排空并关闭共享 FileSession。文件命令进入支持面时还必须在同一所有权下增加 per-tree work admission fence。LOGOFF 先发布 session retirement，取消其它 request，再关闭 authentication、trees 和 orphan authority。断线走同一 ownership 清理，不能仅删除协议 map。Stop 永久拒绝新 accept/auth/tree work，关闭 listener 与连接，等待 admitted goroutine，然后重试全部未决 cleanup。已经失败的 cleanup 由原 Server、Export、session 或 tree 保留，可由后续调用重试。
+TREE_DISCONNECT 取消已经登记到该 tree 的 pending request 并关闭一个 tree；同一 authority 的最后一个 tree 排空并关闭共享 FileSession。文件命令进入支持面时还必须在同一所有权下增加 per-tree work admission fence。LOGOFF 先发布 session retirement，取消其它 request，再关闭 authentication、trees 和 orphan authority。断线走同一 ownership 清理，不能仅删除协议 map。`Server.Shutdown` 永久拒绝新 accept/auth/tree work，关闭 listener 与连接，等待 admitted goroutine，然后重试全部未决 cleanup。已经失败的 cleanup 由原 Server、Export、session 或 tree 保留，可由后续调用重试。
 
 ### 每种累积资源独立有界
 
@@ -44,7 +44,7 @@ TREE_DISCONNECT 取消已经登记到该 tree 的 pending request 并关闭一�
 
 frame bound 在读取 payload 前检查，token 和 context 在保留前检查，compound 和 request admission 在 dispatch 前检查。connection 饱和不分配第二份状态；session 的全局 charge 直到 native/authentication 资源与已登记 response frame 都退休才释放。Status 分别报告 identity-expired session、cleanup-only connection、已经拒绝新用途但仍被 owner 保留的 fenced authority，以及 cleanup failure，使本机身份到期与未完成的 authority retirement 保持可区分。
 
-authentication exchange 有独立 expiry watcher。新的 reauthentication generation 复用同一 watcher；过期 generation 不能关闭后来的 exchange。已建立 identity 到期后，普通命令返回 signed session-expired 状态，signer、session 与 tree 保留以接受 signed SESSION_SETUP；同一身份重新认证成功才解除 fence，LOGOFF 仍可清理。provider 不响应取消时，Stop 和断线仍等待它离开，不能遗弃 native context 后报告 cleanup 成功。
+authentication exchange 有独立 expiry watcher。新的 reauthentication generation 复用同一 watcher；过期 generation 不能关闭后来的 exchange。已建立 identity 到期后，普通命令返回 signed session-expired 状态，signer、session 与 tree 保留以接受 signed SESSION_SETUP；同一身份重新认证成功才解除 fence，LOGOFF 仍可清理。provider 不响应取消时，`Server.Shutdown` 和断线仍等待它离开，不能遗弃 native context 后报告 cleanup 成功。
 
 ### 范围边界
 

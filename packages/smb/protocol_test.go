@@ -795,7 +795,7 @@ func TestRequestLimitRejectsMaxPlusOneAndRecovers(t *testing.T) {
 		}),
 		Limits: limits,
 	}
-	_, _, connection := startConfiguredProtocolServer(t, config)
+	server, _, connection := startConfiguredProtocolServer(t, config)
 	sessionID, key := authenticateProtocol(t, connection)
 	connect := treeConnectPacket(3, sessionID, `\\localhost\data`)
 	if err := key.Sign(connect); err != nil {
@@ -803,6 +803,9 @@ func TestRequestLimitRejectsMaxPlusOneAndRecovers(t *testing.T) {
 	}
 	sendFrame(t, connection, connect)
 	<-entered
+	if state := server.Status(); state.PendingRequests != 1 {
+		t.Fatalf("pending request status = %+v", state)
+	}
 	echo := signedRequest(t, key, wire.Header{Command: wire.Echo, MessageID: 4, SessionID: sessionID, Credits: 1}, wire.EmptyResponseBody())
 	sendFrame(t, connection, echo)
 	response := readFrame(t, connection)
@@ -815,6 +818,9 @@ func TestRequestLimitRejectsMaxPlusOneAndRecovers(t *testing.T) {
 	header, _ = wire.ParseHeader(response)
 	if header.MessageID != 3 || header.Status != statusOK || key.Verify(response) != nil {
 		t.Fatalf("admitted response = %+v", header)
+	}
+	if state := server.Status(); state.PendingRequests != 0 {
+		t.Fatalf("completed request remained pending: %+v", state)
 	}
 	echo = signedRequest(t, key, wire.Header{Command: wire.Echo, MessageID: 5, SessionID: sessionID, Credits: 1}, wire.EmptyResponseBody())
 	sendFrame(t, connection, echo)
