@@ -138,7 +138,7 @@ func (c *connection) negotiate(request wire.Request) ([]byte, uint32) {
 	if !found311 {
 		return nil, statusUnsupported
 	}
-	sha512, cmac := false, true
+	sha512, cmac, signingContext := false, true, false
 	for _, context := range negotiation.Contexts {
 		switch context.Type {
 		case 1:
@@ -154,6 +154,7 @@ func (c *connection) negotiate(request wire.Request) ([]byte, uint32) {
 				sha512 = sha512 || binary.LittleEndian.Uint16(context.Data[4+index*2:]) == 1
 			}
 		case 8:
+			signingContext = true
 			cmac = false
 			if len(context.Data) < 2 {
 				return nil, statusInvalid
@@ -178,12 +179,16 @@ func (c *connection) negotiate(request wire.Request) ([]byte, uint32) {
 		return nil, statusIO
 	}
 	limits := c.server.config.Limits
+	contexts := []wire.Context{{Type: wire.ContextPreauthIntegrity, Data: preauth}}
+	if signingContext {
+		contexts = append(contexts, wire.Context{Type: wire.ContextSigning, Data: []byte{1, 0, 1, 0}})
+	}
 	body, err := wire.NegotiateResponseBody(wire.Negotiation{
 		SecurityMode: 3, Dialect: wire.Dialect311, ServerGUID: c.server.guid,
 		Capabilities: 4, MaxTransactSize: uint32(limits.MaxIOBytes),
 		MaxReadSize: uint32(limits.MaxIOBytes), MaxWriteSize: uint32(limits.MaxIOBytes),
 		SystemTime: uint64(time.Now().UnixNano()/100 + 116444736000000000),
-		Contexts:   []wire.Context{{Type: 1, Data: preauth}, {Type: 8, Data: []byte{1, 0, 1, 0}}},
+		Contexts:   contexts,
 	})
 	if err != nil {
 		return nil, statusIO

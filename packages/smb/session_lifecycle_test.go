@@ -62,6 +62,37 @@ func TestPrincipalComparisonIncludesLogonSession(t *testing.T) {
 	}
 }
 
+func TestPreviousSessionRetirementRequiresExactIdentity(t *testing.T) {
+	server, currentConnection := testConnection(t, DefaultLimits())
+	left, right := net.Pipe()
+	defer left.Close()
+	defer right.Close()
+	oldConnection := newConnection(server, left)
+	server.mu.Lock()
+	server.connections[oldConnection] = struct{}{}
+	server.mu.Unlock()
+	old := &session{principal: testPrincipal("0123456789abcdef"), trees: make(map[uint32]*tree)}
+	registerSession(t, server, oldConnection, old)
+	current := &session{principal: old.principal, trees: make(map[uint32]*tree)}
+	registerSession(t, server, currentConnection, current)
+	if err := currentConnection.retirePreviousSession(t.Context(), current, old.id,
+		testPrincipal("fedcba9876543210")); err != nil {
+		t.Fatal(err)
+	}
+	if owner := server.sessions.get(old.id); owner.session != old {
+		t.Fatal("different logon session retired the previous owner")
+	}
+	if err := currentConnection.retirePreviousSession(t.Context(), current, old.id, old.principal); err != nil {
+		t.Fatal(err)
+	}
+	if owner := server.sessions.get(old.id); owner.session != nil {
+		t.Fatal("exact identity did not retire previous session")
+	}
+	if err := currentConnection.retirePreviousSession(t.Context(), current, 0, old.principal); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func setupRequest(t *testing.T, message, sessionID uint64, token string) wire.Request {
 	t.Helper()
 	requests, err := wire.ParseFrame(setupPacket(message, sessionID, token), wire.Limits{
@@ -443,5 +474,97 @@ func TestShutdownRetainsFailedCleanupAndRetries(t *testing.T) {
 	}
 	if state := server.Status(); state.Sessions != 0 || state.Connections != 0 || state.Trees != 0 {
 		t.Fatalf("retry did not settle ownership: %+v", state)
+	}
+}
+
+func TestAuthorityRenewalFailureFencesAndClosesSession(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		server, _ := testConnection(t, DefaultLimits())
+		failure := errors.New("renew failed")
+		raw := newEndpointFileSession()
+		raw.status.Remaining = 9 * time.Second
+		raw.renewFn = func(_ context.Context, attempt int) (storage.FileSessionStatus, error) {
+			if attempt == 1 {
+				status := raw.status
+				status.Revision++
+				return status, nil
+			}
+			return storage.FileSessionStatus{}, failure
+		}
+		export := &Export{server: server, share: Share{Volume: "volume"}}
+		authority := &authoritySession{
+			raw: raw, export: export, principal: testPrincipal("0123456789abcdef"),
+			ready: make(chan struct{}), done: make(chan struct{}), epoch: raw.status.Epoch,
+			revision: raw.status.Revision, actionEpoch: raw.status.ActionEpoch,
+			deadline: time.Now().Add(raw.status.Remaining),
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		authority.cancel = cancel
+		go authority.renew(ctx, server.config.Limits)
+		time.Sleep(5 * time.Second)
+		synctest.Wait()
+		raw.mu.Lock()
+		renewals := raw.renewals
+		raw.mu.Unlock()
+		authority.installMu.RLock()
+		revision := authority.revision
+		authority.installMu.RUnlock()
+		if renewals != 1 || revision != 2 {
+			t.Fatalf("first renewal: calls=%d revision=%d", renewals, revision)
+		}
+		time.Sleep(5 * time.Second)
+		synctest.Wait()
+		select {
+		case <-authority.done:
+		default:
+			t.Fatal("failed renewal did not stop the worker")
+		}
+		raw.mu.Lock()
+		closes := raw.closes
+		raw.mu.Unlock()
+		if !authority.isClosed() || closes != 1 || server.Status().CleanupFailures == 0 {
+			t.Fatalf("renewal failure state: closed=%v closes=%d status=%+v", authority.isClosed(), closes, server.Status())
+		}
+	})
+}
+
+func TestControlTreeDispatchAndCapacityReuse(t *testing.T) {
+	_, connection := testConnection(t, DefaultLimits())
+	s := &session{trees: make(map[uint32]*tree)}
+	header := wire.Header{}
+	if _, status := connection.connectControl(s, &header); status != statusOK {
+		t.Fatalf("connect control = %#x", status)
+	}
+	tree := s.trees[header.TreeID]
+	unsupported := setupRequest(t, 1, 0, "x")
+	unsupported.Header.Command = wire.IOCTL
+	if _, status := connection.control(s, tree, unsupported); status != statusUnsupported {
+		t.Fatalf("control IOCTL = %#x", status)
+	}
+	disconnect := setupRequest(t, 2, 0, "x")
+	disconnect.Header.Command = wire.TreeDisconnect
+	disconnect.Body = wire.EmptyResponseBody()
+	if _, status := connection.control(s, tree, disconnect); status != statusOK {
+		t.Fatalf("control disconnect = %#x", status)
+	}
+	if len(s.trees) != 0 {
+		t.Fatal("control tree was retained")
+	}
+}
+
+func TestStatusErrorPreservesClosedFailureVocabulary(t *testing.T) {
+	for _, test := range []struct {
+		err  error
+		want uint32
+	}{
+		{nil, statusOK}, {authz.ErrDenied, statusDenied}, {syscall.EINTR, statusCancelled},
+		{syscall.EINVAL, statusInvalid}, {syscall.EACCES, statusDenied},
+		{syscall.ENOMEM, statusResources}, {syscall.EOPNOTSUPP, statusUnsupported},
+		{syscall.ESTALE, statusSessionDeleted}, {errors.New("unknown"), statusIO},
+	} {
+		if got := statusError(test.err); got != test.want {
+			t.Fatalf("statusError(%v) = %#x, want %#x", test.err, got, test.want)
+		}
 	}
 }

@@ -152,6 +152,57 @@ func negotiatePacket() []byte {
 	return requestPacket(wire.Header{Command: wire.Negotiate, Credits: 32}, body)
 }
 
+func negotiatePacketWithSigningContext() []byte {
+	body := make([]byte, 68)
+	binary.LittleEndian.PutUint16(body, 36)
+	binary.LittleEndian.PutUint16(body[2:], 1)
+	binary.LittleEndian.PutUint16(body[4:], 3)
+	binary.LittleEndian.PutUint32(body[28:], 104)
+	binary.LittleEndian.PutUint16(body[32:], 2)
+	binary.LittleEndian.PutUint16(body[36:], wire.Dialect311)
+	binary.LittleEndian.PutUint16(body[40:], wire.ContextPreauthIntegrity)
+	binary.LittleEndian.PutUint16(body[42:], 6)
+	binary.LittleEndian.PutUint16(body[48:], 1)
+	binary.LittleEndian.PutUint16(body[52:], wire.HashSHA512)
+	binary.LittleEndian.PutUint16(body[56:], wire.ContextSigning)
+	binary.LittleEndian.PutUint16(body[58:], 4)
+	binary.LittleEndian.PutUint16(body[64:], 1)
+	binary.LittleEndian.PutUint16(body[66:], wire.SigningAESCMAC)
+	return requestPacket(wire.Header{Command: wire.Negotiate, Credits: 32}, body)
+}
+
+func TestNegotiateOnlyEchoesRequestedSigningContext(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		packet     []byte
+		contexts   uint16
+		secondType uint16
+	}{
+		{name: "default CMAC", packet: negotiatePacket(), contexts: 1},
+		{name: "explicit CMAC", packet: negotiatePacketWithSigningContext(), contexts: 2, secondType: wire.ContextSigning},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, connection := testConnection(t, DefaultLimits())
+			requests, err := wire.ParseFrame(test.packet, wire.Limits{MaxBytes: 1 << 20, MaxCommands: 1, MaxContexts: 4})
+			if err != nil {
+				t.Fatal(err)
+			}
+			body, status := connection.negotiate(requests[0])
+			if status != statusOK || binary.LittleEndian.Uint16(body[6:8]) != test.contexts {
+				t.Fatalf("negotiate status=%#x contexts=%d", status, binary.LittleEndian.Uint16(body[6:8]))
+			}
+			if test.secondType != 0 {
+				offset := int(binary.LittleEndian.Uint32(body[60:64])) - wire.HeaderSize
+				firstLength := int(binary.LittleEndian.Uint16(body[offset+2 : offset+4]))
+				offset = (offset + 8 + firstLength + 7) &^ 7
+				if got := binary.LittleEndian.Uint16(body[offset : offset+2]); got != test.secondType {
+					t.Fatalf("second response context = %#x", got)
+				}
+			}
+		})
+	}
+}
+
 func setupPacket(message, session uint64, token string) []byte {
 	body := make([]byte, 24+len(token))
 	binary.LittleEndian.PutUint16(body, 25)
@@ -206,6 +257,34 @@ func authenticateProtocol(t *testing.T, connection net.Conn) (uint64, *signing.S
 		t.Fatalf("authenticated response = %+v, %v", final, err)
 	}
 	return header.SessionID, key
+}
+
+func multiProtocolPacket() []byte {
+	dialects := []byte("\x02NT LM 0.12\x00\x02SMB 2.002\x00\x02SMB 2.???\x00")
+	packet := make([]byte, 35+len(dialects))
+	copy(packet, "\xffSMB")
+	packet[4] = 0x72
+	packet[9] = 0x18
+	binary.LittleEndian.PutUint16(packet[10:], 0xc853)
+	binary.LittleEndian.PutUint16(packet[33:], uint16(len(dialects)))
+	copy(packet[35:], dialects)
+	return packet
+}
+
+func TestMultiProtocolBootstrapAdvertisesOnlySMB2Negotiation(t *testing.T) {
+	_, _, connection := startProtocolServer(t, DefaultLimits())
+	sendFrame(t, connection, multiProtocolPacket())
+	response := readFrame(t, connection)
+	header, err := wire.ParseHeader(response)
+	if err != nil || header.Command != wire.Negotiate || header.Status != statusOK ||
+		header.MessageID != 0 || header.Credits != 1 || header.Flags != wire.FlagResponse || len(response) != 128 {
+		t.Fatalf("bootstrap header=%+v length=%d error=%v", header, len(response), err)
+	}
+	if binary.LittleEndian.Uint16(response[68:]) != wire.DialectWildcard ||
+		binary.LittleEndian.Uint16(response[66:]) != 3 || binary.LittleEndian.Uint16(response[120:]) != 128 ||
+		binary.LittleEndian.Uint16(response[122:]) != 0 {
+		t.Fatal("bootstrap response changed the wildcard or signing-only contract")
+	}
 }
 
 func signedRequest(t *testing.T, key *signing.Session, header wire.Header, body []byte) []byte {

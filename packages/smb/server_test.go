@@ -115,7 +115,9 @@ func (s *endpointStorage) NewFileSession(context.Context, storage.FileSessionOpt
 type endpointFileSession struct {
 	mu       sync.Mutex
 	status   storage.FileSessionStatus
+	renewFn  func(context.Context, int) (storage.FileSessionStatus, error)
 	closeErr error
+	renewals int
 	closes   int
 }
 
@@ -137,9 +139,13 @@ func (*endpointFileSession) StatNode(context.Context, uint64) (storage.Attr, err
 func (*endpointFileSession) SetNodeAttr(context.Context, uint64, storage.AttrChange) (storage.Attr, error) {
 	return storage.Attr{}, syscall.ENOSYS
 }
-func (s *endpointFileSession) Renew(context.Context) (storage.FileSessionStatus, error) {
+func (s *endpointFileSession) Renew(ctx context.Context) (storage.FileSessionStatus, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.renewals++
+	if s.renewFn != nil {
+		return s.renewFn(ctx, s.renewals)
+	}
 	s.status.Revision++
 	return s.status, nil
 }
