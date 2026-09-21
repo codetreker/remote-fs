@@ -25,8 +25,10 @@ func (c *connection) cleanup() {
 }
 
 func (c *connection) retryDisconnected(ctx context.Context) error {
-	c.cleanupMu.Lock()
-	defer c.cleanupMu.Unlock()
+	if err := c.cleanupMu.lock(ctx); err != nil {
+		return err
+	}
+	defer c.cleanupMu.unlock()
 	c.mu.Lock()
 	if !c.disconnected {
 		c.mu.Unlock()
@@ -207,8 +209,10 @@ func (c *connection) closeTreeContext(ctx context.Context, tree *tree) error {
 		}
 
 		authority := tree.authority
-		authority.treeCloseMu.Lock()
-		defer authority.treeCloseMu.Unlock()
+		if err := authority.treeCloseMu.lock(ctx); err != nil {
+			return err
+		}
+		defer authority.treeCloseMu.unlock()
 		ctx = WithPrincipal(ctx, authority.principal)
 		authority.installMu.Lock()
 		authority.mu.Lock()
@@ -259,7 +263,10 @@ func (c *connection) closeOrphansLocked(ctx context.Context, s *session, selecte
 			errs = append(errs, ctx.Err())
 			continue
 		}
-		item.authority.treeCloseMu.Lock()
+		if err := item.authority.treeCloseMu.lock(ctx); err != nil {
+			errs = append(errs, err)
+			continue
+		}
 		item.authority.mu.Lock()
 		empty := item.authority.refs == 0
 		item.authority.mu.Unlock()
@@ -279,7 +286,7 @@ func (c *connection) closeOrphansLocked(ctx context.Context, s *session, selecte
 				s.mu.Unlock()
 			}
 		}
-		item.authority.treeCloseMu.Unlock()
+		item.authority.treeCloseMu.unlock()
 	}
 	s.mu.Lock()
 	return errors.Join(errs...)
@@ -304,8 +311,38 @@ func (c *connection) pruneRetiredSessionsLocked() {
 }
 
 func (c *connection) closeExport(ctx context.Context, export *Export) error {
-	c.cleanupMu.Lock()
-	defer c.cleanupMu.Unlock()
+	if !c.ownsExport(export) {
+		return nil
+	}
+	if err := c.cleanupMu.lock(ctx); err != nil {
+		return err
+	}
+	defer c.cleanupMu.unlock()
+	if !c.ownsExport(export) {
+		return nil
+	}
+	return c.closeOwnedExport(ctx, export)
+}
+
+func (c *connection) ownsExport(export *Export) bool {
+	c.mu.Lock()
+	sessions := make([]*session, 0, len(c.sessions))
+	for _, session := range c.sessions {
+		sessions = append(sessions, session)
+	}
+	c.mu.Unlock()
+	for _, session := range sessions {
+		session.mu.Lock()
+		_, owns := session.authorities[export]
+		session.mu.Unlock()
+		if owns {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *connection) closeOwnedExport(ctx context.Context, export *Export) error {
 	c.mu.Lock()
 	sessions := make([]*session, 0, len(c.sessions))
 	for _, session := range c.sessions {

@@ -23,7 +23,7 @@ type authoritySession struct {
 	installMu   sync.RWMutex
 	mu          sync.Mutex
 	closeMu     cleanupGate
-	treeCloseMu sync.Mutex
+	treeCloseMu contextLock
 	refs        int
 	orphan      bool
 	stopping    bool
@@ -233,8 +233,14 @@ func (c *connection) connectVolume(ctx context.Context, s *session, key string, 
 			if !owned {
 				return
 			}
-			authority.treeCloseMu.Lock()
-			defer authority.treeCloseMu.Unlock()
+			cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), server.config.Limits.CleanupTimeout)
+			defer cancel()
+			if err := authority.treeCloseMu.lock(cleanup); err != nil {
+				status = statusIO
+				server.cleanupFailure(err)
+				return
+			}
+			defer authority.treeCloseMu.unlock()
 			authority.installMu.Lock()
 			authority.mu.Lock()
 			empty := authority.refs == 0
@@ -246,8 +252,6 @@ func (c *connection) connectVolume(ctx context.Context, s *session, key string, 
 			if !empty {
 				return
 			}
-			cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), server.config.Limits.CleanupTimeout)
-			defer cancel()
 			err := authority.close(cleanup)
 			if err == nil {
 				err = authority.wait(cleanup)

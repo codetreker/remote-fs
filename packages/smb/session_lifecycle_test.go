@@ -730,6 +730,128 @@ func TestUnpublishRefusesAnIdleLiveTreeWithoutChangingIt(t *testing.T) {
 	}
 }
 
+func TestUnpublishUnusedExportDoesNotJoinUnrelatedConnectionCleanup(t *testing.T) {
+	server, connection := testConnection(t, DefaultLimits())
+	target, err := server.Publish(Share{Name: "target", Volume: "target", Backend: &endpointStorage{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	closeEntered := make(chan struct{})
+	closeRelease := make(chan struct{})
+	t.Cleanup(func() {
+		select {
+		case <-closeRelease:
+		default:
+			close(closeRelease)
+		}
+	})
+	unrelatedBackend := &endpointStorage{session: newEndpointFileSession()}
+	unrelatedBackend.session.closeEntered = closeEntered
+	unrelatedBackend.session.closeRelease = closeRelease
+	unrelated, err := server.Publish(Share{Name: "unrelated", Volume: "unrelated", Backend: unrelatedBackend})
+	if err != nil {
+		t.Fatal(err)
+	}
+	principal := testPrincipal("0123456789abcdef")
+	s := &session{principal: principal, trees: make(map[uint32]*tree)}
+	registerSession(t, server, connection, s)
+	if _, status := connection.connectVolume(WithPrincipal(t.Context(), principal), s, unrelated.key, &wire.Header{}); status != statusOK {
+		t.Fatalf("unrelated tree connect = %#x", status)
+	}
+	connection.mu.Lock()
+	connection.disconnected = true
+	connection.mu.Unlock()
+	cleanupDone := make(chan error, 1)
+	go func() { cleanupDone <- connection.retryDisconnected(context.Background()) }()
+	<-closeEntered
+
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
+	defer cancel()
+	unpublishDone := make(chan error, 1)
+	go func() { unpublishDone <- target.Unpublish(ctx) }()
+	select {
+	case err := <-unpublishDone:
+		if err != nil {
+			t.Fatalf("unused export unpublish = %v", err)
+		}
+	case <-time.After(100 * time.Millisecond):
+		close(closeRelease)
+		<-cleanupDone
+		t.Fatal("unused export unpublish waited behind unrelated connection cleanup")
+	}
+	if state := server.Status(); state.Exports != 1 {
+		t.Fatalf("unused export remained published: %+v", state)
+	}
+	close(closeRelease)
+	if err := <-cleanupDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCloseExportCleanupSerializationHonorsContext(t *testing.T) {
+	server, connection := testConnection(t, DefaultLimits())
+	export := &Export{server: server, share: Share{Volume: "target"}}
+	authority := &authoritySession{export: export}
+	s := &session{
+		trees:       make(map[uint32]*tree),
+		authorities: map[*Export]*authoritySession{export: authority},
+	}
+	registerSession(t, server, connection, s)
+	if err := connection.cleanupMu.lock(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	defer connection.cleanupMu.unlock()
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
+	defer cancel()
+	if err := connection.closeExport(ctx, export); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("close export lock wait = %v", err)
+	}
+}
+
+func TestUnpublishOwnedCleanupWaitHonorsContextAndCanRetry(t *testing.T) {
+	server, connection := testConnection(t, DefaultLimits())
+	export, err := server.Publish(Share{Name: "target", Volume: "target", Backend: &endpointStorage{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ready := make(chan struct{})
+	close(ready)
+	done := make(chan struct{})
+	close(done)
+	authority := &authoritySession{
+		export: export, principal: testPrincipal("0123456789abcdef"), orphan: true,
+		ready: ready, done: done,
+	}
+	s := &session{
+		trees:       make(map[uint32]*tree),
+		authorities: map[*Export]*authoritySession{export: authority},
+	}
+	registerSession(t, server, connection, s)
+	server.mu.Lock()
+	export.refs++
+	server.mu.Unlock()
+	if err := authority.treeCloseMu.lock(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
+	defer cancel()
+	if err := export.Unpublish(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		authority.treeCloseMu.unlock()
+		t.Fatalf("unpublish cleanup wait = %v", err)
+	}
+	if state := server.Status(); state.Exports != 1 || state.StoppingExports != 1 {
+		authority.treeCloseMu.unlock()
+		t.Fatalf("timed-out cleanup lost ownership: %+v", state)
+	}
+	authority.treeCloseMu.unlock()
+	if err := export.Unpublish(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if state := server.Status(); state.Exports != 0 || state.StoppingExports != 0 {
+		t.Fatalf("retry did not settle export: %+v", state)
+	}
+}
+
 func TestAuthorityRenewalFailureFencesAndClosesSession(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		server, connection := testConnection(t, DefaultLimits())

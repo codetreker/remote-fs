@@ -80,8 +80,10 @@ func (c *connection) retirePreviousSession(ctx context.Context, current *session
 	if !sameIdentity {
 		return nil
 	}
-	old.connection.cleanupMu.Lock()
-	defer old.connection.cleanupMu.Unlock()
+	if err := old.connection.cleanupMu.lock(ctx); err != nil {
+		return err
+	}
+	defer old.connection.cleanupMu.unlock()
 	if err := old.connection.logoff(WithPrincipal(ctx, principal), old.session); err != nil {
 		old.session.mu.Lock()
 		cleaned := old.session.cleaned

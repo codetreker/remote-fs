@@ -41,7 +41,7 @@ const (
 
 type connection struct {
 	clientGUID   [16]byte
-	cleanupMu    sync.Mutex
+	cleanupMu    contextLock
 	closing      bool
 	disconnected bool
 	pendingWake  chan struct{}

@@ -15,6 +15,30 @@ type cleanupGate struct {
 	running *cleanupAttempt
 }
 
+type contextLock struct {
+	once  sync.Once
+	token chan struct{}
+}
+
+func (l *contextLock) lock(ctx context.Context) error {
+	l.once.Do(func() {
+		l.token = make(chan struct{}, 1)
+		l.token <- struct{}{}
+	})
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-l.token:
+		if err := ctx.Err(); err != nil {
+			l.token <- struct{}{}
+			return err
+		}
+		return nil
+	}
+}
+
+func (l *contextLock) unlock() { l.token <- struct{}{} }
+
 // Concurrent callers share one attempt's immutable outcome. A later caller
 // may retry a failed cleanup; cancellation of a waiter does not cancel it.
 func (g *cleanupGate) run(ctx context.Context, work func() error) error {
