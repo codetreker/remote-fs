@@ -2,6 +2,8 @@ package httprest
 
 import (
 	"bytes"
+	"encoding/json"
+	"fmt"
 	"net/http"
 	"strings"
 	"testing"
@@ -90,11 +92,53 @@ func TestObservationRequestBoundsAcceptExactMaxima(t *testing.T) {
 	}
 }
 
+func TestObservationRequestBoundsPreserveEscapedMemberNames(t *testing.T) {
+	guards := &storage.NamespaceGuards{
+		Directories: []storage.DirectoryObservation{{ParentID: 1, Revision: []byte{'r'}}},
+		Edges:       []storage.ObservedEdge{{ParentID: 1, RawLeaf: []byte("child"), ChildID: 2}},
+	}
+	for _, test := range []struct {
+		request fileRequest
+		keys    []string
+	}{
+		{request: observationNameRequest(guards), keys: []string{"resultBytes", "guards", "directories", "parentId", "revision"}},
+		{request: observationDirectoryMetadataRequest(guards), keys: []string{"directoryMetadata", "includeName", "guards", "edges", "rawLeaf"}},
+	} {
+		encoded, err := json.Marshal(test.request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, key := range test.keys {
+			encoded = bytes.ReplaceAll(encoded, []byte(`"`+key+`":`), []byte(`"`+escapedJSONMemberName(key)+`":`))
+		}
+		var decoded fileRequest
+		if err := decodeFileJSON(encoded, &decoded); err != nil {
+			t.Fatalf("escaped %s request field was rejected: %v", test.request.Op, err)
+		}
+		if err := validateFileRequest(decoded); err != nil {
+			t.Fatalf("escaped %s request changed shape: %v", test.request.Op, err)
+		}
+		if err := validateFileArguments(decoded, DefaultFileLimits().Session); err != nil {
+			t.Fatalf("escaped %s request changed semantics: %v", test.request.Op, err)
+		}
+	}
+}
+
+func escapedJSONMemberName(name string) string {
+	var result strings.Builder
+	for _, value := range []byte(name) {
+		fmt.Fprintf(&result, `\u%04x`, value)
+	}
+	return result.String()
+}
+
 func observationNameRequest(guards *storage.NamespaceGuards) fileRequest {
 	return fileRequest{
 		Op:          storage.OpFileObserveName,
 		Session:     strings.Repeat("a", 64),
 		File:        strings.Repeat("b", 64),
+		Path:        []byte{},
+		Data:        []byte{},
 		ResultBytes: DefaultMaxBodyBytes,
 		Guards:      namespaceGuardsOf(guards),
 	}
@@ -104,6 +148,8 @@ func observationDirectoryMetadataRequest(guards *storage.NamespaceGuards) fileRe
 	return fileRequest{
 		Op:                storage.OpFileObserveDirectoryMetadata,
 		Session:           strings.Repeat("a", 64),
+		Path:              []byte{},
+		Data:              []byte{},
 		ResultBytes:       DefaultMaxBodyBytes,
 		Directory:         &storage.DirectoryTarget{NodeID: 1},
 		DirectoryMetadata: directoryMetadataOptionsOf(storage.DirectoryMetadataOptions{Guards: guards}),
