@@ -531,6 +531,11 @@ func (c *connection) addStatus(status *Status) {
 	c.mu.Unlock()
 	status.Sessions += len(sessions)
 	for _, session := range sessions {
+		session.authMu.Lock()
+		if session.identityExpired {
+			status.ExpiredSessions++
+		}
+		session.authMu.Unlock()
 		session.mu.Lock()
 		status.Trees += len(session.trees) + session.openingTrees
 		authorities := make([]*authoritySession, 0, len(session.authorities))

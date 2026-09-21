@@ -252,6 +252,9 @@ func TestNativeIdentityExpiryFencesWorkAndAllowsReauthentication(t *testing.T) {
 	if owner := server.sessions.get(s.id); owner.session != s {
 		t.Fatal("expired identity lost its reauthentication owner")
 	}
+	if status := server.Status(); status.ExpiredSessions != 1 {
+		t.Fatalf("expired identity was not observable: %+v", status)
+	}
 	echo := signedParsedRequest(t, key, requestPacket(wire.Header{Command: wire.Echo, MessageID: 1, SessionID: s.id}, wire.EmptyResponseBody()))
 	header := echo.Header
 	if _, status, signer := connection.dispatch(t.Context(), echo, echo, &header); status != statusNetworkSessionExpired || signer != key {
@@ -267,6 +270,9 @@ func TestNativeIdentityExpiryFencesWorkAndAllowsReauthentication(t *testing.T) {
 	header = second.Header
 	if _, status, signer := connection.sessionSetup(t.Context(), second, &header); status != statusOK || signer != key {
 		t.Fatalf("expired reauthentication completion = %#x signer=%p", status, signer)
+	}
+	if status := server.Status(); status.ExpiredSessions != 0 {
+		t.Fatalf("reauthenticated identity remained expired: %+v", status)
 	}
 	echo = signedParsedRequest(t, key, requestPacket(wire.Header{Command: wire.Echo, MessageID: 4, SessionID: s.id}, wire.EmptyResponseBody()))
 	header = echo.Header

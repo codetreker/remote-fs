@@ -66,6 +66,6 @@ type Share struct {
 type Status struct {
 	Serving, Stopping, Stopped                                 bool
 	Exports, StoppingExports, Connections, RetainedConnections int
-	Sessions, Trees, PendingRequests                           int
+	Sessions, ExpiredSessions, Trees, PendingRequests          int
 	FencedAuthorities, CleanupFailures                         int
 }
