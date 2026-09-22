@@ -223,6 +223,7 @@ func TestCreateRetriesCaseEquivalentInsertionAtFinalAuthorityOperation(t *testin
 	request := createTestRequest(3)
 	request.Name = "new"
 	request.DesiredAccess = fileReadData | fileReadAttributes
+	request.Options = createWriteThrough
 	resolver := func(ctx context.Context, tree *tree, name string, retain namespaceReferenceRetainer, authorize namespaceAuthorizer, action namespaceActionFactory) (resolvedName, error) {
 		path, err := parseSMBPath(name)
 		if err != nil {
@@ -251,7 +252,7 @@ func TestCreateRetriesCaseEquivalentInsertionAtFinalAuthorityOperation(t *testin
 	var id wire.FileID
 	copy(id[:], body[64:80])
 	handle := smbTree.files.get(id)
-	if handle == nil || handle.file != file || handle.nodeID != attr.ID {
+	if handle == nil || handle.file != file || handle.nodeID != attr.ID || !handle.writeThrough {
 		t.Fatalf("installed handle = %+v", handle)
 	}
 	if err := smbTree.files.closeID(t.Context(), id, handle); err != nil {

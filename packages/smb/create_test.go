@@ -132,6 +132,18 @@ func TestCreatePlanMapsShareAndDeleteIntentIntoOneAtomicClaim(t *testing.T) {
 	}
 }
 
+func TestCreatePlanRetainsWriteThroughForTheInstalledHandle(t *testing.T) {
+	request := createTestRequest(3)
+	request.Options = createWriteThrough
+	plan, err := buildCreatePlan(request, createTestResolved(nil), createTestOwner(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !plan.writeThrough {
+		t.Fatal("FILE_WRITE_THROUGH was not retained in the CREATE plan")
+	}
+}
+
 func TestCreatePlanUsesMetadataReferenceForDirectoriesAndMetadataOnlyFiles(t *testing.T) {
 	for _, test := range []struct {
 		name    string

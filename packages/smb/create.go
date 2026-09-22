@@ -24,20 +24,22 @@ const (
 	fileSynchronize     uint32 = 0x100000
 
 	createDirectory     uint32 = 0x1
+	createWriteThrough  uint32 = 0x2
 	createNonDirectory  uint32 = 0x40
 	createDeleteOnClose uint32 = 0x1000
 )
 
 type createPlan struct {
-	access   uint32
-	share    uint32
-	name     resolvedName
-	file     *storage.OpenAtOptions
-	node     *storage.NodeRefOptions
-	outcome  storage.OpenOutcome
-	kind     storage.NodeKind
-	create   bool
-	contexts []wire.CreateContext
+	access       uint32
+	share        uint32
+	name         resolvedName
+	file         *storage.OpenAtOptions
+	node         *storage.NodeRefOptions
+	outcome      storage.OpenOutcome
+	kind         storage.NodeKind
+	create       bool
+	writeThrough bool
+	contexts     []wire.CreateContext
 }
 
 type createNameResolver func(
@@ -126,7 +128,7 @@ func validateCreateRequest(request wire.CreateRequest) (uint32, error) {
 		return 0, syscall.EINVAL
 	}
 	const ignoredOptions = 0x10 | 0x20 | 0x100 | 0x400 | 0x20000 | 0x800000
-	const supportedOptions = createDirectory | 0x2 | 0x4 | ignoredOptions | createNonDirectory | 0x800 | createDeleteOnClose | 0x4000 | 0x200000
+	const supportedOptions = createDirectory | createWriteThrough | 0x4 | ignoredOptions | createNonDirectory | 0x800 | createDeleteOnClose | 0x4000 | 0x200000
 	if request.Options&^uint32(supportedOptions) != 0 {
 		return 0, syscall.EOPNOTSUPP
 	}
@@ -188,7 +190,10 @@ func buildCreatePlan(request wire.CreateRequest, name resolvedName, owner storag
 	if err != nil {
 		return createPlan{}, err
 	}
-	plan := createPlan{access: access, share: request.ShareAccess, name: name, contexts: request.Contexts}
+	plan := createPlan{
+		access: access, share: request.ShareAccess, name: name,
+		writeThrough: request.Options&createWriteThrough != 0, contexts: request.Contexts,
+	}
 	present := name.condition.State == storage.SameNode
 	if present != (name.attr != nil) || !present && name.condition.State != storage.Absent {
 		return createPlan{}, syscall.EIO
@@ -450,6 +455,7 @@ func executeCreatePlan(ctx context.Context, tree *tree, reservation *openReserva
 	if intent := createPlanDeleteIntent(plan); intent != "" {
 		reservation.setDeleteIntent(intent)
 	}
+	reservation.setWriteThrough(plan.writeThrough)
 
 	call := storage.WithBoundedAttrResult(ctx, tree.files.limits.MaxOpenResultBytes, reservation.resultBudget)
 	var reference handleReference
