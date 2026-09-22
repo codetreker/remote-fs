@@ -51,6 +51,9 @@ func (*nodeAuthorityWithoutName) SetAttrWithBarrier(context.Context, storage.Att
 func (*nodeAuthorityWithoutName) CloseWithBarrier(context.Context) (*httprest.MutationBarrier, error) {
 	return nil, syscall.EIO
 }
+func (*nodeAuthorityWithoutName) CloseWithResultAndBarrier(context.Context) (storage.ReferenceCloseResult, *httprest.MutationBarrier, error) {
+	return storage.ReferenceCloseResult{}, nil, syscall.EIO
+}
 
 type nameObserverContextKey struct{}
 

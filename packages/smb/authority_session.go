@@ -94,11 +94,12 @@ func (a *authoritySession) close(ctx context.Context) error {
 			a.recoveryPending = true
 		}
 		a.deleteMu.Unlock()
+		closeResult := storage.ReferenceCloseResult{Released: true}
 		var closeErr error
 		if a.raw != nil {
-			closeErr = a.raw.Close(WithPrincipal(ctx, a.principal))
+			closeResult, closeErr = storage.CloseFileSession(WithPrincipal(ctx, a.principal), a.raw)
 		}
-		if closeErr == nil {
+		if closeResult.Released {
 			a.installMu.Lock()
 			a.closed = true
 			a.installMu.Unlock()

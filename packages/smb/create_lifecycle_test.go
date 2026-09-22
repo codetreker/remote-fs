@@ -56,6 +56,10 @@ func (f *incompleteCreateFile) Close(context.Context) error {
 	f.closed++
 	return nil
 }
+func (f *incompleteCreateFile) CloseWithResult(ctx context.Context) (storage.ReferenceCloseResult, error) {
+	err := f.Close(ctx)
+	return storage.ReferenceCloseResult{Released: err == nil}, err
+}
 
 type guardedCreateSession struct {
 	*namespaceSession

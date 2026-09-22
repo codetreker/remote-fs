@@ -78,6 +78,10 @@ func (p *fileIOProbe) Sync(ctx context.Context) error {
 	return nil
 }
 func (p *fileIOProbe) Close(context.Context) error         { p.closes.Add(1); return nil }
+func (p *fileIOProbe) CloseWithResult(ctx context.Context) (storage.ReferenceCloseResult, error) {
+	err := p.Close(ctx)
+	return storage.ReferenceCloseResult{Released: err == nil}, err
+}
 func (p *fileIOProbe) CheckConditionalFileMutation() error { return p.checkErr }
 func (p *fileIOProbe) MutateFile(ctx context.Context, command storage.FileMutation) (storage.Attr, error) {
 	p.mutations.Add(1)
@@ -544,6 +548,9 @@ func (*directoryFlushReference) SetAttr(context.Context, storage.AttrChange) (st
 	return storage.Attr{}, syscall.EBADF
 }
 func (*directoryFlushReference) Close(context.Context) error { return nil }
+func (*directoryFlushReference) CloseWithResult(context.Context) (storage.ReferenceCloseResult, error) {
+	return storage.ReferenceCloseResult{Released: true}, nil
+}
 func (*directoryFlushReference) CheckScopedReference() error { return nil }
 func (*directoryFlushReference) Scope(context.Context) (storage.UseScope, error) {
 	return storage.UseScope{Token: "directory"}, nil

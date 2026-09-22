@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"syscall"
 	"unicode/utf8"
 )
@@ -48,6 +49,49 @@ type NodeReference interface {
 	Stat(context.Context) (Attr, error)
 	SetAttr(context.Context, AttrChange) (Attr, error)
 	Close(context.Context) error
+	CloseWithResult(context.Context) (ReferenceCloseResult, error)
+}
+
+// ReferenceCloseResult separates ownership transfer from the semantic result
+// of a close-time delete intent. Released references must never be retried.
+type ReferenceCloseResult struct {
+	Released bool
+}
+
+func (r ReferenceCloseResult) Check(err error) error {
+	if !r.Released && err == nil {
+		return errors.New("close retained ownership without an error: invalid result")
+	}
+	return nil
+}
+
+type ReferenceCloseReporter interface {
+	CloseWithResult(context.Context) (ReferenceCloseResult, error)
+}
+
+func CloseReference(ctx context.Context, reference interface{ Close(context.Context) error }) (ReferenceCloseResult, error) {
+	if reporter, ok := reference.(ReferenceCloseReporter); ok {
+		result, err := reporter.CloseWithResult(ctx)
+		return validateReferenceCloseResult(result, err)
+	}
+	err := reference.Close(ctx)
+	return ReferenceCloseResult{Released: ReferenceCloseReleased(err)}, err
+}
+
+func CloseFileSession(ctx context.Context, session FileSession) (ReferenceCloseResult, error) {
+	result, err := session.CloseWithResult(ctx)
+	return validateReferenceCloseResult(result, err)
+}
+
+func validateReferenceCloseResult(result ReferenceCloseResult, err error) (ReferenceCloseResult, error) {
+	if checkErr := result.Check(err); checkErr != nil {
+		return ReferenceCloseResult{}, checkErr
+	}
+	return result, err
+}
+
+func ReferenceCloseReleased(err error) bool {
+	return err == nil || ErrnoOf(err) == syscall.ESTALE
 }
 
 // NodeReferences opens retained identities directly or as an exact child of a
@@ -76,7 +120,8 @@ type ReferenceStateAccess interface {
 type FileActions interface {
 	CheckFileActions() error
 	QueryFileAction(context.Context, FileActionID) (FileActionReceipt, error)
-	QueryDeleteIntent(context.Context, DeleteIntentID) (DeleteIntentStatus, error)
+	QueryDeleteIntent(context.Context, DeleteIntentOwner, DeleteIntentID) (DeleteIntentStatus, error)
+	ListDeleteIntents(context.Context, DeleteIntentOwner, DeleteIntentCursor, int) (DeleteIntentPage, error)
 	AcknowledgeDeleteIntent(context.Context, AcknowledgeDeleteIntentCommand) error
 }
 
@@ -439,6 +484,7 @@ const (
 
 type CloseIntent struct {
 	ID               DeleteIntentID
+	Owner            DeleteIntentOwner
 	Trigger          CloseTrigger
 	Condition        UnlinkCondition
 	ExpectedMetadata map[string][]byte `json:",omitempty"`
@@ -518,7 +564,11 @@ type FileActionReceipt struct {
 	Outcome   FileActionOutcome
 }
 
-const DeleteIntentIDBytes = 32
+const (
+	DeleteIntentIDBytes        = 32
+	MaxDeleteIntentOwnerBytes  = 128
+	MaxDeleteIntentPageEntries = 256
+)
 
 // DeleteIntentID identifies one accepted close-time deletion obligation across
 // process and authority restart. It is opaque and caller-generated.
@@ -531,6 +581,20 @@ func NewDeleteIntentID() (DeleteIntentID, error) {
 	}
 	return DeleteIntentID(hex.EncodeToString(nonce[:])), nil
 }
+
+// DeleteIntentOwner is a caller-held durable namespace for discovering and
+// acknowledging close-time deletion obligations after reconnect or restart.
+type DeleteIntentOwner string
+
+func NewDeleteIntentOwner() (DeleteIntentOwner, error) {
+	var nonce [16]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return "", err
+	}
+	return DeleteIntentOwner(hex.EncodeToString(nonce[:])), nil
+}
+
+type DeleteIntentCursor uint64
 
 type DeleteIntentOutcome uint8
 
@@ -551,8 +615,14 @@ type DeleteIntentStatus struct {
 	Failure syscall.Errno `json:",omitempty"`
 }
 
+type DeleteIntentPage struct {
+	Intents []DeleteIntentStatus
+	Next    DeleteIntentCursor
+}
+
 type AcknowledgeDeleteIntentCommand struct {
 	Action FileActionID
+	Owner  DeleteIntentOwner
 	Intent DeleteIntentID
 }
 

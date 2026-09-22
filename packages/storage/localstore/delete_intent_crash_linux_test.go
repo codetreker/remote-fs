@@ -21,6 +21,7 @@ const deleteIntentCrashRootEnvironment = "REMOTE_FS_DELETE_INTENT_CRASH_ROOT"
 type deleteIntentCrashReceipt struct {
 	Node   uint64
 	Intent storage.DeleteIntentID
+	Owner  storage.DeleteIntentOwner
 }
 
 func deleteIntentCrashConfig(root string, initialize bool) Config {
@@ -90,7 +91,7 @@ func TestDeleteIntentSurvivesSIGKILLAndRecovers(t *testing.T) {
 	actions := session.(storage.FileActions)
 	deadline := time.Now().Add(10 * time.Second)
 	for {
-		status, err := actions.QueryDeleteIntent(t.Context(), receipt.Intent)
+		status, err := actions.QueryDeleteIntent(t.Context(), receipt.Owner, receipt.Intent)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -122,16 +123,17 @@ func TestDeleteIntentSurvivesSIGKILLAndRecovers(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := actions.AcknowledgeDeleteIntent(t.Context(), storage.AcknowledgeDeleteIntentCommand{Action: action, Intent: receipt.Intent}); err != nil {
+	if err := actions.AcknowledgeDeleteIntent(t.Context(), storage.AcknowledgeDeleteIntentCommand{Action: action, Owner: receipt.Owner, Intent: receipt.Intent}); err != nil {
 		t.Fatal(err)
 	}
-	acknowledged, err := actions.QueryDeleteIntent(t.Context(), receipt.Intent)
+	acknowledged, err := actions.QueryDeleteIntent(t.Context(), receipt.Owner, receipt.Intent)
 	if err != nil || acknowledged.Outcome != storage.DeleteIntentUnknown || acknowledged.NodeID != 0 {
 		t.Fatalf("acknowledged intent=%+v error=%v", acknowledged, err)
 	}
 }
 
 func runDeleteIntentCrashChild(t *testing.T) {
+	owner := storage.DeleteIntentOwner("localstore-crash-test")
 	root := os.Getenv(deleteIntentCrashRootEnvironment)
 	if root == "" {
 		t.Fatal("missing crash root")
@@ -174,13 +176,13 @@ func runDeleteIntentCrashChild(t *testing.T) {
 		storage.OpenAtOptions{
 			Read: true, Target: storage.ChildCondition{State: storage.SameNode, NodeID: victim.ID},
 			Action: action, Existing: storage.Keep, Use: storage.UseClaim{Uses: storage.ReadData | storage.DeleteName},
-			CloseIntent: &storage.CloseIntent{ID: intent, Trigger: storage.OnReferenceClose, Condition: storage.UnlinkFile},
+			CloseIntent: &storage.CloseIntent{ID: intent, Owner: owner, Trigger: storage.OnReferenceClose, Condition: storage.UnlinkFile},
 		})
 
 	if err != nil || opened.File == nil {
 		t.Fatalf("arm durable close intent: %+v %v", opened, err)
 	}
-	if err := json.NewEncoder(os.Stdout).Encode(deleteIntentCrashReceipt{Node: victim.ID, Intent: intent}); err != nil {
+	if err := json.NewEncoder(os.Stdout).Encode(deleteIntentCrashReceipt{Node: victim.ID, Intent: intent, Owner: owner}); err != nil {
 		t.Fatal(err)
 	}
 	select {}

@@ -38,6 +38,7 @@ type retainedReference interface {
 	retire() error
 	drainAndRelease() error
 	Close(context.Context) error
+	closeWithResult(context.Context) (storage.ReferenceCloseResult, error)
 	retryClose(context.Context) (bool, error)
 }
 
@@ -82,6 +83,8 @@ type fileSession struct {
 	closeMu            sync.Mutex
 	closeDone          chan struct{}
 	closeErr           error
+	closeFinal         bool
+	closeSemantic      error
 }
 
 var _ storage.FileStorage = (*Storage)(nil)
@@ -432,7 +435,7 @@ func (fs *fileSession) startClose() <-chan struct{} {
 	if fs.closeDone != nil {
 		select {
 		case <-fs.closeDone:
-			if fs.closeErr == nil {
+			if fs.closeFinal {
 				return fs.closeDone
 			}
 		default:
@@ -451,8 +454,12 @@ func (fs *fileSession) startClose() <-chan struct{} {
 }
 
 func (fs *fileSession) finishClose() {
-	err := fs.locks.Retire(fs.cleanup)
-	if err == nil {
+	fs.closeMu.Lock()
+	semantic := fs.closeSemantic
+	fs.closeMu.Unlock()
+	cleanupErr := fs.locks.Retire(fs.cleanup)
+	released := cleanupErr == nil
+	if cleanupErr == nil {
 		fs.mu.Lock()
 		files := make([]retainedReference, 0, len(fs.files))
 		for f := range fs.files {
@@ -460,29 +467,42 @@ func (fs *fileSession) finishClose() {
 		}
 		fs.mu.Unlock()
 		for _, f := range files {
-			err = errors.Join(err, f.Close(fs.cleanup))
+			result, closeErr := f.closeWithResult(fs.cleanup)
+			if result.Released {
+				semantic = errors.Join(semantic, closeErr)
+			} else {
+				released = false
+				cleanupErr = errors.Join(cleanupErr, closeErr)
+			}
 		}
 	}
-	if err == nil {
+	if released {
 		fs.storage.fileMu.Lock()
 		delete(fs.storage.fileSessions, fs)
 		fs.storage.fileMu.Unlock()
 	}
 	fs.closeMu.Lock()
-	fs.closeErr = err
+	fs.closeSemantic = semantic
+	fs.closeErr = errors.Join(semantic, cleanupErr)
+	fs.closeFinal = released
 	close(fs.closeDone)
 	fs.closeMu.Unlock()
 }
 
 func (fs *fileSession) Close(ctx context.Context) error {
+	_, err := fs.CloseWithResult(ctx)
+	return err
+}
+
+func (fs *fileSession) CloseWithResult(ctx context.Context) (storage.ReferenceCloseResult, error) {
 	done := fs.startClose()
 	select {
 	case <-done:
 		fs.closeMu.Lock()
 		defer fs.closeMu.Unlock()
-		return fs.closeErr
+		return storage.ReferenceCloseResult{Released: fs.closeFinal}, fs.closeErr
 	case <-ctx.Done():
-		return ctx.Err()
+		return storage.ReferenceCloseResult{}, ctx.Err()
 	}
 }
 
@@ -504,7 +524,10 @@ func (s *Storage) CloseFileSessions() error {
 	}
 	var errs []error
 	for _, fs := range sessions {
-		errs = append(errs, fs.Close(context.Background()))
+		result, err := storage.CloseFileSession(context.Background(), fs)
+		if !result.Released {
+			errs = append(errs, err)
+		}
 	}
 	if err := errors.Join(errs...); err != nil {
 		return fmt.Errorf("closing retained file sessions: %w", err)

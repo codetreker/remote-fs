@@ -95,6 +95,12 @@ func (r *namespaceReference) Close(context.Context) error {
 	return nil
 }
 
+func (r *namespaceReference) CloseWithResult(ctx context.Context) (storage.ReferenceCloseResult, error) {
+	err := r.Close(ctx)
+	released := storage.ReferenceCloseReleased(err) || storage.ErrnoOf(err) == syscall.ENOTEMPTY
+	return storage.ReferenceCloseResult{Released: released}, err
+}
+
 type namespaceSession struct {
 	storage.FileSession
 	views       map[uint64]*namespaceView

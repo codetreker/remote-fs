@@ -117,12 +117,24 @@ func (s *fileSession) QueryFileAction(ctx context.Context, id storage.FileAction
 	return backend.QueryFileAction(readContext(ctx), id)
 }
 
-func (s *fileSession) QueryDeleteIntent(ctx context.Context, id storage.DeleteIntentID) (storage.DeleteIntentStatus, error) {
+func (s *fileSession) QueryDeleteIntent(ctx context.Context, owner storage.DeleteIntentOwner, id storage.DeleteIntentID) (storage.DeleteIntentStatus, error) {
 	backend, err := capability(s.FileSession, storage.FileActions.CheckFileActions)
 	if err != nil {
 		return storage.DeleteIntentStatus{}, err
 	}
-	return backend.QueryDeleteIntent(readContext(ctx), id)
+	return backend.QueryDeleteIntent(readContext(ctx), owner, id)
+}
+
+func (s *fileSession) ListDeleteIntents(ctx context.Context, owner storage.DeleteIntentOwner, after storage.DeleteIntentCursor, limit int) (storage.DeleteIntentPage, error) {
+	backend, err := capability(s.FileSession, storage.FileActions.CheckFileActions)
+	if err != nil {
+		return storage.DeleteIntentPage{}, err
+	}
+	page, err := backend.ListDeleteIntents(readContext(ctx), owner, after, limit)
+	if err == nil {
+		err = page.Check(owner, after, limit)
+	}
+	return page, err
 }
 
 func (s *fileSession) AcknowledgeDeleteIntent(ctx context.Context, command storage.AcknowledgeDeleteIntentCommand) error {

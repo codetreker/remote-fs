@@ -56,6 +56,7 @@ type FileSession interface {
 	// and drains admitted operations. Unknown cleanup retains its charge and
 	// ownership and returns an error; it must not report reclaimed resources.
 	Close(context.Context) error
+	CloseWithResult(context.Context) (ReferenceCloseResult, error)
 }
 
 // File addresses the same live regular-file object through rename, replacement,
@@ -89,6 +90,7 @@ type File interface {
 	// operations. Owner cleanup is explicit through UseOwners; closing one
 	// reference must not infer an unrelated owner's identity.
 	Close(context.Context) error
+	CloseWithResult(context.Context) (ReferenceCloseResult, error)
 }
 
 // OpenAccess describes the access and atomic creation intent of a file open.

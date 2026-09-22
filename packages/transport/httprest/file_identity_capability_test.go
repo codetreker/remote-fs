@@ -190,10 +190,11 @@ func TestIdentityCapabilitiesRoundTripOverHTTP(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	deleteOwner := storage.DeleteIntentOwner("identity-capability-test")
 	deleteOpen, err := session.OpenAt(ctx, storage.ChildSelection{Name: storage.ChildName{Parent: storage.DirectoryTarget{NodeID: parent.ID}, RawLeaf: []byte("delete")}}, storage.OpenAtOptions{
 		Read: true, Target: storage.ChildCondition{State: storage.SameNode, NodeID: deleteAttr.ID}, Action: deleteAction,
 		Use: storage.UseClaim{Uses: storage.ReadData | storage.DeleteName}, Existing: storage.Keep,
-		CloseIntent: &storage.CloseIntent{ID: deleteID, Trigger: storage.OnReferenceClose, Condition: storage.UnlinkFile},
+		CloseIntent: &storage.CloseIntent{ID: deleteID, Owner: deleteOwner, Trigger: storage.OnReferenceClose, Condition: storage.UnlinkFile},
 	})
 
 	if err != nil {
@@ -202,22 +203,43 @@ func TestIdentityCapabilitiesRoundTripOverHTTP(t *testing.T) {
 	if err := deleteOpen.File.Close(ctx); err != nil {
 		t.Fatal(err)
 	}
-	deleteStatus, err := session.QueryDeleteIntent(ctx, deleteID)
+	deleteStatus, err := session.QueryDeleteIntent(ctx, deleteOwner, deleteID)
 	if err != nil || deleteStatus.Outcome != storage.DeleteIntentCompleted || deleteStatus.NodeID != deleteAttr.ID {
 		t.Fatalf("delete intent status=%+v err=%v", deleteStatus, err)
+	}
+	page, err := session.ListDeleteIntents(ctx, deleteOwner, 0, 1)
+	if err != nil || len(page.Intents) != 1 || page.Intents[0] != deleteStatus || page.Next == 0 {
+		t.Fatalf("delete intent page=%+v err=%v", page, err)
+	}
+	wrongOwner := storage.DeleteIntentOwner("other-owner")
+	if hidden, err := session.QueryDeleteIntent(ctx, wrongOwner, deleteID); err != nil || hidden.Outcome != storage.DeleteIntentUnknown {
+		t.Fatalf("cross-owner query=%+v err=%v", hidden, err)
+	}
+	if hidden, err := session.ListDeleteIntents(ctx, wrongOwner, 0, 1); err != nil || len(hidden.Intents) != 0 || hidden.Next != 0 {
+		t.Fatalf("cross-owner list=%+v err=%v", hidden, err)
+	}
+	wrongAckAction, err := storage.NewFileActionID(status.ActionEpoch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := session.AcknowledgeDeleteIntent(ctx, storage.AcknowledgeDeleteIntentCommand{Action: wrongAckAction, Owner: wrongOwner, Intent: deleteID}); err != nil {
+		t.Fatalf("cross-owner acknowledgement exposed the intent: %v", err)
+	}
+	if retained, err := session.QueryDeleteIntent(ctx, deleteOwner, deleteID); err != nil || retained.Outcome != storage.DeleteIntentCompleted {
+		t.Fatalf("cross-owner acknowledgement removed the intent: %+v, %v", retained, err)
 	}
 	ackAction, err := storage.NewFileActionID(status.ActionEpoch)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := session.AcknowledgeDeleteIntent(ctx, storage.AcknowledgeDeleteIntentCommand{Action: ackAction, Intent: deleteID}); err != nil {
+	if err := session.AcknowledgeDeleteIntent(ctx, storage.AcknowledgeDeleteIntentCommand{Action: ackAction, Owner: deleteOwner, Intent: deleteID}); err != nil {
 		t.Fatal(err)
 	}
 	ackReceipt, err := session.QueryFileAction(ctx, ackAction)
 	if err != nil || ackReceipt.Operation != storage.OpFileAcknowledgeDeleteIntent || ackReceipt.Outcome != storage.FileActionCompleted {
 		t.Fatalf("delete acknowledgement receipt=%+v err=%v", ackReceipt, err)
 	}
-	deleteStatus, err = session.QueryDeleteIntent(ctx, deleteID)
+	deleteStatus, err = session.QueryDeleteIntent(ctx, deleteOwner, deleteID)
 	if err != nil || deleteStatus.Outcome != storage.DeleteIntentUnknown || deleteStatus.NodeID != 0 {
 		t.Fatalf("acknowledged delete status=%+v err=%v", deleteStatus, err)
 	}
@@ -374,6 +396,83 @@ func TestGuardedOpenReplayDoesNotReevaluateACompletedSelection(t *testing.T) {
 		t.Fatalf("guarded replay = %+v, calls=%d, error=%v", opened, calls.Load(), err)
 	}
 	if err := opened.File.Close(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestTerminalDirectoryCloseReleasesHTTPReferenceCapacity(t *testing.T) {
+	client, _, backend := retainedHTTPFixture(t, DefaultFileLimits())
+	if err := backend.Mkdir(t.Context(), "dir"); err != nil {
+		t.Fatal(err)
+	}
+	if err := backend.Write(t.Context(), "dir/child", nil); err != nil {
+		t.Fatal(err)
+	}
+	root, err := backend.Stat(t.Context(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	directory, err := backend.Stat(t.Context(), "dir")
+	if err != nil {
+		t.Fatal(err)
+	}
+	options := storage.DefaultFileSessionOptions()
+	options.MaxFiles = 1
+	sessionValue, err := client.NewFileSession(t.Context(), options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sessionValue.Close(context.Background())
+	session := sessionValue.(*remoteFileSession)
+	status, err := session.Status(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	action, err := storage.NewFileActionID(status.ActionEpoch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	intent, err := storage.NewDeleteIntentID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner := storage.DeleteIntentOwner("http-terminal-close-test")
+	opened, err := session.OpenChildRef(t.Context(), storage.ChildSelection{Name: storage.ChildName{
+		Parent: storage.DirectoryTarget{NodeID: root.ID}, RawLeaf: []byte("dir"),
+	}}, storage.NodeRefOptions{
+		Kind: storage.NodeDirectory, Target: storage.ChildCondition{State: storage.SameNode, NodeID: directory.ID},
+		Action: action, Use: storage.UseClaim{Uses: storage.DeleteName}, MetadataAccess: storage.ReadMetadata,
+		CloseIntent: &storage.CloseIntent{ID: intent, Owner: owner, Trigger: storage.OnReferenceClose, Condition: storage.UnlinkIfEmpty},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	closeCalls := loseFileResponses(t, client, storage.OpFileClose, 1)
+	result, err := opened.Reference.(storage.ReferenceCloseReporter).CloseWithResult(t.Context())
+	if !result.Released || !errors.Is(err, syscall.ENOTEMPTY) || closeCalls.Load() != 2 {
+		t.Fatalf("terminal close result=%+v calls=%d err=%v", result, closeCalls.Load(), err)
+	}
+	if err := opened.Reference.Close(t.Context()); !errors.Is(err, syscall.ENOTEMPTY) {
+		t.Fatalf("terminal close replay=%v", err)
+	}
+	status, err = session.Status(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	action, err = storage.NewFileActionID(status.ActionEpoch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := session.OpenChildRef(t.Context(), storage.ChildSelection{Name: storage.ChildName{
+		Parent: storage.DirectoryTarget{NodeID: root.ID}, RawLeaf: []byte("dir"),
+	}}, storage.NodeRefOptions{
+		Kind: storage.NodeDirectory, Target: storage.ChildCondition{State: storage.SameNode, NodeID: directory.ID},
+		Action: action, MetadataAccess: storage.ReadMetadata,
+	})
+	if err != nil {
+		t.Fatalf("released terminal reference kept MaxFiles occupied: %v", err)
+	}
+	if err := reopened.Reference.Close(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 }

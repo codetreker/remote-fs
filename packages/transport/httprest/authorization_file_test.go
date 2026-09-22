@@ -130,6 +130,8 @@ func TestEveryFileOperationAuthorizesBeforeCapabilityLookup(t *testing.T) {
 		t.Fatal(err)
 	}
 	lock := storage.RangeCommand{Domain: storage.DomainWholeFile, Edit: storage.Replace, Mode: storage.RangeExclusive, Range: storage.Range{Kind: storage.Bytes, Length: uint64(math.MaxInt64) + 1}}
+	deleteOwner := storage.DeleteIntentOwner("authorization-test")
+	deleteIntent := storage.DeleteIntentID("0123456789abcdef0123456789abcdef")
 	fullOpen := storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true, Create: true, Truncate: true, Exclusive: true}, InitialMetadata: map[string][]byte{"test": {1, 2}}}
 	for _, req := range []fileRequest{
 		{Op: storage.OpFileSessionOpen, Options: storage.DefaultFileSessionOptions()},
@@ -153,6 +155,9 @@ func TestEveryFileOperationAuthorizesBeforeCapabilityLookup(t *testing.T) {
 		{Op: storage.OpFileSync},
 		{Op: storage.OpFileScope},
 		{Op: storage.OpFileObserveName},
+		{Op: storage.OpFileQueryDeleteIntent, DeleteOwner: deleteOwner, DeleteIntent: deleteIntent},
+		{Op: storage.OpFileListDeleteIntents, DeleteOwner: deleteOwner, DeleteLimit: 1},
+		{Op: storage.OpFileAcknowledgeDeleteIntent, Acknowledge: acknowledgeDeleteIntentCommandOf(storage.AcknowledgeDeleteIntentCommand{Action: storage.FileActionID(action), Owner: deleteOwner, Intent: deleteIntent})},
 		{Op: storage.OpFileNewUseOwner, Node: 71, Scope: &storage.UseScope{Token: strings.Repeat("c", 64)}, OwnerOptions: storage.OwnerOptions{Lifetime: storage.OwnerExplicit}},
 		{Op: storage.OpFileRetireUseOwner, Owner: 13},
 		{Op: storage.OpFileRangeGetConflict, Owner: 13, Commands: []storage.RangeCommand{lock}},
@@ -296,12 +301,16 @@ func TestDeniedFileActionsDoNotMutateOrExposeRetainedReceipts(t *testing.T) {
 	expires := served.expires
 	served.mu.Unlock()
 	policy.reset(authz.ErrDenied)
+	closeAction, err := storage.NewLockRequestID(session.Epoch)
+	if err != nil {
+		t.Fatal(err)
+	}
 	for _, denied := range []fileRequest{
 		req,
 		{Op: storage.OpFileAck, Session: session.Session, File: opened.File},
 		{Op: storage.OpFileRenew, Session: session.Session},
 		{Op: storage.OpFileStatus, Session: session.Session},
-		{Op: storage.OpFileClose, Session: session.Session, File: opened.File},
+		{Op: storage.OpFileClose, Session: session.Session, File: opened.File, Action: closeAction},
 		{Op: storage.OpFileSessionClose, Session: session.Session},
 	} {
 		fileAuthorizationDenied(t, fileAuthorizationRequest(t, h, denied), "EACCES", "access denied")
@@ -448,7 +457,11 @@ func TestDeniedFileCloseStillAllowsInternalLeaseCleanup(t *testing.T) {
 		t.Fatal(err)
 	}
 	policy.reset(authz.ErrDenied)
-	fileAuthorizationDenied(t, fileAuthorizationRequest(t, h, fileRequest{Op: storage.OpFileClose, Session: session.Session, File: opened.File}), "EACCES", "access denied")
+	closeAction, err := storage.NewLockRequestID(session.Epoch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fileAuthorizationDenied(t, fileAuthorizationRequest(t, h, fileRequest{Op: storage.OpFileClose, Session: session.Session, File: opened.File, Action: closeAction}), "EACCES", "access denied")
 	if used, err := backend.Usage(t.Context()); err != nil || used != 8 {
 		t.Fatalf("denied close released retained bytes: %d, %v", used, err)
 	}

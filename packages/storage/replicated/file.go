@@ -2,17 +2,23 @@ package replicated
 
 import (
 	"context"
+	"errors"
 	"sync"
+	"syscall"
 
 	"github.com/codetreker/remote-fs/packages/storage"
 	"github.com/codetreker/remote-fs/packages/transport/httprest"
 )
 
 type retainedFile struct {
-	session *fileSession
-	remote  httprest.FileWithBarrier
-	mu      sync.Mutex
-	closed  bool
+	session           *fileSession
+	remote            httprest.FileWithBarrier
+	mu                sync.Mutex
+	authorityReleased bool
+	closeConfirmed    bool
+	closeBarrier      *httprest.MutationBarrier
+	closeErr          error
+	closeRun          chan struct{}
 }
 
 func fileCall[T any](ctx context.Context, session *fileSession, ordinary bool, call func(context.Context) (T, error)) (T, error) {
@@ -79,26 +85,77 @@ func (f *retainedFile) Sync(ctx context.Context) error {
 }
 
 func (f *retainedFile) Close(ctx context.Context) error {
+	_, err := f.CloseWithResult(ctx)
+	return err
+}
+
+func (f *retainedFile) CloseWithResult(ctx context.Context) (storage.ReferenceCloseResult, error) {
 	f.mu.Lock()
-	closed := f.closed
-	f.mu.Unlock()
-	f.session.mu.Lock()
-	closed = closed || f.session.closed
-	f.session.mu.Unlock()
-	if closed {
-		return nil
-	}
-	_, err := fileCall(ctx, f.session, false, func(ctx context.Context) (struct{}, error) {
-		barrier, err := f.remote.CloseWithBarrier(ctx)
-		if err != nil {
-			return struct{}{}, err
+	for f.closeRun != nil {
+		finished := f.closeRun
+		f.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return storage.ReferenceCloseResult{}, ctx.Err()
+		case <-finished:
 		}
-		return struct{}{}, f.session.confirmCleanup(ctx, "close-file", barrier)
-	})
-	if err == nil {
 		f.mu.Lock()
-		f.closed = true
+	}
+	released, confirmed, barrier, semanticErr := f.authorityReleased, f.closeConfirmed, f.closeBarrier, f.closeErr
+	if confirmed {
+		f.mu.Unlock()
+		return storage.ReferenceCloseResult{Released: true}, semanticErr
+	}
+	f.session.mu.Lock()
+	sessionClosed := f.session.closed
+	f.session.mu.Unlock()
+	if sessionClosed && !released {
+		f.mu.Unlock()
+		return storage.ReferenceCloseResult{Released: true}, nil
+	}
+	f.closeRun = make(chan struct{})
+	defer func() {
+		f.mu.Lock()
+		close(f.closeRun)
+		f.closeRun = nil
+		f.mu.Unlock()
+	}()
+	f.mu.Unlock()
+	if !released {
+		var remoteResult storage.ReferenceCloseResult
+		_, callErr := fileCall(ctx, f.session, false, func(ctx context.Context) (struct{}, error) {
+			result, remoteBarrier, remoteErr := f.remote.CloseWithResultAndBarrier(ctx)
+			remoteResult = result
+			if checkErr := result.Check(remoteErr); checkErr != nil {
+				return struct{}{}, checkErr
+			}
+			if result.Released && (remoteBarrier != nil || errors.Is(remoteErr, syscall.ENOTEMPTY)) {
+				f.mu.Lock()
+				f.authorityReleased = true
+				f.closeBarrier = remoteBarrier
+				f.closeErr = remoteErr
+				f.mu.Unlock()
+			}
+			return struct{}{}, remoteErr
+		})
+		f.mu.Lock()
+		released, barrier, semanticErr = f.authorityReleased, f.closeBarrier, f.closeErr
+		f.mu.Unlock()
+		if !released {
+			if callErr == nil {
+				return storage.ReferenceCloseResult{}, errors.New("released file close returned no replication outcome")
+			}
+			return remoteResult, callErr
+		}
+	}
+	var confirmationErr error
+	if barrier != nil || !errors.Is(semanticErr, syscall.ENOTEMPTY) {
+		confirmationErr = f.session.confirmCleanup(ctx, "close-file", barrier)
+	}
+	if confirmationErr == nil {
+		f.mu.Lock()
+		f.closeConfirmed = true
 		f.mu.Unlock()
 	}
-	return err
+	return storage.ReferenceCloseResult{Released: true}, errors.Join(semanticErr, confirmationErr)
 }

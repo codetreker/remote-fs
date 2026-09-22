@@ -811,6 +811,9 @@ func (*mismatchedIdentityReference) SetAttr(context.Context, storage.AttrChange)
 	return storage.Attr{ID: 2, Kind: storage.NodeDirectory}, nil
 }
 func (*mismatchedIdentityReference) Close(context.Context) error { return nil }
+func (*mismatchedIdentityReference) CloseWithResult(context.Context) (storage.ReferenceCloseResult, error) {
+	return storage.ReferenceCloseResult{Released: true}, nil
+}
 func (*mismatchedIdentityReference) CheckScopedReference() error { return nil }
 func (*mismatchedIdentityReference) Scope(context.Context) (storage.UseScope, error) {
 	return storage.UseScope{Token: "scope"}, nil

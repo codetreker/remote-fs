@@ -61,7 +61,13 @@ func (s *fileSession) SetNodeAttr(ctx context.Context, id uint64, change storage
 }
 
 func (s *fileSession) Close(ctx context.Context) error {
-	return s.storage.publicationError(s.FileSession.Close(ctx))
+	_, err := s.CloseWithResult(ctx)
+	return err
+}
+
+func (s *fileSession) CloseWithResult(ctx context.Context) (storage.ReferenceCloseResult, error) {
+	result, err := storage.CloseFileSession(ctx, s.FileSession)
+	return result, s.storage.publicationError(err)
 }
 
 type file struct {
@@ -95,7 +101,13 @@ func (f *file) SetAttr(ctx context.Context, change storage.AttrChange) (storage.
 }
 
 func (f *file) Close(ctx context.Context) error {
-	return f.referenceCapabilities.storage.publicationError(f.File.Close(ctx))
+	_, err := f.CloseWithResult(ctx)
+	return err
+}
+
+func (f *file) CloseWithResult(ctx context.Context) (storage.ReferenceCloseResult, error) {
+	result, err := storage.CloseReference(ctx, f.File)
+	return result, f.referenceCapabilities.storage.publicationError(err)
 }
 
 func fileMutation[T any](s *Storage, ctx context.Context, name string, operation func(context.Context) (T, error)) (T, error) {

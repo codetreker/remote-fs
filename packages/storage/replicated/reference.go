@@ -2,17 +2,23 @@ package replicated
 
 import (
 	"context"
+	"errors"
 	"sync"
+	"syscall"
 
 	"github.com/codetreker/remote-fs/packages/storage"
 	"github.com/codetreker/remote-fs/packages/transport/httprest"
 )
 
 type nodeReference struct {
-	session *fileSession
-	remote  httprest.NodeReferenceWithBarrier
-	mu      sync.Mutex
-	closed  bool
+	session           *fileSession
+	remote            httprest.NodeReferenceWithBarrier
+	mu                sync.Mutex
+	authorityReleased bool
+	closeConfirmed    bool
+	closeBarrier      *httprest.MutationBarrier
+	closeErr          error
+	closeRun          chan struct{}
 }
 
 func referenceCall[C, R any](ctx context.Context, session *fileSession, remote any, call func(context.Context, C) (R, error)) (R, error) {
@@ -39,28 +45,79 @@ func (r *nodeReference) SetAttr(ctx context.Context, change storage.AttrChange) 
 }
 
 func (r *nodeReference) Close(ctx context.Context) error {
+	_, err := r.CloseWithResult(ctx)
+	return err
+}
+
+func (r *nodeReference) CloseWithResult(ctx context.Context) (storage.ReferenceCloseResult, error) {
 	r.mu.Lock()
-	closed := r.closed
-	r.mu.Unlock()
-	r.session.mu.Lock()
-	closed = closed || r.session.closed
-	r.session.mu.Unlock()
-	if closed {
-		return nil
-	}
-	_, err := fileCall(ctx, r.session, false, func(ctx context.Context) (struct{}, error) {
-		barrier, err := r.remote.CloseWithBarrier(ctx)
-		if err != nil {
-			return struct{}{}, err
+	for r.closeRun != nil {
+		finished := r.closeRun
+		r.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return storage.ReferenceCloseResult{}, ctx.Err()
+		case <-finished:
 		}
-		return struct{}{}, r.session.confirmCleanup(ctx, "close-reference", barrier)
-	})
-	if err == nil {
 		r.mu.Lock()
-		r.closed = true
+	}
+	released, confirmed, barrier, semanticErr := r.authorityReleased, r.closeConfirmed, r.closeBarrier, r.closeErr
+	if confirmed {
+		r.mu.Unlock()
+		return storage.ReferenceCloseResult{Released: true}, semanticErr
+	}
+	r.session.mu.Lock()
+	sessionClosed := r.session.closed
+	r.session.mu.Unlock()
+	if sessionClosed && !released {
+		r.mu.Unlock()
+		return storage.ReferenceCloseResult{Released: true}, nil
+	}
+	r.closeRun = make(chan struct{})
+	defer func() {
+		r.mu.Lock()
+		close(r.closeRun)
+		r.closeRun = nil
+		r.mu.Unlock()
+	}()
+	r.mu.Unlock()
+	if !released {
+		var remoteResult storage.ReferenceCloseResult
+		_, callErr := fileCall(ctx, r.session, false, func(ctx context.Context) (struct{}, error) {
+			result, remoteBarrier, remoteErr := r.remote.CloseWithResultAndBarrier(ctx)
+			remoteResult = result
+			if checkErr := result.Check(remoteErr); checkErr != nil {
+				return struct{}{}, checkErr
+			}
+			if result.Released && (remoteBarrier != nil || errors.Is(remoteErr, syscall.ENOTEMPTY)) {
+				r.mu.Lock()
+				r.authorityReleased = true
+				r.closeBarrier = remoteBarrier
+				r.closeErr = remoteErr
+				r.mu.Unlock()
+			}
+			return struct{}{}, remoteErr
+		})
+		r.mu.Lock()
+		released, barrier, semanticErr = r.authorityReleased, r.closeBarrier, r.closeErr
+		r.mu.Unlock()
+		if !released {
+			if callErr == nil {
+				return storage.ReferenceCloseResult{}, errors.New("released reference close returned no replication outcome")
+			}
+			return remoteResult, callErr
+		}
+	}
+	var confirmationErr error
+	if barrier != nil || !errors.Is(semanticErr, syscall.ENOTEMPTY) {
+		confirmationErr = r.session.confirmCleanup(ctx, "close-reference", barrier)
+	}
+	if confirmationErr == nil {
+		r.mu.Lock()
+		r.closeConfirmed = true
 		r.mu.Unlock()
 	}
-	return err
+	return storage.ReferenceCloseResult{Released: true}, errors.Join(semanticErr, confirmationErr)
 }
 
 func (r *nodeReference) CheckScopedReference() error {
@@ -237,6 +294,9 @@ func (r *failedOpenReference) State(context.Context) (storage.ReferenceState, er
 	return storage.ReferenceState{}, r.failure
 }
 func (r *failedOpenReference) Close(ctx context.Context) error { return r.native.Close(ctx) }
+func (r *failedOpenReference) CloseWithResult(ctx context.Context) (storage.ReferenceCloseResult, error) {
+	return storage.CloseReference(ctx, r.native)
+}
 
 type failedOpenFile struct{ failedOpenReference }
 

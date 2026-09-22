@@ -73,6 +73,7 @@ type servedFileAction struct {
 	file           string
 	err            error
 	barrierPending bool
+	retryableClose bool
 }
 
 type fileBarrierError struct{ cause error }
@@ -188,7 +189,8 @@ func (r *fileRegistry) run() {
 			}
 			s.mu.Unlock()
 			for cap, f := range pending {
-				if err := f.native.Close(context.Background()); err != nil {
+				result, _ := storage.CloseReference(context.Background(), f.native)
+				if !result.Released {
 					s.mu.Lock()
 					s.retired = true
 					s.mu.Unlock()
@@ -200,9 +202,9 @@ func (r *fileRegistry) run() {
 				}
 			}
 			if retire {
-				err := s.native.Close(context.Background())
+				result, err := storage.CloseFileSession(context.Background(), s.native)
 				r.mu.Lock()
-				if err == nil {
+				if result.Released {
 					delete(r.sessions, id)
 				} else if closing {
 					r.err = errors.Join(r.err, err)
@@ -374,12 +376,18 @@ func partialFileResult(request fileRequest, response fileResponse) *fileResponse
 		include = response.ActionReceipt != nil
 	case storage.OpFileQueryDeleteIntent:
 		include = response.DeleteStatus != nil
+	case storage.OpFileListDeleteIntents:
+		include = response.DeletePage != nil
 	case storage.OpFileOpenAt, storage.OpFileOpenNodeRef, storage.OpFileOpenChildRef:
 		include = response.File != "" || response.Attr != nil || response.Outcome != 0 || response.Barrier != nil
 	case storage.OpFileMutateName, storage.OpFileMutate:
 		include = response.Attr != nil || response.Barrier != nil
 	case storage.OpFileSetPendingUnlink, storage.OpFileClearPendingUnlink:
 		include = response.State != nil || response.Barrier != nil
+	case storage.OpFileClose:
+		include = response.CloseResult != nil || response.Barrier != nil
+	case storage.OpFileSessionClose:
+		include = response.CloseResult != nil || response.Barrier != nil
 	}
 	if !include {
 		return nil
@@ -422,7 +430,7 @@ func validateFileArguments(req fileRequest, maximum storage.FileSessionOptions) 
 		return err
 	case storage.OpFileOpenNode:
 		return req.Open.CheckNode(req.Node)
-	case storage.OpFileOpenAt, storage.OpFileOpenNodeRef, storage.OpFileOpenChildRef, storage.OpFileLookupAt, storage.OpFileReadDirNode, storage.OpFileObserveDirectoryMetadata, storage.OpFileObserveName, storage.OpFileMutateName:
+	case storage.OpFileOpenAt, storage.OpFileOpenNodeRef, storage.OpFileOpenChildRef, storage.OpFileLookupAt, storage.OpFileReadDirNode, storage.OpFileObserveDirectoryMetadata, storage.OpFileObserveName, storage.OpFileMutateName, storage.OpFileQueryDeleteIntent, storage.OpFileListDeleteIntents:
 		return validateCapabilityArguments(req)
 	case storage.OpFileRead:
 		if req.Offset < 0 || req.Length < 0 {
@@ -495,6 +503,19 @@ func (h *Handler) fileCall(ctx context.Context, req fileRequest, digest [32]byte
 			}
 			previous.retryMu.Lock()
 			defer previous.retryMu.Unlock()
+			if previous.retryableClose {
+				response, retryErr := h.performFile(ctx, session, req)
+				response.Epoch = epoch
+				var barrierFailure *fileBarrierError
+				previous.response = response
+				previous.err = retainFileActionError(retryErr)
+				previous.barrierPending = errors.As(retryErr, &barrierFailure)
+				previous.retryableClose = response.CloseResult == nil || !response.CloseResult.Released
+				if previous.err != nil && !previous.barrierPending {
+					return previous.response, &recordedFileError{cause: previous.err}
+				}
+				return previous.response, previous.err
+			}
 			if replayedFile != "" {
 				defer h.finishSemanticOpenReplay(session, replayedFile)
 			}
@@ -518,11 +539,12 @@ func (h *Handler) fileCall(ctx context.Context, req fileRequest, digest [32]byte
 			}
 			return fileResponse{}, syscall.ESTALE
 		}
-		if session.retired || !now.Before(session.expires) {
+		if req.Op != storage.OpFileClose && (session.retired || !now.Before(session.expires)) {
 			session.mu.Unlock()
 			return fileResponse{}, syscall.ESTALE
 		}
-		cleanup := req.Op == storage.OpFileRangeDrop || req.Op == storage.OpFileRetireUseOwner
+		cleanup := req.Op == storage.OpFileRangeDrop || req.Op == storage.OpFileRetireUseOwner ||
+			req.Op == storage.OpFileAcknowledgeDeleteIntent || req.Op == storage.OpFileClose
 		if cleanup && session.cleanupActions >= registry.limits.MaxCleanupActions {
 			session.retired = true
 			session.mu.Unlock()
@@ -549,6 +571,7 @@ func (h *Handler) fileCall(ctx context.Context, req fileRequest, digest [32]byte
 		action.file = response.File
 		action.err = retainFileActionError(err)
 		action.barrierPending = errors.As(err, &barrierFailure)
+		action.retryableClose = req.Op == storage.OpFileClose && (response.CloseResult == nil || !response.CloseResult.Released)
 		retainSemanticOpenCapability(session, req, response, action.expires)
 		close(action.done)
 		session.mu.Unlock()
@@ -653,7 +676,9 @@ func (h *Handler) performFile(ctx context.Context, s *servedFileSession, req fil
 		s.mu.Lock()
 		s.retired = true
 		s.mu.Unlock()
-		err = s.native.Close(ctx)
+		result, closeErr := storage.CloseFileSession(ctx, s.native)
+		response.CloseResult = referenceCloseResultOf(result)
+		err = closeErr
 	case storage.OpFileStatNode:
 		attr, err := s.native.StatNode(ctx, req.Node)
 		wire := AttrOf(attr)
@@ -667,7 +692,7 @@ func (h *Handler) performFile(ctx context.Context, s *servedFileSession, req fil
 		err = e
 		wire := AttrOf(attr)
 		response.Attr = wire
-	case storage.OpFileQueryAction, storage.OpFileQueryDeleteIntent, storage.OpFileAcknowledgeDeleteIntent, storage.OpFileLookupAt, storage.OpFileReadDirNode, storage.OpFileObserveDirectoryMetadata, storage.OpFileMutateName, storage.OpFileSetNodeMetadata, storage.OpFileNewUseOwner, storage.OpFileRetireUseOwner, storage.OpFileRangeGetConflict, storage.OpFileRangeApply, storage.OpFileRangeQuery, storage.OpFileRangeCancel, storage.OpFileRangeDrop:
+	case storage.OpFileQueryAction, storage.OpFileQueryDeleteIntent, storage.OpFileListDeleteIntents, storage.OpFileAcknowledgeDeleteIntent, storage.OpFileLookupAt, storage.OpFileReadDirNode, storage.OpFileObserveDirectoryMetadata, storage.OpFileMutateName, storage.OpFileSetNodeMetadata, storage.OpFileNewUseOwner, storage.OpFileRetireUseOwner, storage.OpFileRangeGetConflict, storage.OpFileRangeApply, storage.OpFileRangeQuery, storage.OpFileRangeCancel, storage.OpFileRangeDrop:
 		response, err = h.performSessionCapability(ctx, s.native, req)
 	case storage.OpFileOpen, storage.OpFileOpenNode, storage.OpFileOpenAt, storage.OpFileOpenNodeRef, storage.OpFileOpenChildRef:
 		return h.openReference(ctx, s, req)
@@ -688,7 +713,8 @@ func (h *Handler) performFile(ctx context.Context, s *servedFileSession, req fil
 		file := s.files[req.File]
 		if file == nil && req.Op == storage.OpFileClose {
 			s.mu.Unlock()
-			return response, nil
+			response.CloseResult = referenceCloseResultOf(storage.ReferenceCloseResult{Released: true})
+			return h.finishFileMutation(ctx, response)
 		}
 		if file == nil || file.native == nil || file.closing && req.Op != storage.OpFileClose {
 			s.mu.Unlock()
@@ -741,8 +767,10 @@ func (h *Handler) performFile(ctx context.Context, s *servedFileSession, req fil
 		case storage.OpFileObserveName, storage.OpFileState, storage.OpFileScope, storage.OpFileSetMetadata, storage.OpFileSetPendingUnlink, storage.OpFileClearPendingUnlink, storage.OpFileMutate:
 			response, err = performReferenceCapability(ctx, file.native, req)
 		case storage.OpFileClose:
-			err = file.native.Close(ctx)
-			if err == nil {
+			result, closeErr := storage.CloseReference(ctx, file.native)
+			response.CloseResult = referenceCloseResultOf(result)
+			err = closeErr
+			if result.Released {
 				s.mu.Lock()
 				delete(s.files, req.File)
 				s.mu.Unlock()
@@ -757,7 +785,7 @@ func (h *Handler) performFile(ctx context.Context, s *servedFileSession, req fil
 		}
 	}
 	if err != nil {
-		if fileMutation(req.Op) && (response.Attr != nil || response.State != nil) {
+		if fileMutation(req.Op) && (response.Attr != nil || response.State != nil || req.Op == storage.OpFileSessionClose && response.CloseResult != nil && response.CloseResult.Released) {
 			updated, barrierErr := h.finishFileMutation(ctx, response)
 			return updated, errors.Join(err, barrierErr)
 		}

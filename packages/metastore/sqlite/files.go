@@ -528,6 +528,10 @@ func (f *retainedFile) Close(ctx context.Context) error {
 	return err
 }
 
+func (f *retainedFile) CloseWithResult(ctx context.Context) (storage.ReferenceCloseResult, error) {
+	return f.closeWithResult(ctx)
+}
+
 func (f *retainedFile) closeWithResult(ctx context.Context) (storage.ReferenceCloseResult, error) {
 	if err := f.store.coordinator.commit.acquire(ctx); err != nil {
 		return storage.ReferenceCloseResult{}, err

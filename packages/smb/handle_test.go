@@ -66,6 +66,12 @@ func (p *handleReferenceProbe) Close(ctx context.Context) error {
 	return closeFn(ctx, attempt)
 }
 
+func (p *handleReferenceProbe) CloseWithResult(ctx context.Context) (storage.ReferenceCloseResult, error) {
+	err := p.Close(ctx)
+	released := storage.ReferenceCloseReleased(err) || storage.ErrnoOf(err) == syscall.ENOTEMPTY
+	return storage.ReferenceCloseResult{Released: released}, err
+}
+
 func (p *handleReferenceProbe) calls() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -97,6 +103,11 @@ func (s *incompleteFileSession) Close(context.Context) error {
 	return nil
 }
 
+func (s *incompleteFileSession) CloseWithResult(ctx context.Context) (storage.ReferenceCloseResult, error) {
+	err := s.Close(ctx)
+	return storage.ReferenceCloseResult{Released: err == nil}, err
+}
+
 type fileSessionBackend struct {
 	*endpointStorage
 	fileSession storage.FileSession
@@ -116,9 +127,26 @@ type publishingFileSession struct {
 	publish func()
 }
 
+type releasedFileSessionProbe struct {
+	*endpointFileSession
+	err error
+}
+
 func (s *publishingFileSession) Close(ctx context.Context) error {
 	s.publish()
 	return s.endpointFileSession.Close(ctx)
+}
+
+func (s *publishingFileSession) CloseWithResult(ctx context.Context) (storage.ReferenceCloseResult, error) {
+	err := s.Close(ctx)
+	return storage.ReferenceCloseResult{Released: storage.ReferenceCloseReleased(err)}, err
+}
+
+func (s *releasedFileSessionProbe) CloseWithResult(context.Context) (storage.ReferenceCloseResult, error) {
+	s.mu.Lock()
+	s.closes++
+	s.mu.Unlock()
+	return storage.ReferenceCloseResult{Released: true}, s.err
 }
 
 func (s *failingCapabilitySession) CheckAtomicFileOpen() error { return s.err }
@@ -1025,6 +1053,26 @@ func TestAuthorityCloseAttemptsRecoveryAfterRawCloseFailure(t *testing.T) {
 	defer recovery.mu.Unlock()
 	if len(recovery.acknowledgements) != 1 || recovery.acknowledgements[0].Intent != intent {
 		t.Fatalf("recovery after raw close failure = %+v", recovery.acknowledgements)
+	}
+}
+
+func TestAuthorityDoesNotRetryReleasedSessionAfterSemanticCloseError(t *testing.T) {
+	registry := newHandleTestRegistry(t, 1)
+	raw := &releasedFileSessionProbe{
+		endpointFileSession: newEndpointFileSession(), err: errors.Join(syscall.ENOTEMPTY, syscall.EIO),
+	}
+	registry.tree.authority.raw = raw
+	if err := registry.tree.authority.close(t.Context()); storage.ErrnoOf(err) != syscall.EIO {
+		t.Fatalf("released session close = %v", err)
+	}
+	if !registry.tree.authority.isClosed() {
+		t.Fatal("released session retained authority ownership")
+	}
+	if err := registry.tree.authority.close(t.Context()); err != nil {
+		t.Fatalf("released session retry = %v", err)
+	}
+	if raw.closes != 1 {
+		t.Fatalf("released session close calls = %d", raw.closes)
 	}
 }
 

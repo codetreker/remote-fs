@@ -3,6 +3,7 @@ package replicated
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"syscall"
 	"testing"
 
@@ -68,6 +69,10 @@ func (r *cleanupReferenceStub) Close(context.Context) error {
 	r.closes++
 	return r.closeErr
 }
+func (r *cleanupReferenceStub) CloseWithResult(context.Context) (storage.ReferenceCloseResult, error) {
+	r.closes++
+	return storage.ReferenceCloseResult{Released: storage.ReferenceCloseReleased(r.closeErr)}, r.closeErr
+}
 
 type barrierReferenceStub struct {
 	storage.NodeReference
@@ -88,7 +93,20 @@ func (r *barrierReferenceStub) Close(context.Context) error {
 
 func (r *barrierReferenceStub) CloseWithBarrier(context.Context) (*httprest.MutationBarrier, error) {
 	r.closes++
-	return &httprest.MutationBarrier{Incarnation: "log"}, r.closeErr
+	barrier := r.barrier
+	if barrier == nil {
+		barrier = &httprest.MutationBarrier{Incarnation: "log"}
+	}
+	return barrier, r.closeErr
+}
+
+func (r *barrierReferenceStub) CloseWithResultAndBarrier(context.Context) (storage.ReferenceCloseResult, *httprest.MutationBarrier, error) {
+	r.closes++
+	barrier := r.barrier
+	if barrier == nil {
+		barrier = &httprest.MutationBarrier{Incarnation: "log"}
+	}
+	return storage.ReferenceCloseResult{Released: r.closeErr == nil || errors.Is(r.closeErr, syscall.ENOTEMPTY)}, barrier, r.closeErr
 }
 
 func (*barrierReferenceStub) SetAttrWithBarrier(context.Context, storage.AttrChange) (storage.Attr, *httprest.MutationBarrier, error) {
@@ -379,6 +397,68 @@ func TestNodeOpenRejectsAReferenceWithoutReplicationBarriers(t *testing.T) {
 	if err := result.Reference.Close(t.Context()); err != nil || plain.closes != 2 {
 		t.Fatalf("unsupported node cleanup retry=%v closes=%d", err, plain.closes)
 	}
+}
+
+func TestReleasedNodeReferenceRetriesOnlyBarrierConfirmation(t *testing.T) {
+	session := retainedTestSession(t, nil)
+	remote := &barrierReferenceStub{
+		barrier: &httprest.MutationBarrier{Incarnation: "other", Position: 1},
+	}
+	reference := &nodeReference{session: session, remote: remote}
+	result, err := reference.CloseWithResult(t.Context())
+	if !result.Released || storage.ErrnoOf(err) != syscall.EIO || remote.closes != 1 {
+		t.Fatalf("first close result=%+v error=%v calls=%d", result, err, remote.closes)
+	}
+	remote.barrier.Incarnation = "log"
+	session.base.mu.Lock()
+	session.base.at = 1
+	session.base.mu.Unlock()
+	result, err = reference.CloseWithResult(t.Context())
+	if !result.Released || err != nil || remote.closes != 1 {
+		t.Fatalf("confirmed close result=%+v error=%v calls=%d", result, err, remote.closes)
+	}
+	result, err = reference.CloseWithResult(t.Context())
+	if !result.Released || err != nil || remote.closes != 1 {
+		t.Fatalf("replayed close result=%+v error=%v calls=%d", result, err, remote.closes)
+	}
+}
+
+func TestConcurrentNodeReferenceCloseSharesOneAuthorityCall(t *testing.T) {
+	session := retainedTestSession(t, nil)
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	remote := &barrierReferenceStub{}
+	remoteClose := func(context.Context) error {
+		close(entered)
+		<-release
+		return nil
+	}
+	reference := &nodeReference{session: session, remote: &blockingBarrierReference{barrierReferenceStub: remote, close: remoteClose}}
+	results := make(chan error, 2)
+	go func() { _, err := reference.CloseWithResult(t.Context()); results <- err }()
+	<-entered
+	go func() { _, err := reference.CloseWithResult(t.Context()); results <- err }()
+	close(release)
+	for range 2 {
+		if err := <-results; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if reference.remote.(*blockingBarrierReference).calls.Load() != 1 {
+		t.Fatalf("concurrent close called authority %d times", reference.remote.(*blockingBarrierReference).calls.Load())
+	}
+}
+
+type blockingBarrierReference struct {
+	*barrierReferenceStub
+	close func(context.Context) error
+	calls atomic.Int32
+}
+
+func (r *blockingBarrierReference) CloseWithResultAndBarrier(ctx context.Context) (storage.ReferenceCloseResult, *httprest.MutationBarrier, error) {
+	r.calls.Add(1)
+	err := r.close(ctx)
+	return storage.ReferenceCloseResult{Released: err == nil}, &httprest.MutationBarrier{Incarnation: "log"}, err
 }
 
 func TestNodeReferenceConditionalMutationPreservesKindsAndPartialAuthorityResults(t *testing.T) {

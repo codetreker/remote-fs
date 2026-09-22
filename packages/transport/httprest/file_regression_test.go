@@ -3,6 +3,7 @@ package httprest
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"github.com/codetreker/remote-fs/packages/locking"
@@ -15,6 +16,7 @@ import (
 	"net/http/httptest"
 	"reflect"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -943,6 +945,61 @@ type pendingCloseFile struct {
 	backend *pendingCloseBackend
 }
 
+type retryableCloseReference struct {
+	storage.NodeReference
+	calls atomic.Int32
+}
+
+func (r *retryableCloseReference) Stat(context.Context) (storage.Attr, error) {
+	return storage.Attr{}, syscall.EBADF
+}
+func (r *retryableCloseReference) SetAttr(context.Context, storage.AttrChange) (storage.Attr, error) {
+	return storage.Attr{}, syscall.EBADF
+}
+func (r *retryableCloseReference) Close(context.Context) error {
+	_, err := r.CloseWithResult(context.Background())
+	return err
+}
+func (r *retryableCloseReference) CloseWithResult(context.Context) (storage.ReferenceCloseResult, error) {
+	if r.calls.Add(1) == 1 {
+		return storage.ReferenceCloseResult{}, syscall.EIO
+	}
+	return storage.ReferenceCloseResult{Released: true}, nil
+}
+
+func TestRetainedHTTPCloseActionRetriesOnlyTheSameIntent(t *testing.T) {
+	limits := DefaultFileLimits()
+	reference := &retryableCloseReference{}
+	options := storage.DefaultFileSessionOptions()
+	started := time.Now()
+	served := &servedFileSession{
+		authority: "authority", files: map[string]*servedFile{strings.Repeat("f", 64): {native: reference}},
+		actions: make(map[storage.LockRequestID]*servedFileAction), options: options, started: started, expires: started.Add(options.Lease),
+	}
+	handler := &Handler{files: &fileRegistry{limits: limits, sessions: map[string]*servedFileSession{strings.Repeat("s", 64): served}}}
+	action, err := storage.NewLockRequestID(served.epoch(started))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := fileRequest{Op: storage.OpFileClose, Session: strings.Repeat("s", 64), File: strings.Repeat("f", 64), Action: action}
+	digest := sha256.Sum256([]byte("close"))
+	if response, err := handler.fileCall(t.Context(), request, digest); !errors.Is(err, syscall.EIO) || response.CloseResult == nil || response.CloseResult.Released {
+		t.Fatalf("retryable close=%+v error=%v", response, err)
+	}
+	changed := request
+	changed.File = strings.Repeat("g", 64)
+	if _, err := handler.fileCall(t.Context(), changed, sha256.Sum256([]byte("changed"))); !errors.Is(err, syscall.EINVAL) {
+		t.Fatalf("changed close action=%v", err)
+	}
+	response, err := handler.fileCall(t.Context(), request, digest)
+	if err != nil || response.CloseResult == nil || !response.CloseResult.Released || reference.calls.Load() != 2 {
+		t.Fatalf("retried close=%+v error=%v calls=%d", response, err, reference.calls.Load())
+	}
+	if _, err := handler.fileCall(t.Context(), request, digest); err != nil || reference.calls.Load() != 2 {
+		t.Fatalf("replayed close=%v calls=%d", err, reference.calls.Load())
+	}
+}
+
 func (b *pendingCloseBackend) NewFileSession(ctx context.Context, o storage.FileSessionOptions) (storage.FileSession, error) {
 	s, err := b.Storage.NewFileSession(ctx, o)
 	if err != nil {
@@ -1034,8 +1091,12 @@ func TestRetainedHTTPPendingExpiryRetainsCapabilityAndChargeUntilNativeClose(t *
 		t.Fatalf("pending close refunded native bytes: %d, %v", usage, err)
 	}
 	outcome := make(chan error, 1)
+	closeAction, err := storage.NewLockRequestID(remote.epoch)
+	if err != nil {
+		t.Fatal(err)
+	}
 	go func() {
-		_, err := client.fileCall(ctx, fileRequest{Op: storage.OpFileClose, Session: remote.id, File: opened.File})
+		_, err := client.fileCall(ctx, fileRequest{Op: storage.OpFileClose, Session: remote.id, File: opened.File, Action: closeAction})
 		outcome <- err
 	}()
 	select {

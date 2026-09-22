@@ -118,15 +118,20 @@ func (r *nodeReference) startClose() <-chan struct{} {
 
 func (r *nodeReference) finishClose() {
 	err := r.retire()
+	final := false
 	if err == nil {
 		err = r.drainAndRelease()
 	}
 	if err == nil {
 		ctx, cancel := r.session.operationContext(r.session.cleanup)
-		err = r.native.Close(ctx)
+		result, closeErr := r.native.CloseWithResult(ctx)
 		cancel()
+		if checkErr := result.Check(closeErr); checkErr != nil {
+			err = checkErr
+		} else {
+			final, err = result.Released, closeErr
+		}
 	}
-	final := err == nil || storage.ErrnoOf(err) == syscall.ENOTEMPTY
 	if final {
 		r.session.mu.Lock()
 		delete(r.session.files, r)
@@ -141,14 +146,23 @@ func (r *nodeReference) finishClose() {
 }
 
 func (r *nodeReference) Close(ctx context.Context) error {
+	_, err := r.CloseWithResult(ctx)
+	return err
+}
+
+func (r *nodeReference) CloseWithResult(ctx context.Context) (storage.ReferenceCloseResult, error) {
+	return r.closeWithResult(ctx)
+}
+
+func (r *nodeReference) closeWithResult(ctx context.Context) (storage.ReferenceCloseResult, error) {
 	done := r.startClose()
 	select {
 	case <-done:
 		r.closeMu.Lock()
 		defer r.closeMu.Unlock()
-		return r.closeErr
+		return storage.ReferenceCloseResult{Released: r.closeFinal}, r.closeErr
 	case <-ctx.Done():
-		return ctx.Err()
+		return storage.ReferenceCloseResult{}, ctx.Err()
 	}
 }
 

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"math"
 	"syscall"
+	"unicode/utf8"
 )
 
 const (
@@ -283,6 +284,9 @@ func (i CloseIntent) Check() error {
 	if err := i.ID.Check(); err != nil {
 		return err
 	}
+	if err := i.Owner.Check(); err != nil {
+		return err
+	}
 	if err := checkMetadataConditions(i.ExpectedMetadata); err != nil {
 		return err
 	}
@@ -520,6 +524,18 @@ func (id DeleteIntentID) Check() error {
 	return nil
 }
 
+func (owner DeleteIntentOwner) Check() error {
+	if len(owner) == 0 || len(owner) > MaxDeleteIntentOwnerBytes || !utf8.ValidString(string(owner)) {
+		return syscall.EINVAL
+	}
+	for index := range owner {
+		if owner[index] == 0 {
+			return syscall.EINVAL
+		}
+	}
+	return nil
+}
+
 func (s DeleteIntentStatus) Check() error {
 	if err := s.ID.Check(); err != nil {
 		return err
@@ -548,7 +564,33 @@ func (c AcknowledgeDeleteIntentCommand) Check() error {
 	if err := c.Action.Check(); err != nil {
 		return err
 	}
+	if err := c.Owner.Check(); err != nil {
+		return err
+	}
 	return c.Intent.Check()
+}
+
+func (p DeleteIntentPage) Check(owner DeleteIntentOwner, after DeleteIntentCursor, limit int) error {
+	if err := owner.Check(); err != nil {
+		return err
+	}
+	if uint64(after) > math.MaxInt64 || uint64(p.Next) > math.MaxInt64 || limit < 1 || limit > MaxDeleteIntentPageEntries || len(p.Intents) > limit || p.Next < after {
+		return syscall.EINVAL
+	}
+	if len(p.Intents) == 0 && p.Next != after || len(p.Intents) != 0 && p.Next == after {
+		return syscall.EINVAL
+	}
+	seen := make(map[DeleteIntentID]struct{}, len(p.Intents))
+	for _, status := range p.Intents {
+		if err := status.Check(); err != nil {
+			return err
+		}
+		if _, exists := seen[status.ID]; exists {
+			return syscall.EINVAL
+		}
+		seen[status.ID] = struct{}{}
+	}
+	return nil
 }
 
 func checkMetadataConditions(expected map[string][]byte) error {

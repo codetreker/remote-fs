@@ -31,6 +31,9 @@ func (*queryInfoReference) SetAttr(context.Context, storage.AttrChange) (storage
 	return storage.Attr{}, syscall.EBADF
 }
 func (*queryInfoReference) Close(context.Context) error { return nil }
+func (*queryInfoReference) CloseWithResult(context.Context) (storage.ReferenceCloseResult, error) {
+	return storage.ReferenceCloseResult{Released: true}, nil
+}
 func (*queryInfoReference) CheckScopedReference() error { return nil }
 func (*queryInfoReference) Scope(context.Context) (storage.UseScope, error) {
 	return storage.UseScope{Token: "query"}, nil

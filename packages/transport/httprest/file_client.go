@@ -24,7 +24,7 @@ type fileRequestAdmission struct {
 
 func fileReadOnly(op storage.Operation) bool {
 	switch op {
-	case storage.OpFileRead, storage.OpFileStat, storage.OpFileStatNode, storage.OpFileLookupAt, storage.OpFileReadDirNode, storage.OpFileObserveDirectoryMetadata, storage.OpFileObserveName, storage.OpFileQueryAction, storage.OpFileQueryDeleteIntent, storage.OpFileState, storage.OpFileScope, storage.OpFileRangeGetConflict, storage.OpFileRangeQuery, storage.OpFileStatus:
+	case storage.OpFileRead, storage.OpFileStat, storage.OpFileStatNode, storage.OpFileLookupAt, storage.OpFileReadDirNode, storage.OpFileObserveDirectoryMetadata, storage.OpFileObserveName, storage.OpFileQueryAction, storage.OpFileQueryDeleteIntent, storage.OpFileListDeleteIntents, storage.OpFileState, storage.OpFileScope, storage.OpFileRangeGetConflict, storage.OpFileRangeQuery, storage.OpFileStatus:
 		return true
 	}
 	return false
@@ -40,19 +40,22 @@ func requestInterruptible(ctx context.Context, r Request) bool {
 func fileScopeEnabled(ctx context.Context) bool { v, _ := ctx.Value(fileScopeKey{}).(bool); return v }
 
 type remoteFileSession struct {
-	storage      *Storage
-	id           string
-	mu           sync.Mutex
-	reconcileMu  sync.Mutex
-	epoch        uint64
-	failed       error
-	closed       bool
-	closeAction  storage.LockRequestID
-	closeBarrier *MutationBarrier
-	pending      map[string]pendingFileAction
-	inflight     int
-	pendingLimit int
-	capabilities fileCapabilities
+	storage           *Storage
+	id                string
+	mu                sync.Mutex
+	reconcileMu       sync.Mutex
+	epoch             uint64
+	failed            error
+	closed            bool
+	authorityReleased bool
+	closeRun          chan struct{}
+	closeAction       storage.LockRequestID
+	closeBarrier      *MutationBarrier
+	closeErr          error
+	pending           map[string]pendingFileAction
+	inflight          int
+	pendingLimit      int
+	capabilities      fileCapabilities
 }
 
 type pendingFileAction struct {
@@ -65,14 +68,17 @@ type pendingFileAction struct {
 }
 
 type remoteFile struct {
-	session      *remoteFileSession
-	id           string
-	node         uint64
-	mu           sync.Mutex
-	closed       bool
-	closeAction  storage.LockRequestID
-	closeBarrier *MutationBarrier
-	capabilities fileCapabilities
+	session           *remoteFileSession
+	id                string
+	node              uint64
+	mu                sync.Mutex
+	closed            bool
+	authorityReleased bool
+	closeRun          chan struct{}
+	closeAction       storage.LockRequestID
+	closeBarrier      *MutationBarrier
+	closeErr          error
+	capabilities      fileCapabilities
 }
 
 func (s *Storage) CheckFileStorage() error { return nil }
@@ -478,7 +484,7 @@ func (s *remoteFileSession) open(ctx context.Context, req fileRequest) (storage.
 	_, err = s.call(ctx, fileRequest{Op: storage.OpFileAck, File: response.File})
 	if err != nil {
 		cleanup, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		_, cleanupErr := s.storage.fileCall(cleanup, fileRequest{Op: storage.OpFileClose, Session: s.id, File: response.File})
+		cleanupErr := s.closeUnreturnedReference(cleanup, response.File)
 		cancel()
 		s.mu.Lock()
 		sessionClosed := s.closed
@@ -561,36 +567,75 @@ func (s *remoteFileSession) Renew(ctx context.Context) (storage.FileSessionStatu
 	return s.status(ctx, storage.OpFileRenew)
 }
 func (s *remoteFileSession) Close(ctx context.Context) error {
-	_, err := s.CloseWithBarrier(ctx)
+	_, _, err := s.CloseWithResultAndBarrier(ctx)
 	return err
 }
 
 func (s *remoteFileSession) CloseWithBarrier(ctx context.Context) (*MutationBarrier, error) {
+	_, barrier, err := s.CloseWithResultAndBarrier(ctx)
+	return barrier, err
+}
+
+func (s *remoteFileSession) CloseWithResult(ctx context.Context) (storage.ReferenceCloseResult, error) {
+	result, _, err := s.CloseWithResultAndBarrier(ctx)
+	return result, err
+}
+
+func (s *remoteFileSession) CloseWithResultAndBarrier(ctx context.Context) (storage.ReferenceCloseResult, *MutationBarrier, error) {
 	s.mu.Lock()
-	if s.closed {
-		barrier := s.closeBarrier
+	for s.closeRun != nil {
+		finished := s.closeRun
 		s.mu.Unlock()
-		return barrier, nil
+		select {
+		case <-ctx.Done():
+			return storage.ReferenceCloseResult{}, nil, ctx.Err()
+		case <-finished:
+		}
+		s.mu.Lock()
 	}
+	if s.closed {
+		result, barrier, err := storage.ReferenceCloseResult{Released: true}, s.closeBarrier, s.closeErr
+		s.mu.Unlock()
+		return result, barrier, err
+	}
+	s.closeRun = make(chan struct{})
+	defer func() {
+		s.mu.Lock()
+		close(s.closeRun)
+		s.closeRun = nil
+		s.mu.Unlock()
+	}()
 	if s.closeAction == "" {
 		var err error
 		s.closeAction, err = storage.NewLockRequestID(s.epoch)
 		if err != nil {
 			s.mu.Unlock()
-			return nil, err
+			return storage.ReferenceCloseResult{}, nil, err
 		}
 	}
 	action := s.closeAction
 	s.mu.Unlock()
 	r, e := s.storage.fileCall(ctx, fileRequest{Op: storage.OpFileSessionClose, Session: s.id, Action: action})
-	if e == nil || errors.Is(e, syscall.ESTALE) {
-		s.mu.Lock()
-		s.closed = true
-		s.closeBarrier = r.Barrier
-		s.mu.Unlock()
-		return r.Barrier, nil
+	result := storage.ReferenceCloseResult{Released: s.authorityReleased}
+	if r.CloseResult != nil {
+		result = r.CloseResult.storage()
+	} else if e == nil {
+		e = unreachable(Request{Op: OpFile}, errors.New("session close response omitted its release result"))
 	}
-	return nil, e
+	if checkErr := result.Check(e); checkErr != nil {
+		return storage.ReferenceCloseResult{}, nil, unreachable(Request{Op: OpFileControl}, checkErr)
+	}
+	if result.Released {
+		s.mu.Lock()
+		s.authorityReleased = true
+		s.closeBarrier = r.Barrier
+		s.closeErr = e
+		if e == nil || storage.ErrnoOf(e) == syscall.ENOTEMPTY {
+			s.closed = true
+		}
+		s.mu.Unlock()
+	}
+	return result, r.Barrier, e
 }
 
 func (f *remoteFile) call(ctx context.Context, r fileRequest) (fileResponse, error) {
@@ -680,17 +725,48 @@ func (f *remoteFile) Sync(ctx context.Context) error {
 	return e
 }
 func (f *remoteFile) Close(ctx context.Context) error {
-	_, err := f.CloseWithBarrier(ctx)
+	_, _, err := f.closeWithResultAndBarrier(ctx)
 	return err
 }
 
+func (f *remoteFile) CloseWithResult(ctx context.Context) (storage.ReferenceCloseResult, error) {
+	result, _, err := f.closeWithResultAndBarrier(ctx)
+	return result, err
+}
+
+func (f *remoteFile) CloseWithResultAndBarrier(ctx context.Context) (storage.ReferenceCloseResult, *MutationBarrier, error) {
+	return f.closeWithResultAndBarrier(ctx)
+}
+
 func (f *remoteFile) CloseWithBarrier(ctx context.Context) (*MutationBarrier, error) {
+	_, barrier, err := f.closeWithResultAndBarrier(ctx)
+	return barrier, err
+}
+
+func (f *remoteFile) closeWithResultAndBarrier(ctx context.Context) (storage.ReferenceCloseResult, *MutationBarrier, error) {
 	f.mu.Lock()
-	if f.closed {
-		barrier := f.closeBarrier
+	for f.closeRun != nil {
+		finished := f.closeRun
 		f.mu.Unlock()
-		return barrier, nil
+		select {
+		case <-ctx.Done():
+			return storage.ReferenceCloseResult{}, nil, ctx.Err()
+		case <-finished:
+		}
+		f.mu.Lock()
 	}
+	if f.closed {
+		result, barrier, err := storage.ReferenceCloseResult{Released: true}, f.closeBarrier, f.closeErr
+		f.mu.Unlock()
+		return result, barrier, err
+	}
+	f.closeRun = make(chan struct{})
+	defer func() {
+		f.mu.Lock()
+		close(f.closeRun)
+		f.closeRun = nil
+		f.mu.Unlock()
+	}()
 	if f.closeAction == "" {
 		f.session.mu.Lock()
 		epoch := f.session.epoch
@@ -699,18 +775,30 @@ func (f *remoteFile) CloseWithBarrier(ctx context.Context) (*MutationBarrier, er
 		f.closeAction, err = storage.NewLockRequestID(epoch)
 		if err != nil {
 			f.mu.Unlock()
-			return nil, err
+			return storage.ReferenceCloseResult{}, nil, err
 		}
 	}
 	action := f.closeAction
 	f.mu.Unlock()
 	r, e := f.session.call(ctx, fileRequest{Op: storage.OpFileClose, File: f.id, Action: action})
-	if e == nil || errors.Is(e, syscall.ESTALE) {
-		f.mu.Lock()
-		f.closed = true
-		f.closeBarrier = r.Barrier
-		f.mu.Unlock()
-		return r.Barrier, nil
+	result := storage.ReferenceCloseResult{Released: f.authorityReleased}
+	if r.CloseResult != nil {
+		result = r.CloseResult.storage()
+	} else if e == nil {
+		e = unreachable(Request{Op: OpFile}, errors.New("close response omitted its release result"))
 	}
-	return nil, e
+	if checkErr := result.Check(e); checkErr != nil {
+		return storage.ReferenceCloseResult{}, nil, unreachable(Request{Op: OpFileControl}, checkErr)
+	}
+	if result.Released {
+		f.mu.Lock()
+		f.authorityReleased = true
+		f.closeBarrier = r.Barrier
+		f.closeErr = e
+		if e == nil || storage.ErrnoOf(e) == syscall.ENOTEMPTY {
+			f.closed = true
+		}
+		f.mu.Unlock()
+	}
+	return result, r.Barrier, e
 }

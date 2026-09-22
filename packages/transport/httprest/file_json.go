@@ -64,6 +64,11 @@ func validateFileRequest(r fileRequest) error {
 		expected.FileAction = r.FileAction
 	case storage.OpFileQueryDeleteIntent:
 		expected.DeleteIntent = r.DeleteIntent
+		expected.DeleteOwner = r.DeleteOwner
+	case storage.OpFileListDeleteIntents:
+		expected.DeleteOwner = r.DeleteOwner
+		expected.DeleteAfter = r.DeleteAfter
+		expected.DeleteLimit = r.DeleteLimit
 	case storage.OpFileAcknowledgeDeleteIntent:
 		expected.Acknowledge = r.Acknowledge
 	case storage.OpFileOpen:
@@ -249,6 +254,8 @@ func validateFileResponse(req fileRequest, r fileResponse) error {
 			expected.ActionReceipt = r.ActionReceipt
 		case storage.OpFileQueryDeleteIntent:
 			expected.DeleteStatus = r.DeleteStatus
+		case storage.OpFileListDeleteIntents:
+			expected.DeletePage = r.DeletePage
 		case storage.OpFileOpen, storage.OpFileOpenNode:
 			expected.Node = r.Node
 			expected.File = r.File
@@ -275,8 +282,14 @@ func validateFileResponse(req fileRequest, r fileResponse) error {
 		case storage.OpFileMutateName:
 			expected.Attr = r.Attr
 			expected.Barrier = r.Barrier
-		case storage.OpFileSync, storage.OpFileClose, storage.OpFileSessionClose:
+		case storage.OpFileSync:
 			expected.Barrier = r.Barrier
+		case storage.OpFileSessionClose:
+			expected.Barrier = r.Barrier
+			expected.CloseResult = r.CloseResult
+		case storage.OpFileClose:
+			expected.Barrier = r.Barrier
+			expected.CloseResult = r.CloseResult
 		case storage.OpFileScope:
 			expected.Scope = r.Scope
 		case storage.OpFileState:
@@ -323,6 +336,25 @@ func validateFileResponse(req fileRequest, r fileResponse) error {
 		}
 		if _, err := r.DeleteStatus.storage(); err != nil {
 			return err
+		}
+	case storage.OpFileListDeleteIntents:
+		if r.DeletePage == nil {
+			return errors.New("delete intent list is absent")
+		}
+		page, err := r.DeletePage.storage()
+		if err != nil {
+			return err
+		}
+		if err := page.Check(req.DeleteOwner, req.DeleteAfter, req.DeleteLimit); err != nil {
+			return err
+		}
+	case storage.OpFileClose:
+		if r.CloseResult == nil || !r.CloseResult.Released {
+			return errors.New("successful close did not release its reference")
+		}
+	case storage.OpFileSessionClose:
+		if r.CloseResult == nil || !r.CloseResult.Released {
+			return errors.New("successful session close did not release its session")
 		}
 	case storage.OpFileOpen, storage.OpFileOpenNode:
 		if !validFileCapability(r.File) || r.Capabilities == nil {
@@ -517,6 +549,12 @@ func validatePartialFileResponse(req fileRequest, response fileResponse) error {
 			if err := validateReferenceState(response.State); err != nil {
 				return err
 			}
+		}
+	case storage.OpFileClose, storage.OpFileSessionClose:
+		expected.Barrier = response.Barrier
+		expected.CloseResult = response.CloseResult
+		if response.CloseResult == nil {
+			return errors.New("partial close result is absent")
 		}
 	default:
 		return errors.New("operation cannot return a partial file result")

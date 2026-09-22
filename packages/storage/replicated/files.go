@@ -119,16 +119,19 @@ func (s *Storage) closeFileSessions() error {
 }
 
 type fileSession struct {
-	base     *Storage
-	remote   httprest.FileSessionWithBarrier
-	lifetime context.Context
-	stop     context.CancelFunc
-	mu       sync.Mutex
-	active   int
-	closing  bool
-	closed   bool
-	changed  chan struct{}
-	closeRun chan struct{}
+	base          *Storage
+	remote        httprest.FileSessionWithBarrier
+	lifetime      context.Context
+	stop          context.CancelFunc
+	mu            sync.Mutex
+	active        int
+	closing       bool
+	closed        bool
+	changed       chan struct{}
+	closeRun      chan struct{}
+	closeReleased bool
+	closeBarrier  *httprest.MutationBarrier
+	closeErr      error
 }
 
 // The session drains local calls as well as server references. Reconciliation and
@@ -160,20 +163,26 @@ func (s *fileSession) begin(ctx context.Context, ordinary bool) (context.Context
 }
 
 func (s *fileSession) Close(ctx context.Context) error {
+	_, err := s.CloseWithResult(ctx)
+	return err
+}
+
+func (s *fileSession) CloseWithResult(ctx context.Context) (storage.ReferenceCloseResult, error) {
 	s.mu.Lock()
 	for s.closeRun != nil {
 		finished := s.closeRun
 		s.mu.Unlock()
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return storage.ReferenceCloseResult{}, ctx.Err()
 		case <-finished:
 		}
 		s.mu.Lock()
 	}
 	if s.closed {
+		err := s.closeErr
 		s.mu.Unlock()
-		return nil
+		return storage.ReferenceCloseResult{Released: true}, err
 	}
 	s.closing = true
 	s.stop()
@@ -189,18 +198,37 @@ func (s *fileSession) Close(ctx context.Context) error {
 		s.mu.Unlock()
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return storage.ReferenceCloseResult{}, ctx.Err()
 		case <-changed:
 		}
 		s.mu.Lock()
 	}
+	released, barrier, semanticErr := s.closeReleased, s.closeBarrier, s.closeErr
 	s.mu.Unlock()
-	barrier, err := s.remote.CloseWithBarrier(ctx)
-	if err != nil {
-		return err
+	if !released {
+		result, remoteBarrier, remoteErr := s.remote.CloseWithResultAndBarrier(ctx)
+		if checkErr := result.Check(remoteErr); checkErr != nil {
+			return storage.ReferenceCloseResult{}, checkErr
+		}
+		if result.Released && remoteBarrier != nil {
+			s.mu.Lock()
+			s.closeReleased = true
+			s.closeBarrier = remoteBarrier
+			s.closeErr = remoteErr
+			s.mu.Unlock()
+			released, barrier, semanticErr = true, remoteBarrier, remoteErr
+		} else if !result.Released {
+			return storage.ReferenceCloseResult{}, remoteErr
+		} else {
+			if remoteErr == nil {
+				return storage.ReferenceCloseResult{}, errors.New("released file session close returned no replication barrier")
+			}
+			return storage.ReferenceCloseResult{Released: true}, remoteErr
+		}
 	}
-	if err := s.confirmCleanup(ctx, "close-file-session", barrier); err != nil {
-		return err
+	confirmationErr := s.confirmCleanup(ctx, "close-file-session", barrier)
+	if confirmationErr != nil {
+		return storage.ReferenceCloseResult{Released: true}, errors.Join(semanticErr, confirmationErr)
 	}
 	s.mu.Lock()
 	s.closed = true
@@ -208,7 +236,7 @@ func (s *fileSession) Close(ctx context.Context) error {
 	s.base.mu.Lock()
 	delete(s.base.fileSessions, s)
 	s.base.mu.Unlock()
-	return nil
+	return storage.ReferenceCloseResult{Released: true}, semanticErr
 }
 
 func (s *fileSession) OpenFile(ctx context.Context, path string, options storage.FileOpenOptions) (storage.File, error) {

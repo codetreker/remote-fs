@@ -22,7 +22,7 @@ func failedClose(done <-chan struct{}, err error) bool {
 
 func (f *openFile) retryClose(ctx context.Context) (bool, error) {
 	f.closeMu.Lock()
-	retry := failedClose(f.closeDone, f.closeErr)
+	retry := !f.closeFinal && failedClose(f.closeDone, f.closeErr)
 	f.closeMu.Unlock()
 	if !retry {
 		return false, nil

@@ -80,9 +80,19 @@ func (s *fileSession) QueryFileAction(ctx context.Context, action storage.FileAc
 	})
 }
 
-func (s *fileSession) QueryDeleteIntent(ctx context.Context, intent storage.DeleteIntentID) (storage.DeleteIntentStatus, error) {
+func (s *fileSession) QueryDeleteIntent(ctx context.Context, owner storage.DeleteIntentOwner, intent storage.DeleteIntentID) (storage.DeleteIntentStatus, error) {
 	return sessionCapability(ctx, s, false, func(ctx context.Context, c storage.FileActions) (storage.DeleteIntentStatus, error) {
-		return c.QueryDeleteIntent(ctx, intent)
+		return c.QueryDeleteIntent(ctx, owner, intent)
+	})
+}
+
+func (s *fileSession) ListDeleteIntents(ctx context.Context, owner storage.DeleteIntentOwner, after storage.DeleteIntentCursor, limit int) (storage.DeleteIntentPage, error) {
+	return sessionCapability(ctx, s, false, func(ctx context.Context, c storage.FileActions) (storage.DeleteIntentPage, error) {
+		page, err := c.ListDeleteIntents(ctx, owner, after, limit)
+		if err == nil {
+			err = page.Check(owner, after, limit)
+		}
+		return page, err
 	})
 }
 
@@ -244,9 +254,9 @@ func (s *fileSession) openReference(ctx context.Context, open func(context.Conte
 	if err != nil {
 		if result.Reference != nil {
 			cleanup, done := s.base.fileCleanupContext()
-			cleanupErr := result.Reference.Close(cleanup)
+			closeResult, cleanupErr := storage.CloseReference(cleanup, result.Reference)
 			done()
-			if cleanupErr != nil {
+			if !closeResult.Released {
 				if remote, ok := result.Reference.(httprest.NodeReferenceWithBarrier); ok {
 					result.Reference = &nodeReference{session: s, remote: remote}
 				} else {
@@ -254,6 +264,7 @@ func (s *fileSession) openReference(ctx context.Context, open func(context.Conte
 				}
 				return result, errors.Join(err, cleanupErr)
 			}
+			err = errors.Join(err, cleanupErr)
 		}
 		return storage.NodeOpenResult{}, err
 	}
@@ -262,12 +273,13 @@ func (s *fileSession) openReference(ctx context.Context, open func(context.Conte
 		failure := fmt.Errorf("node open returned no barrier-capable reference: %w", syscall.EIO)
 		if result.Reference != nil {
 			cleanup, done := s.base.fileCleanupContext()
-			cleanupErr := result.Reference.Close(cleanup)
+			closeResult, cleanupErr := storage.CloseReference(cleanup, result.Reference)
 			done()
-			if cleanupErr != nil {
+			if !closeResult.Released {
 				result.Reference = newFailedOpenReference(result.Reference, failure)
 				return result, errors.Join(failure, cleanupErr)
 			}
+			failure = errors.Join(failure, cleanupErr)
 		}
 		return storage.NodeOpenResult{}, failure
 	}

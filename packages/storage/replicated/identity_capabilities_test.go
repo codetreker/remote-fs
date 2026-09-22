@@ -267,6 +267,7 @@ func verifyNodeReference(t *testing.T, session storage.FileSession, references s
 
 func verifyDeleteIntentLifecycle(t *testing.T, session storage.FileSession, actions storage.FileActions, opener storage.AtomicFileOpener, parent uint64) {
 	t.Helper()
+	owner := storage.DeleteIntentOwner("replicated-delete-test")
 	intent, err := storage.NewDeleteIntentID()
 	if err != nil {
 		t.Fatal(err)
@@ -279,7 +280,7 @@ func verifyDeleteIntentLifecycle(t *testing.T, session storage.FileSession, acti
 		storage.OpenAtOptions{
 			Read: true, Create: true, Exclusive: true, Target: storage.ChildCondition{State: storage.Absent},
 			Action: createAction, Use: storage.UseClaim{Uses: storage.ReadData | storage.DeleteName}, Existing: storage.Keep,
-			CloseIntent: &storage.CloseIntent{ID: intent, Trigger: storage.OnReferenceClose, Condition: storage.UnlinkFile},
+			CloseIntent: &storage.CloseIntent{ID: intent, Owner: owner, Trigger: storage.OnReferenceClose, Condition: storage.UnlinkFile},
 		})
 
 	if err != nil || opened.File == nil || opened.Outcome != storage.Created {
@@ -288,12 +289,12 @@ func verifyDeleteIntentLifecycle(t *testing.T, session storage.FileSession, acti
 	if err := opened.File.Close(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	status, err := actions.QueryDeleteIntent(t.Context(), intent)
+	status, err := actions.QueryDeleteIntent(t.Context(), owner, intent)
 	if err != nil || status.NodeID != opened.Attr.ID || status.Outcome != storage.DeleteIntentCompleted {
 		t.Fatalf("delete intent=%+v error=%v", status, err)
 	}
 	ackAction := replicatedFileActionFor(t, session)
-	if err := actions.AcknowledgeDeleteIntent(t.Context(), storage.AcknowledgeDeleteIntentCommand{Action: ackAction, Intent: intent}); err != nil {
+	if err := actions.AcknowledgeDeleteIntent(t.Context(), storage.AcknowledgeDeleteIntentCommand{Action: ackAction, Owner: owner, Intent: intent}); err != nil {
 		t.Fatal(err)
 	}
 	receipt, err := actions.QueryFileAction(t.Context(), ackAction)

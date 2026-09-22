@@ -25,7 +25,13 @@ func (r *nodeReference) SetAttr(ctx context.Context, change storage.AttrChange) 
 }
 
 func (r *nodeReference) Close(ctx context.Context) error {
-	return r.storage.publicationError(r.NodeReference.Close(ctx))
+	_, err := r.CloseWithResult(ctx)
+	return err
+}
+
+func (r *nodeReference) CloseWithResult(ctx context.Context) (storage.ReferenceCloseResult, error) {
+	result, err := storage.CloseReference(ctx, r.NodeReference)
+	return result, r.storage.publicationError(err)
 }
 
 func (r *nodeReference) CheckScopedReference() error {

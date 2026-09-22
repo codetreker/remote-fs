@@ -47,6 +47,10 @@ func (r *nodeReferenceFixture) Close(ctx context.Context) error {
 	r.clean = ctx.Err() == nil && deadline
 	return r.closeErr
 }
+func (r *nodeReferenceFixture) CloseWithResult(ctx context.Context) (storage.ReferenceCloseResult, error) {
+	err := r.Close(ctx)
+	return storage.ReferenceCloseResult{Released: storage.ReferenceCloseReleased(err)}, err
+}
 func (r *nodeReferenceFixture) CheckScopedReference() error { return r.checkErr }
 func (r *nodeReferenceFixture) Scope(context.Context) (storage.UseScope, error) {
 	return r.scope, r.scopeErr
@@ -108,8 +112,11 @@ func (s *directorySessionFixture) QueryFileAction(_ context.Context, action stor
 	receipt.Action = action
 	return receipt, s.queryErr
 }
-func (s *directorySessionFixture) QueryDeleteIntent(context.Context, storage.DeleteIntentID) (storage.DeleteIntentStatus, error) {
+func (s *directorySessionFixture) QueryDeleteIntent(context.Context, storage.DeleteIntentOwner, storage.DeleteIntentID) (storage.DeleteIntentStatus, error) {
 	panic("node reference open queried a delete intent")
+}
+func (s *directorySessionFixture) ListDeleteIntents(context.Context, storage.DeleteIntentOwner, storage.DeleteIntentCursor, int) (storage.DeleteIntentPage, error) {
+	panic("node reference open listed delete intents")
 }
 func (s *directorySessionFixture) AcknowledgeDeleteIntent(context.Context, storage.AcknowledgeDeleteIntentCommand) error {
 	panic("node reference open acknowledged a delete intent")

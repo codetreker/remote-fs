@@ -37,17 +37,35 @@ func (f *fileAuthorityStub) CloseWithBarrier(ctx context.Context) (*httprest.Mut
 	err := f.close(ctx)
 	return &httprest.MutationBarrier{Incarnation: "log"}, err
 }
+func (f *fileAuthorityStub) CloseWithResultAndBarrier(ctx context.Context) (storage.ReferenceCloseResult, *httprest.MutationBarrier, error) {
+	err := f.close(ctx)
+	return storage.ReferenceCloseResult{Released: storage.ReferenceCloseReleased(err)}, &httprest.MutationBarrier{Incarnation: "log"}, err
+}
 
 type fileSessionStub struct {
 	httprest.FileSessionWithBarrier
-	close func(context.Context) error
-	open  func(context.Context) (storage.File, *httprest.MutationBarrier, error)
+	close        func(context.Context) error
+	closeResult  *storage.ReferenceCloseResult
+	closeBarrier *httprest.MutationBarrier
+	open         func(context.Context) (storage.File, *httprest.MutationBarrier, error)
 }
 
 func (s *fileSessionStub) Close(ctx context.Context) error { return s.close(ctx) }
 func (s *fileSessionStub) CloseWithBarrier(ctx context.Context) (*httprest.MutationBarrier, error) {
 	err := s.close(ctx)
 	return &httprest.MutationBarrier{Incarnation: "log"}, err
+}
+func (s *fileSessionStub) CloseWithResultAndBarrier(ctx context.Context) (storage.ReferenceCloseResult, *httprest.MutationBarrier, error) {
+	err := s.close(ctx)
+	result := storage.ReferenceCloseResult{Released: storage.ReferenceCloseReleased(err)}
+	if s.closeResult != nil {
+		result = *s.closeResult
+	}
+	barrier := s.closeBarrier
+	if barrier == nil {
+		barrier = &httprest.MutationBarrier{Incarnation: "log"}
+	}
+	return result, barrier, err
 }
 func (s *fileSessionStub) OpenFileWithBarrier(ctx context.Context, _ string, _ storage.FileOpenOptions) (storage.File, *httprest.MutationBarrier, error) {
 	return s.open(ctx)
@@ -185,6 +203,26 @@ func TestRetainedSessionKeepsOwnershipWhenCleanupIsUnknown(t *testing.T) {
 	}
 	if err := session.Close(t.Context()); err != nil || len(session.base.fileSessions) != 0 {
 		t.Fatalf("explicit cleanup reconciliation failed: %v", err)
+	}
+}
+
+func TestRetainedSessionReleasesCapacityOnTerminalCloseResult(t *testing.T) {
+	closes := 0
+	released := storage.ReferenceCloseResult{Released: true}
+	session := retainedTestSession(t, &fileSessionStub{
+		close: func(context.Context) error {
+			closes++
+			return syscall.ENOTEMPTY
+		},
+		closeResult: &released,
+	})
+	result, err := session.CloseWithResult(t.Context())
+	if !result.Released || !errors.Is(err, syscall.ENOTEMPTY) || closes != 1 || len(session.base.fileSessions) != 0 {
+		t.Fatalf("terminal session close=%+v error=%v calls=%d sessions=%d", result, err, closes, len(session.base.fileSessions))
+	}
+	result, err = session.CloseWithResult(t.Context())
+	if !result.Released || !errors.Is(err, syscall.ENOTEMPTY) || closes != 1 {
+		t.Fatalf("terminal session replay=%+v error=%v calls=%d", result, err, closes)
 	}
 }
 

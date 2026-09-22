@@ -268,7 +268,7 @@ func (h *Handler) performSessionCapability(ctx context.Context, session storage.
 	switch req.Op {
 	case storage.OpFileObserveDirectoryMetadata:
 		return h.observeDirectoryMetadata(ctx, session, req)
-	case storage.OpFileQueryAction, storage.OpFileQueryDeleteIntent, storage.OpFileAcknowledgeDeleteIntent:
+	case storage.OpFileQueryAction, storage.OpFileQueryDeleteIntent, storage.OpFileListDeleteIntents, storage.OpFileAcknowledgeDeleteIntent:
 		capability, ok := session.(storage.FileActions)
 		if !ok {
 			return response, syscall.EOPNOTSUPP
@@ -286,7 +286,14 @@ func (h *Handler) performSessionCapability(ctx context.Context, session storage.
 		if req.Op == storage.OpFileAcknowledgeDeleteIntent {
 			return response, capability.AcknowledgeDeleteIntent(ctx, req.Acknowledge.storage())
 		}
-		value, err := capability.QueryDeleteIntent(ctx, req.DeleteIntent)
+		if req.Op == storage.OpFileListDeleteIntents {
+			value, err := capability.ListDeleteIntents(ctx, req.DeleteOwner, req.DeleteAfter, req.DeleteLimit)
+			if err == nil {
+				response.DeletePage, err = deleteIntentPageOf(value)
+			}
+			return response, err
+		}
+		value, err := capability.QueryDeleteIntent(ctx, req.DeleteOwner, req.DeleteIntent)
 		if value.ID != "" {
 			wire, wireErr := deleteIntentStatusOf(value)
 			response.DeleteStatus = wire

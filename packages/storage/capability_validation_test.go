@@ -2,6 +2,7 @@ package storage
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"strings"
 	"syscall"
@@ -18,6 +19,7 @@ func validFileAction(t *testing.T) FileActionID {
 }
 
 const validDeleteIntent DeleteIntentID = "0123456789abcdef0123456789abcdef"
+const validDeleteIntentOwner DeleteIntentOwner = "test-owner"
 
 func TestFileActionAndDurableDeleteIdentitiesAreBounded(t *testing.T) {
 	action := validFileAction(t)
@@ -41,6 +43,15 @@ func TestFileActionAndDurableDeleteIdentitiesAreBounded(t *testing.T) {
 	for _, invalid := range []DeleteIntentID{"", "0123456789ABCDEF0123456789ABCDEF", "0123456789abcdef0123456789abcdeg", DeleteIntentID(strings.Repeat("x", DeleteIntentIDBytes+1))} {
 		if !errors.Is(invalid.Check(), syscall.EINVAL) {
 			t.Fatalf("invalid delete intent accepted: %q", invalid)
+		}
+	}
+	owner, err := NewDeleteIntentOwner()
+	if err != nil || owner.Check() != nil {
+		t.Fatalf("generated delete intent owner = %q, %v", owner, err)
+	}
+	for _, invalid := range []DeleteIntentOwner{"", "bad\x00owner", DeleteIntentOwner(strings.Repeat("x", MaxDeleteIntentOwnerBytes+1)), DeleteIntentOwner(string([]byte{0xff}))} {
+		if !errors.Is(invalid.Check(), syscall.EINVAL) {
+			t.Fatalf("invalid delete intent owner accepted: %q", invalid)
 		}
 	}
 	for _, outcome := range []FileActionOutcome{FileActionPending, FileActionCompleted, FileActionNotExecuted, FileActionUnknown, FileActionRetired} {
@@ -88,12 +99,54 @@ func TestFileActionAndDurableDeleteIdentitiesAreBounded(t *testing.T) {
 			t.Fatalf("invalid delete intent status accepted: %+v", invalid)
 		}
 	}
-	ack := AcknowledgeDeleteIntentCommand{Action: action, Intent: validDeleteIntent}
+	ack := AcknowledgeDeleteIntentCommand{Action: action, Owner: validDeleteIntentOwner, Intent: validDeleteIntent}
 	if err := ack.Check(); err != nil {
 		t.Fatalf("valid delete intent acknowledgement: %v", err)
 	}
-	if (AcknowledgeDeleteIntentCommand{Intent: validDeleteIntent}).Check() == nil || (AcknowledgeDeleteIntentCommand{Action: action}).Check() == nil {
+	if (AcknowledgeDeleteIntentCommand{Owner: validDeleteIntentOwner, Intent: validDeleteIntent}).Check() == nil || (AcknowledgeDeleteIntentCommand{Action: action, Owner: validDeleteIntentOwner}).Check() == nil {
 		t.Fatal("incomplete delete intent acknowledgement accepted")
+	}
+}
+
+func TestDeleteIntentPageIsBoundedAndMonotonic(t *testing.T) {
+	status := DeleteIntentStatus{ID: validDeleteIntent, NodeID: 1, Outcome: DeleteIntentArmed}
+	if err := (DeleteIntentPage{Intents: []DeleteIntentStatus{status}, Next: 4}).Check(validDeleteIntentOwner, 3, 1); err != nil {
+		t.Fatalf("valid page: %v", err)
+	}
+	for _, page := range []DeleteIntentPage{
+		{Intents: []DeleteIntentStatus{status}, Next: 3},
+		{Intents: nil, Next: 4},
+		{Intents: []DeleteIntentStatus{status, status}, Next: 4},
+	} {
+		if !errors.Is(page.Check(validDeleteIntentOwner, 3, 2), syscall.EINVAL) {
+			t.Fatalf("invalid page accepted: %+v", page)
+		}
+	}
+	if err := (DeleteIntentPage{Next: 3}).Check(validDeleteIntentOwner, 3, 1); err != nil {
+		t.Fatalf("valid empty page: %v", err)
+	}
+}
+
+func TestReferenceCloseReleasedRequiresExplicitSemanticFailureReporting(t *testing.T) {
+	if !ReferenceCloseReleased(nil) || !ReferenceCloseReleased(syscall.ESTALE) {
+		t.Fatal("terminal close outcomes were not recognized")
+	}
+	if ReferenceCloseReleased(syscall.ENOTEMPTY) || ReferenceCloseReleased(errors.Join(syscall.ENOTEMPTY, syscall.EIO)) || ReferenceCloseReleased(errors.Join(syscall.ESTALE, syscall.EIO)) {
+		t.Fatal("semantic close result inferred release without an explicit result")
+	}
+}
+
+type invalidReferenceCloseReporter struct{}
+
+func (invalidReferenceCloseReporter) Close(context.Context) error { return nil }
+func (invalidReferenceCloseReporter) CloseWithResult(context.Context) (ReferenceCloseResult, error) {
+	return ReferenceCloseResult{}, nil
+}
+
+func TestCloseReferenceRejectsSuccessThatRetainsOwnership(t *testing.T) {
+	result, err := CloseReference(t.Context(), invalidReferenceCloseReporter{})
+	if result.Released || err == nil {
+		t.Fatalf("invalid close result=%+v error=%v", result, err)
 	}
 }
 
@@ -174,7 +227,7 @@ func TestAtomicOpenAndNodeReferenceValidateEffects(t *testing.T) {
 	closeIntent := base
 	closeIntent.Action = validFileAction(t)
 	closeIntent.Use.Uses |= DeleteName
-	closeIntent.CloseIntent = &CloseIntent{ID: validDeleteIntent, Trigger: OnReferenceClose, Condition: UnlinkFile}
+	closeIntent.CloseIntent = &CloseIntent{ID: validDeleteIntent, Owner: validDeleteIntentOwner, Trigger: OnReferenceClose, Condition: UnlinkFile}
 	for _, options := range []OpenAtOptions{base, create, reset, replace, closeIntent} {
 		if err := options.Check(); err != nil {
 			t.Fatalf("valid open %+v: %v", options, err)
@@ -194,7 +247,7 @@ func TestAtomicOpenAndNodeReferenceValidateEffects(t *testing.T) {
 		func(o *OpenAtOptions) { o.Initial.OnCreate.LinkTarget = []byte("x") },
 		func(o *OpenAtOptions) { o.Initial.OnReset.Metadata = map[string][]byte{"a": nil} },
 		func(o *OpenAtOptions) {
-			o.CloseIntent = &CloseIntent{ID: validDeleteIntent, Trigger: OnReferenceClose, Condition: UnlinkFile}
+			o.CloseIntent = &CloseIntent{ID: validDeleteIntent, Owner: validDeleteIntentOwner, Trigger: OnReferenceClose, Condition: UnlinkFile}
 		},
 	}
 	for _, change := range invalid {
@@ -217,7 +270,7 @@ func TestAtomicOpenAndNodeReferenceValidateEffects(t *testing.T) {
 		Kind: NodeRegular, Target: ChildCondition{State: SameNode, NodeID: 3},
 		Action:      validFileAction(t),
 		Use:         UseClaim{Uses: DeleteName},
-		CloseIntent: &CloseIntent{ID: validDeleteIntent, Trigger: OnReferenceClose, Condition: UnlinkFile},
+		CloseIntent: &CloseIntent{ID: validDeleteIntent, Owner: validDeleteIntentOwner, Trigger: OnReferenceClose, Condition: UnlinkFile},
 	}
 	for _, options := range []NodeRefOptions{directory, symlink, deleting} {
 		if err := options.Check(); err != nil {
@@ -233,7 +286,7 @@ func TestAtomicOpenAndNodeReferenceValidateEffects(t *testing.T) {
 		func(o *NodeRefOptions) { o.InitialState.OnCreate.LinkTarget = []byte("x") },
 		func(o *NodeRefOptions) { o.InitialState.OnReset.Metadata = map[string][]byte{"a": nil} },
 		func(o *NodeRefOptions) {
-			o.CloseIntent = &CloseIntent{ID: validDeleteIntent, Trigger: OnReferenceClose, Condition: UnlinkFile}
+			o.CloseIntent = &CloseIntent{ID: validDeleteIntent, Owner: validDeleteIntentOwner, Trigger: OnReferenceClose, Condition: UnlinkFile}
 		},
 	} {
 		options := directory
@@ -321,7 +374,7 @@ func TestNamespaceAndDeletionCommandsValidateTaggedEffects(t *testing.T) {
 		}
 	}
 
-	if err := (CloseIntent{ID: validDeleteIntent, Trigger: OnReferenceClose, Condition: UnlinkIfEmpty, ExpectedMetadata: map[string][]byte{"windows.attributes": nil}, Uses: uses}).Check(); err != nil {
+	if err := (CloseIntent{ID: validDeleteIntent, Owner: validDeleteIntentOwner, Trigger: OnReferenceClose, Condition: UnlinkIfEmpty, ExpectedMetadata: map[string][]byte{"windows.attributes": nil}, Uses: uses}).Check(); err != nil {
 		t.Fatalf("valid close intent: %v", err)
 	}
 	if err := (PendingUnlinkCommand{Action: action, Condition: UnlinkFile, ExpectedMetadata: map[string][]byte{"windows.attributes": nil}, Uses: uses}).Check(); err != nil {
@@ -330,7 +383,7 @@ func TestNamespaceAndDeletionCommandsValidateTaggedEffects(t *testing.T) {
 	if err := (ClearPendingUnlinkCommand{Action: action, Generation: []byte{1}, Uses: uses}).Check(); err != nil {
 		t.Fatalf("valid pending clear: %v", err)
 	}
-	for _, bad := range []CloseIntent{{}, {ID: validDeleteIntent, Trigger: Now, Condition: UnlinkFile}, {ID: validDeleteIntent, Trigger: OnReferenceClose, Condition: UnlinkFile, ExpectedMetadata: map[string][]byte{"bad key": nil}}} {
+	for _, bad := range []CloseIntent{{}, {ID: validDeleteIntent, Owner: validDeleteIntentOwner, Trigger: Now, Condition: UnlinkFile}, {ID: validDeleteIntent, Owner: validDeleteIntentOwner, Trigger: OnReferenceClose, Condition: UnlinkFile, ExpectedMetadata: map[string][]byte{"bad key": nil}}} {
 		if bad.Check() == nil {
 			t.Fatalf("invalid close intent accepted: %+v", bad)
 		}

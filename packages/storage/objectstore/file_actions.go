@@ -460,7 +460,10 @@ func (fs *fileSession) QueryFileAction(ctx context.Context, id storage.FileActio
 	return storage.FileActionReceipt{Action: id, Outcome: outcome}, nil
 }
 
-func (fs *fileSession) QueryDeleteIntent(ctx context.Context, id storage.DeleteIntentID) (storage.DeleteIntentStatus, error) {
+func (fs *fileSession) QueryDeleteIntent(ctx context.Context, owner storage.DeleteIntentOwner, id storage.DeleteIntentID) (storage.DeleteIntentStatus, error) {
+	if err := owner.Check(); err != nil {
+		return storage.DeleteIntentStatus{}, err
+	}
 	if err := id.Check(); err != nil {
 		return storage.DeleteIntentStatus{}, err
 	}
@@ -471,7 +474,28 @@ func (fs *fileSession) QueryDeleteIntent(ctx context.Context, id storage.DeleteI
 		return storage.DeleteIntentStatus{}, err
 	}
 	defer done()
-	return fs.native.QueryDeleteIntent(ctx, id)
+	return fs.native.QueryDeleteIntent(ctx, owner, id)
+}
+
+func (fs *fileSession) ListDeleteIntents(ctx context.Context, owner storage.DeleteIntentOwner, after storage.DeleteIntentCursor, limit int) (storage.DeleteIntentPage, error) {
+	if err := owner.Check(); err != nil {
+		return storage.DeleteIntentPage{}, err
+	}
+	if limit < 1 || limit > storage.MaxDeleteIntentPageEntries {
+		return storage.DeleteIntentPage{}, syscall.EINVAL
+	}
+	ctx, cancel := fs.operationContext(ctx)
+	defer cancel()
+	done, err := fs.beginControl(ctx)
+	if err != nil {
+		return storage.DeleteIntentPage{}, err
+	}
+	defer done()
+	page, err := fs.native.ListDeleteIntents(ctx, owner, after, limit)
+	if err == nil {
+		err = page.Check(owner, after, limit)
+	}
+	return page, err
 }
 
 func (fs *fileSession) AcknowledgeDeleteIntent(ctx context.Context, command storage.AcknowledgeDeleteIntentCommand) error {
