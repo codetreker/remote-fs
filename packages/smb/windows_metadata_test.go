@@ -21,9 +21,9 @@ func metadataTestValue(t *testing.T, value windowsMetadata) map[string]storage.O
 }
 
 func TestWindowsMetadataRoundTripAndValidation(t *testing.T) {
-	value := windowsMetadata{Attributes: dosHidden | dosArchive, DirectorySymlink: true}
+	value := windowsMetadata{Attributes: dosHidden | dosArchive}
 	encoded, err := encodeWindowsMetadata(value)
-	want := []byte{'S', 'M', 'W', 1, 0x22, 0, 0, 0, 1, 0, 0, 0}
+	want := []byte{'S', 'M', 'W', 1, 0x22, 0, 0, 0}
 	if err != nil || !bytes.Equal(encoded, want) {
 		t.Fatalf("encoded metadata = %x, %v", encoded, err)
 	}
@@ -35,9 +35,15 @@ func TestWindowsMetadataRoundTripAndValidation(t *testing.T) {
 	if !reflect.DeepEqual(metadata, before) {
 		t.Fatal("decoding changed source metadata")
 	}
-	for _, attributes := range []uint32{dosDirectory, dosReparsePoint, dosNormal | dosHidden, 0xffffffff} {
+	for _, attributes := range []uint32{dosDirectory, dosReparsePoint, dosNormal, dosNormal | dosHidden, 0xffffffff} {
 		if data, err := encodeWindowsMetadata(windowsMetadata{Attributes: attributes}); data != nil || !errors.Is(err, syscall.EINVAL) {
 			t.Fatalf("invalid attributes %x = %x, %v", attributes, data, err)
+		}
+		data := []byte{'S', 'M', 'W', 1, 0, 0, 0, 0}
+		binary.LittleEndian.PutUint32(data[4:], attributes)
+		stored := map[string]storage.OpaquePayload{windowsMetadataKey: {Version: []byte{1}, Data: data}}
+		if decoded, err := decodeWindowsMetadata(stored); decoded != (windowsMetadata{}) || !errors.Is(err, syscall.EIO) {
+			t.Fatalf("stored derived attributes %x = %+v, %v", attributes, decoded, err)
 		}
 	}
 	for _, metadata := range []map[string]storage.OpaquePayload{nil, {}, {"foreign": {Version: []byte{1}, Data: []byte("opaque")}}} {
@@ -46,9 +52,9 @@ func TestWindowsMetadataRoundTripAndValidation(t *testing.T) {
 		}
 	}
 	invalid := metadataTestValue(t, windowsMetadata{})
-	binary.LittleEndian.PutUint32(invalid[windowsMetadataKey].Data[8:], 2)
+	invalid[windowsMetadataKey] = storage.OpaquePayload{Version: []byte{1}, Data: append(invalid[windowsMetadataKey].Data, make([]byte, 4)...)}
 	if decoded, err := decodeWindowsMetadata(invalid); decoded != (windowsMetadata{}) || !errors.Is(err, syscall.EIO) {
-		t.Fatalf("unknown hint = %+v, %v", decoded, err)
+		t.Fatalf("obsolete derived hint payload = %+v, %v", decoded, err)
 	}
 }
 
@@ -66,7 +72,7 @@ func TestWindowsMetadataPreservesForeignInitialValues(t *testing.T) {
 	if !reflect.DeepEqual(initial, before) {
 		t.Fatal("returned metadata aliases the input")
 	}
-	if !bytes.Equal(result[windowsMetadataKey], []byte{'S', 'M', 'W', 1, 1, 0, 0, 0, 0, 0, 0, 0}) {
+	if !bytes.Equal(result[windowsMetadataKey], []byte{'S', 'M', 'W', 1, 1, 0, 0, 0}) {
 		t.Fatalf("Windows metadata = %x", result[windowsMetadataKey])
 	}
 }
@@ -79,9 +85,10 @@ func TestWindowsMetadataProjectsOnlyKnownFacts(t *testing.T) {
 	}{
 		{storage.NodeRegular, windowsMetadata{}, dosNormal},
 		{storage.NodeRegular, windowsMetadata{Attributes: dosHidden}, dosHidden},
-		{storage.NodeDirectory, windowsMetadata{Attributes: dosNormal}, dosDirectory},
+		{storage.NodeDirectory, windowsMetadata{}, dosDirectory},
+		{storage.NodeDirectory, windowsMetadata{Attributes: dosHidden}, dosHidden | dosDirectory},
 		{storage.NodeSymlink, windowsMetadata{}, dosReparsePoint},
-		{storage.NodeSymlink, windowsMetadata{Attributes: dosHidden, DirectorySymlink: true}, dosHidden | dosDirectory | dosReparsePoint},
+		{storage.NodeSymlink, windowsMetadata{Attributes: dosHidden}, dosHidden | dosReparsePoint},
 	} {
 		attr := storage.Attr{ID: 7, Kind: test.kind, Metadata: metadataTestValue(t, test.metadata)}
 		if got, err := projectWindowsAttributes(attr); err != nil || got != test.want {
@@ -91,7 +98,7 @@ func TestWindowsMetadataProjectsOnlyKnownFacts(t *testing.T) {
 	for _, attr := range []storage.Attr{
 		{Kind: storage.NodeRegular},
 		{ID: 7},
-		{ID: 7, Kind: storage.NodeRegular, Metadata: metadataTestValue(t, windowsMetadata{DirectorySymlink: true})},
+		{ID: 7, Kind: storage.NodeRegular, Metadata: map[string]storage.OpaquePayload{windowsMetadataKey: {Version: []byte{1}, Data: []byte{'S', 'M', 'W', 1, 0, 0, 0, 0, 1, 0, 0, 0}}}},
 	} {
 		if got, err := projectWindowsAttributes(attr); got != 0 || !errors.Is(err, syscall.EIO) {
 			t.Fatalf("invalid projection = %x, %v", got, err)

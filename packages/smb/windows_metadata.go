@@ -21,16 +21,15 @@ const (
 	dosNormal       uint32 = 0x80
 	dosReparsePoint uint32 = 0x400
 
-	dosSettableAttributes = dosReadOnly | dosHidden | dosSystem | dosArchive | dosNormal
+	dosSettableAttributes = dosReadOnly | dosHidden | dosSystem | dosArchive
 )
 
 type windowsMetadata struct {
-	Attributes       uint32
-	DirectorySymlink bool
+	Attributes uint32
 }
 
 func validDOSAttributes(attributes uint32) bool {
-	return attributes&^dosSettableAttributes == 0 && (attributes&dosNormal == 0 || attributes == dosNormal)
+	return attributes&^dosSettableAttributes == 0
 }
 
 // Format version belongs to Data. OpaquePayload.Version remains the authority's
@@ -39,17 +38,14 @@ func encodeWindowsMetadata(value windowsMetadata) ([]byte, error) {
 	if !validDOSAttributes(value.Attributes) {
 		return nil, fmt.Errorf("invalid Windows metadata attributes: %w", syscall.EINVAL)
 	}
-	data := make([]byte, 12)
+	data := make([]byte, 8)
 	copy(data, "SMW\x01")
 	binary.LittleEndian.PutUint32(data[4:], value.Attributes)
-	if value.DirectorySymlink {
-		binary.LittleEndian.PutUint32(data[8:], 1)
-	}
 	return data, nil
 }
 
-// An absent namespace contributes no Windows-only attributes or directory-link
-// hint. An empty present namespace is malformed.
+// An absent namespace contributes no Windows-only attributes. An empty present
+// namespace is malformed.
 func decodeWindowsMetadata(values map[string]storage.OpaquePayload) (windowsMetadata, error) {
 	if err := storage.CheckMetadata(values); err != nil {
 		return windowsMetadata{}, errors.Join(syscall.EIO, err)
@@ -65,15 +61,14 @@ func decodeWindowsMetadata(values map[string]storage.OpaquePayload) (windowsMeta
 	if data[3] != 1 {
 		return windowsMetadata{}, fmt.Errorf("unsupported Windows metadata format %d: %w", data[3], syscall.EOPNOTSUPP)
 	}
-	if len(data) != 12 {
-		return windowsMetadata{}, fmt.Errorf("Windows metadata requires 12 bytes: %w", syscall.EIO)
+	if len(data) != 8 {
+		return windowsMetadata{}, fmt.Errorf("Windows metadata requires 8 bytes: %w", syscall.EIO)
 	}
 	attributes := binary.LittleEndian.Uint32(data[4:])
-	hints := binary.LittleEndian.Uint32(data[8:])
-	if !validDOSAttributes(attributes) || hints&^uint32(1) != 0 {
-		return windowsMetadata{}, fmt.Errorf("invalid Windows metadata attributes or hints: %w", syscall.EIO)
+	if !validDOSAttributes(attributes) {
+		return windowsMetadata{}, fmt.Errorf("invalid Windows metadata attributes: %w", syscall.EIO)
 	}
-	return windowsMetadata{Attributes: attributes, DirectorySymlink: hints&1 != 0}, nil
+	return windowsMetadata{Attributes: attributes}, nil
 }
 
 // Initial metadata is copied as a whole so adding this namespace cannot discard
@@ -108,15 +103,12 @@ func projectWindowsAttributes(attr storage.Attr) (uint32, error) {
 	if err != nil {
 		return 0, err
 	}
-	if metadata.DirectorySymlink && attr.Kind != storage.NodeSymlink {
-		return 0, fmt.Errorf("directory-link hint on a non-link node: %w", syscall.EIO)
-	}
 	attributes := metadata.Attributes
-	if attr.Kind == storage.NodeDirectory || metadata.DirectorySymlink {
-		attributes = attributes&^dosNormal | dosDirectory
+	if attr.Kind == storage.NodeDirectory {
+		attributes |= dosDirectory
 	}
 	if attr.Kind == storage.NodeSymlink {
-		attributes = attributes&^dosNormal | dosReparsePoint
+		attributes |= dosReparsePoint
 	}
 	if attributes == 0 {
 		attributes = dosNormal
