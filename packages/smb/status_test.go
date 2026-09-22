@@ -16,6 +16,7 @@ func TestFileAndNamespaceStatusPreserveWindowsDistinctions(t *testing.T) {
 		{syscall.EBADF, statusFileClosed}, {syscall.ENOENT, statusObjectNameNotFound},
 		{syscall.ENOTDIR, statusNotADirectory}, {syscall.ENOSPC, statusDiskFull},
 		{syscall.EDQUOT, statusQuotaExceeded}, {syscall.EROFS, statusMediaWriteProtected},
+		{syscall.ENOTEMPTY, statusDirectoryNotEmpty},
 		{syscall.EAGAIN, statusRetry}, {storage.ErrUseConflict, statusSharingViolation},
 		{storage.ErrRangeConflict, statusFileLockConflict}, {storage.ErrPendingDelete, statusDeletePending},
 	} {

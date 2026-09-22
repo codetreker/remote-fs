@@ -95,6 +95,8 @@ func fileCommandStatus(err error) uint32 {
 		return statusRetry
 	case syscall.EISDIR:
 		return statusInvalidDeviceRequest
+	case syscall.ENOTEMPTY:
+		return statusDirectoryNotEmpty
 	case syscall.EROFS:
 		return statusMediaWriteProtected
 	default:
