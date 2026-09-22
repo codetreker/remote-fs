@@ -19,14 +19,15 @@ var _ metastore.AtomicFileOpener = (*Store)(nil)
 
 func (s *Store) CheckAtomicFileOpen() error { return s.CheckFileStore() }
 
-func (s *Store) OpenAt(ctx context.Context, name storage.ChildName, options storage.OpenAtOptions) (metastore.OpenResult, error) {
-	if err := name.Check(); err != nil {
+func (s *Store) OpenAt(ctx context.Context, selection storage.ChildSelection, options storage.OpenAtOptions) (metastore.OpenResult, error) {
+	if err := selection.Check(); err != nil {
 		return metastore.OpenResult{}, err
 	}
 	if err := options.Check(); err != nil {
 		return metastore.OpenResult{}, err
 	}
-	file, state, outcome, err := s.openAtomicChild(ctx, name, storage.NodeRegular, options.Read, options.Write,
+	selection = selection.Clone()
+	file, state, outcome, err := s.openAtomicChild(ctx, selection, storage.NodeRegular, options.Read, options.Write,
 		storage.ReadMetadata|storage.WriteMetadata, options.Create, options.Exclusive, options.Target,
 		options.Use, options.Existing, options.Initial, options.CloseIntent)
 	if file == nil {
@@ -35,7 +36,7 @@ func (s *Store) OpenAt(ctx context.Context, name storage.ChildName, options stor
 	return metastore.OpenResult{File: file, State: state, Outcome: outcome}, err
 }
 
-func (s *Store) openAtomicChild(ctx context.Context, name storage.ChildName, kind storage.NodeKind, read, write bool,
+func (s *Store) openAtomicChild(ctx context.Context, selection storage.ChildSelection, kind storage.NodeKind, read, write bool,
 	metadata storage.MetadataPermissions, create, exclusive bool, target storage.ChildCondition,
 	use storage.UseClaim, existing storage.ExistingEffect,
 	initial storage.InitialState, closeIntent *storage.CloseIntent,
@@ -56,19 +57,29 @@ func (s *Store) openAtomicChild(ctx context.Context, name storage.ChildName, kin
 	}
 	file := &retainedFile{store: s, scope: scope, session: metastore.ReferenceSession(ctx), use: use,
 		read: read, write: write, metadata: metadata, active: true}
+	if err := s.inspect(ctx, func(tx *sql.Tx) error {
+		_, _, err := s.directoryTarget(ctx, tx, selection.Name.Parent, 0)
+		return err
+	}); err != nil {
+		return nil, metastore.FileState{}, 0, sqlerr.Failure(err)
+	}
 	var before metastore.Node
 	var found bool
-	inspect := func(tx *sql.Tx) error {
+	plan := func(tx *sql.Tx) (*volumeIntent, bool, error) {
+		name := selection.Name
 		if _, _, err := s.directoryTarget(ctx, tx, name.Parent, 0); err != nil {
-			return err
+			return nil, false, err
+		}
+		if err := s.checkNamespaceGuards(ctx, tx, selection.Guards); err != nil {
+			return nil, false, err
 		}
 		id, exists, err := s.lookupNodeID(ctx, tx, int64(name.Parent.NodeID), name.RawLeaf)
 		if err != nil {
-			return err
+			return nil, false, err
 		}
 		found = exists
 		if found && exclusive {
-			return syscall.EEXIST
+			return nil, false, syscall.EEXIST
 		}
 		if found {
 			if existing == storage.Keep {
@@ -77,66 +88,44 @@ func (s *Store) openAtomicChild(ctx context.Context, name storage.ChildName, kin
 				before, err = s.nodeByID(ctx, tx, id)
 			}
 			if err != nil {
-				return err
+				return nil, false, err
 			}
 		}
 		if err := checkChildCondition(target, before, found); err != nil {
-			return err
+			return nil, false, err
 		}
 		if !found {
 			if !create {
-				return syscall.ENOENT
+				return nil, false, syscall.ENOENT
 			}
 			pending, err := s.nodePendingUnlink(ctx, tx, int64(name.Parent.NodeID))
 			if err != nil {
-				return err
+				return nil, false, err
 			}
 			if pending {
-				return storage.ErrPendingDelete
+				return nil, false, storage.ErrPendingDelete
 			}
-			return nil
+			return atomicOpenVolumeIntent(before, false, existing, scope), true, nil
 		}
 		if before.Kind != kind {
-			return nodeKindMismatch(before.Kind, kind)
+			return nil, false, nodeKindMismatch(before.Kind, kind)
 		}
 		pending, err := s.nodePendingUnlink(ctx, tx, before.ID)
 		if err != nil {
-			return err
+			return nil, false, err
 		}
 		if pending {
-			return storage.ErrPendingDelete
+			return nil, false, storage.ErrPendingDelete
 		}
-		return nil
-	}
-	if err := s.inspect(ctx, inspect); err != nil {
-		return nil, metastore.FileState{}, 0, sqlerr.Failure(err)
-	}
-	mutation := !found || existing != storage.Keep || closeIntent != nil
-	intent := &volumeIntent{kind: locking.CreateMutation, nodes: []int64{}}
-	if found {
-		intent.nodes = nil
-		intent.node = before.ID
-		if existing == storage.ResetContent {
-			intent.kind = locking.WriteMutation
-			intent.scope = scope
-		} else if existing == storage.ReplaceNode {
-			intent.kind = locking.RemoveMutation
-		} else {
-			intent.kind = locking.SetAttrMutation
-		}
-	}
-	if found && existing == storage.Keep {
-		intent = nil
+		mutation := existing != storage.Keep || closeIntent != nil
+		return atomicOpenVolumeIntent(before, true, existing, scope), mutation, nil
 	}
 	var state metastore.FileState
 	var outcome storage.OpenOutcome
 	claimed := false
 	apply := func(tx *sql.Tx) error {
-		if err := inspect(tx); err != nil {
-			return err
-		}
 		at := time.Now()
-		node, selected, err := s.applyAtomicOpen(ctx, tx, name, before, found, kind, existing, initial, at)
+		node, selected, err := s.applyAtomicOpen(ctx, tx, selection.Name, before, found, kind, existing, initial, at)
 		if err != nil {
 			return err
 		}
@@ -154,10 +143,18 @@ func (s *Store) openAtomicChild(ctx context.Context, name storage.ChildName, kin
 		}
 		return err
 	}
-	if mutation {
-		err = s.mutateTransactionLocked(ctx, ctx, intent, apply)
+	mutationPossible := existing != storage.Keep || closeIntent != nil || create && target.State != storage.SameNode
+	if mutationPossible {
+		err = s.mutatePlannedTransactionLocked(ctx, ctx, plan, apply)
 	} else {
-		err = s.inspect(ctx, apply)
+		err = s.inspect(ctx, func(tx *sql.Tx) error {
+			if _, mutation, err := plan(tx); err != nil {
+				return err
+			} else if mutation {
+				return syscall.EIO
+			}
+			return apply(tx)
+		})
 		if err == nil {
 			err = metastore.CheckFilePublication(ctx)
 		}
@@ -167,6 +164,24 @@ func (s *Store) openAtomicChild(ctx context.Context, name storage.ChildName, kin
 		deleteIntent = closeIntent.ID
 	}
 	return s.finishReferenceOpen(ctx, file, claimed, deleteIntent, state, outcome, err)
+}
+
+func atomicOpenVolumeIntent(before metastore.Node, found bool, existing storage.ExistingEffect, scope storage.UseScope) *volumeIntent {
+	if !found {
+		return &volumeIntent{kind: locking.CreateMutation, nodes: []int64{}}
+	}
+	if existing == storage.Keep {
+		return nil
+	}
+	intent := &volumeIntent{kind: locking.SetAttrMutation, node: before.ID}
+	switch existing {
+	case storage.ResetContent:
+		intent.kind = locking.WriteMutation
+		intent.scope = scope
+	case storage.ReplaceNode:
+		intent.kind = locking.RemoveMutation
+	}
+	return intent
 }
 
 func (s *Store) finishReferenceOpen(ctx context.Context, file *retainedFile, claimed bool, closeIntent storage.DeleteIntentID, state metastore.FileState, outcome storage.OpenOutcome, err error) (*retainedFile, metastore.FileState, storage.OpenOutcome, error) {

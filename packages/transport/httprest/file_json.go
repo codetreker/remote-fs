@@ -27,6 +27,15 @@ func decodeFileJSON(data []byte, target any) error {
 	return json.Unmarshal(data, target)
 }
 
+func canonicalFileRequestBody(body []byte, request fileRequest) ([]byte, error) {
+	if request.Op != storage.OpFileOpenAt && request.Op != storage.OpFileOpenChildRef {
+		return body, nil
+	}
+	selection := childSelectionStorage(request.Child, request.Guards)
+	request.Child, request.Guards = childSelectionWire(selection)
+	return json.Marshal(request)
+}
+
 func validFileCapability(cap string) bool {
 	if len(cap) != 64 {
 		return false
@@ -95,12 +104,14 @@ func validateFileRequest(r fileRequest) error {
 		expected.Change = r.Change
 	case storage.OpFileOpenAt:
 		expected.Child = r.Child
+		expected.Guards = r.Guards
 		expected.OpenAt = r.OpenAt
 	case storage.OpFileOpenNodeRef:
 		expected.Node = r.Node
 		expected.NodeRef = r.NodeRef
 	case storage.OpFileOpenChildRef:
 		expected.Child = r.Child
+		expected.Guards = r.Guards
 		expected.NodeRef = r.NodeRef
 	case storage.OpFileLookupAt:
 		expected.Child = r.Child

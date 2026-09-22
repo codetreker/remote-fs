@@ -14,14 +14,14 @@ import (
 )
 
 type openAtActionInput struct {
-	Name    storage.ChildName
-	Options storage.OpenAtOptions
+	Selection storage.ChildSelection
+	Options   storage.OpenAtOptions
 }
 
 type nodeRefActionInput struct {
-	Node    uint64
-	Name    *storage.ChildName
-	Options storage.NodeRefOptions
+	Node      uint64
+	Selection *storage.ChildSelection
+	Options   storage.NodeRefOptions
 }
 
 type referenceActionTarget struct {
@@ -94,15 +94,15 @@ func fileActionDigest(operation storage.Operation, input any) ([sha256.Size]byte
 func canonicalFileActionInput(input any) any {
 	switch value := input.(type) {
 	case openAtActionInput:
-		value.Name = canonicalChildName(value.Name)
+		value.Selection = canonicalChildSelection(value.Selection)
 		value.Options.Target = canonicalChildCondition(value.Options.Target)
 		value.Options.Initial = canonicalInitialState(value.Options.Initial)
 		value.Options.CloseIntent = canonicalCloseIntent(value.Options.CloseIntent)
 		return value
 	case nodeRefActionInput:
-		if value.Name != nil {
-			name := canonicalChildName(*value.Name)
-			value.Name = &name
+		if value.Selection != nil {
+			selection := canonicalChildSelection(*value.Selection)
+			value.Selection = &selection
 		}
 		value.Options.Target = canonicalChildCondition(value.Options.Target)
 		value.Options.InitialState = canonicalInitialState(value.Options.InitialState)
@@ -167,6 +167,30 @@ func canonicalChildName(name storage.ChildName) storage.ChildName {
 		name.Parent.Scope = &scope
 	}
 	return name
+}
+
+func canonicalChildSelection(selection storage.ChildSelection) storage.ChildSelection {
+	selection = selection.Clone()
+	if selection.Guards != nil {
+		if selection.Guards.RootID == 0 && len(selection.Guards.Directories) == 0 && len(selection.Guards.Edges) == 0 {
+			selection.Guards = nil
+			return selection
+		}
+		sort.Slice(selection.Guards.Directories, func(left, right int) bool {
+			return selection.Guards.Directories[left].ParentID < selection.Guards.Directories[right].ParentID
+		})
+		sort.Slice(selection.Guards.Edges, func(left, right int) bool {
+			leftEdge, rightEdge := selection.Guards.Edges[left], selection.Guards.Edges[right]
+			if leftEdge.ParentID != rightEdge.ParentID {
+				return leftEdge.ParentID < rightEdge.ParentID
+			}
+			if compared := bytes.Compare(leftEdge.RawLeaf, rightEdge.RawLeaf); compared != 0 {
+				return compared < 0
+			}
+			return leftEdge.ChildID < rightEdge.ChildID
+		})
+	}
+	return selection
 }
 
 func canonicalChildCondition(condition storage.ChildCondition) storage.ChildCondition {

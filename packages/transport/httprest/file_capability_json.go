@@ -25,7 +25,7 @@ func validateCapabilityArguments(req fileRequest) error {
 		if req.Child == nil || req.OpenAt == nil {
 			return syscall.EINVAL
 		}
-		if err := req.Child.storage().Check(); err != nil {
+		if err := (storage.ChildSelection{Name: req.Child.storage(), Guards: req.Guards.storage()}).Check(); err != nil {
 			return err
 		}
 		return req.OpenAt.storage().Check()
@@ -38,7 +38,7 @@ func validateCapabilityArguments(req fileRequest) error {
 		if req.Child == nil || req.NodeRef == nil {
 			return syscall.EINVAL
 		}
-		if err := req.Child.storage().Check(); err != nil {
+		if err := (storage.ChildSelection{Name: req.Child.storage(), Guards: req.Guards.storage()}).Check(); err != nil {
 			return err
 		}
 		return req.NodeRef.storage().Check()

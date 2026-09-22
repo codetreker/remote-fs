@@ -341,7 +341,12 @@ func (h *Handler) serveFile(w http.ResponseWriter, r *http.Request) {
 		r = r.WithContext(storage.WithBoundedAttrResult(r.Context(), req.ResultBytes, h.attrResultBudget(req)))
 	}
 	r = r.WithContext(h.observationResultContext(r.Context(), req))
-	digest := sha256.Sum256(append(body, []byte(r.Header.Get(HeaderMutationScope))...))
+	journalBody, err := canonicalFileRequestBody(body, req)
+	if err != nil {
+		writeFault(http.StatusInternalServerError, err)
+		return
+	}
+	digest := sha256.Sum256(append(journalBody, []byte(r.Header.Get(HeaderMutationScope))...))
 	response, err := h.fileCall(r.Context(), req, digest)
 	if err != nil {
 		if response.Attempt != nil {

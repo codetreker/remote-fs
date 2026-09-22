@@ -145,7 +145,7 @@ func (h *Handler) openReference(ctx context.Context, session *servedFileSession,
 		}
 		if err = provider.CheckAtomicFileOpen(); err == nil {
 			var result storage.OpenResult
-			result, err = provider.OpenAt(ctx, request.Child.storage(), request.OpenAt.storage())
+			result, err = provider.OpenAt(ctx, childSelectionStorage(request.Child, request.Guards), request.OpenAt.storage())
 			reference = result.File
 			if result.Attr.ID != 0 {
 				response.Attr = AttrOf(result.Attr)
@@ -163,7 +163,7 @@ func (h *Handler) openReference(ctx context.Context, session *servedFileSession,
 			if request.Op == storage.OpFileOpenNodeRef {
 				result, err = provider.OpenNodeRef(ctx, request.Node, request.NodeRef.storage())
 			} else {
-				result, err = provider.OpenChildRef(ctx, request.Child.storage(), request.NodeRef.storage())
+				result, err = provider.OpenChildRef(ctx, childSelectionStorage(request.Child, request.Guards), request.NodeRef.storage())
 			}
 			reference = result.Reference
 			if result.Attr.ID != 0 {

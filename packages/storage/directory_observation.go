@@ -2,6 +2,17 @@ package storage
 
 import "bytes"
 
+// Clone owns the raw child name and every namespace guard token.
+func (s ChildSelection) Clone() ChildSelection {
+	s.Name.RawLeaf = bytes.Clone(s.Name.RawLeaf)
+	if s.Name.Parent.Scope != nil {
+		scope := *s.Name.Parent.Scope
+		s.Name.Parent.Scope = &scope
+	}
+	s.Guards = s.Guards.Clone()
+	return s
+}
+
 // Clone owns the opaque revision token.
 func (d DirectoryObservation) Clone() DirectoryObservation {
 	d.Revision = bytes.Clone(d.Revision)

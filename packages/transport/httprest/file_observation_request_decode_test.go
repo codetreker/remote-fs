@@ -48,6 +48,10 @@ func TestObservationRequestBoundsRejectBeforeAuthorization(t *testing.T) {
 			name:    "aggregate",
 			request: observationDirectoryMetadataRequest(namespaceGuardsAtRequestByteLimit(1)),
 		},
+		{
+			name:    "guarded-open-aggregate",
+			request: guardedOpenRequest(t, namespaceGuardsAtRequestByteLimit(1)),
+		},
 	}
 
 	for _, test := range tests {
@@ -80,7 +84,7 @@ func TestObservationRequestBoundsAcceptExactMaxima(t *testing.T) {
 	}
 	policy := &fileAuthorizationPolicy{err: authz.ErrDenied}
 	handler, _ := fileAuthorizationFixture(t, policy, DefaultFileLimits())
-	for _, request := range []fileRequest{observationNameRequest(guards), observationDirectoryMetadataRequest(guards)} {
+	for _, request := range []fileRequest{observationNameRequest(guards), observationDirectoryMetadataRequest(guards), guardedOpenRequest(t, guards)} {
 		policy.reset(authz.ErrDenied)
 		fileAuthorizationDenied(t, fileAuthorizationRequest(t, handler, request), "EACCES", "access denied")
 		policy.mu.Lock()
@@ -103,6 +107,7 @@ func TestObservationRequestBoundsPreserveEscapedMemberNames(t *testing.T) {
 	}{
 		{request: observationNameRequest(guards), keys: []string{"resultBytes", "guards", "directories", "parentId", "revision"}},
 		{request: observationDirectoryMetadataRequest(guards), keys: []string{"directoryMetadata", "includeName", "guards", "edges", "rawLeaf"}},
+		{request: guardedOpenRequest(t, guards), keys: []string{"child", "guards", "edges", "rawLeaf"}},
 	} {
 		encoded, err := json.Marshal(test.request)
 		if err != nil {
@@ -121,6 +126,22 @@ func TestObservationRequestBoundsPreserveEscapedMemberNames(t *testing.T) {
 		if err := validateFileArguments(decoded, DefaultFileLimits().Session); err != nil {
 			t.Fatalf("escaped %s request changed semantics: %v", test.request.Op, err)
 		}
+	}
+}
+
+func TestGuardedOpenKeepsTheV4ChildAndGuardsShape(t *testing.T) {
+	request := guardedOpenRequest(t, &storage.NamespaceGuards{RootID: 1})
+	encoded, err := json.Marshal(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(encoded, []byte(`"child":`)) || !bytes.Contains(encoded, []byte(`"guards":`)) || bytes.Contains(encoded, []byte(`"selection":`)) {
+		t.Fatalf("guarded open changed the file request shape: %s", encoded)
+	}
+	damaged := bytes.Replace(encoded, []byte(`"child":`), []byte(`"selection":`), 1)
+	var decoded fileRequest
+	if err := decodeFileJSON(damaged, &decoded); err == nil {
+		t.Fatal("accepted a nested child selection DTO")
 	}
 }
 
@@ -153,6 +174,25 @@ func observationDirectoryMetadataRequest(guards *storage.NamespaceGuards) fileRe
 		ResultBytes:       DefaultMaxBodyBytes,
 		Directory:         &storage.DirectoryTarget{NodeID: 1},
 		DirectoryMetadata: directoryMetadataOptionsOf(storage.DirectoryMetadataOptions{Guards: guards}),
+	}
+}
+
+func guardedOpenRequest(t *testing.T, guards *storage.NamespaceGuards) fileRequest {
+	t.Helper()
+	action := storage.FileActionID("1:00000000000000000000000000000000")
+	return fileRequest{
+		Op:          storage.OpFileOpenAt,
+		Session:     strings.Repeat("a", 64),
+		Action:      storage.LockRequestID(action),
+		Path:        []byte{},
+		Data:        []byte{},
+		ResultBytes: DefaultMaxBodyBytes,
+		Child:       childNameOf(storage.ChildName{Parent: storage.DirectoryTarget{NodeID: 1}, RawLeaf: []byte("file")}),
+		Guards:      namespaceGuardsOf(guards),
+		OpenAt: openAtOptionsOf(storage.OpenAtOptions{
+			Read: true, Target: storage.ChildCondition{State: storage.Any}, Action: action,
+			Use: storage.UseClaim{Uses: storage.ReadData}, Existing: storage.Keep,
+		}),
 	}
 }
 

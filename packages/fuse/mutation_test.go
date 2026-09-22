@@ -82,11 +82,11 @@ func (s *mutationSession) LookupAt(ctx context.Context, name storage.ChildName) 
 	return attr, s.owner.finish("stat", err)
 }
 
-func (s *mutationSession) OpenAt(ctx context.Context, name storage.ChildName, options storage.OpenAtOptions) (storage.OpenResult, error) {
+func (s *mutationSession) OpenAt(ctx context.Context, selection storage.ChildSelection, options storage.OpenAtOptions) (storage.OpenResult, error) {
 	if err := s.owner.enter(ctx, "open"); err != nil {
 		return storage.OpenResult{}, err
 	}
-	result, err := s.AtomicFileOpener.OpenAt(ctx, name, options)
+	result, err := s.AtomicFileOpener.OpenAt(ctx, selection, options)
 	if err := s.owner.finish("open", err); err != nil {
 		return result, err
 	}

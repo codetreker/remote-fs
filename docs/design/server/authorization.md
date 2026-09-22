@@ -102,7 +102,7 @@ storage.Operation 是覆盖路径、文件会话、复制和锁控制的 transpo
 
 副本构建还需要 replication.checkpoint 的明确许可；允许订阅或快照不隐含这项权限。Checkpoint 是一次普通读取，遵循入口授权、通用传输预算和安全错误规则，不建立持续输出。
 
-`FileOpenOptions` 嵌入共享的 `storage.OpenAccess`；file.open／file.open-node 继续把这五项意图放入 `AccessRequest.Open`。OpenAt、OpenNodeRef 与 OpenChildRef 也携带由 metadata 权限、Use 与打开效果导出的 OpenAccess。一个复杂动作按固定顺序产生基础 Operation 及它实际包含的 remove、set-attr、set-metadata 或 set-pending 等补充 Operation；每项分别调用同一 Authorizer，任一拒绝都发生在 native action 前。NodeID、Scope、metadata token、action ID 和 delete-intent ID 不作为业务身份。带 Create 的打开即使最终选择已有对象，也报告创建意图。
+`FileOpenOptions` 嵌入共享的 `storage.OpenAccess`；file.open／file.open-node 继续把这五项意图放入 `AccessRequest.Open`。OpenAt、OpenNodeRef 与 OpenChildRef 也携带由 metadata 权限、Use 与打开效果导出的 OpenAccess。OpenAt/OpenChildRef 的顶层 child/guards 在进入策略前完成结构和 guard 上限校验，server 再把它们组装为 `ChildSelection`；guards 是 authority 核对的名字证据，不增加授权 Operation，也不作为策略资源。一个复杂动作按固定顺序产生基础 Operation 及它实际包含的 remove、set-attr、set-metadata 或 set-pending 等补充 Operation；每项分别调用同一 Authorizer，任一拒绝都发生在 native action 前。NodeID、Scope、metadata token、namespace guard、action ID 和 delete-intent ID 不作为业务身份。带 Create 的打开即使最终选择已有对象，也报告创建意图。
 
 `volume.write` 可以创建缺失文件，单独拒绝 volume.create 不能禁止创建。应用枚举、完整目录 metadata 与 reference current-name 分别授权；允许 `file.read-dir-node` 不授予另两项，DirectoryMetadataObserver 也不从 `ReadEntries` 或 `ReadMetadata` 推导权限。metadata、range apply 与 range drop 同样分别授权；查询、取消或已有 owner 不能绕过本次策略。range mode 不代替内容读写权限，后续数据访问仍检查 file.read / file.write。FUSE 的 flock/POSIX 解释不进入 AccessRequest。
 

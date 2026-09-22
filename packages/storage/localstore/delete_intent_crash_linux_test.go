@@ -167,9 +167,9 @@ func runDeleteIntentCrashChild(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	opened, err := session.(storage.AtomicFileOpener).OpenAt(t.Context(), storage.ChildName{
+	opened, err := session.(storage.AtomicFileOpener).OpenAt(t.Context(), storage.ChildSelection{Name: storage.ChildName{
 		Parent: storage.DirectoryTarget{NodeID: rootAttr.ID}, RawLeaf: []byte("victim"),
-	}, storage.OpenAtOptions{
+	}}, storage.OpenAtOptions{
 		Read: true, Target: storage.ChildCondition{State: storage.SameNode, NodeID: victim.ID},
 		Action: action, Existing: storage.Keep, Use: storage.UseClaim{Uses: storage.ReadData | storage.DeleteName},
 		CloseIntent: &storage.CloseIntent{ID: intent, Trigger: storage.OnReferenceClose, Condition: storage.UnlinkFile},

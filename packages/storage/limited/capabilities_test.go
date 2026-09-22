@@ -21,6 +21,7 @@ type capabilityProbe struct {
 	name         storage.NameResult
 	action       storage.FileActionReceipt
 	deleteStatus storage.DeleteIntentStatus
+	selection    storage.ChildSelection
 }
 
 type directoryReaderOnlyProbe struct{ storage.FileSession }
@@ -70,7 +71,8 @@ func TestNamespaceCapabilityIsIndependentOfDirectoryRead(t *testing.T) {
 }
 
 func (p *capabilityProbe) CheckAtomicFileOpen() error { return p.checkErr }
-func (p *capabilityProbe) OpenAt(context.Context, storage.ChildName, storage.OpenAtOptions) (storage.OpenResult, error) {
+func (p *capabilityProbe) OpenAt(_ context.Context, selection storage.ChildSelection, _ storage.OpenAtOptions) (storage.OpenResult, error) {
+	p.selection = selection
 	return p.open, p.callErr
 }
 func (p *capabilityProbe) CheckNamespaceAccess() error { return p.checkErr }
@@ -94,7 +96,8 @@ func (p *capabilityProbe) CheckNodeReferences() error { return p.checkErr }
 func (p *capabilityProbe) OpenNodeRef(context.Context, uint64, storage.NodeRefOptions) (storage.NodeOpenResult, error) {
 	return p.node, p.callErr
 }
-func (p *capabilityProbe) OpenChildRef(context.Context, storage.ChildName, storage.NodeRefOptions) (storage.NodeOpenResult, error) {
+func (p *capabilityProbe) OpenChildRef(_ context.Context, selection storage.ChildSelection, _ storage.NodeRefOptions) (storage.NodeOpenResult, error) {
+	p.selection = selection
 	return p.node, p.callErr
 }
 func (p *capabilityProbe) CheckFileActions() error { return p.checkErr }
@@ -331,9 +334,13 @@ func TestIdentityCapabilityWrappersPreservePartialResultsAndReferences(t *testin
 			t.Fatalf("%s check=%v", name, err)
 		}
 	}
-	opened, err := wrapper.OpenAt(t.Context(), storage.ChildName{}, storage.OpenAtOptions{})
+	openSelection := storage.ChildSelection{Name: storage.ChildName{RawLeaf: []byte("open")}, Guards: &storage.NamespaceGuards{RootID: 7}}
+	opened, err := wrapper.OpenAt(t.Context(), openSelection, storage.OpenAtOptions{})
 	if !errors.Is(err, failure) || opened.File == nil || opened.Attr.ID != attr.ID || opened.Outcome != storage.Created {
 		t.Fatalf("atomic open=%+v error=%v", opened, err)
+	}
+	if !reflect.DeepEqual(probe.selection, openSelection) {
+		t.Fatalf("atomic open selection=%+v, want %+v", probe.selection, openSelection)
 	}
 	reference, err := wrapper.OpenNodeRef(t.Context(), attr.ID, storage.NodeRefOptions{})
 	if !errors.Is(err, failure) || reference.Reference == nil || reference.Attr.ID != attr.ID {
@@ -342,9 +349,13 @@ func TestIdentityCapabilityWrappersPreservePartialResultsAndReferences(t *testin
 	if _, ok := reference.Reference.(*nodeReference); !ok {
 		t.Fatalf("node reference was not wrapped: %T", reference.Reference)
 	}
-	child, err := wrapper.OpenChildRef(t.Context(), storage.ChildName{}, storage.NodeRefOptions{})
+	childSelection := storage.ChildSelection{Name: storage.ChildName{RawLeaf: []byte("child")}, Guards: &storage.NamespaceGuards{RootID: 9}}
+	child, err := wrapper.OpenChildRef(t.Context(), childSelection, storage.NodeRefOptions{})
 	if !errors.Is(err, failure) || child.Reference == nil || child.Attr.ID != attr.ID {
 		t.Fatalf("child reference=%+v error=%v", child, err)
+	}
+	if !reflect.DeepEqual(probe.selection, childSelection) {
+		t.Fatalf("child reference selection=%+v, want %+v", probe.selection, childSelection)
 	}
 	if lookedUp, err := wrapper.LookupAt(t.Context(), storage.ChildName{}); !errors.Is(err, failure) || lookedUp.ID != attr.ID {
 		t.Fatalf("lookup=%+v error=%v", lookedUp, err)

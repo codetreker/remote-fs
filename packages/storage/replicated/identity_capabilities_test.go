@@ -36,10 +36,12 @@ func TestIdentityCapabilitiesConfirmAuthorityResultsThroughTheReplica(t *testing
 	opener := session.(storage.AtomicFileOpener)
 	namespace := session.(storage.NamespaceAccess)
 	references := session.(storage.NodeReferences)
+	reader := session.(storage.DirectoryReader)
 	actions := session.(storage.FileActions)
 	for name, check := range map[string]func() error{
 		"atomic open": opener.CheckAtomicFileOpen,
 		"namespace":   namespace.CheckNamespaceAccess,
+		"directory":   reader.CheckDirectoryRead,
 		"references":  references.CheckNodeReferences,
 		"actions":     actions.CheckFileActions,
 	} {
@@ -76,8 +78,13 @@ func TestIdentityCapabilitiesConfirmAuthorityResultsThroughTheReplica(t *testing
 		t.Fatalf("lookup=%+v error=%v", lookedUp, err)
 	}
 
-	opened, err := opener.OpenAt(t.Context(), storage.ChildName{
-		Parent: storage.DirectoryTarget{NodeID: directory.ID}, RawLeaf: []byte("file"),
+	directoryObservation, err := reader.ReadDirNode(t.Context(), storage.DirectoryTarget{NodeID: directory.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	opened, err := opener.OpenAt(t.Context(), storage.ChildSelection{
+		Name:   storage.ChildName{Parent: storage.DirectoryTarget{NodeID: directory.ID}, RawLeaf: []byte("file")},
+		Guards: &storage.NamespaceGuards{Directories: []storage.DirectoryObservation{directoryObservation.Observation}},
 	}, storage.OpenAtOptions{
 		Read: true, Write: true, Target: storage.ChildCondition{State: storage.SameNode, NodeID: fileAttr.ID},
 		Action: replicatedFileActionFor(t, session), Use: storage.UseClaim{Uses: storage.ReadData | storage.WriteData | storage.DeleteName}, Existing: storage.Keep,
@@ -152,15 +159,21 @@ func TestIdentityCapabilitiesConfirmAuthorityResultsThroughTheReplica(t *testing
 		t.Fatalf("clear pending unlink=%+v error=%v", cleared, err)
 	}
 
-	verifyNodeReference(t, session, references, *nameResult.Attr, root.ID, "link")
-	verifyNodeReference(t, session, references, directory, root.ID, "dir")
+	rootObservation, err := reader.ReadDirNode(t.Context(), storage.DirectoryTarget{NodeID: root.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	guards := &storage.NamespaceGuards{Directories: []storage.DirectoryObservation{rootObservation.Observation}}
+	verifyNodeReference(t, session, references, *nameResult.Attr, root.ID, "link", guards)
+	verifyNodeReference(t, session, references, directory, root.ID, "dir", guards)
 	verifyDeleteIntentLifecycle(t, session, actions, opener, directory.ID)
 }
 
-func verifyNodeReference(t *testing.T, session storage.FileSession, references storage.NodeReferences, attr storage.Attr, parent uint64, leaf string) {
+func verifyNodeReference(t *testing.T, session storage.FileSession, references storage.NodeReferences, attr storage.Attr, parent uint64, leaf string, guards *storage.NamespaceGuards) {
 	t.Helper()
-	opened, err := references.OpenChildRef(t.Context(), storage.ChildName{
-		Parent: storage.DirectoryTarget{NodeID: parent}, RawLeaf: []byte(leaf),
+	opened, err := references.OpenChildRef(t.Context(), storage.ChildSelection{
+		Name:   storage.ChildName{Parent: storage.DirectoryTarget{NodeID: parent}, RawLeaf: []byte(leaf)},
+		Guards: guards,
 	}, storage.NodeRefOptions{
 		Kind: attr.Kind, Target: storage.ChildCondition{State: storage.SameNode, NodeID: attr.ID},
 		Action: replicatedFileActionFor(t, session), Use: storage.UseClaim{Uses: storage.DeleteName},
@@ -266,9 +279,9 @@ func verifyDeleteIntentLifecycle(t *testing.T, session storage.FileSession, acti
 		t.Fatal(err)
 	}
 	createAction := replicatedFileActionFor(t, session)
-	opened, err := opener.OpenAt(t.Context(), storage.ChildName{
+	opened, err := opener.OpenAt(t.Context(), storage.ChildSelection{Name: storage.ChildName{
 		Parent: storage.DirectoryTarget{NodeID: parent}, RawLeaf: []byte("delete-on-close"),
-	}, storage.OpenAtOptions{
+	}}, storage.OpenAtOptions{
 		Read: true, Create: true, Exclusive: true, Target: storage.ChildCondition{State: storage.Absent},
 		Action: createAction, Use: storage.UseClaim{Uses: storage.ReadData | storage.DeleteName}, Existing: storage.Keep,
 		CloseIntent: &storage.CloseIntent{ID: intent, Trigger: storage.OnReferenceClose, Condition: storage.UnlinkFile},

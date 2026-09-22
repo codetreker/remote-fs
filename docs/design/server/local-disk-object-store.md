@@ -251,7 +251,7 @@ shard identity 或对象 publication 已经发生后，任何无法证明 direct
 
 `metastore.FileStore` 在同一原生 gate 内完成路径或节点身份核对、创建／截断、InitialMetadata、Use claim 与引用保留。`ExpectedID` 不匹配以 `ESTALE` 失败；创建不存在的文件、排他创建判断、初始节点事实与返回引用属于同一次结果。保留引用绑定 node ID，改名不改变它；unlink 或 rename 替换目的地时，仍有 pin 的普通文件成为 `detached`，其当前 object 引用、属性、metadata 与配额继续保留。路径查询与 named snapshot 不暴露 detached 节点，其后修改不产生 named change event；句柄仍可读取、修改当前状态。
 
-DirectoryTarget/ChildName 把子项操作绑定到父 NodeID 和可选活 Scope。OpenAt/OpenChildRef、LookupAt 与 MutateName 在 SQLite 最终事务中核对源／目标身份和 metadata predicates，不从旧路径重建父对象。NodeReference 与 File 共用 pin、Use claim、session action history 和关闭排空；NodeReference 没有内容方法。
+DirectoryTarget/ChildName 把子项操作绑定到父 NodeID、可选活 Scope 和原始叶名；OpenAt/OpenChildRef 进一步使用 `ChildSelection` 携带可选 `NamespaceGuards`。有界 preflight 只验证父 DirectoryTarget／Scope；SQLite 最终 authority transaction 再次验证父／Scope，一次性核对 guards，随后核对目标身份和 metadata predicates，不从旧路径重建父对象。子项选定后才推导动态 publication intent；Keep 打开已有对象不发布，创建、清空、替换及其它实际 mutation 才进入发布。NodeReference 与 File 共用 pin、Use claim、session action history 和关闭排空；NodeReference 没有内容方法。
 
 句柄的 `ReadAt` 每次从一份 `FileState` 取得 node、size、object key 和 content revision，再在原生 gate 外读取该不可变对象。返回的属性、范围与 EOF 来自这同一状态。旧对象已被清扫且节点已指向另一对象时有界重试；节点仍指向缺失对象时以 `EIO` 失败。一次调用可以输给持续覆盖而返回 `EAGAIN`，不会拼接两份状态。
 

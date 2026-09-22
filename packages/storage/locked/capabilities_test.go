@@ -13,15 +13,16 @@ import (
 
 type capabilitySessionProbe struct {
 	storage.FileSession
-	checkErr error
-	failure  error
-	attempt  storage.RangeAttempt
-	observed locking.MutationScope
-	open     storage.OpenResult
-	node     storage.NodeOpenResult
-	name     storage.NameResult
-	action   storage.FileActionReceipt
-	deleted  storage.DeleteIntentStatus
+	checkErr  error
+	failure   error
+	attempt   storage.RangeAttempt
+	observed  locking.MutationScope
+	open      storage.OpenResult
+	node      storage.NodeOpenResult
+	name      storage.NameResult
+	action    storage.FileActionReceipt
+	deleted   storage.DeleteIntentStatus
+	selection storage.ChildSelection
 }
 
 type directoryReaderOnlyProbe struct{ storage.FileSession }
@@ -134,8 +135,9 @@ func TestNamespaceWrapperRejectsSubstitutedDirectoryIdentity(t *testing.T) {
 	}
 }
 func (p *capabilitySessionProbe) CheckAtomicFileOpen() error { return p.checkErr }
-func (p *capabilitySessionProbe) OpenAt(ctx context.Context, _ storage.ChildName, _ storage.OpenAtOptions) (storage.OpenResult, error) {
+func (p *capabilitySessionProbe) OpenAt(ctx context.Context, selection storage.ChildSelection, _ storage.OpenAtOptions) (storage.OpenResult, error) {
 	p.capture(ctx)
+	p.selection = selection
 	return p.open, p.failure
 }
 func (p *capabilitySessionProbe) CheckNamespaceAccess() error { return p.checkErr }
@@ -164,8 +166,9 @@ func (p *capabilitySessionProbe) OpenNodeRef(ctx context.Context, _ uint64, _ st
 	p.capture(ctx)
 	return p.node, p.failure
 }
-func (p *capabilitySessionProbe) OpenChildRef(ctx context.Context, _ storage.ChildName, _ storage.NodeRefOptions) (storage.NodeOpenResult, error) {
+func (p *capabilitySessionProbe) OpenChildRef(ctx context.Context, selection storage.ChildSelection, _ storage.NodeRefOptions) (storage.NodeOpenResult, error) {
 	p.capture(ctx)
+	p.selection = selection
 	return p.node, p.failure
 }
 func (p *capabilitySessionProbe) CheckFileActions() error { return p.checkErr }
@@ -357,9 +360,13 @@ func TestIdentityWrappersSeparateReadAndMutationScopes(t *testing.T) {
 			t.Fatalf("%s check=%v", name, err)
 		}
 	}
-	opened, err := session.OpenAt(t.Context(), storage.ChildName{}, storage.OpenAtOptions{})
+	openSelection := storage.ChildSelection{Name: storage.ChildName{RawLeaf: []byte("open")}, Guards: &storage.NamespaceGuards{RootID: 7}}
+	opened, err := session.OpenAt(t.Context(), openSelection, storage.OpenAtOptions{})
 	if !errors.Is(err, failure) || opened.File == nil || !reflect.DeepEqual(probe.observed, proof) {
 		t.Fatalf("atomic open=%+v error=%v scope=%+v", opened, err, probe.observed)
+	}
+	if !reflect.DeepEqual(probe.selection, openSelection) {
+		t.Fatalf("atomic open selection=%+v, want %+v", probe.selection, openSelection)
 	}
 	if _, err := session.LookupAt(locking.WithScope(t.Context(), proof), storage.ChildName{}); !errors.Is(err, failure) || !reflect.DeepEqual(probe.observed, locking.MutationScope{}) {
 		t.Fatalf("lookup error=%v scope=%+v", err, probe.observed)
@@ -386,9 +393,13 @@ func TestIdentityWrappersSeparateReadAndMutationScopes(t *testing.T) {
 	if !errors.Is(err, failure) || result.Reference == nil || !reflect.DeepEqual(probe.observed, locking.MutationScope{}) {
 		t.Fatalf("read-only reference=%+v error=%v scope=%+v", result, err, probe.observed)
 	}
-	result, err = session.OpenChildRef(t.Context(), storage.ChildName{}, storage.NodeRefOptions{Create: true})
+	childSelection := storage.ChildSelection{Name: storage.ChildName{RawLeaf: []byte("child")}, Guards: &storage.NamespaceGuards{RootID: 9}}
+	result, err = session.OpenChildRef(t.Context(), childSelection, storage.NodeRefOptions{Create: true})
 	if !errors.Is(err, failure) || result.Reference == nil || !reflect.DeepEqual(probe.observed, proof) {
 		t.Fatalf("creating reference=%+v error=%v scope=%+v", result, err, probe.observed)
+	}
+	if !reflect.DeepEqual(probe.selection, childSelection) {
+		t.Fatalf("child reference selection=%+v, want %+v", probe.selection, childSelection)
 	}
 	if state, err := result.Reference.State(t.Context()); !errors.Is(err, failure) || state.Attr.ID != attr.ID || !reflect.DeepEqual(reference.observed, locking.MutationScope{}) {
 		t.Fatalf("reference state=%+v error=%v scope=%+v", state, err, reference.observed)

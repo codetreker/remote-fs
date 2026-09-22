@@ -34,7 +34,7 @@ func TestIdentityNamespaceAndReferenceCapabilities(t *testing.T) {
 	if err != nil || lookedUp.ID != created.Attr.ID {
 		t.Fatalf("lookup=%+v error=%v", lookedUp, err)
 	}
-	opened, err := session.(storage.AtomicFileOpener).OpenAt(t.Context(), fileName, storage.OpenAtOptions{
+	opened, err := session.(storage.AtomicFileOpener).OpenAt(t.Context(), storage.ChildSelection{Name: fileName}, storage.OpenAtOptions{
 		Read: true, Write: true, Existing: storage.Keep, Action: fileActionFor(t, session),
 		Target: storage.ChildCondition{State: storage.SameNode, NodeID: lookedUp.ID},
 		Use:    storage.UseClaim{Uses: storage.ReadData | storage.WriteData},
@@ -55,7 +55,7 @@ func TestIdentityNamespaceAndReferenceCapabilities(t *testing.T) {
 	if err != nil || directory.Attr == nil || directory.Attr.Kind != storage.NodeDirectory {
 		t.Fatalf("mkdir=%+v error=%v", directory, err)
 	}
-	referenceResult, err := session.(storage.NodeReferences).OpenChildRef(t.Context(), directoryName, storage.NodeRefOptions{
+	referenceResult, err := session.(storage.NodeReferences).OpenChildRef(t.Context(), storage.ChildSelection{Name: directoryName}, storage.NodeRefOptions{
 		Kind: storage.NodeDirectory, Action: fileActionFor(t, session),
 		Target:         storage.ChildCondition{State: storage.SameNode, NodeID: directory.Attr.ID},
 		MetadataAccess: storage.ReadMetadata | storage.WriteMetadata,

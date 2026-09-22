@@ -17,14 +17,15 @@ var _ metastore.NodeReference = (*retainedNodeReference)(nil)
 
 func (s *Store) CheckNodeReferences() error { return s.CheckFileStore() }
 
-func (s *Store) OpenChildRef(ctx context.Context, name storage.ChildName, options storage.NodeRefOptions) (metastore.NodeOpenResult, error) {
-	if err := name.Check(); err != nil {
+func (s *Store) OpenChildRef(ctx context.Context, selection storage.ChildSelection, options storage.NodeRefOptions) (metastore.NodeOpenResult, error) {
+	if err := selection.Check(); err != nil {
 		return metastore.NodeOpenResult{}, err
 	}
 	if err := options.Check(); err != nil {
 		return metastore.NodeOpenResult{}, err
 	}
-	file, state, outcome, err := s.openAtomicChild(ctx, name, options.Kind, false, false, options.MetadataAccess,
+	selection = selection.Clone()
+	file, state, outcome, err := s.openAtomicChild(ctx, selection, options.Kind, false, false, options.MetadataAccess,
 		options.Create, options.Exclusive, options.Target, options.Use, storage.Keep,
 		options.InitialState, options.CloseIntent)
 	if file == nil {
