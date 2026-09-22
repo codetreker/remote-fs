@@ -23,7 +23,7 @@ func (c *connection) connectControl(s *session, header *wire.Header) ([]byte, ui
 	c.nextTree++
 	id := c.nextTree
 	c.mu.Unlock()
-	s.trees[id] = &tree{kind: controlTree, id: id, sessionID: s.id, done: make(chan struct{})}
+	s.trees[id] = &tree{kind: controlTree, id: id, sessionID: s.id, session: s, done: make(chan struct{})}
 	header.TreeID = id
 	return wire.TreeConnectResponseBody(2, 0x30, 0, 0x001f01ff), statusOK
 }

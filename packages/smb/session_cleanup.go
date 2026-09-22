@@ -13,6 +13,7 @@ func (c *connection) cleanup() {
 	c.mu.Lock()
 	c.closing = true
 	c.mu.Unlock()
+	c.fenceFileWork()
 	c.cancel()
 	_ = c.net.Close()
 	c.wg.Wait()
@@ -22,6 +23,28 @@ func (c *connection) cleanup() {
 	ctx, cancel := context.WithTimeout(context.Background(), c.server.config.Limits.CleanupTimeout)
 	defer cancel()
 	c.server.cleanupFailure(c.retryDisconnected(ctx))
+}
+
+func (c *connection) fenceFileWork() {
+	c.mu.Lock()
+	sessions := make([]*session, 0, len(c.sessions))
+	for _, session := range c.sessions {
+		sessions = append(sessions, session)
+	}
+	c.mu.Unlock()
+	for _, session := range sessions {
+		session.mu.Lock()
+		trees := make([]*tree, 0, len(session.trees))
+		for _, tree := range session.trees {
+			trees = append(trees, tree)
+		}
+		session.mu.Unlock()
+		for _, tree := range trees {
+			if tree.files != nil {
+				tree.files.fence()
+			}
+		}
+	}
 }
 
 func (c *connection) retryDisconnected(ctx context.Context) error {
@@ -194,6 +217,9 @@ func (c *connection) closeTreeContext(ctx context.Context, tree *tree) error {
 		if tree.closed {
 			return nil
 		}
+		if tree.files != nil {
+			tree.files.fence()
+		}
 		tree.stopOnce.Do(func() { close(tree.done) })
 		c.mu.Lock()
 		for _, pending := range c.pending {
@@ -222,13 +248,19 @@ func (c *connection) closeTreeContext(ctx context.Context, tree *tree) error {
 		}
 		authority.mu.Unlock()
 		authority.installMu.Unlock()
+		var errs []error
+		if err := tree.files.close(ctx); err != nil {
+			errs = append(errs, err)
+		}
 		if last {
 			if err := authority.close(ctx); err != nil {
-				return err
+				errs = append(errs, err)
+			} else if err := authority.wait(ctx); err != nil {
+				errs = append(errs, err)
 			}
-			if err := authority.wait(ctx); err != nil {
-				return err
-			}
+		}
+		if err := errors.Join(errs...); err != nil {
+			return err
 		}
 		authority.mu.Lock()
 		authority.refs--

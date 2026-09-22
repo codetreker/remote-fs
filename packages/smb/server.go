@@ -34,15 +34,17 @@ type Server struct {
 }
 
 type Export struct {
-	server    *Server
-	share     Share
-	key       string
-	refs      int
-	trees     int
-	active    int
-	stopping  bool
-	published bool
-	cleanupMu cleanupGate
+	server                                            *Server
+	share                                             Share
+	key                                               string
+	refs                                              int
+	trees                                             int
+	opens                                             int
+	openResultBytes, directoryEntries, directoryBytes int64
+	active                                            int
+	stopping                                          bool
+	published                                         bool
+	cleanupMu                                         cleanupGate
 }
 
 func interfaceNil(value any) bool {
@@ -90,7 +92,7 @@ func shareKey(name string) (string, error) {
 // acquires no file session and never takes ownership of the backend.
 func (s *Server) Publish(share Share) (*Export, error) {
 	key, err := shareKey(share.Name)
-	if err != nil || key == "IPC$" || share.Volume == "" || interfaceNil(share.Backend) {
+	if err != nil || key == "IPC$" || share.Volume == "" || share.DeleteIntentOwner.Check() != nil || interfaceNil(share.Backend) {
 		return nil, ErrConfig
 	}
 	e := &Export{server: s, share: share, key: key, active: 1}
@@ -230,18 +232,25 @@ func (s *Server) Serve(ctx context.Context, listener net.Listener) error {
 
 func (s *Server) stop() {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.stopping {
+		s.mu.Unlock()
 		return
 	}
 	s.stopping = true
 	for _, export := range s.exports {
 		export.stopping = true
 	}
-	if s.listener != nil {
-		_ = s.listener.Close()
-	}
+	listener := s.listener
+	connections := make([]*connection, 0, len(s.connections))
 	for connection := range s.connections {
+		connections = append(connections, connection)
+	}
+	s.mu.Unlock()
+	if listener != nil {
+		_ = listener.Close()
+	}
+	for _, connection := range connections {
+		connection.fenceFileWork()
 		connection.cancel()
 		_ = connection.net.Close()
 	}

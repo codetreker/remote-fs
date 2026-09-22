@@ -101,6 +101,36 @@ func (c *connection) dispatch(ctx context.Context, request, original wire.Reques
 		return body, status, signer
 	}
 	if request.Header.Command != wire.TreeDisconnect {
+		release, err := tree.beginFileWork()
+		if err != nil {
+			return nil, fileCommandStatus(err), signer
+		}
+		defer release()
+	}
+	switch request.Header.Command {
+	case wire.Create:
+		body, status := c.create(ctx, tree, request)
+		return body, status, signer
+	case wire.Close:
+		body, status := c.closeHandle(ctx, tree, request)
+		return body, status, signer
+	case wire.Flush:
+		body, status := c.flushHandle(ctx, tree, request)
+		return body, status, signer
+	case wire.Read:
+		body, status := c.readHandle(ctx, tree, request)
+		return body, status, signer
+	case wire.Write:
+		body, status := c.writeHandle(ctx, tree, request)
+		return body, status, signer
+	case wire.QueryDirectory:
+		body, status := c.queryDirectory(ctx, tree, request)
+		return body, status, signer
+	case wire.QueryInfo:
+		body, status := c.queryInfo(ctx, tree, request)
+		return body, status, signer
+	case wire.TreeDisconnect:
+	default:
 		return nil, statusUnsupported, signer
 	}
 	if request.Empty() != nil {

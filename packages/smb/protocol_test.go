@@ -75,7 +75,7 @@ func startConfiguredProtocolServer(t *testing.T, config Config) (*Server, *endpo
 		t.Fatal(err)
 	}
 	backend := &endpointStorage{session: newEndpointFileSession()}
-	if _, err := server.Publish(Share{Name: "data", Volume: "volume", Backend: backend}); err != nil {
+	if _, err := server.Publish(endpointShare("data", "volume", backend)); err != nil {
 		t.Fatal(err)
 	}
 	listener, err := net.Listen("tcp4", "127.0.0.1:0")
@@ -411,7 +411,7 @@ func TestHandshakeCommandsInAnyCompoundPositionFailBeforeDispatch(t *testing.T) 
 	}
 }
 
-func TestAuthenticatedControlTranscriptAndUnsupportedCommands(t *testing.T) {
+func TestAuthenticatedFileCommandDispatchRejectsMalformedAndUnsupportedCommands(t *testing.T) {
 	server, backend, connection := startProtocolServer(t, DefaultLimits())
 	sessionID, key := authenticateProtocol(t, connection)
 
@@ -435,17 +435,32 @@ func TestAuthenticatedControlTranscriptAndUnsupportedCommands(t *testing.T) {
 	}
 	treeID := header.TreeID
 
-	for index, command := range []uint16{wire.Create, wire.Close, wire.Flush, wire.Read, wire.Write, wire.Lock, wire.QueryDirectory, wire.ChangeNotify, wire.QueryInfo, wire.SetInfo} {
-		packet := signedRequest(t, key, wire.Header{Command: command, MessageID: uint64(5 + index), SessionID: sessionID, TreeID: treeID, Credits: 1}, []byte{2, 0})
+	commands := []struct {
+		command uint16
+		status  uint32
+	}{
+		{wire.Create, statusInvalid},
+		{wire.Close, statusInvalid},
+		{wire.Flush, statusInvalid},
+		{wire.Read, statusInvalid},
+		{wire.Write, statusInvalid},
+		{wire.Lock, statusUnsupported},
+		{wire.QueryDirectory, statusInvalid},
+		{wire.ChangeNotify, statusUnsupported},
+		{wire.QueryInfo, statusInvalid},
+		{wire.SetInfo, statusUnsupported},
+	}
+	for index, test := range commands {
+		packet := signedRequest(t, key, wire.Header{Command: test.command, MessageID: uint64(5 + index), SessionID: sessionID, TreeID: treeID, Credits: 1}, []byte{2, 0})
 		sendFrame(t, connection, packet)
 		response = readFrame(t, connection)
 		header, _ = wire.ParseHeader(response)
-		if header.Status != statusUnsupported || key.Verify(response) != nil {
-			t.Fatalf("command %d = %+v", command, header)
+		if header.Status != test.status || key.Verify(response) != nil {
+			t.Fatalf("command %d = %+v", test.command, header)
 		}
 	}
 	if calls := backend.dataCalls.Load(); calls != 0 {
-		t.Fatalf("unsupported commands reached backend %d times", calls)
+		t.Fatalf("rejected commands reached backend %d times", calls)
 	}
 
 	message := uint64(15)

@@ -123,8 +123,10 @@ type tree struct {
 	kind      treeKind
 	id        uint32
 	sessionID uint64
+	session   *session
 	export    *Export
 	authority *authoritySession
+	files     *handleRegistry
 	closeMu   sync.Mutex
 	cleanup   cleanupGate
 	closed    bool
@@ -434,12 +436,28 @@ func checkReceivedRequests(requests []wire.Request, frameBytes int, negotiated b
 	if negotiated && frameBytes > limits.MaxIOBytes+requestEnvelopeBytes {
 		return wire.ErrMalformed
 	}
-	for _, request := range requests {
+	responseBytes := 0
+	for index, request := range requests {
 		if controlCommand(request.Header.Command) {
 			if len(request.Packet) > maxControlFrameBytes || request.Header.CreditCharge > 1 {
 				return wire.ErrMalformed
 			}
 		}
+		transfer, err := declaredIOBytes(request)
+		if err != nil {
+			return err
+		}
+		if transfer > limits.MaxIOBytes {
+			return wire.ErrMalformed
+		}
+		budget := responseBudget(request)
+		if index+1 < len(requests) {
+			budget = (budget + 7) &^ 7
+		}
+		if budget > limits.MaxFrameBytes-responseBytes {
+			return wire.ErrMalformed
+		}
+		responseBytes += budget
 	}
 	return nil
 }
@@ -448,7 +466,51 @@ func requiredCredits(request wire.Request) int {
 	if controlCommand(request.Header.Command) {
 		return 1
 	}
-	return max(1, (len(request.Packet)+65535)/65536)
+	transfer, err := requestTransferBytes(request)
+	if err != nil {
+		return 1
+	}
+	return max(1, (transfer+65535)/65536)
+}
+
+func requestTransferBytes(request wire.Request) (int, error) {
+	requestBytes := max(0, len(request.Packet)-wire.HeaderSize)
+	transfer, err := declaredIOBytes(request)
+	if err != nil {
+		return 0, err
+	}
+	return max(requestBytes, transfer), nil
+}
+
+func declaredIOBytes(request wire.Request) (int, error) {
+	switch request.Header.Command {
+	case wire.Read:
+		value, err := request.Read()
+		if err != nil {
+			return 0, nil
+		}
+		return int(value.Length), nil
+	case wire.Write:
+		value, err := request.Write()
+		if err != nil {
+			return 0, nil
+		}
+		return len(value.Data), nil
+	case wire.QueryDirectory:
+		value, err := request.QueryDirectory()
+		if err != nil {
+			return 0, nil
+		}
+		return int(value.OutputLength), nil
+	case wire.QueryInfo:
+		value, err := request.QueryInfo()
+		if err != nil {
+			return 0, nil
+		}
+		return int(max(value.InputLength, value.OutputLength)), nil
+	default:
+		return 0, nil
+	}
 }
 
 func (c *connection) grantCredits(requested uint16) uint16 {
@@ -532,9 +594,23 @@ func responseBudget(request wire.Request) int {
 	switch request.Header.Command {
 	case wire.SessionSetup, wire.Negotiate:
 		return 72 + 65535
+	case wire.Create:
+		return 512
+	case wire.Read:
+		if value, err := request.Read(); err == nil {
+			return 80 + int(value.Length)
+		}
+	case wire.QueryDirectory:
+		if value, err := request.QueryDirectory(); err == nil {
+			return 72 + int(value.OutputLength)
+		}
+	case wire.QueryInfo:
+		if value, err := request.QueryInfo(); err == nil {
+			return 72 + int(value.OutputLength)
+		}
 	default:
-		return 128
 	}
+	return 128
 }
 
 // Session lookup and frame enrollment share c.mu, so retirement cannot remove
@@ -588,15 +664,30 @@ func (c *connection) addStatus(status *Status) {
 		}
 		session.mu.Lock()
 		status.Trees += len(session.trees) + session.openingTrees
+		trees := make([]*tree, 0, len(session.trees))
+		for _, tree := range session.trees {
+			trees = append(trees, tree)
+		}
 		authorities := make([]*authoritySession, 0, len(session.authorities))
 		for _, authority := range session.authorities {
 			authorities = append(authorities, authority)
 		}
 		session.mu.Unlock()
+		for _, tree := range trees {
+			if tree.files != nil {
+				tree.files.addStatus(status)
+			}
+		}
 		for _, authority := range authorities {
 			if authority.isStopping() {
 				status.FencedAuthorities++
 			}
+			authority.deleteMu.Lock()
+			status.DeleteIntents += len(authority.deleteIntents)
+			if authority.recoveryPending || len(authority.deleteIntents) != 0 || authority.recoverySession != nil {
+				status.RecoveryPendingAuthorities++
+			}
+			authority.deleteMu.Unlock()
 		}
 	}
 }

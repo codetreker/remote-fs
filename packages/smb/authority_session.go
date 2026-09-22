@@ -20,22 +20,27 @@ type authoritySession struct {
 	export    *Export
 	principal Principal
 
-	installMu   sync.RWMutex
-	mu          sync.Mutex
-	closeMu     cleanupGate
-	treeCloseMu contextLock
-	refs        int
-	orphan      bool
-	stopping    bool
-	closed      bool
-	initErr     error
-	ready       chan struct{}
-	done        chan struct{}
-	cancel      context.CancelFunc
-	epoch       string
-	revision    uint64
-	actionEpoch uint64
-	deadline    time.Time
+	installMu       sync.RWMutex
+	mu              sync.Mutex
+	closeMu         cleanupGate
+	treeCloseMu     contextLock
+	refs            int
+	orphan          bool
+	stopping        bool
+	closed          bool
+	initErr         error
+	ready           chan struct{}
+	done            chan struct{}
+	cancel          context.CancelFunc
+	epoch           string
+	revision        uint64
+	actionEpoch     uint64
+	deadline        time.Time
+	deleteMu        sync.Mutex
+	deleteIntents   map[storage.DeleteIntentID]*deleteIntentCleanup
+	deleteProduced  bool
+	recoverySession storage.FileSession
+	recoveryPending bool
 }
 
 func (a *authoritySession) isClosed() bool {
@@ -82,17 +87,23 @@ func (a *authoritySession) close(ctx context.Context) error {
 		}
 		a.installMu.Unlock()
 		if already {
-			return nil
+			return a.recoverDeleteIntents(ctx)
 		}
+		a.deleteMu.Lock()
+		if a.deleteProduced {
+			a.recoveryPending = true
+		}
+		a.deleteMu.Unlock()
+		var closeErr error
 		if a.raw != nil {
-			if err := a.raw.Close(WithPrincipal(ctx, a.principal)); err != nil {
-				return err
-			}
+			closeErr = a.raw.Close(WithPrincipal(ctx, a.principal))
 		}
-		a.installMu.Lock()
-		a.closed = true
-		a.installMu.Unlock()
-		return nil
+		if closeErr == nil {
+			a.installMu.Lock()
+			a.closed = true
+			a.installMu.Unlock()
+		}
+		return errors.Join(closeErr, a.recoverDeleteIntents(ctx))
 	})
 }
 
@@ -142,6 +153,9 @@ func (a *authoritySession) renew(ctx context.Context, limits Limits) {
 			status, err = a.raw.Renew(call)
 			if err == nil {
 				err = a.acceptStatus(status)
+			}
+			if err == nil {
+				a.export.server.cleanupFailure(a.scanDeleteIntentsWith(call, a.raw.(storage.FileActions), status.ActionEpoch))
 			}
 		}
 		cancel()
@@ -272,19 +286,25 @@ func (c *connection) connectVolume(ctx context.Context, s *session, key string, 
 
 	if creator {
 		raw, err := export.share.Backend.NewFileSession(ctx, server.config.Limits.FileSession)
+		var current storage.FileSessionStatus
 		authority.raw = raw
 		if err == nil && raw == nil {
 			err = syscall.EIO
 		}
 		if err == nil {
+			err = checkSMBFileSession(raw)
+		}
+		if err == nil {
 			err = server.config.Authorize.Authorize(ctx, authz.AccessRequest{Volume: export.share.Volume, Operation: storage.OpFileStatus})
 		}
 		if err == nil {
-			var current storage.FileSessionStatus
 			current, err = raw.Status(ctx)
 			if err == nil {
 				err = authority.acceptStatus(current)
 			}
+		}
+		if err == nil {
+			err = authority.scanDeleteIntentsWith(ctx, raw.(storage.FileActions), current.ActionEpoch)
 		}
 		authority.initErr = err
 		if err == nil {
@@ -328,7 +348,8 @@ func (c *connection) connectVolume(ctx context.Context, s *session, key string, 
 	c.nextTree++
 	id := c.nextTree
 	c.mu.Unlock()
-	tree := &tree{kind: volumeTree, id: id, sessionID: s.id, export: export, authority: authority, done: make(chan struct{})}
+	tree := &tree{kind: volumeTree, id: id, sessionID: s.id, session: s, export: export, authority: authority, done: make(chan struct{})}
+	tree.files = newHandleRegistry(tree, server.config.Limits)
 	authority.mu.Lock()
 	authority.refs++
 	authority.mu.Unlock()

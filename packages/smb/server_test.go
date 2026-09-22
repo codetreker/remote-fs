@@ -16,6 +16,12 @@ import (
 
 type endpointAuthenticator struct{ authentication Authentication }
 
+const testDeleteIntentOwner storage.DeleteIntentOwner = "smb-test-owner"
+
+func endpointShare(name, volume string, backend storage.FileStorage) Share {
+	return Share{Name: name, Volume: volume, DeleteIntentOwner: testDeleteIntentOwner, Backend: backend}
+}
+
 func (a endpointAuthenticator) Begin(context.Context) (Authentication, error) {
 	if a.authentication == nil {
 		return &endpointAuthentication{}, nil
@@ -46,6 +52,7 @@ func (a *endpointAuthentication) Close() error {
 }
 
 type endpointStorage struct {
+	mu           sync.Mutex
 	checkErr     error
 	session      *endpointFileSession
 	sessionOpens atomic.Int32
@@ -108,7 +115,15 @@ func (s *endpointStorage) ReadBounded(context.Context, string, int64) ([]byte, e
 func (s *endpointStorage) CheckFileStorage() error { return s.checkErr }
 func (s *endpointStorage) NewFileSession(context.Context, storage.FileSessionOptions) (storage.FileSession, error) {
 	s.sessionOpens.Add(1)
-	if s.session == nil {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	closed := false
+	if s.session != nil {
+		s.session.mu.Lock()
+		closed = s.session.closed
+		s.session.mu.Unlock()
+	}
+	if s.session == nil || closed {
 		s.session = newEndpointFileSession()
 	}
 	return s.session, nil
@@ -119,6 +134,7 @@ type endpointFileSession struct {
 	status       storage.FileSessionStatus
 	renewFn      func(context.Context, int) (storage.FileSessionStatus, error)
 	closeErr     error
+	closed       bool
 	renewals     int
 	closes       int
 	closeEntered chan struct{}
@@ -142,6 +158,48 @@ func (*endpointFileSession) StatNode(context.Context, uint64) (storage.Attr, err
 }
 func (*endpointFileSession) SetNodeAttr(context.Context, uint64, storage.AttrChange) (storage.Attr, error) {
 	return storage.Attr{}, syscall.ENOSYS
+}
+func (*endpointFileSession) CheckAtomicFileOpen() error { return nil }
+func (*endpointFileSession) OpenAt(context.Context, storage.ChildSelection, storage.OpenAtOptions) (storage.OpenResult, error) {
+	return storage.OpenResult{}, syscall.ENOSYS
+}
+func (*endpointFileSession) CheckNamespaceAccess() error { return nil }
+func (*endpointFileSession) LookupAt(context.Context, storage.ChildName) (storage.Attr, error) {
+	return storage.Attr{}, syscall.ENOSYS
+}
+func (*endpointFileSession) MutateName(context.Context, storage.NameCommand) (storage.NameResult, error) {
+	return storage.NameResult{}, syscall.ENOSYS
+}
+func (*endpointFileSession) CheckDirectoryRead() error { return nil }
+func (*endpointFileSession) ReadDirNode(context.Context, storage.DirectoryTarget) (storage.ObservedDirectory, error) {
+	return storage.ObservedDirectory{}, syscall.ENOSYS
+}
+func (*endpointFileSession) ReadDirNodeBounded(context.Context, storage.DirectoryTarget, *storage.ListResult) (storage.DirectoryObservation, error) {
+	return storage.DirectoryObservation{}, syscall.ENOSYS
+}
+func (*endpointFileSession) CheckDirectoryMetadataObservation() error { return nil }
+func (*endpointFileSession) ObserveDirectoryMetadata(context.Context, storage.DirectoryTarget, storage.DirectoryMetadataOptions, *storage.ListResult) (storage.DirectoryMetadataObservation, error) {
+	return storage.DirectoryMetadataObservation{}, syscall.ENOSYS
+}
+func (*endpointFileSession) CheckNodeReferences() error { return nil }
+func (*endpointFileSession) OpenNodeRef(context.Context, uint64, storage.NodeRefOptions) (storage.NodeOpenResult, error) {
+	return storage.NodeOpenResult{}, syscall.ENOSYS
+}
+func (*endpointFileSession) OpenChildRef(context.Context, storage.ChildSelection, storage.NodeRefOptions) (storage.NodeOpenResult, error) {
+	return storage.NodeOpenResult{}, syscall.ENOSYS
+}
+func (*endpointFileSession) CheckFileActions() error { return nil }
+func (*endpointFileSession) QueryFileAction(context.Context, storage.FileActionID) (storage.FileActionReceipt, error) {
+	return storage.FileActionReceipt{}, syscall.ENOSYS
+}
+func (*endpointFileSession) QueryDeleteIntent(context.Context, storage.DeleteIntentOwner, storage.DeleteIntentID) (storage.DeleteIntentStatus, error) {
+	return storage.DeleteIntentStatus{}, syscall.ENOSYS
+}
+func (*endpointFileSession) ListDeleteIntents(_ context.Context, _ storage.DeleteIntentOwner, cursor storage.DeleteIntentCursor, _ int) (storage.DeleteIntentPage, error) {
+	return storage.DeleteIntentPage{Next: cursor}, nil
+}
+func (*endpointFileSession) AcknowledgeDeleteIntent(context.Context, storage.AcknowledgeDeleteIntentCommand) error {
+	return syscall.ENOSYS
 }
 func (s *endpointFileSession) Renew(ctx context.Context) (storage.FileSessionStatus, error) {
 	s.mu.Lock()
@@ -176,6 +234,11 @@ func (s *endpointFileSession) Close(ctx context.Context) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		}
+	}
+	if err == nil {
+		s.mu.Lock()
+		s.closed = true
+		s.mu.Unlock()
 	}
 	return err
 }
@@ -217,14 +280,17 @@ func TestEndpointConfigurationAndExportReservation(t *testing.T) {
 		t.Fatal(err)
 	}
 	backend := &endpointStorage{}
-	export, err := server.Publish(Share{Name: "Volume", Volume: "volume-a", Backend: backend})
+	if _, err := server.Publish(Share{Name: "ownerless", Volume: "volume", Backend: backend}); !errors.Is(err, ErrConfig) {
+		t.Fatalf("ownerless export = %v", err)
+	}
+	export, err := server.Publish(endpointShare("Volume", "volume-a", backend))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := server.Publish(Share{Name: "Other", Volume: "volume-b", Backend: &endpointStorage{}}); !errors.Is(err, ErrBusy) {
+	if _, err := server.Publish(endpointShare("Other", "volume-b", &endpointStorage{})); !errors.Is(err, ErrBusy) {
 		t.Fatalf("second export = %v", err)
 	}
-	if _, err := server.Publish(Share{Name: "volume", Volume: "volume-c", Backend: &endpointStorage{}}); !errors.Is(err, ErrBusy) {
+	if _, err := server.Publish(endpointShare("volume", "volume-c", &endpointStorage{})); !errors.Is(err, ErrBusy) {
 		t.Fatalf("case-equivalent export = %v", err)
 	}
 	if err := export.Unpublish(t.Context()); err != nil {
@@ -246,10 +312,10 @@ func TestPublishFailureDoesNotConsumeCapacity(t *testing.T) {
 		t.Fatal(err)
 	}
 	cause := errors.New("capability chain")
-	if _, err := server.Publish(Share{Name: "bad", Volume: "bad", Backend: &endpointStorage{checkErr: cause}}); !errors.Is(err, cause) {
+	if _, err := server.Publish(endpointShare("bad", "bad", &endpointStorage{checkErr: cause})); !errors.Is(err, cause) {
 		t.Fatalf("failed publish = %v", err)
 	}
-	if _, err := server.Publish(Share{Name: "good", Volume: "good", Backend: &endpointStorage{}}); err != nil {
+	if _, err := server.Publish(endpointShare("good", "good", &endpointStorage{})); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -260,7 +326,7 @@ func TestShutdownRemovesQuiescentExportsWithoutTakingBackendOwnership(t *testing
 		t.Fatal(err)
 	}
 	backend := &endpointStorage{}
-	if _, err := server.Publish(Share{Name: "data", Volume: "volume", Backend: backend}); err != nil {
+	if _, err := server.Publish(endpointShare("data", "volume", backend)); err != nil {
 		t.Fatal(err)
 	}
 	if err := server.Shutdown(t.Context()); err != nil {
