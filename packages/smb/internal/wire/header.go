@@ -55,6 +55,8 @@ type Limits struct {
 	MaxContexts int
 }
 
+type FileID [16]byte
+
 type Header struct {
 	CreditCharge uint16
 	Status       uint32

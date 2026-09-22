@@ -63,3 +63,33 @@ func TestControlResponses(t *testing.T) {
 		t.Fatal("fixed response")
 	}
 }
+
+func TestFileResponses(t *testing.T) {
+	information := FileInformation{
+		CreationTime: 1, AccessTime: 2, WriteTime: 3, ChangeTime: 4,
+		AllocationSize: 5, EndOfFile: 6, Attributes: 7,
+	}
+	body := CreateResponseBody(CreateResult{Action: 2, FileInformation: information, FileID: FileID{99}})
+	if len(body) != 88 || le.Uint16(body) != 89 || le.Uint64(body[48:56]) != 6 || body[64] != 99 {
+		t.Fatalf("CREATE response = %x", body)
+	}
+	body = CloseResponseBody(1, information)
+	if len(body) != 60 || le.Uint16(body) != 60 || le.Uint16(body[2:4]) != 1 || le.Uint64(body[48:56]) != 6 {
+		t.Fatalf("CLOSE response = %x", body)
+	}
+	body = ReadResponseBody([]byte("abc"), 12)
+	if le.Uint16(body) != 17 || body[2] != HeaderSize+16 || le.Uint32(body[4:8]) != 3 || le.Uint32(body[8:12]) != 12 || string(body[16:]) != "abc" {
+		t.Fatalf("READ response = %x", body)
+	}
+	body = WriteResponseBody(12, 34)
+	if le.Uint16(body) != 17 || le.Uint32(body[4:8]) != 12 || le.Uint32(body[8:12]) != 34 {
+		t.Fatalf("WRITE response = %x", body)
+	}
+	body = BufferResponseBody([]byte("abc"))
+	if le.Uint16(body) != 9 || le.Uint16(body[2:4]) != HeaderSize+8 || le.Uint32(body[4:8]) != 3 || string(body[8:]) != "abc" {
+		t.Fatalf("buffer response = %x", body)
+	}
+	if body = BufferResponseBody(nil); len(body) != 8 || le.Uint16(body[2:4]) != 0 {
+		t.Fatalf("empty buffer response = %x", body)
+	}
+}

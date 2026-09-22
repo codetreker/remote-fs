@@ -16,6 +16,24 @@ type Negotiation struct {
 	Contexts        []Context
 }
 
+type FileInformation struct {
+	CreationTime   uint64
+	AccessTime     uint64
+	WriteTime      uint64
+	ChangeTime     uint64
+	AllocationSize uint64
+	EndOfFile      uint64
+	Attributes     uint32
+}
+
+type CreateResult struct {
+	OplockLevel byte
+	Flags       byte
+	Action      uint32
+	FileInformation
+	FileID FileID
+}
+
 func NegotiateResponseBody(negotiation Negotiation) ([]byte, error) {
 	if len(negotiation.Token) > 65535 || len(negotiation.Contexts) > 65535 || len(negotiation.Contexts) != 0 && negotiation.Dialect != Dialect311 {
 		return nil, ErrMalformed
@@ -94,6 +112,65 @@ func TreeConnectResponseBody(shareType byte, flags, capabilities, access uint32)
 	le.PutUint32(body[4:8], flags)
 	le.PutUint32(body[8:12], capabilities)
 	le.PutUint32(body[12:16], access)
+	return body
+}
+
+func encodeFileInformation(body []byte, information FileInformation) {
+	le.PutUint64(body, information.CreationTime)
+	le.PutUint64(body[8:16], information.AccessTime)
+	le.PutUint64(body[16:24], information.WriteTime)
+	le.PutUint64(body[24:32], information.ChangeTime)
+	le.PutUint64(body[32:40], information.AllocationSize)
+	le.PutUint64(body[40:48], information.EndOfFile)
+	le.PutUint32(body[48:52], information.Attributes)
+}
+
+func CreateResponseBody(result CreateResult) []byte {
+	body := make([]byte, 88)
+	le.PutUint16(body, 89)
+	body[2] = result.OplockLevel
+	body[3] = result.Flags
+	le.PutUint32(body[4:8], result.Action)
+	encodeFileInformation(body[8:60], result.FileInformation)
+	copy(body[64:80], result.FileID[:])
+	return body
+}
+
+func CloseResponseBody(flags uint16, information FileInformation) []byte {
+	body := make([]byte, 60)
+	le.PutUint16(body, 60)
+	le.PutUint16(body[2:4], flags)
+	encodeFileInformation(body[8:60], information)
+	return body
+}
+
+func ReadResponseBody(data []byte, remaining uint32) []byte {
+	body := make([]byte, 16+len(data))
+	le.PutUint16(body, 17)
+	body[2] = HeaderSize + 16
+	le.PutUint32(body[4:8], uint32(len(data)))
+	le.PutUint32(body[8:12], remaining)
+	copy(body[16:], data)
+	return body
+}
+
+func WriteResponseBody(count, remaining uint32) []byte {
+	body := make([]byte, 16)
+	le.PutUint16(body, 17)
+	le.PutUint32(body[4:8], count)
+	le.PutUint32(body[8:12], remaining)
+	return body
+}
+
+// BufferResponseBody is shared by QUERY_INFO and QUERY_DIRECTORY.
+func BufferResponseBody(data []byte) []byte {
+	body := make([]byte, 8+len(data))
+	le.PutUint16(body, 9)
+	if len(data) != 0 {
+		le.PutUint16(body[2:4], HeaderSize+8)
+		le.PutUint32(body[4:8], uint32(len(data)))
+		copy(body[8:], data)
+	}
 	return body
 }
 

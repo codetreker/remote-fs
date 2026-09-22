@@ -8,6 +8,26 @@ import (
 	"github.com/codetreker/remote-fs/packages/storage"
 )
 
+const (
+	statusInvalidDeviceRequest uint32 = 0xc0000010
+	statusEndOfFile            uint32 = 0xc0000011
+	statusFileClosed           uint32 = 0xc0000128
+	statusObjectNameInvalid    uint32 = 0xc0000033
+	statusObjectNameNotFound   uint32 = 0xc0000034
+	statusObjectNameCollision  uint32 = 0xc0000035
+	statusObjectPathNotFound   uint32 = 0xc000003a
+	statusSharingViolation     uint32 = 0xc0000043
+	statusFileLockConflict     uint32 = 0xc0000054
+	statusDeletePending        uint32 = 0xc0000056
+	statusDiskFull             uint32 = 0xc000007f
+	statusMediaWriteProtected  uint32 = 0xc00000a2
+	statusFileIsADirectory     uint32 = 0xc00000ba
+	statusDirectoryNotEmpty    uint32 = 0xc0000101
+	statusNotADirectory        uint32 = 0xc0000103
+	statusQuotaExceeded        uint32 = 0xc0000802
+	statusRetry                uint32 = 0xc000022d
+)
+
 func statusError(err error) uint32 {
 	if err == nil {
 		return statusOK
@@ -28,7 +48,56 @@ func statusError(err error) uint32 {
 		return statusUnsupported
 	case syscall.ESTALE:
 		return statusSessionDeleted
+	case syscall.ENOENT:
+		return statusObjectNameNotFound
+	case syscall.ENOTDIR:
+		return statusNotADirectory
 	default:
 		return statusIO
+	}
+}
+
+func namespaceStatus(err error) uint32 {
+	switch {
+	case errors.Is(err, errNameInvalid):
+		return statusObjectNameInvalid
+	case errors.Is(err, errPathMissing):
+		return statusObjectPathNotFound
+	default:
+		return statusError(err)
+	}
+}
+
+func fileCommandStatus(err error) uint32 {
+	if err == nil {
+		return statusOK
+	}
+	if storage.ErrnoOf(err) == syscall.EIO {
+		return statusIO
+	}
+	if errors.Is(err, storage.ErrRangeConflict) {
+		return statusFileLockConflict
+	}
+	if errors.Is(err, storage.ErrUseConflict) {
+		return statusSharingViolation
+	}
+	if errors.Is(err, storage.ErrPendingDelete) {
+		return statusDeletePending
+	}
+	switch storage.ErrnoOf(err) {
+	case syscall.EBADF, syscall.ESTALE:
+		return statusFileClosed
+	case syscall.EDQUOT:
+		return statusQuotaExceeded
+	case syscall.ENOSPC:
+		return statusDiskFull
+	case syscall.EAGAIN:
+		return statusRetry
+	case syscall.EISDIR:
+		return statusInvalidDeviceRequest
+	case syscall.EROFS:
+		return statusMediaWriteProtected
+	default:
+		return statusError(err)
 	}
 }
