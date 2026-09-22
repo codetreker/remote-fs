@@ -155,6 +155,64 @@ func windowsArchiveMutation(attr storage.Attr, command storage.FileMutation) (st
 	return command, nil
 }
 
+func (c *connection) reconcileWindowsMutation(
+	ctx context.Context,
+	tree *tree,
+	mutation storage.ConditionalFileMutation,
+	command storage.FileMutation,
+	cause error,
+) (storage.Attr, bool, error) {
+	actions, ok := tree.authority.raw.(storage.FileActions)
+	if !ok {
+		return storage.Attr{}, false, errors.Join(cause, syscall.EIO)
+	}
+	if err := actions.CheckFileActions(); err != nil {
+		return storage.Attr{}, false, errors.Join(cause, err, syscall.EIO)
+	}
+	recovery, cancel := context.WithTimeout(context.WithoutCancel(ctx), c.server.config.Limits.CleanupTimeout)
+	defer cancel()
+	recovery = WithPrincipal(recovery, tree.authority.principal)
+	if err := c.authorizeFileOperation(recovery, tree, storage.OpFileQueryAction); err != nil {
+		return storage.Attr{}, false, errors.Join(cause, err, syscall.EIO)
+	}
+	receipt, err := actions.QueryFileAction(recovery, command.Action)
+	if err != nil {
+		return storage.Attr{}, false, errors.Join(cause, err, syscall.EIO)
+	}
+	if err := receipt.Check(); err != nil || receipt.Action != command.Action {
+		return storage.Attr{}, false, errors.Join(cause, err, syscall.EIO)
+	}
+	switch receipt.Outcome {
+	case storage.FileActionNotExecuted:
+		if receipt.Operation != "" && receipt.Operation != storage.OpFileMutate {
+			return storage.Attr{}, false, errors.Join(cause, syscall.EIO)
+		}
+		return storage.Attr{}, true, cause
+	case storage.FileActionCompleted:
+		if receipt.Operation != storage.OpFileMutate {
+			return storage.Attr{}, false, errors.Join(cause, syscall.EIO)
+		}
+		result, replayErr := mutation.MutateFile(recovery, command)
+		if replayErr != nil {
+			return storage.Attr{}, false, errors.Join(cause, replayErr, syscall.EIO)
+		}
+		return result, false, nil
+	case storage.FileActionPending:
+		if receipt.Operation != storage.OpFileMutate {
+			return storage.Attr{}, false, errors.Join(cause, syscall.EIO)
+		}
+		result, replayErr := mutation.MutateFile(recovery, command)
+		if replayErr == nil {
+			return result, false, nil
+		}
+		return storage.Attr{}, false, errors.Join(cause, replayErr, syscall.EIO)
+	case storage.FileActionUnknown, storage.FileActionRetired:
+		return storage.Attr{}, false, errors.Join(cause, syscall.EIO)
+	default:
+		return storage.Attr{}, false, errors.Join(cause, syscall.EIO)
+	}
+}
+
 // mutateWindowsFile publishes the byte or length change, timestamps, and
 // ARCHIVE metadata in one authority mutation. A metadata race restarts from a
 // fresh capture; an ambiguous result is returned without redispatch.
@@ -206,8 +264,12 @@ func (c *connection) mutateWindowsFile(ctx context.Context, tree *tree, handle *
 			return storage.Attr{}, err
 		}
 		result, err := mutation.MutateFile(ctx, attempt)
-		if errors.Is(err, storage.ErrConditionConflict) && storage.ErrnoOf(err) == syscall.EAGAIN && result.ID == 0 {
-			continue
+		if err != nil {
+			var retry bool
+			result, retry, err = c.reconcileWindowsMutation(ctx, tree, mutation, attempt, err)
+			if retry && errors.Is(err, storage.ErrConditionConflict) && storage.ErrnoOf(err) == syscall.EAGAIN && ctx.Err() == nil {
+				continue
+			}
 		}
 		if err != nil {
 			return storage.Attr{}, err
@@ -272,6 +334,12 @@ func (c *connection) writeHandle(ctx context.Context, tree *tree, request wire.R
 	if !appendWrite && uint64(len(write.Data)) > math.MaxInt64-write.Offset {
 		return nil, statusInvalid
 	}
+	writeThrough := handle.writeThrough || write.Flags&1 != 0
+	if writeThrough {
+		if err := c.authorizeFileOperation(ctx, tree, storage.OpFileSync); err != nil {
+			return nil, fileCommandStatus(err)
+		}
+	}
 	releaseResult, err := reserveFileCommandResult(ctx, tree, false)
 	if err != nil {
 		return nil, fileCommandStatus(err)
@@ -286,6 +354,11 @@ func (c *connection) writeHandle(ctx context.Context, tree *tree, request wire.R
 	attr, err := c.mutateWindowsFile(ctx, tree, handle, command)
 	if err != nil {
 		return nil, fileCommandStatus(err)
+	}
+	if writeThrough {
+		if err := handle.file.Sync(ctx); err != nil {
+			return nil, fileCommandStatus(errors.Join(err, syscall.EIO))
+		}
 	}
 	if len(write.Data) != 0 {
 		minimum := int64(len(write.Data))
@@ -316,17 +389,32 @@ func (c *connection) flushHandle(ctx context.Context, tree *tree, request wire.R
 	if handle.grantedAccess&(fileWriteData|fileAppendData) == 0 {
 		return nil, statusDenied
 	}
-	if handle.file == nil {
-		return nil, statusInvalidDeviceRequest
-	}
 	if err := c.authorizeFileOperation(ctx, tree, storage.OpFileSync); err != nil {
 		return nil, fileCommandStatus(err)
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, fileCommandStatus(err)
 	}
-	if err := handle.file.Sync(ctx); err != nil {
-		return nil, fileCommandStatus(err)
+	if handle.file != nil {
+		if err := handle.file.Sync(ctx); err != nil {
+			return nil, fileCommandStatus(err)
+		}
+	} else {
+		if err := c.authorizeFileOperation(ctx, tree, storage.OpFileStat); err != nil {
+			return nil, fileCommandStatus(err)
+		}
+		releaseResult, err := reserveFileCommandResult(ctx, tree, false)
+		if err != nil {
+			return nil, fileCommandStatus(err)
+		}
+		defer releaseResult()
+		attr, err := handle.reference.Stat(ctx)
+		if err != nil {
+			return nil, fileCommandStatus(err)
+		}
+		if err := checkQueryCapture(attr, handle.nodeID); err != nil || attr.Kind != storage.NodeDirectory {
+			return nil, statusIO
+		}
 	}
 	return wire.EmptyResponseBody(), statusOK
 }

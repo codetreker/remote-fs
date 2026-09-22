@@ -27,6 +27,30 @@ type fileIOProbe struct {
 	syncs, closes                              atomic.Int32
 }
 
+type fileActionSessionProbe struct {
+	storage.FileSession
+	query   func(storage.FileActionID) (storage.FileActionReceipt, error)
+	queries atomic.Int32
+}
+
+func (*fileActionSessionProbe) CheckFileActions() error { return nil }
+func (p *fileActionSessionProbe) QueryFileAction(_ context.Context, action storage.FileActionID) (storage.FileActionReceipt, error) {
+	p.queries.Add(1)
+	if p.query != nil {
+		return p.query(action)
+	}
+	return storage.FileActionReceipt{Action: action, Operation: storage.OpFileMutate, Outcome: storage.FileActionNotExecuted}, nil
+}
+func (*fileActionSessionProbe) QueryDeleteIntent(context.Context, storage.DeleteIntentOwner, storage.DeleteIntentID) (storage.DeleteIntentStatus, error) {
+	return storage.DeleteIntentStatus{}, syscall.EOPNOTSUPP
+}
+func (*fileActionSessionProbe) ListDeleteIntents(context.Context, storage.DeleteIntentOwner, storage.DeleteIntentCursor, int) (storage.DeleteIntentPage, error) {
+	return storage.DeleteIntentPage{}, syscall.EOPNOTSUPP
+}
+func (*fileActionSessionProbe) AcknowledgeDeleteIntent(context.Context, storage.AcknowledgeDeleteIntentCommand) error {
+	return syscall.EOPNOTSUPP
+}
+
 func (p *fileIOProbe) Stat(context.Context) (storage.Attr, error) {
 	p.stats.Add(1)
 	return p.attr.Clone(), p.statErr
@@ -79,6 +103,7 @@ func fileIOFixture(t *testing.T, file *fileIOProbe, access uint32) (*connection,
 	registry := newHandleTestRegistry(t, 2)
 	registry.tree.export.share.Volume = "trusted-volume"
 	registry.tree.authority.actionEpoch = 9
+	registry.tree.authority.raw = &fileActionSessionProbe{}
 	reservation, err := registry.reserve()
 	if err != nil {
 		t.Fatal(err)
@@ -312,6 +337,74 @@ func TestFileWriteFailureNeverReturnsCountOrUsesOrdinaryWrite(t *testing.T) {
 	}
 }
 
+func TestFileWriteReconcilesTheSameActionBeforeReportingOrRetrying(t *testing.T) {
+	t.Run("completed mutation replay", func(t *testing.T) {
+		probe := &fileIOProbe{attr: fileIOAttr(t, 4, 0, 1)}
+		var first storage.FileMutation
+		probe.mutate = func(_ context.Context, command storage.FileMutation) (storage.Attr, error) {
+			if first.Action == "" {
+				first = command
+				return storage.Attr{}, syscall.EIO
+			}
+			if !reflect.DeepEqual(command, first) {
+				t.Fatalf("replay changed action input: first=%+v replay=%+v", first, command)
+			}
+			result := probe.attr.Clone()
+			result.Size = 5
+			result.ModTime = time.Unix(8, 0).UTC()
+			change := time.Unix(9, 0).UTC()
+			result.ChangeTime = &change
+			payload := command.Metadata[windowsMetadataKey]
+			payload.Version = []byte{2}
+			result.Metadata[windowsMetadataKey] = payload
+			return result, nil
+		}
+		connection, tree, id := fileIOFixture(t, probe, fileAppendData)
+		actions := tree.authority.raw.(*fileActionSessionProbe)
+		actions.query = func(action storage.FileActionID) (storage.FileActionReceipt, error) {
+			if action != first.Action {
+				t.Fatal("queried a different action")
+			}
+			return storage.FileActionReceipt{Action: action, Operation: storage.OpFileMutate, Outcome: storage.FileActionCompleted}, nil
+		}
+		body, status := connection.writeHandle(t.Context(), tree, fileIOWriteRequest(id, 0, []byte("x")))
+		if status != statusOK || binary.LittleEndian.Uint32(body[4:]) != 1 || probe.mutations.Load() != 2 || actions.queries.Load() != 1 {
+			t.Fatalf("reconciled WRITE = %x, %#x, mutations=%d queries=%d", body, status, probe.mutations.Load(), actions.queries.Load())
+		}
+	})
+
+	t.Run("unknown append never reports retryable cancellation", func(t *testing.T) {
+		probe := &fileIOProbe{attr: fileIOAttr(t, 4, 0, 1)}
+		probe.mutate = func(_ context.Context, command storage.FileMutation) (storage.Attr, error) {
+			result := probe.attr.Clone()
+			result.Size++
+			return result, context.Canceled
+		}
+		connection, tree, id := fileIOFixture(t, probe, fileAppendData)
+		actions := tree.authority.raw.(*fileActionSessionProbe)
+		actions.query = func(action storage.FileActionID) (storage.FileActionReceipt, error) {
+			return storage.FileActionReceipt{Action: action, Operation: storage.OpFileMutate, Outcome: storage.FileActionUnknown}, nil
+		}
+		body, status := connection.writeHandle(t.Context(), tree, fileIOWriteRequest(id, 0, []byte("x")))
+		if body != nil || status != statusIO || probe.mutations.Load() != 1 || actions.queries.Load() != 1 {
+			t.Fatalf("unknown append = %x, %#x, mutations=%d queries=%d", body, status, probe.mutations.Load(), actions.queries.Load())
+		}
+	})
+
+	t.Run("known not executed cancellation remains safe", func(t *testing.T) {
+		probe := &fileIOProbe{attr: fileIOAttr(t, 4, 0, 1)}
+		probe.mutate = func(context.Context, storage.FileMutation) (storage.Attr, error) {
+			return storage.Attr{}, context.Canceled
+		}
+		connection, tree, id := fileIOFixture(t, probe, fileAppendData)
+		actions := tree.authority.raw.(*fileActionSessionProbe)
+		body, status := connection.writeHandle(t.Context(), tree, fileIOWriteRequest(id, 0, []byte("x")))
+		if body != nil || status != statusCancelled || probe.mutations.Load() != 1 || actions.queries.Load() != 1 {
+			t.Fatalf("not-executed cancellation = %x, %#x, mutations=%d queries=%d", body, status, probe.mutations.Load(), actions.queries.Load())
+		}
+	})
+}
+
 func TestZeroFileWriteUsesConditionalHealthCheckWithoutChangingMetadata(t *testing.T) {
 	before := fileIOAttr(t, 4, dosHidden, 1)
 	probe := &fileIOProbe{attr: before}
@@ -346,6 +439,146 @@ func TestFileFlushMapsDirectlyToSync(t *testing.T) {
 	body, status = connection.flushHandle(t.Context(), tree, fileIOFlushRequest(id))
 	if status != statusOK || !bytes.Equal(body, wire.EmptyResponseBody()) || probe.syncs.Load() != 2 {
 		t.Fatalf("successful FLUSH = %x, %#x, syncs=%d", body, status, probe.syncs.Load())
+	}
+}
+
+func TestWriteThroughFlushesOnlyAfterSuccessfulMutation(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		handleMode  bool
+		requestFlag bool
+		data        string
+	}{
+		{"create option", true, false, "x"},
+		{"write flag", false, true, "x"},
+		{"both", true, true, "x"},
+		{"zero write", true, false, ""},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			probe := &fileIOProbe{attr: fileIOAttr(t, 4, 0, 1)}
+			var order []string
+			probe.mutate = func(_ context.Context, command storage.FileMutation) (storage.Attr, error) {
+				order = append(order, "mutate")
+				result := probe.attr.Clone()
+				if len(command.Data) != 0 {
+					result.Size = 5
+					result.ModTime = time.Unix(8, 0).UTC()
+					change := time.Unix(9, 0).UTC()
+					result.ChangeTime = &change
+					payload := command.Metadata[windowsMetadataKey]
+					payload.Version = []byte{2}
+					result.Metadata[windowsMetadataKey] = payload
+				}
+				return result, nil
+			}
+			probe.sync = func(context.Context) error {
+				order = append(order, "sync")
+				return nil
+			}
+			connection, tree, id := fileIOFixture(t, probe, fileWriteData)
+			tree.files.get(id).writeThrough = test.handleMode
+			request := fileIOWriteRequest(id, 4, []byte(test.data))
+			if test.requestFlag {
+				binary.LittleEndian.PutUint32(request.Body[44:], 1)
+			}
+			body, status := connection.writeHandle(t.Context(), tree, request)
+			if status != statusOK || binary.LittleEndian.Uint32(body[4:]) != uint32(len(test.data)) || !reflect.DeepEqual(order, []string{"mutate", "sync"}) {
+				t.Fatalf("write-through WRITE = %x, %#x, order=%v", body, status, order)
+			}
+		})
+	}
+
+	t.Run("sync authorization before effect", func(t *testing.T) {
+		probe := &fileIOProbe{attr: fileIOAttr(t, 4, 0, 1), mutate: func(context.Context, storage.FileMutation) (storage.Attr, error) {
+			return storage.Attr{}, nil
+		}}
+		connection, tree, id := fileIOFixture(t, probe, fileWriteData)
+		request := fileIOWriteRequest(id, 0, []byte("x"))
+		binary.LittleEndian.PutUint32(request.Body[44:], 1)
+		connection.server.config.Authorize = authz.AuthorizerFunc(func(_ context.Context, request authz.AccessRequest) error {
+			if request.Operation == storage.OpFileSync {
+				return authz.ErrDenied
+			}
+			return nil
+		})
+		if body, status := connection.writeHandle(t.Context(), tree, request); body != nil || status != statusDenied || probe.mutations.Load() != 0 || probe.syncs.Load() != 0 {
+			t.Fatalf("denied write-through = %x, %#x, mutations=%d syncs=%d", body, status, probe.mutations.Load(), probe.syncs.Load())
+		}
+	})
+
+	for _, failure := range []error{syscall.EIO, context.Canceled, syscall.EAGAIN} {
+		t.Run("sync failure "+failure.Error(), func(t *testing.T) {
+			probe := &fileIOProbe{attr: fileIOAttr(t, 4, 0, 1)}
+			probe.mutate = func(_ context.Context, command storage.FileMutation) (storage.Attr, error) {
+				result := probe.attr.Clone()
+				result.Size = 5
+				result.ModTime = time.Unix(8, 0).UTC()
+				change := time.Unix(9, 0).UTC()
+				result.ChangeTime = &change
+				payload := command.Metadata[windowsMetadataKey]
+				payload.Version = []byte{2}
+				result.Metadata[windowsMetadataKey] = payload
+				return result, nil
+			}
+			probe.sync = func(context.Context) error { return failure }
+			connection, tree, id := fileIOFixture(t, probe, fileWriteData)
+			tree.files.get(id).writeThrough = true
+			if body, status := connection.writeHandle(t.Context(), tree, fileIOWriteRequest(id, 4, []byte("x"))); body != nil || status != statusIO || probe.mutations.Load() != 1 || probe.syncs.Load() != 1 {
+				t.Fatalf("failed write-through = %x, %#x, mutations=%d syncs=%d", body, status, probe.mutations.Load(), probe.syncs.Load())
+			}
+		})
+	}
+}
+
+type directoryFlushReference struct {
+	attr  storage.Attr
+	err   error
+	stats atomic.Int32
+}
+
+func (r *directoryFlushReference) Stat(context.Context) (storage.Attr, error) {
+	r.stats.Add(1)
+	return r.attr.Clone(), r.err
+}
+func (*directoryFlushReference) SetAttr(context.Context, storage.AttrChange) (storage.Attr, error) {
+	return storage.Attr{}, syscall.EBADF
+}
+func (*directoryFlushReference) Close(context.Context) error { return nil }
+func (*directoryFlushReference) CheckScopedReference() error { return nil }
+func (*directoryFlushReference) Scope(context.Context) (storage.UseScope, error) {
+	return storage.UseScope{Token: "directory"}, nil
+}
+func (*directoryFlushReference) CheckReferenceState() error { return nil }
+func (r *directoryFlushReference) State(context.Context) (storage.ReferenceState, error) {
+	return storage.ReferenceState{Attr: r.attr.Clone()}, r.err
+}
+
+func TestFileFlushSupportsWritableDirectoryHandles(t *testing.T) {
+	registry := newHandleTestRegistry(t, 2)
+	registry.tree.export.share.Volume = "trusted-volume"
+	reference := &directoryFlushReference{attr: storage.Attr{ID: 11, Kind: storage.NodeDirectory}}
+	reservation, err := registry.reserve()
+	if err != nil {
+		t.Fatal(err)
+	}
+	reservation.attachNode(storage.NodeOpenResult{Reference: reference, Attr: reference.attr, Outcome: storage.Opened})
+	id, err := reservation.install(fileWriteData, 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reservation.finish(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	var operations []storage.Operation
+	registry.tree.export.server.config.Authorize = authz.AuthorizerFunc(func(_ context.Context, request authz.AccessRequest) error {
+		operations = append(operations, request.Operation)
+		return nil
+	})
+	connection := &connection{server: registry.tree.export.server}
+	body, status := connection.flushHandle(t.Context(), registry.tree, fileIOFlushRequest(id))
+	if status != statusOK || !bytes.Equal(body, wire.EmptyResponseBody()) || reference.stats.Load() != 1 ||
+		!reflect.DeepEqual(operations, []storage.Operation{storage.OpFileSync, storage.OpFileStat}) {
+		t.Fatalf("directory FLUSH = %x, %#x, stats=%d operations=%v", body, status, reference.stats.Load(), operations)
 	}
 }
 

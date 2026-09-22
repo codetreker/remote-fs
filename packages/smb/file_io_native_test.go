@@ -132,6 +132,7 @@ func TestNativeAndHTTPFileIOPublishAtomicWindowsState(t *testing.T) {
 		}
 		t.Run(name, func(t *testing.T) {
 			fixture := newNativeFileIOFixture(t, throughHTTP)
+			fixture.tree.files.get(fixture.id).writeThrough = true
 			body, status := fixture.connection.writeHandle(t.Context(), fixture.tree, fileIOWriteRequest(fixture.id, 1, []byte("Z")))
 			if status != statusOK || binary.LittleEndian.Uint32(body[4:]) != 1 {
 				t.Fatalf("range WRITE = %x, %#x", body, status)
