@@ -46,10 +46,11 @@ type namespaceView struct {
 }
 
 type namespaceReference struct {
-	id      uint64
-	scope   storage.UseScope
-	closed  int
-	closeFn func(int) error
+	id       uint64
+	scope    storage.UseScope
+	closed   int
+	closeFn  func(int) error
+	checkErr error
 }
 
 func (r *namespaceReference) ReferenceNodeID() (uint64, error) { return r.id, nil }
@@ -76,7 +77,7 @@ func (*namespaceReference) SetPendingUnlink(context.Context, storage.PendingUnli
 func (*namespaceReference) ClearPendingUnlink(context.Context, storage.ClearPendingUnlinkCommand) (storage.ReferenceState, error) {
 	return storage.ReferenceState{}, syscall.EBADF
 }
-func (*namespaceReference) CheckConditionalFileMutation() error { return nil }
+func (r *namespaceReference) CheckConditionalFileMutation() error { return r.checkErr }
 func (*namespaceReference) MutateFile(context.Context, storage.FileMutation) (storage.Attr, error) {
 	return storage.Attr{}, syscall.EBADF
 }

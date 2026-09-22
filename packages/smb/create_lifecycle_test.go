@@ -30,6 +30,33 @@ func (*guardedCreateFile) Truncate(context.Context, int64) (storage.Attr, error)
 }
 func (*guardedCreateFile) Sync(context.Context) error { return nil }
 
+type incompleteCreateFile struct {
+	id     uint64
+	closed int
+}
+
+func (f *incompleteCreateFile) ReferenceNodeID() (uint64, error) { return f.id, nil }
+func (*incompleteCreateFile) Stat(context.Context) (storage.Attr, error) {
+	return storage.Attr{}, syscall.EBADF
+}
+func (*incompleteCreateFile) ReadAt(context.Context, int64, int) (storage.FileRead, error) {
+	return storage.FileRead{}, syscall.EBADF
+}
+func (*incompleteCreateFile) WriteAt(context.Context, int64, []byte) (storage.Attr, error) {
+	return storage.Attr{}, syscall.EBADF
+}
+func (*incompleteCreateFile) Truncate(context.Context, int64) (storage.Attr, error) {
+	return storage.Attr{}, syscall.EBADF
+}
+func (*incompleteCreateFile) SetAttr(context.Context, storage.AttrChange) (storage.Attr, error) {
+	return storage.Attr{}, syscall.EBADF
+}
+func (*incompleteCreateFile) Sync(context.Context) error { return nil }
+func (f *incompleteCreateFile) Close(context.Context) error {
+	f.closed++
+	return nil
+}
+
 type guardedCreateSession struct {
 	*namespaceSession
 	attr       storage.Attr
@@ -207,6 +234,107 @@ func TestCreateDoesNotRetryPartialConditionConflict(t *testing.T) {
 		createStatus(err) != statusIO || resolverCalls != 1 || session.attempts != 1 || reference.closed != 1 {
 		t.Fatalf("partial conflict = %x, %v, errno=%v, resolves=%d opens=%d closes=%d",
 			body, err, storage.ErrnoOf(err), resolverCalls, session.attempts, reference.closed)
+	}
+}
+
+func TestCreateDiscardsUnacceptedDeleteIntentBeforeGuardRetry(t *testing.T) {
+	smbTree, _, namespace := namespaceTree(t)
+	session := &guardedCreateSession{namespaceSession: namespace}
+	session.open = func(context.Context, storage.ChildSelection, storage.OpenAtOptions) (storage.OpenResult, error) {
+		return storage.OpenResult{}, storage.ErrConditionConflict
+	}
+	smbTree.authority.raw = session
+	smbTree.export.share.DeleteIntentOwner = createTestOwner(t)
+	request := createTestRequest(2)
+	request.DesiredAccess |= fileDelete
+	request.Options = createDeleteOnClose
+	plan, err := buildCreatePlan(request, createTestResolved(nil), smbTree.export.share.DeleteIntentOwner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reservation, err := smbTree.files.reserveResponse()
+	if err != nil {
+		t.Fatal(err)
+	}
+	connection := &connection{server: smbTree.export.server}
+	authorize := func(ctx context.Context, request authz.AccessRequest) error {
+		return connection.authorizeFileAccess(ctx, smbTree, request)
+	}
+	body, retry, err := executeCreatePlan(t.Context(), smbTree, reservation, plan, authorize)
+	if body != nil || !retry || !errors.Is(err, storage.ErrConditionConflict) {
+		t.Fatalf("guard conflict = %x, retry=%v, err=%v", body, retry, err)
+	}
+	reservation.mu.Lock()
+	intent := reservation.deleteIntent
+	reservation.mu.Unlock()
+	if intent != "" {
+		t.Fatalf("unaccepted delete intent retained as %q", intent)
+	}
+	if err := finalizeOpenReservation(t.Context(), smbTree.export.server, reservation, err); !errors.Is(err, storage.ErrConditionConflict) {
+		t.Fatalf("guard cleanup = %v", err)
+	}
+}
+
+func TestCreateRejectsReturnedReferencesWithIncompleteCapabilities(t *testing.T) {
+	capabilityFailure := errors.New("conditional mutation unavailable")
+	for _, test := range []struct {
+		name string
+		file storage.File
+		err  error
+	}{
+		{
+			name: "missing facet",
+			file: &incompleteCreateFile{id: 12},
+			err:  syscall.EOPNOTSUPP,
+		},
+		{
+			name: "failing facet check",
+			file: &guardedCreateFile{namespaceReference: &namespaceReference{id: 12, scope: storage.UseScope{Token: "file-scope"}, checkErr: capabilityFailure}},
+			err:  capabilityFailure,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			smbTree, _, namespace := namespaceTree(t)
+			attr := createTestAttr(t, 12, storage.NodeRegular, dosArchive)
+			session := &guardedCreateSession{namespaceSession: namespace}
+			session.open = func(ctx context.Context, _ storage.ChildSelection, _ storage.OpenAtOptions) (storage.OpenResult, error) {
+				scalar := attr
+				scalar.Metadata = nil
+				metadataBytes, err := storage.MetadataSize(attr.Metadata)
+				if err != nil {
+					return storage.OpenResult{}, err
+				}
+				if err := storage.CheckAttrResultBudget(ctx, scalar, int64(metadataBytes)); err != nil {
+					return storage.OpenResult{}, err
+				}
+				return storage.OpenResult{File: test.file, Attr: attr.Clone(), Outcome: storage.Created}, nil
+			}
+			smbTree.authority.raw = session
+			smbTree.export.share.DeleteIntentOwner = createTestOwner(t)
+			connection := &connection{server: smbTree.export.server}
+			request := createTestRequest(2)
+			request.Name = "new"
+			resolver := func(context.Context, *tree, string, namespaceReferenceRetainer, namespaceAuthorizer, namespaceActionFactory) (resolvedName, error) {
+				return createTestResolved(nil), nil
+			}
+			body, err := connection.createOpenWithResolver(t.Context(), smbTree, request, resolver)
+			smbTree.files.mu.Lock()
+			handles := len(smbTree.files.handles)
+			smbTree.files.mu.Unlock()
+			if body != nil || !errors.Is(err, test.err) || handles != 0 {
+				t.Fatalf("capability failure = %x, %v", body, err)
+			}
+			switch file := test.file.(type) {
+			case *incompleteCreateFile:
+				if file.closed != 1 {
+					t.Fatalf("missing-facet reference closes = %d", file.closed)
+				}
+			case *guardedCreateFile:
+				if file.closed != 1 {
+					t.Fatalf("check-failing reference closes = %d", file.closed)
+				}
+			}
+		})
 	}
 }
 

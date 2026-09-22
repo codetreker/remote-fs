@@ -54,10 +54,54 @@ func (c *connection) closeHandle(ctx context.Context, tree *tree, request wire.R
 	if handle == nil {
 		return nil, statusFileClosed
 	}
-	if err := tree.files.closeID(ctx, decoded.FileID, handle); err != nil {
+	capture := decoded.Flags&1 != 0
+	if capture {
+		if err := c.authorizeFileOperation(ctx, tree, storage.OpFileStat); err != nil {
+			if storage.ErrnoOf(err) == syscall.EINTR {
+				return nil, fileCommandStatus(err)
+			}
+			capture = false
+		}
+	}
+	var releaseResult func()
+	if capture {
+		releaseResult, err = reserveFileCommandResult(ctx, tree, false)
+		if err != nil {
+			if storage.ErrnoOf(err) == syscall.EINTR {
+				return nil, fileCommandStatus(err)
+			}
+			capture = false
+		} else {
+			defer releaseResult()
+			ctx = storage.WithBoundedAttrResult(ctx, tree.files.limits.MaxOpenResultBytes, func(_ storage.Attr, metadataBytes int64) error {
+				charge, err := storage.MetadataRetentionBytes(metadataBytes)
+				if err != nil {
+					return err
+				}
+				if charge+512 > tree.files.limits.MaxOpenResultBytes {
+					return syscall.EFBIG
+				}
+				return nil
+			})
+		}
+	}
+	attr, err := tree.files.closeIDWithAttr(ctx, decoded.FileID, handle, capture)
+	if err != nil {
 		return nil, fileCommandStatus(err)
 	}
-	// POSTQUERY_ATTRIB is optional. Returning Flags=0 avoids inventing a
-	// post-close attribute capture that did not participate in handle retirement.
-	return wire.CloseResponseBody(0, wire.FileInformation{}), statusOK
+	if !capture {
+		return wire.CloseResponseBody(0, wire.FileInformation{}), statusOK
+	}
+	if attr.ID != handle.nodeID {
+		return nil, statusIO
+	}
+	size, err := virtualFileSize(attr)
+	if err != nil {
+		return nil, fileCommandStatus(err)
+	}
+	information, err := captureCreateInformation(attr, size)
+	if err != nil {
+		return nil, fileCommandStatus(err)
+	}
+	return wire.CloseResponseBody(1, information), statusOK
 }

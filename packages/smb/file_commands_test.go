@@ -28,18 +28,64 @@ func TestCloseCommandAuthorizesRetiresAndReleasesHandle(t *testing.T) {
 		requests = append(requests, request)
 		return nil
 	})
-	reference := &handleReferenceProbe{}
+	attr := createTestAttr(t, 7, storage.NodeRegular, dosArchive)
+	attr.Size = 9
+	reference := &handleReferenceProbe{stat: func(ctx context.Context) (storage.Attr, error) {
+		scalar := attr
+		scalar.Metadata = nil
+		metadataBytes, err := storage.MetadataSize(attr.Metadata)
+		if err != nil {
+			return storage.Attr{}, err
+		}
+		if err := storage.CheckAttrResultBudget(ctx, scalar, int64(metadataBytes)); err != nil {
+			return storage.Attr{}, err
+		}
+		return attr.Clone(), nil
+	}}
 	id, _ := reserveFileHandle(t, registry, reference, 7)
 	connection := &connection{server: registry.tree.export.server}
 	body, status := connection.closeHandle(t.Context(), registry.tree, closeCommand(id, 1))
-	if status != statusOK || len(body) != 60 || binary.LittleEndian.Uint16(body) != 60 || binary.LittleEndian.Uint16(body[2:]) != 0 {
+	if status != statusOK || len(body) != 60 || binary.LittleEndian.Uint16(body) != 60 || binary.LittleEndian.Uint16(body[2:]) != 1 ||
+		binary.LittleEndian.Uint64(body[48:56]) != 9 {
 		t.Fatalf("CLOSE response = %x, %x", body, status)
 	}
-	if len(requests) != 1 || requests[0].Volume != "trusted" || requests[0].Operation != storage.OpFileClose {
+	if len(requests) != 2 || requests[0].Volume != "trusted" || requests[0].Operation != storage.OpFileClose ||
+		requests[1].Volume != "trusted" || requests[1].Operation != storage.OpFileStat {
 		t.Fatalf("authorization = %+v", requests)
 	}
 	if reference.calls() != 1 || registry.get(id) != nil {
 		t.Fatalf("handle cleanup calls=%d retained=%v", reference.calls(), registry.get(id) != nil)
+	}
+}
+
+func TestCloseCommandOmitsOptionalAttributesWhenStatAuthorizationIsDenied(t *testing.T) {
+	registry := newHandleTestRegistry(t, 1)
+	registry.tree.export.server.config.Authorize = authz.AuthorizerFunc(func(_ context.Context, request authz.AccessRequest) error {
+		if request.Operation == storage.OpFileStat {
+			return authz.ErrDenied
+		}
+		return nil
+	})
+	reference := &handleReferenceProbe{stat: func(context.Context) (storage.Attr, error) {
+		t.Fatal("denied optional capture reached reference")
+		return storage.Attr{}, nil
+	}}
+	id, _ := reserveFileHandle(t, registry, reference, 7)
+	connection := &connection{server: registry.tree.export.server}
+	body, status := connection.closeHandle(t.Context(), registry.tree, closeCommand(id, 1))
+	if status != statusOK || len(body) != 60 || binary.LittleEndian.Uint16(body[2:]) != 0 || reference.calls() != 1 {
+		t.Fatalf("optional postquery denial = %x, %#x, closes=%d", body, status, reference.calls())
+	}
+}
+
+func TestCloseCommandReportsCaptureFailureAfterReleasingHandle(t *testing.T) {
+	registry := newHandleTestRegistry(t, 1)
+	reference := &handleReferenceProbe{stat: func(context.Context) (storage.Attr, error) { return storage.Attr{}, syscall.EIO }}
+	id, _ := reserveFileHandle(t, registry, reference, 10)
+	connection := &connection{server: registry.tree.export.server}
+	body, status := connection.closeHandle(t.Context(), registry.tree, closeCommand(id, 1))
+	if body != nil || status != statusIO || reference.calls() != 1 || registry.get(id) != nil {
+		t.Fatalf("postquery failure = %x, %#x, closes=%d, retained=%v", body, status, reference.calls(), registry.get(id) != nil)
 	}
 }
 

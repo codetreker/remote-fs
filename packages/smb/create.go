@@ -452,6 +452,27 @@ func executeCreatePlan(ctx context.Context, tree *tree, reservation *openReserva
 			return nil, false, err
 		}
 	}
+	var opener storage.AtomicFileOpener
+	var references storage.NodeReferences
+	if plan.file != nil {
+		var ok bool
+		opener, ok = tree.authority.raw.(storage.AtomicFileOpener)
+		if !ok {
+			return nil, false, syscall.EOPNOTSUPP
+		}
+		if err := opener.CheckAtomicFileOpen(); err != nil {
+			return nil, false, err
+		}
+	} else {
+		var ok bool
+		references, ok = tree.authority.raw.(storage.NodeReferences)
+		if !ok {
+			return nil, false, syscall.EOPNOTSUPP
+		}
+		if err := references.CheckNodeReferences(); err != nil {
+			return nil, false, err
+		}
+	}
 	if intent := createPlanDeleteIntent(plan); intent != "" {
 		reservation.setDeleteIntent(intent)
 	}
@@ -462,24 +483,10 @@ func executeCreatePlan(ctx context.Context, tree *tree, reservation *openReserva
 	var attr storage.Attr
 	var outcome storage.OpenOutcome
 	if plan.file != nil {
-		opener, ok := tree.authority.raw.(storage.AtomicFileOpener)
-		if !ok {
-			return nil, false, syscall.EOPNOTSUPP
-		}
-		if err := opener.CheckAtomicFileOpen(); err != nil {
-			return nil, false, err
-		}
 		result, failure := opener.OpenAt(call, plan.name.selection, *plan.file)
 		reservation.attachFile(result)
 		reference, attr, outcome, err = result.File, result.Attr, result.Outcome, failure
 	} else {
-		references, ok := tree.authority.raw.(storage.NodeReferences)
-		if !ok {
-			return nil, false, syscall.EOPNOTSUPP
-		}
-		if err := references.CheckNodeReferences(); err != nil {
-			return nil, false, err
-		}
 		var result storage.NodeOpenResult
 		if plan.name.root {
 			result, err = references.OpenNodeRef(call, plan.name.rootID, *plan.node)
@@ -492,6 +499,9 @@ func executeCreatePlan(ctx context.Context, tree *tree, reservation *openReserva
 	if err != nil {
 		retry := errors.Is(err, storage.ErrConditionConflict) && storage.ErrnoOf(err) == syscall.EAGAIN &&
 			reference == nil && zeroCreateAttr(attr) && outcome == 0
+		if retry {
+			reservation.discardDeleteIntent()
+		}
 		if !retry && (reference != nil || !zeroCreateAttr(attr) || outcome != 0) {
 			err = errors.Join(err, syscall.EIO)
 		}
