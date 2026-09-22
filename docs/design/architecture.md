@@ -4,11 +4,11 @@
 
 ## 一、两个角色
 
-系统只有两个角色，它们运行在不同的机器上，通过 HTTP 交互。
+系统只有两个角色，它们运行在不同的机器上，通过 HTTP 交互。Linux 内核通过 FUSE、Windows 系统 SMB client 通过本机 loopback SMB 进入 client；这些平台协议不越过 client/server 边界。
 
 **server** —— volume 与文件占有的权威持有者。它将原生支持发布检查的 **storage** 与对应锁服务配对，经 HTTP 暴露出去。volume 的事实、有效授权和修改顺序以这里为准。
 
-**client** —— volume 的使用者。它通过 remote storage 的路径接口与保留文件接口访问数据，通过中立 Use/range 能力协调访问，并通过显式 S/X 控制取得与核对强权限；client 侧还负责把 volume 呈现为本地目录。普通文件打开不自动执行占有策略。
+**client** —— volume 的使用者。它通过 remote storage 的路径接口与保留文件接口访问数据，通过中立 Use/range 能力协调访问，并通过显式 S/X 控制取得与核对强权限；client 侧把 volume 呈现为 Linux 本地目录，并提供 Windows 本机 SMB 的安全会话端点。Windows 文件命令不在该端点的支持面。普通文件打开不自动执行占有策略。
 
 一个 server 面对多个 client（R-CON-1）。client 之间不直接通信。
 
@@ -17,8 +17,10 @@
 ```mermaid
 flowchart LR
     subgraph client[client]
-        App[普通文件操作] --> Fuse[挂载呈现层]
+        LinuxApp[Linux 文件操作] --> Fuse[FUSE 呈现层]
+        WindowsApp[Windows SMB client] --> SMB[本机 SMB 端点]
         Fuse --> Replica[本地元数据副本]
+        SMB --> Remote
         Replica --> Remote[remote storage]
         SDK[显式 S/X 控制]
         Fuse -. 文件引用、Uses 与范围 .-> Replica
@@ -64,6 +66,8 @@ client 侧的 remote storage 与 server 侧的 storage **实现同一份 `storag
 基础 storage 描述 volume 操作，锁控制描述跨请求的占有与核对，HTTP 同时承载它们和复制。各自的义务不能由另一层猜测补齐。
 
 **平台解释到客户端为止。** 底层提供按路径寻址的基础 volume、FileStorage 的保留 File/NodeReference、按父身份寻址的原子子项操作与完整目录观察，以及以 NodeKind、opaque metadata、目录 revision、原始名字、Uses、pending deletion 和 range 表达的中立能力。FUSE 解释 POSIX 权限、kernel owner、flock 与 record lock；远端不解释平台 mode、名字规则或锁协议。对象在 rename、unlink 或覆盖后的存活由服务端保留引用保证，不由旧路径重建。
+
+Windows client 内的 SMB endpoint 同样停在这条边界：SMB 3.1.1、SSPI、SID／登录会话、share 名和协议状态只存在于 client。endpoint 通过可信配置把 share 映射到一份 FileStorage；远端 storage 与 HTTP 不出现 SMB 状态码、Windows 主体或网络协议对象。endpoint 的支持面是 secure session/tree foundation，不包含文件命令，见[本机 SMB 端点](client/smb-endpoint.md)。
 
 **节点身份在契约里**（R-FS-5）。属性带一个 `ID`，说的是「这个名字后面是哪个节点」，与它此刻叫什么无关。挂载呈现层分不出这件事就会把两个活着的节点报成一个：一个描述符会读到别人的字节，而 mmap 了它的程序拿到 SIGBUS。而挂载点只直接观测到自己执行的操作，别的客户端做的改名不经过它的任何一条路径，所以这个答案只能由 volume 给。
 
@@ -190,7 +194,7 @@ remote-fs ──▶ 建立 remote storage，先访问一次根，确认 server �
 | 角色 | 作为库嵌入 | 作为独立二进制 |
 |---|---|---|
 | server | `packages/transport/httprest` 提供一个 `http.Handler`，链接进集成方既有的 server | `cmd/remote-fs-server`：服务 Azure Blob + SQLite，或同一私有目录中的本地对象 + SQLite |
-| client | `packages/transport/httprest` 与 `packages/fuse` 链接进集成方既有的 daemon service | `cmd/remote-fs`：把一个 server 的 volume 挂到本地目录 |
+| client | `packages/transport/httprest`、`packages/fuse` 或 `packages/smb` 链接进集成方既有的 daemon／Windows 进程 | `cmd/remote-fs`：把一个 server 的 volume 挂到 Linux 本地目录；不提供 Windows WNet 二进制 |
 
 client 侧还有第三种用法：只使用 remote storage，不挂载（R-INT-5）。这条路径不依赖 FUSE，因此不受 Linux 限制。
 
@@ -208,6 +212,7 @@ client 侧还有第三种用法：只使用 remote storage，不挂载（R-INT-5
 - `server/file-handles.md` —— 保留对象、同步修改、中立 metadata、Uses/range 与文件会话协议
 - `server/authorization.md` —— 嵌入方策略、语义操作、请求与流的授权和安全错误
 - `client/architecture.md` —— remote storage、挂载呈现层、打开的文件、节点身份、生命周期
+- `client/smb-endpoint.md` —— Windows 本机 SMB 3.1.1 endpoint、身份、签名、share 与 session 生命周期
 
 第二层只写角色内部，不重讲系统全貌，跨角色只通过本文定义的接口与契约来引用。
 
@@ -241,6 +246,8 @@ packages/                    可被外部与自身 import
     httprest/                HTTP：URL 与消息的形状、服务端、拨号端
   fuse/                      挂载呈现层：FUSE 与 Linux owner/属性政策
     posix/                   POSIX 权限 metadata codec
+  smb/                       Windows 本机 SMB 3.1.1 endpoint 与 session/tree/export 生命周期
+    windows/                 SSPI authentication 与本机 Windows identity policy
 
 cmd/                         二进制，不被 import
   remote-fs/                 把一个 server 的 volume 挂到本地目录
@@ -265,8 +272,9 @@ docs/
 | `storage/limited` | server 侧 |
 | `transport/httprest` | 两个角色共用：服务端在 server 侧，拨号端在 client 侧 |
 | `fuse` | client 侧 |
+| `smb`、`smb/windows` | client 侧：同机 Windows SMB 呈现、SSPI 身份与有界 endpoint 生命周期 |
 
-这些拆分各自守住一条依赖或 ownership 边界：`storage` 与实现分开，使第三方实现自有存储时只需引入接口（R-INT-6）；配额自成 `storage/limited`，因为它是一层包装而不是某一个实现的性质（R-WS-5、R-INT-3）；`metastore` 与 `storage/objectstore` 分开，因为名字树不持有文件字节，而对象接口不认识路径；`storage/localstore` 负责把两个 durable half、WAL 外部见证、store identity、初始化与 lifetime lock 组合成一个资源，避免这些规则散落在二进制里；契约用例分别属于 `storage/storagetest`、`objectstore/objectstoretest` 与 `metastore/metastoretest`；每种传输自成 `transport/` 下的一个包（R-INT-9、R-INT-10）；`fuse` 与传输分开，使得不挂载的使用者不被 FUSE 与平台限制绑住（R-INT-5、R-INT-8）。
+这些拆分各自守住一条依赖或 ownership 边界：`storage` 与实现分开，使第三方实现自有存储时只需引入接口（R-INT-6）；配额自成 `storage/limited`，因为它是一层包装而不是某一个实现的性质（R-WS-5、R-INT-3）；`metastore` 与 `storage/objectstore` 分开，因为名字树不持有文件字节，而对象接口不认识路径；`storage/localstore` 负责把两个 durable half、WAL 外部见证、store identity、初始化与 lifetime lock 组合成一个资源，避免这些规则散落在二进制里；契约用例分别属于 `storage/storagetest`、`objectstore/objectstoretest` 与 `metastore/metastoretest`；每种远端传输自成 `transport/` 下的一个包（R-INT-9、R-INT-10）；`fuse` 与 `smb` 各自承担一个平台呈现层，使只选择 Linux、Windows 或不挂载访问的集成方不承担其它入口的依赖（R-INT-1、R-INT-8）。
 
 SQLite 的公开类型、单一发布协调器与内部组件的归属见[SQLite 内部模块](server/sqlite-modules.md)。该目录划分不改变 Store、Replica 或它们的调用方角色。
 
