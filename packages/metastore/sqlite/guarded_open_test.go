@@ -48,10 +48,11 @@ func TestGuardedChildOpenRejectsAChangedDirectoryWithoutPartialEffects(t *testin
 	}
 
 	intent := storage.DeleteIntentID("33333333333333333333333333333333")
+	owner := storage.DeleteIntentOwner("guarded-open-owner")
 	result, err := store.OpenAt(t.Context(), selection, storage.OpenAtOptions{
 		Read: true, Write: true, Target: storage.ChildCondition{State: storage.SameNode, NodeID: uint64(file.ID)},
 		Action: fileAction(t), Use: storage.UseClaim{Uses: storage.ReadData | storage.WriteData | storage.DeleteName, Deny: storage.ReadData}, Existing: storage.ResetContent,
-		CloseIntent: &storage.CloseIntent{ID: intent, Trigger: storage.OnReferenceClose, Condition: storage.UnlinkFile},
+		CloseIntent: &storage.CloseIntent{ID: intent, Owner: owner, Trigger: storage.OnReferenceClose, Condition: storage.UnlinkFile},
 	})
 	if !errors.Is(err, storage.ErrConditionConflict) || result.File != nil || result.State.ID != 0 || result.Outcome != 0 {
 		t.Fatalf("stale guarded open = %+v, %v", result, err)
@@ -59,7 +60,7 @@ func TestGuardedChildOpenRejectsAChangedDirectoryWithoutPartialEffects(t *testin
 	if current, err := store.Stat(t.Context(), "file"); err != nil || current.ID != file.ID {
 		t.Fatalf("failed guarded open changed the selected file: %+v, %v", current, err)
 	}
-	if status, err := store.QueryDeleteIntent(t.Context(), intent); err != nil || status.Outcome != storage.DeleteIntentUnknown {
+	if status, err := store.QueryDeleteIntent(t.Context(), owner, intent); err != nil || status.Outcome != storage.DeleteIntentUnknown {
 		t.Fatalf("failed guarded open armed a close intent: %+v, %v", status, err)
 	}
 	probe, err := store.OpenAt(t.Context(), storage.ChildSelection{Name: selection.Name}, storage.OpenAtOptions{

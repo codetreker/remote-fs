@@ -23,12 +23,12 @@ const (
 	// reference HTTP server can produce concurrently.
 	DefaultMaxSnapshotReaderConnections = 16
 
-	// DefaultMaxIntegrityRecords bounds the volume, node, object, entry, log, and change rows
-	// examined by one integrity pass when the caller supplies no limit of its own.
+	// DefaultMaxIntegrityRecords bounds durable rows examined by one integrity pass when the
+	// caller supplies no limit of its own.
 	DefaultMaxIntegrityRecords int64 = 1_000_000
 
-	// DefaultMaxIntegrityBytes bounds variable-length volume and log fields examined by
-	// one full integrity pass.
+	// DefaultMaxIntegrityBytes bounds variable-length names and deletion-intent owners
+	// examined by one full integrity pass.
 	DefaultMaxIntegrityBytes int64 = 64 << 20
 
 	// DefaultMaxMetadataBytes bounds canonical opaque metadata retained by current nodes
@@ -73,14 +73,13 @@ type Options struct {
 	// snapshots. Zero selects DefaultMaxSnapshotReaderConnections.
 	MaxSnapshotReaderConnections int
 
-	// MaxIntegrityRecords bounds the volume, node, object, entry, log, and change rows
-	// accepted by an integrity pass. A larger retained volume returns syscall.EFBIG before
-	// recursive traversal or row validation. Zero selects DefaultMaxIntegrityRecords.
+	// MaxIntegrityRecords bounds rows accepted by an integrity pass. A larger retained volume
+	// returns syscall.EFBIG before recursive traversal or row validation. Zero selects
+	// DefaultMaxIntegrityRecords.
 	MaxIntegrityRecords int64
 
-	// MaxIntegrityBytes bounds the combined entry and retained-change name bytes examined by
-	// a full integrity pass before content-sensitive validation. Zero selects
-	// DefaultMaxIntegrityBytes.
+	// MaxIntegrityBytes bounds combined entry, retained-change, deletion-intent name, and owner
+	// bytes examined before content-sensitive validation. Zero selects DefaultMaxIntegrityBytes.
 	MaxIntegrityBytes int64
 
 	// MaxMetadataBytes bounds stored metadata independently of content quota and name-byte

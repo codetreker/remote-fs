@@ -524,29 +524,37 @@ func (f *retainedFile) dropUseLocked(ctx context.Context) error {
 }
 
 func (f *retainedFile) Close(ctx context.Context) error {
+	_, err := f.closeWithResult(ctx)
+	return err
+}
+
+func (f *retainedFile) closeWithResult(ctx context.Context) (storage.ReferenceCloseResult, error) {
 	if err := f.store.coordinator.commit.acquire(ctx); err != nil {
-		return err
+		return storage.ReferenceCloseResult{}, err
 	}
 	defer f.store.coordinator.commit.release()
 	terminalResult := f.retireResult
 	if !f.useDropped {
 		if err := f.retireLocked(ctx); err != nil {
-			return sqlerr.Failure(err)
+			return storage.ReferenceCloseResult{}, sqlerr.Failure(err)
 		}
 		terminalResult = f.retireResult
 		if err := f.dropUseLocked(ctx); err != nil {
-			return errors.Join(sqlerr.Failure(terminalResult), sqlerr.Failure(err))
+			return storage.ReferenceCloseResult{}, errors.Join(sqlerr.Failure(terminalResult), sqlerr.Failure(err))
 		}
 		f.useDropped = true
 	}
-	if f.closed || f.closeErr != nil {
-		return f.closeErr
+	if f.closed {
+		return storage.ReferenceCloseResult{Released: true}, f.closeErr
+	}
+	if f.closeErr != nil {
+		return storage.ReferenceCloseResult{}, f.closeErr
 	}
 	s := f.store
 	key := retainedNode{s.volume, f.id}
 	count := s.coordinator.pins[key]
 	if count < 1 {
-		return syscall.EIO
+		return storage.ReferenceCloseResult{}, syscall.EIO
 	}
 	if count == 1 {
 		var state metastore.ReferenceState
@@ -556,7 +564,7 @@ func (f *retainedFile) Close(ctx context.Context) error {
 			return err
 		})
 		if err != nil {
-			return sqlerr.Failure(err)
+			return storage.ReferenceCloseResult{}, sqlerr.Failure(err)
 		}
 		if state.PendingUnlink {
 			err = s.finalizePendingUnlinkLocked(ctx, f.id)
@@ -572,9 +580,9 @@ func (f *retainedFile) Close(ctx context.Context) error {
 				if s.locks != nil {
 					s.locks.Fence(f.closeErr)
 				}
-				return errors.Join(sqlerr.Failure(terminalResult), f.closeErr)
+				return storage.ReferenceCloseResult{}, errors.Join(sqlerr.Failure(terminalResult), f.closeErr)
 			}
-			return errors.Join(sqlerr.Failure(terminalResult), sqlerr.Failure(err))
+			return storage.ReferenceCloseResult{}, errors.Join(sqlerr.Failure(terminalResult), sqlerr.Failure(err))
 		}
 		delete(s.coordinator.pins, key)
 	} else {
@@ -584,7 +592,7 @@ func (f *retainedFile) Close(ctx context.Context) error {
 	s.fileDomain.files--
 	f.closed = true
 	f.closeErr = sqlerr.Failure(terminalResult)
-	return f.closeErr
+	return storage.ReferenceCloseResult{Released: true}, f.closeErr
 }
 
 type fileDomain struct {

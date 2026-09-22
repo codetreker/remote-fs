@@ -123,6 +123,9 @@ func (r *retainedNodeReference) SetAttr(ctx context.Context, change storage.Attr
 func (r *retainedNodeReference) Retire(ctx context.Context) error  { return r.file.Retire(ctx) }
 func (r *retainedNodeReference) DropUse(ctx context.Context) error { return r.file.DropUse(ctx) }
 func (r *retainedNodeReference) Close(ctx context.Context) error   { return r.file.Close(ctx) }
+func (r *retainedNodeReference) CloseWithResult(ctx context.Context) (storage.ReferenceCloseResult, error) {
+	return r.file.closeWithResult(ctx)
+}
 func (r *retainedNodeReference) Order(ctx context.Context, transition func() error) error {
 	return r.file.Order(ctx, transition)
 }

@@ -13,6 +13,8 @@ import (
 	"github.com/codetreker/remote-fs/packages/storage"
 )
 
+const deleteIntentOwner = storage.DeleteIntentOwner("sqlite-test-owner")
+
 func fileAction(t *testing.T) storage.FileActionID {
 	t.Helper()
 	id, err := storage.NewFileActionID(1)
@@ -28,6 +30,20 @@ func accountingContext(t *testing.T, calls *[][2]int64) context.Context {
 		*calls = append(*calls, [2]int64{previous, next})
 		return func(storage.PublicationResult) error { return nil }, nil
 	})
+}
+
+type stagedCancellationContext struct {
+	context.Context
+	errChecks int
+}
+
+func (*stagedCancellationContext) Done() <-chan struct{} { return nil }
+func (c *stagedCancellationContext) Err() error {
+	c.errChecks++
+	if c.errChecks > 1 {
+		return context.Canceled
+	}
+	return nil
 }
 
 func TestConditionalPublicationAppliesMetadataWithTheContentRevision(t *testing.T) {
@@ -347,13 +363,13 @@ func TestCloseDeleteIntentFollowsRenameWithoutDeletingTheSuccessor(t *testing.T)
 		Read: true, Create: true, Exclusive: true, Target: storage.ChildCondition{State: storage.Absent},
 		Action: fileAction(t), Existing: storage.Keep,
 		Use:         storage.UseClaim{Uses: storage.ReadData | storage.DeleteName},
-		CloseIntent: &storage.CloseIntent{ID: intentID, Trigger: storage.OnReferenceClose, Condition: storage.UnlinkFile},
+		CloseIntent: &storage.CloseIntent{ID: intentID, Owner: deleteIntentOwner, Trigger: storage.OnReferenceClose, Condition: storage.UnlinkFile},
 	})
 
 	if err != nil {
 		t.Fatal(err)
 	}
-	status, err := store.QueryDeleteIntent(t.Context(), intentID)
+	status, err := store.QueryDeleteIntent(t.Context(), deleteIntentOwner, intentID)
 	if err != nil || status.Outcome != storage.DeleteIntentArmed || status.NodeID != opened.State.Attr().ID {
 		t.Fatalf("armed status = %+v, %v", status, err)
 	}
@@ -390,7 +406,7 @@ func TestCloseDeleteIntentFollowsRenameWithoutDeletingTheSuccessor(t *testing.T)
 	if got, err := store.Stat(t.Context(), "name"); err != nil || got.ID != successor.ID {
 		t.Fatalf("successor after original close = %+v, %v", got, err)
 	}
-	status, err = store.QueryDeleteIntent(t.Context(), intentID)
+	status, err = store.QueryDeleteIntent(t.Context(), deleteIntentOwner, intentID)
 	if err != nil || status.Outcome != storage.DeleteIntentCompleted {
 		t.Fatalf("completed status = %+v, %v", status, err)
 	}
@@ -414,9 +430,13 @@ func TestRecoveredDeleteIntentCompletesAndRemainsQueryable(t *testing.T) {
 	if _, err := store.write.ExecContext(t.Context(), `UPDATE nodes SET pending_generation=1 WHERE volume=? AND id=?`, store.volume, node.ID); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := store.write.ExecContext(t.Context(), `UPDATE volumes SET delete_intent_high_water=1 WHERE id=?`, store.volume); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := store.write.ExecContext(t.Context(), `INSERT INTO delete_intents
-		(intent,volume,node,parent,name,reference,request_hash,if_empty,outcome,failure,updated_sec,updated_nsec)
-		VALUES(?,?,?,?,?,?,?,?,?,NULL,0,0)`, string(intentID), store.volume, node.ID, store.root, []byte("victim"),
+		(intent,volume,owner,sequence,node,parent,name,reference,request_hash,if_empty,outcome,failure,updated_sec,updated_nsec)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,NULL,0,0)`, string(intentID), store.volume, string(deleteIntentOwner), 1,
+		node.ID, store.root, []byte("victim"),
 		make([]byte, 16), make([]byte, 32), false, storage.DeleteIntentArmed); err != nil {
 		t.Fatal(err)
 	}
@@ -432,16 +452,20 @@ func TestRecoveredDeleteIntentCompletesAndRemainsQueryable(t *testing.T) {
 	if _, err := reopened.Stat(t.Context(), "victim"); !errors.Is(err, syscall.ENOENT) {
 		t.Fatalf("recovered name = %v", err)
 	}
-	status, err := reopened.QueryDeleteIntent(t.Context(), intentID)
+	page, err := reopened.ListDeleteIntents(t.Context(), deleteIntentOwner, 0, 1)
+	if err != nil || len(page.Intents) != 1 || page.Intents[0].ID != intentID || page.Next == 0 {
+		t.Fatalf("recovered discovery page = %+v, %v", page, err)
+	}
+	status, err := reopened.QueryDeleteIntent(t.Context(), deleteIntentOwner, intentID)
 	if err != nil || status.Outcome != storage.DeleteIntentCompleted || status.NodeID != uint64(node.ID) {
 		t.Fatalf("recovered status = %+v, %v", status, err)
 	}
 	if err := reopened.AcknowledgeDeleteIntent(t.Context(), storage.AcknowledgeDeleteIntentCommand{
-		Action: fileAction(t), Intent: intentID,
+		Action: fileAction(t), Owner: deleteIntentOwner, Intent: intentID,
 	}); err != nil {
 		t.Fatal(err)
 	}
-	status, err = reopened.QueryDeleteIntent(t.Context(), intentID)
+	status, err = reopened.QueryDeleteIntent(t.Context(), deleteIntentOwner, intentID)
 	if err != nil || status.Outcome != storage.DeleteIntentUnknown || status.NodeID != 0 {
 		t.Fatalf("acknowledged status = %+v, %v", status, err)
 	}
@@ -462,7 +486,7 @@ func TestDeleteCleanupFailureIsReportedAndRetryable(t *testing.T) {
 		Read: true, Create: true, Exclusive: true, Existing: storage.Keep, Action: fileAction(t),
 		Target:      storage.ChildCondition{State: storage.Absent},
 		Use:         storage.UseClaim{Uses: storage.ReadData | storage.DeleteName},
-		CloseIntent: &storage.CloseIntent{ID: intentID, Trigger: storage.OnReferenceClose, Condition: storage.UnlinkFile},
+		CloseIntent: &storage.CloseIntent{ID: intentID, Owner: deleteIntentOwner, Trigger: storage.OnReferenceClose, Condition: storage.UnlinkFile},
 	})
 
 	if err != nil {
@@ -480,19 +504,19 @@ func TestDeleteCleanupFailureIsReportedAndRetryable(t *testing.T) {
 	if err := opened.File.Close(ctx); !errors.Is(err, refused) {
 		t.Fatalf("failed close = %v", err)
 	}
-	status, err := store.QueryDeleteIntent(t.Context(), intentID)
+	status, err := store.QueryDeleteIntent(t.Context(), deleteIntentOwner, intentID)
 	if err != nil || status.Outcome != storage.DeleteIntentCleanupFailed || status.Failure == 0 {
 		t.Fatalf("cleanup-failed status = %+v, %v", status, err)
 	}
 	if err := store.AcknowledgeDeleteIntent(t.Context(), storage.AcknowledgeDeleteIntentCommand{
-		Action: fileAction(t), Intent: intentID,
+		Action: fileAction(t), Owner: deleteIntentOwner, Intent: intentID,
 	}); !errors.Is(err, syscall.EBUSY) {
 		t.Fatalf("cleanup-failed acknowledgement = %v", err)
 	}
 	if err := opened.File.Close(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	status, err = store.QueryDeleteIntent(t.Context(), intentID)
+	status, err = store.QueryDeleteIntent(t.Context(), deleteIntentOwner, intentID)
 	if err != nil || status.Outcome != storage.DeleteIntentCompleted {
 		t.Fatalf("retried cleanup status = %+v, %v", status, err)
 	}
@@ -547,27 +571,73 @@ func TestNotExecutedCloseIntentStillReleasesTheReference(t *testing.T) {
 	opened, err := store.OpenChildRef(t.Context(), storage.ChildSelection{Name: storage.ChildName{Parent: directoryTarget(root), RawLeaf: []byte("dir")}}, storage.NodeRefOptions{
 		Kind: storage.NodeDirectory, Target: storage.ChildCondition{State: storage.SameNode, NodeID: uint64(directory.ID)},
 		Action: fileAction(t), Use: storage.UseClaim{Uses: storage.DeleteName}, MetadataAccess: storage.ReadMetadata,
-		CloseIntent: &storage.CloseIntent{ID: intentID, Trigger: storage.OnReferenceClose, Condition: storage.UnlinkIfEmpty},
+		CloseIntent: &storage.CloseIntent{ID: intentID, Owner: deleteIntentOwner, Trigger: storage.OnReferenceClose, Condition: storage.UnlinkIfEmpty},
 	})
 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := opened.Reference.Close(t.Context()); !errors.Is(err, syscall.ENOTEMPTY) {
-		t.Fatalf("nonempty close = %v", err)
+	result, err := opened.Reference.CloseWithResult(t.Context())
+	if !result.Released || !errors.Is(err, syscall.ENOTEMPTY) {
+		t.Fatalf("nonempty close = %+v, %v", result, err)
 	}
-	if err := opened.Reference.Close(t.Context()); !errors.Is(err, syscall.ENOTEMPTY) {
-		t.Fatalf("replayed nonempty close = %v", err)
+	result, err = opened.Reference.CloseWithResult(t.Context())
+	if !result.Released || !errors.Is(err, syscall.ENOTEMPTY) {
+		t.Fatalf("replayed nonempty close = %+v, %v", result, err)
 	}
 	if _, err := opened.Reference.Node(t.Context()); !errors.Is(err, syscall.ESTALE) {
 		t.Fatalf("reference remained active after terminal close result: %v", err)
 	}
-	status, err := store.QueryDeleteIntent(t.Context(), intentID)
+	status, err := store.QueryDeleteIntent(t.Context(), deleteIntentOwner, intentID)
 	if err != nil || status.Outcome != storage.DeleteIntentNotExecuted {
 		t.Fatalf("not-executed status = %+v, %v", status, err)
 	}
 	if _, err := store.Stat(t.Context(), "dir/child"); err != nil {
 		t.Fatalf("failed deletion changed directory: %v", err)
+	}
+}
+
+func TestCloseResultDoesNotReleaseAfterTerminalIntentWhenUseCleanupFails(t *testing.T) {
+	store, err := OpenLocking(t.Context(), lockingTestConfig(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.Mkdir(t.Context(), "dir"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Create(t.Context(), "dir/child"); err != nil {
+		t.Fatal(err)
+	}
+	root, err := store.Stat(t.Context(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	directory, err := store.Stat(t.Context(), "dir")
+	if err != nil {
+		t.Fatal(err)
+	}
+	opened, err := store.OpenChildRef(t.Context(), storage.ChildSelection{Name: storage.ChildName{
+		Parent: directoryTarget(root), RawLeaf: []byte("dir"),
+	}}, storage.NodeRefOptions{
+		Kind: storage.NodeDirectory, Target: storage.ChildCondition{State: storage.SameNode, NodeID: uint64(directory.ID)},
+		Action: fileAction(t), Use: storage.UseClaim{Uses: storage.DeleteName}, MetadataAccess: storage.ReadMetadata,
+		CloseIntent: &storage.CloseIntent{ID: storage.DeleteIntentID("44444444444444444444444444444444"),
+			Owner: deleteIntentOwner, Trigger: storage.OnReferenceClose, Condition: storage.UnlinkIfEmpty},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := opened.Reference.Retire(t.Context()); err != nil {
+		t.Fatalf("retiring nonempty directory = %v", err)
+	}
+	result, err := opened.Reference.CloseWithResult(&stagedCancellationContext{Context: t.Context()})
+	if result.Released || !errors.Is(err, syscall.ENOTEMPTY) || !errors.Is(err, context.Canceled) {
+		t.Fatalf("close with failed use cleanup = %+v, %v", result, err)
+	}
+	result, err = opened.Reference.CloseWithResult(t.Context())
+	if !result.Released || !errors.Is(err, syscall.ENOTEMPTY) {
+		t.Fatalf("retried close = %+v, %v", result, err)
 	}
 }
 
@@ -665,7 +735,7 @@ func TestPendingDeletePublishesTheRemovedRegularBytes(t *testing.T) {
 		Read: true, Write: true, Create: true, Exclusive: true, Existing: storage.Keep, Action: fileAction(t),
 		Target:      storage.ChildCondition{State: storage.Absent},
 		Use:         storage.UseClaim{Uses: storage.ReadData | storage.WriteData | storage.DeleteName},
-		CloseIntent: &storage.CloseIntent{ID: storage.DeleteIntentID("33333333333333333333333333333333"), Trigger: storage.OnReferenceClose, Condition: storage.UnlinkFile},
+		CloseIntent: &storage.CloseIntent{ID: storage.DeleteIntentID("33333333333333333333333333333333"), Owner: deleteIntentOwner, Trigger: storage.OnReferenceClose, Condition: storage.UnlinkFile},
 	})
 
 	if err != nil {

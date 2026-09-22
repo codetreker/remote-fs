@@ -162,10 +162,11 @@ func deleteIntentHash(node, parent int64, name []byte, intent storage.CloseInten
 	payload := struct {
 		Node, Parent int64
 		Name         []byte
+		Owner        storage.DeleteIntentOwner
 		Condition    storage.UnlinkCondition
 		Metadata     map[string][]byte
 		Uses         []storage.TargetUse
-	}{node, parent, name, intent.Condition, metadata, uses}
+	}{node, parent, name, intent.Owner, intent.Condition, metadata, uses}
 	encoded, err := json.Marshal(payload)
 	if err != nil {
 		return [32]byte{}, err
@@ -246,11 +247,27 @@ func (s *Store) armCloseIntent(ctx context.Context, tx *sql.Tx, f *retainedFile,
 	if count >= int64(s.maxDeleteIntents) {
 		return syscall.EAGAIN
 	}
+	result, err := tx.ExecContext(ctx, `UPDATE volumes
+		SET delete_intent_high_water=delete_intent_high_water+1
+		WHERE id=? AND delete_intent_high_water<?`, s.volume, int64(math.MaxInt64))
+	if err != nil {
+		return err
+	}
+	if count, err := result.RowsAffected(); err != nil {
+		return err
+	} else if count != 1 {
+		return fmt.Errorf("volume %d exhausted its deletion-intent sequence: %w", s.volume, syscall.EOVERFLOW)
+	}
+	var sequence int64
+	if err := tx.QueryRowContext(ctx, `SELECT delete_intent_high_water FROM volumes WHERE id=?`, s.volume).Scan(&sequence); err != nil {
+		return err
+	}
 	now := time.Now()
 	_, err = tx.ExecContext(ctx, `INSERT INTO delete_intents
-		(intent,volume,node,parent,name,reference,request_hash,if_empty,outcome,failure,updated_sec,updated_nsec)
-		VALUES(?,?,?,?,?,?,?,?,?,NULL,?,?)`, string(intent.ID), s.volume, f.id, parent, name, reference,
-		hash[:], intent.Condition == storage.UnlinkIfEmpty, storage.DeleteIntentArmed, now.Unix(), now.Nanosecond())
+		(intent,volume,owner,sequence,node,parent,name,reference,request_hash,if_empty,outcome,failure,updated_sec,updated_nsec)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,NULL,?,?)`, string(intent.ID), s.volume, string(intent.Owner), sequence,
+		f.id, parent, name, reference, hash[:], intent.Condition == storage.UnlinkIfEmpty,
+		storage.DeleteIntentArmed, now.Unix(), now.Nanosecond())
 	if err == nil {
 		f.closeIntent = intent.ID
 	}
@@ -373,7 +390,10 @@ func (f *retainedFile) ClearPendingUnlink(ctx context.Context, command storage.C
 	return state, sqlerr.Failure(err)
 }
 
-func (s *Store) QueryDeleteIntent(ctx context.Context, id storage.DeleteIntentID) (storage.DeleteIntentStatus, error) {
+func (s *Store) QueryDeleteIntent(ctx context.Context, owner storage.DeleteIntentOwner, id storage.DeleteIntentID) (storage.DeleteIntentStatus, error) {
+	if err := owner.Check(); err != nil {
+		return storage.DeleteIntentStatus{}, err
+	}
 	if err := id.Check(); err != nil {
 		return storage.DeleteIntentStatus{}, err
 	}
@@ -387,7 +407,10 @@ func (s *Store) QueryDeleteIntent(ctx context.Context, id storage.DeleteIntentID
 	status := storage.DeleteIntentStatus{ID: id}
 	err := s.inspect(ctx, func(tx *sql.Tx) error {
 		var node int64
-		if err := tx.QueryRowContext(ctx, `SELECT node,outcome FROM delete_intents WHERE volume=? AND intent=?`, s.volume, string(id)).Scan(&node, &status.Outcome); err != nil {
+		var failure sql.NullInt64
+		if err := tx.QueryRowContext(ctx, `SELECT node,outcome,failure FROM delete_intents
+			WHERE volume=? AND owner=? AND intent=?`, s.volume, string(owner), string(id)).Scan(
+			&node, &status.Outcome, &failure); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				status.Outcome = storage.DeleteIntentUnknown
 				return nil
@@ -399,14 +422,12 @@ func (s *Store) QueryDeleteIntent(ctx context.Context, id storage.DeleteIntentID
 		}
 		status.NodeID = uint64(node)
 		if status.Outcome == storage.DeleteIntentCleanupFailed {
-			var failure sql.NullInt64
-			if err := tx.QueryRowContext(ctx, `SELECT failure FROM delete_intents WHERE volume=? AND intent=?`, s.volume, string(id)).Scan(&failure); err != nil {
-				return err
-			}
 			if !failure.Valid || failure.Int64 <= 0 {
 				return syscall.EIO
 			}
 			status.Failure = syscall.Errno(failure.Int64)
+		} else if failure.Valid {
+			return syscall.EIO
 		}
 		return nil
 	})
@@ -414,6 +435,63 @@ func (s *Store) QueryDeleteIntent(ctx context.Context, id storage.DeleteIntentID
 		err = status.Check()
 	}
 	return status, sqlerr.Failure(err)
+}
+
+func (s *Store) ListDeleteIntents(
+	ctx context.Context,
+	owner storage.DeleteIntentOwner,
+	after storage.DeleteIntentCursor,
+	limit int,
+) (storage.DeleteIntentPage, error) {
+	if err := owner.Check(); err != nil {
+		return storage.DeleteIntentPage{}, err
+	}
+	if uint64(after) > math.MaxInt64 || limit < 1 || limit > storage.MaxDeleteIntentPageEntries {
+		return storage.DeleteIntentPage{}, syscall.EINVAL
+	}
+	if err := s.coordinator.commit.acquire(ctx); err != nil {
+		return storage.DeleteIntentPage{}, err
+	}
+	defer s.coordinator.commit.release()
+	if err := s.checkFileOwnership(); err != nil {
+		return storage.DeleteIntentPage{}, err
+	}
+	page := storage.DeleteIntentPage{Next: after}
+	err := s.inspect(ctx, func(tx *sql.Tx) error {
+		rows, err := tx.QueryContext(ctx, `SELECT sequence,intent,node,outcome,failure
+			FROM delete_intents WHERE volume=? AND owner=? AND sequence>?
+			ORDER BY sequence LIMIT ?`, s.volume, string(owner), int64(after), limit)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var sequence int64
+			var status storage.DeleteIntentStatus
+			var failure sql.NullInt64
+			if err := rows.Scan(&sequence, &status.ID, &status.NodeID, &status.Outcome, &failure); err != nil {
+				return err
+			}
+			if sequence < 1 || uint64(sequence) <= uint64(page.Next) {
+				return syscall.EIO
+			}
+			if status.Outcome == storage.DeleteIntentCleanupFailed {
+				if !failure.Valid || failure.Int64 <= 0 {
+					return syscall.EIO
+				}
+				status.Failure = syscall.Errno(failure.Int64)
+			} else if failure.Valid {
+				return syscall.EIO
+			}
+			if err := status.Check(); err != nil {
+				return syscall.EIO
+			}
+			page.Intents = append(page.Intents, status)
+			page.Next = storage.DeleteIntentCursor(sequence)
+		}
+		return rows.Err()
+	})
+	return page, sqlerr.Failure(err)
 }
 
 func (s *Store) AcknowledgeDeleteIntent(ctx context.Context, command storage.AcknowledgeDeleteIntentCommand) error {
@@ -429,7 +507,8 @@ func (s *Store) AcknowledgeDeleteIntent(ctx context.Context, command storage.Ack
 	}
 	err := s.mutateTransactionLocked(ctx, ctx, nil, func(tx *sql.Tx) error {
 		var outcome storage.DeleteIntentOutcome
-		err := tx.QueryRowContext(ctx, `SELECT outcome FROM delete_intents WHERE volume=? AND intent=?`, s.volume, string(command.Intent)).Scan(&outcome)
+		err := tx.QueryRowContext(ctx, `SELECT outcome FROM delete_intents WHERE volume=? AND owner=? AND intent=?`,
+			s.volume, string(command.Owner), string(command.Intent)).Scan(&outcome)
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil
 		}
@@ -439,7 +518,8 @@ func (s *Store) AcknowledgeDeleteIntent(ctx context.Context, command storage.Ack
 		if outcome != storage.DeleteIntentCompleted && outcome != storage.DeleteIntentNotExecuted {
 			return syscall.EBUSY
 		}
-		result, err := tx.ExecContext(ctx, `DELETE FROM delete_intents WHERE volume=? AND intent=?`, s.volume, string(command.Intent))
+		result, err := tx.ExecContext(ctx, `DELETE FROM delete_intents WHERE volume=? AND owner=? AND intent=?`,
+			s.volume, string(command.Owner), string(command.Intent))
 		if err != nil {
 			return err
 		}

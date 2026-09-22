@@ -211,15 +211,19 @@ func validateIntegrityBytes(
 		intentWhere = "WHERE volume=?"
 		intentArgs = []any{*volume}
 	}
-	rows, err = db.QueryContext(ctx, `SELECT typeof(name),CASE WHEN typeof(name)='blob' THEN length(name) END
-		FROM delete_intents `+intentWhere, intentArgs...)
+	ownerColumns := "'null',NULL"
+	if version >= firstDeleteIntentOwnerSchemaVersion {
+		ownerColumns = "typeof(owner),CASE WHEN typeof(owner)='text' THEN length(CAST(owner AS BLOB)) END"
+	}
+	rows, err = db.QueryContext(ctx, `SELECT typeof(name),CASE WHEN typeof(name)='blob' THEN length(name) END,`+
+		ownerColumns+` FROM delete_intents `+intentWhere, intentArgs...)
 	if err != nil {
 		return err
 	}
 	for rows.Next() {
-		var class string
-		var length sql.NullInt64
-		if err := rows.Scan(&class, &length); err != nil {
+		var class, ownerClass string
+		var length, ownerLength sql.NullInt64
+		if err := rows.Scan(&class, &length, &ownerClass, &ownerLength); err != nil {
 			rows.Close()
 			return err
 		}
@@ -233,6 +237,19 @@ func validateIntegrityBytes(
 				maxIntegrityBytes, syscall.EFBIG)
 		}
 		remaining -= length.Int64
+		if version >= firstDeleteIntentOwnerSchemaVersion {
+			if ownerClass != "text" || !ownerLength.Valid || ownerLength.Int64 < 1 ||
+				ownerLength.Int64 > storage.MaxDeleteIntentOwnerBytes {
+				rows.Close()
+				return fmt.Errorf("a deletion-intent owner has an invalid representation: %w", syscall.EIO)
+			}
+			if ownerLength.Int64 > remaining {
+				rows.Close()
+				return fmt.Errorf("entry, change, and deletion-intent fields exceed the %d-byte integrity limit: %w",
+					maxIntegrityBytes, syscall.EFBIG)
+			}
+			remaining -= ownerLength.Int64
+		}
 	}
 	return errors.Join(rows.Err(), rows.Close())
 }
@@ -274,6 +291,9 @@ func validateStorageClassesVersion(ctx context.Context, db sqlvalue.Queryer, vol
 		typeof(root) != 'integer' OR root <= 0 OR typeof(used) != 'integer'`
 	if version >= firstNeutralMetadataSchemaVersion {
 		query += ` OR typeof(metadata_used) != 'integer'`
+	}
+	if version >= firstDeleteIntentOwnerSchemaVersion {
+		query += ` OR typeof(delete_intent_high_water) != 'integer' OR delete_intent_high_water < 0`
 	}
 	query += `)`
 	if err := db.QueryRowContext(ctx, query, scopeArgs...).Scan(&invalidVolumes); err != nil {
@@ -376,6 +396,11 @@ func validateStorageClassesVersion(ctx context.Context, db sqlvalue.Queryer, vol
 		} else {
 			intentWhere = "WHERE "
 		}
+		ownerClasses := ""
+		if version >= firstDeleteIntentOwnerSchemaVersion {
+			ownerClasses = `typeof(owner)!='text' OR length(CAST(owner AS BLOB)) NOT BETWEEN 1 AND 128 OR
+				instr(CAST(owner AS BLOB),X'00')!=0 OR typeof(sequence)!='integer' OR sequence<=0 OR `
+		}
 		queries = append(queries, struct {
 			name  string
 			query string
@@ -385,6 +410,7 @@ func validateStorageClassesVersion(ctx context.Context, db sqlvalue.Queryer, vol
 			typeof(volume)!='integer' OR volume<=0 OR typeof(node)!='integer' OR node<=0 OR
 			typeof(parent) NOT IN ('integer','null') OR typeof(name) NOT IN ('blob','null') OR
 			(parent IS NULL)!=(name IS NULL) OR length(reference)!=16 OR length(request_hash)!=32 OR
+			` + ownerClasses + `
 			typeof(if_empty)!='integer' OR if_empty NOT IN (0,1) OR
 			typeof(outcome)!='integer' OR outcome NOT BETWEEN 1 AND 5 OR
 			typeof(failure) NOT IN ('integer','null') OR (outcome=5)!=(failure IS NOT NULL) OR
@@ -507,7 +533,7 @@ func validateIntegrityWithMetadataPolicy(
 		return err
 	}
 	if version >= firstDurableIdentitySchemaVersion {
-		if err := validateDurableIdentity(ctx, db, volume); err != nil {
+		if err := validateDurableIdentity(ctx, db, volume, version); err != nil {
 			return err
 		}
 	}

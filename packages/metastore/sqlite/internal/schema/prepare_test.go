@@ -16,6 +16,7 @@ import (
 	"github.com/codetreker/remote-fs/packages/metastore/sqlite/internal/changes"
 	"github.com/codetreker/remote-fs/packages/metastore/sqlite/internal/dbstate"
 	"github.com/codetreker/remote-fs/packages/sqliteschema"
+	"github.com/codetreker/remote-fs/packages/storage"
 	_ "modernc.org/sqlite"
 )
 
@@ -226,6 +227,59 @@ func TestPrepareMigratesPopulatedHistoricalVolumes(t *testing.T) {
 				t.Fatalf("migration changed data: version=%d revision=%d size=%d", stored, revision, size)
 			}
 		})
+	}
+}
+
+func TestVersionEightDeleteIntentsGainDeterministicOwnersAndSequences(t *testing.T) {
+	db := testDatabase(t, firstDirectoryRevisionSchemaVersion)
+	execute(t, db, `INSERT INTO volumes(id,name,root,used) VALUES(1,'legacy',1,0)`)
+	execute(t, db, `INSERT INTO nodes(id,volume,kind,size,atime_sec,atime_nsec,mtime_sec,mtime_nsec,directory_revision)
+		VALUES(1,1,2,0,0,0,0,0,X'0000000000000001')`)
+	execute(t, db, `UPDATE nodes SET pending_generation=1 WHERE id=1`)
+	execute(t, db, `INSERT INTO delete_intents
+		(intent,volume,node,parent,name,reference,request_hash,if_empty,outcome,failure,updated_sec,updated_nsec)
+		VALUES
+		('bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',1,1,1,X'62',zeroblob(16),zeroblob(32),0,?,NULL,0,0),
+		('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',1,1,1,X'61',zeroblob(16),zeroblob(32),0,?,NULL,0,0)`,
+		storage.DeleteIntentArmed, storage.DeleteIntentArmed)
+	tx := testTransaction(t, db)
+	if err := schema.Reach(t.Context(), tx); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := db.Query(`SELECT intent,owner,sequence FROM delete_intents ORDER BY sequence`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	want := []string{"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}
+	for index, intent := range want {
+		if !rows.Next() {
+			t.Fatalf("migration returned %d rows, want %d", index, len(want))
+		}
+		var storedIntent, owner string
+		var sequence int
+		if err := rows.Scan(&storedIntent, &owner, &sequence); err != nil {
+			t.Fatal(err)
+		}
+		if storedIntent != intent || owner != intent || sequence != index+1 {
+			t.Fatalf("migrated row %d = intent %q owner %q sequence %d", index, storedIntent, owner, sequence)
+		}
+	}
+	if rows.Next() {
+		t.Fatal("migration produced unexpected deletion intents")
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	var highWater int
+	if err := db.QueryRow(`SELECT delete_intent_high_water FROM volumes WHERE id=1`).Scan(&highWater); err != nil {
+		t.Fatal(err)
+	}
+	if highWater != len(want) {
+		t.Fatalf("migrated deletion-intent high water = %d, want %d", highWater, len(want))
 	}
 }
 
