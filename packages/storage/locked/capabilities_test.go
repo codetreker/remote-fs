@@ -134,7 +134,7 @@ func TestNamespaceWrapperRejectsSubstitutedDirectoryIdentity(t *testing.T) {
 	}
 }
 func (p *capabilitySessionProbe) CheckAtomicFileOpen() error { return p.checkErr }
-func (p *capabilitySessionProbe) OpenAt(ctx context.Context, _ storage.ChildName, _ storage.OpenAtOptions) (storage.OpenResult, error) {
+func (p *capabilitySessionProbe) OpenAt(ctx context.Context, _ storage.ChildSelection, _ storage.OpenAtOptions) (storage.OpenResult, error) {
 	p.capture(ctx)
 	return p.open, p.failure
 }
@@ -164,7 +164,7 @@ func (p *capabilitySessionProbe) OpenNodeRef(ctx context.Context, _ uint64, _ st
 	p.capture(ctx)
 	return p.node, p.failure
 }
-func (p *capabilitySessionProbe) OpenChildRef(ctx context.Context, _ storage.ChildName, _ storage.NodeRefOptions) (storage.NodeOpenResult, error) {
+func (p *capabilitySessionProbe) OpenChildRef(ctx context.Context, _ storage.ChildSelection, _ storage.NodeRefOptions) (storage.NodeOpenResult, error) {
 	p.capture(ctx)
 	return p.node, p.failure
 }
@@ -357,7 +357,7 @@ func TestIdentityWrappersSeparateReadAndMutationScopes(t *testing.T) {
 			t.Fatalf("%s check=%v", name, err)
 		}
 	}
-	opened, err := session.OpenAt(t.Context(), storage.ChildName{}, storage.OpenAtOptions{})
+	opened, err := session.OpenAt(t.Context(), storage.ChildSelection{Name: storage.ChildName{}}, storage.OpenAtOptions{})
 	if !errors.Is(err, failure) || opened.File == nil || !reflect.DeepEqual(probe.observed, proof) {
 		t.Fatalf("atomic open=%+v error=%v scope=%+v", opened, err, probe.observed)
 	}
@@ -386,7 +386,7 @@ func TestIdentityWrappersSeparateReadAndMutationScopes(t *testing.T) {
 	if !errors.Is(err, failure) || result.Reference == nil || !reflect.DeepEqual(probe.observed, locking.MutationScope{}) {
 		t.Fatalf("read-only reference=%+v error=%v scope=%+v", result, err, probe.observed)
 	}
-	result, err = session.OpenChildRef(t.Context(), storage.ChildName{}, storage.NodeRefOptions{Create: true})
+	result, err = session.OpenChildRef(t.Context(), storage.ChildSelection{Name: storage.ChildName{}}, storage.NodeRefOptions{Create: true})
 	if !errors.Is(err, failure) || result.Reference == nil || !reflect.DeepEqual(probe.observed, proof) {
 		t.Fatalf("creating reference=%+v error=%v scope=%+v", result, err, probe.observed)
 	}

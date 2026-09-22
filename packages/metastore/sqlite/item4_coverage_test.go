@@ -63,7 +63,7 @@ func TestAtomicOpenResetsReplacesAndRejectsKindMismatch(t *testing.T) {
 	rootTarget := directoryTarget(root)
 	createdAt := time.Unix(123, 0)
 	name := storage.ChildName{Parent: rootTarget, RawLeaf: []byte("file")}
-	created, err := store.OpenAt(t.Context(), name, storage.OpenAtOptions{
+	created, err := store.OpenAt(t.Context(), storage.ChildSelection{Name: name}, storage.OpenAtOptions{
 		Read: true, Write: true, Create: true, Exclusive: true,
 		Target: storage.ChildCondition{State: storage.Absent}, Action: fileAction(t),
 		Use: storage.UseClaim{Uses: storage.ReadData | storage.WriteData}, Existing: storage.Keep,
@@ -72,6 +72,7 @@ func TestAtomicOpenResetsReplacesAndRejectsKindMismatch(t *testing.T) {
 			Metadata: map[string][]byte{"test.open": []byte("created")},
 		}},
 	})
+
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -84,7 +85,7 @@ func TestAtomicOpenResetsReplacesAndRejectsKindMismatch(t *testing.T) {
 	}
 
 	resetAt := time.Unix(456, 0)
-	reset, err := store.OpenAt(t.Context(), name, storage.OpenAtOptions{
+	reset, err := store.OpenAt(t.Context(), storage.ChildSelection{Name: name}, storage.OpenAtOptions{
 		Read: true, Write: true,
 		Target: storage.ChildCondition{State: storage.SameNode, NodeID: uint64(createdID)}, Action: fileAction(t),
 		Use: storage.UseClaim{Uses: storage.ReadData | storage.WriteData}, Existing: storage.ResetContent,
@@ -93,6 +94,7 @@ func TestAtomicOpenResetsReplacesAndRejectsKindMismatch(t *testing.T) {
 			Metadata: map[string][]byte{"test.open": []byte("reset")},
 		}},
 	})
+
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -105,7 +107,7 @@ func TestAtomicOpenResetsReplacesAndRejectsKindMismatch(t *testing.T) {
 	}
 
 	replaceAt := time.Unix(789, 0)
-	replaced, err := store.OpenAt(t.Context(), name, storage.OpenAtOptions{
+	replaced, err := store.OpenAt(t.Context(), storage.ChildSelection{Name: name}, storage.OpenAtOptions{
 		Read: true, Write: true, Create: true,
 		Target: storage.ChildCondition{State: storage.SameNode, NodeID: uint64(createdID)}, Action: fileAction(t),
 		Use: storage.UseClaim{Uses: storage.ReadData | storage.WriteData | storage.DeleteName}, Existing: storage.ReplaceNode,
@@ -114,6 +116,7 @@ func TestAtomicOpenResetsReplacesAndRejectsKindMismatch(t *testing.T) {
 			Metadata: map[string][]byte{"test.open": []byte("replacement")},
 		}},
 	})
+
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -140,10 +143,11 @@ func TestAtomicOpenResetsReplacesAndRejectsKindMismatch(t *testing.T) {
 		{"file as symlink", "file", storage.NodeSymlink, syscall.EINVAL},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			opened, err := store.OpenChildRef(t.Context(), storage.ChildName{Parent: rootTarget, RawLeaf: []byte(test.leaf)}, storage.NodeRefOptions{
+			opened, err := store.OpenChildRef(t.Context(), storage.ChildSelection{Name: storage.ChildName{Parent: rootTarget, RawLeaf: []byte(test.leaf)}}, storage.NodeRefOptions{
 				Kind: test.kind, Target: storage.ChildCondition{State: storage.Any}, Action: fileAction(t),
 				MetadataAccess: storage.ReadMetadata,
 			})
+
 			if opened.Reference != nil || !errors.Is(err, test.want) {
 				t.Fatalf("kind mismatch opened=%v err=%v", opened.Reference != nil, err)
 			}
@@ -242,11 +246,12 @@ func TestNamespaceMutationPreservesIdentityAndRejectsInvalidRemoval(t *testing.T
 func TestNodeReferenceDelegatesMetadataMutationPendingDeleteAndLifecycle(t *testing.T) {
 	store, root := openIdentityTestStore(t)
 	name := storage.ChildName{Parent: directoryTarget(root), RawLeaf: []byte("file")}
-	opened, err := store.OpenChildRef(t.Context(), name, storage.NodeRefOptions{
+	opened, err := store.OpenChildRef(t.Context(), storage.ChildSelection{Name: name}, storage.NodeRefOptions{
 		Kind: storage.NodeRegular, Target: storage.ChildCondition{State: storage.Absent},
 		Action: fileAction(t), Use: storage.UseClaim{Uses: storage.DeleteName},
 		MetadataAccess: storage.ReadMetadata | storage.WriteMetadata, Create: true, Exclusive: true,
 	})
+
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -310,7 +315,7 @@ func TestNodeReferenceDelegatesMetadataMutationPendingDeleteAndLifecycle(t *test
 	if err != nil || !bytes.Equal(again.PendingGeneration, pending.PendingGeneration) {
 		t.Fatalf("repeated pending state = %+v, %v; want generation %x", again, err, pending.PendingGeneration)
 	}
-	if result, err := store.OpenAt(t.Context(), name, storage.OpenAtOptions{
+	if result, err := store.OpenAt(t.Context(), storage.ChildSelection{Name: name}, storage.OpenAtOptions{
 		Read: true, Target: storage.ChildCondition{State: storage.Any}, Action: fileAction(t),
 		Use: storage.UseClaim{Uses: storage.ReadData}, Existing: storage.Keep,
 	}); result.File != nil || !errors.Is(err, storage.ErrPendingDelete) {
@@ -386,10 +391,11 @@ func TestNodeReferenceDelegatesMetadataMutationPendingDeleteAndLifecycle(t *test
 func TestPendingDeleteRequiresDeleteUseAndValidMetadata(t *testing.T) {
 	store, root := openIdentityTestStore(t)
 	name := storage.ChildName{Parent: directoryTarget(root), RawLeaf: []byte("file")}
-	opened, err := store.OpenChildRef(t.Context(), name, storage.NodeRefOptions{
+	opened, err := store.OpenChildRef(t.Context(), storage.ChildSelection{Name: name}, storage.NodeRefOptions{
 		Kind: storage.NodeRegular, Target: storage.ChildCondition{State: storage.Absent},
 		Action: fileAction(t), MetadataAccess: storage.ReadMetadata, Create: true, Exclusive: true,
 	})
+
 	if err != nil {
 		t.Fatal(err)
 	}

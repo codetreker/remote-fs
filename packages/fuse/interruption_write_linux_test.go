@@ -131,8 +131,8 @@ func (s *signalFileSession) OpenNode(ctx context.Context, id uint64, options sto
 	return file, nil
 }
 
-func (s *signalFileSession) OpenAt(ctx context.Context, name storage.ChildName, options storage.OpenAtOptions) (storage.OpenResult, error) {
-	result, err := s.AtomicFileOpener.OpenAt(ctx, name, options)
+func (s *signalFileSession) OpenAt(ctx context.Context, selection storage.ChildSelection, options storage.OpenAtOptions) (storage.OpenResult, error) {
+	result, err := s.AtomicFileOpener.OpenAt(ctx, selection, options)
 	if result.File != nil && s.wrap != nil {
 		result.File = s.wrap(result.File)
 	}

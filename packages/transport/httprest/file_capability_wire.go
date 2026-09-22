@@ -13,7 +13,7 @@ import (
 
 type AtomicFileOpenerWithBarrier interface {
 	storage.AtomicFileOpener
-	OpenAtWithBarrier(context.Context, storage.ChildName, storage.OpenAtOptions) (storage.OpenResult, *MutationBarrier, error)
+	OpenAtWithBarrier(context.Context, storage.ChildSelection, storage.OpenAtOptions) (storage.OpenResult, *MutationBarrier, error)
 }
 
 type NamespaceAccessWithBarrier interface {
@@ -24,7 +24,7 @@ type NamespaceAccessWithBarrier interface {
 type NodeReferencesWithBarrier interface {
 	storage.NodeReferences
 	OpenNodeRefWithBarrier(context.Context, uint64, storage.NodeRefOptions) (storage.NodeOpenResult, *MutationBarrier, error)
-	OpenChildRefWithBarrier(context.Context, storage.ChildName, storage.NodeRefOptions) (storage.NodeOpenResult, *MutationBarrier, error)
+	OpenChildRefWithBarrier(context.Context, storage.ChildSelection, storage.NodeRefOptions) (storage.NodeOpenResult, *MutationBarrier, error)
 }
 
 type NodeReferenceWithBarrier interface {
@@ -86,6 +86,19 @@ func (value childCondition) storage() storage.ChildCondition {
 type childName struct {
 	Parent  storage.DirectoryTarget `json:"parent"`
 	RawLeaf canonicalBytes          `json:"rawLeaf"`
+}
+
+type childSelection struct {
+	Name   childName        `json:"name"`
+	Guards *namespaceGuards `json:"guards,omitempty"`
+}
+
+func childSelectionOf(value storage.ChildSelection) *childSelection {
+	return &childSelection{Name: *childNameOf(value.Name), Guards: namespaceGuardsOf(value.Guards)}
+}
+
+func (value childSelection) storage() storage.ChildSelection {
+	return storage.ChildSelection{Name: value.Name.storage(), Guards: value.Guards.storage()}
 }
 
 func childNameOf(value storage.ChildName) *childName {

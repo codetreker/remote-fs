@@ -94,13 +94,13 @@ func validateFileRequest(r fileRequest) error {
 		reference = true
 		expected.Change = r.Change
 	case storage.OpFileOpenAt:
-		expected.Child = r.Child
+		expected.Selection = r.Selection
 		expected.OpenAt = r.OpenAt
 	case storage.OpFileOpenNodeRef:
 		expected.Node = r.Node
 		expected.NodeRef = r.NodeRef
 	case storage.OpFileOpenChildRef:
-		expected.Child = r.Child
+		expected.Selection = r.Selection
 		expected.NodeRef = r.NodeRef
 	case storage.OpFileLookupAt:
 		expected.Child = r.Child
@@ -176,7 +176,7 @@ func validateFileRequest(r fileRequest) error {
 			return errors.New("attribute operation carries no change")
 		}
 	case storage.OpFileOpenAt:
-		if r.Child == nil || r.OpenAt == nil {
+		if r.Selection == nil || r.OpenAt == nil {
 			return errors.New("atomic open carries no target or options")
 		}
 	case storage.OpFileOpenNodeRef:
@@ -184,7 +184,7 @@ func validateFileRequest(r fileRequest) error {
 			return errors.New("reference open carries no options")
 		}
 	case storage.OpFileOpenChildRef:
-		if r.Child == nil || r.NodeRef == nil {
+		if r.Selection == nil || r.NodeRef == nil {
 			return errors.New("reference open carries no target or options")
 		}
 	case storage.OpFileLookupAt:

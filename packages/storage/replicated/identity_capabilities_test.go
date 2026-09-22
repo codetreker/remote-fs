@@ -76,12 +76,15 @@ func TestIdentityCapabilitiesConfirmAuthorityResultsThroughTheReplica(t *testing
 		t.Fatalf("lookup=%+v error=%v", lookedUp, err)
 	}
 
-	opened, err := opener.OpenAt(t.Context(), storage.ChildName{
+	opened, err := opener.OpenAt(t.Context(), storage.ChildSelection{Name: storage.ChildName{
 		Parent: storage.DirectoryTarget{NodeID: directory.ID}, RawLeaf: []byte("file"),
-	}, storage.OpenAtOptions{
-		Read: true, Write: true, Target: storage.ChildCondition{State: storage.SameNode, NodeID: fileAttr.ID},
-		Action: replicatedFileActionFor(t, session), Use: storage.UseClaim{Uses: storage.ReadData | storage.WriteData | storage.DeleteName}, Existing: storage.Keep,
-	})
+	}},
+
+		storage.OpenAtOptions{
+			Read: true, Write: true, Target: storage.ChildCondition{State: storage.SameNode, NodeID: fileAttr.ID},
+			Action: replicatedFileActionFor(t, session), Use: storage.UseClaim{Uses: storage.ReadData | storage.WriteData | storage.DeleteName}, Existing: storage.Keep,
+		})
+
 	if err != nil || opened.File == nil || opened.Attr.ID != fileAttr.ID || opened.Outcome != storage.Opened {
 		t.Fatalf("open-at=%+v error=%v", opened, err)
 	}
@@ -159,13 +162,16 @@ func TestIdentityCapabilitiesConfirmAuthorityResultsThroughTheReplica(t *testing
 
 func verifyNodeReference(t *testing.T, session storage.FileSession, references storage.NodeReferences, attr storage.Attr, parent uint64, leaf string) {
 	t.Helper()
-	opened, err := references.OpenChildRef(t.Context(), storage.ChildName{
+	opened, err := references.OpenChildRef(t.Context(), storage.ChildSelection{Name: storage.ChildName{
 		Parent: storage.DirectoryTarget{NodeID: parent}, RawLeaf: []byte(leaf),
-	}, storage.NodeRefOptions{
-		Kind: attr.Kind, Target: storage.ChildCondition{State: storage.SameNode, NodeID: attr.ID},
-		Action: replicatedFileActionFor(t, session), Use: storage.UseClaim{Uses: storage.DeleteName},
-		MetadataAccess: storage.ReadMetadata | storage.WriteMetadata,
-	})
+	}},
+
+		storage.NodeRefOptions{
+			Kind: attr.Kind, Target: storage.ChildCondition{State: storage.SameNode, NodeID: attr.ID},
+			Action: replicatedFileActionFor(t, session), Use: storage.UseClaim{Uses: storage.DeleteName},
+			MetadataAccess: storage.ReadMetadata | storage.WriteMetadata,
+		})
+
 	if err != nil || opened.Reference == nil || opened.Attr.ID != attr.ID {
 		t.Fatalf("open child reference=%+v error=%v", opened, err)
 	}
@@ -266,13 +272,16 @@ func verifyDeleteIntentLifecycle(t *testing.T, session storage.FileSession, acti
 		t.Fatal(err)
 	}
 	createAction := replicatedFileActionFor(t, session)
-	opened, err := opener.OpenAt(t.Context(), storage.ChildName{
+	opened, err := opener.OpenAt(t.Context(), storage.ChildSelection{Name: storage.ChildName{
 		Parent: storage.DirectoryTarget{NodeID: parent}, RawLeaf: []byte("delete-on-close"),
-	}, storage.OpenAtOptions{
-		Read: true, Create: true, Exclusive: true, Target: storage.ChildCondition{State: storage.Absent},
-		Action: createAction, Use: storage.UseClaim{Uses: storage.ReadData | storage.DeleteName}, Existing: storage.Keep,
-		CloseIntent: &storage.CloseIntent{ID: intent, Trigger: storage.OnReferenceClose, Condition: storage.UnlinkFile},
-	})
+	}},
+
+		storage.OpenAtOptions{
+			Read: true, Create: true, Exclusive: true, Target: storage.ChildCondition{State: storage.Absent},
+			Action: createAction, Use: storage.UseClaim{Uses: storage.ReadData | storage.DeleteName}, Existing: storage.Keep,
+			CloseIntent: &storage.CloseIntent{ID: intent, Trigger: storage.OnReferenceClose, Condition: storage.UnlinkFile},
+		})
+
 	if err != nil || opened.File == nil || opened.Outcome != storage.Created {
 		t.Fatalf("close-intent open=%+v error=%v", opened, err)
 	}

@@ -70,7 +70,7 @@ func TestNamespaceCapabilityIsIndependentOfDirectoryRead(t *testing.T) {
 }
 
 func (p *capabilityProbe) CheckAtomicFileOpen() error { return p.checkErr }
-func (p *capabilityProbe) OpenAt(context.Context, storage.ChildName, storage.OpenAtOptions) (storage.OpenResult, error) {
+func (p *capabilityProbe) OpenAt(context.Context, storage.ChildSelection, storage.OpenAtOptions) (storage.OpenResult, error) {
 	return p.open, p.callErr
 }
 func (p *capabilityProbe) CheckNamespaceAccess() error { return p.checkErr }
@@ -94,7 +94,7 @@ func (p *capabilityProbe) CheckNodeReferences() error { return p.checkErr }
 func (p *capabilityProbe) OpenNodeRef(context.Context, uint64, storage.NodeRefOptions) (storage.NodeOpenResult, error) {
 	return p.node, p.callErr
 }
-func (p *capabilityProbe) OpenChildRef(context.Context, storage.ChildName, storage.NodeRefOptions) (storage.NodeOpenResult, error) {
+func (p *capabilityProbe) OpenChildRef(context.Context, storage.ChildSelection, storage.NodeRefOptions) (storage.NodeOpenResult, error) {
 	return p.node, p.callErr
 }
 func (p *capabilityProbe) CheckFileActions() error { return p.checkErr }
@@ -331,7 +331,7 @@ func TestIdentityCapabilityWrappersPreservePartialResultsAndReferences(t *testin
 			t.Fatalf("%s check=%v", name, err)
 		}
 	}
-	opened, err := wrapper.OpenAt(t.Context(), storage.ChildName{}, storage.OpenAtOptions{})
+	opened, err := wrapper.OpenAt(t.Context(), storage.ChildSelection{Name: storage.ChildName{}}, storage.OpenAtOptions{})
 	if !errors.Is(err, failure) || opened.File == nil || opened.Attr.ID != attr.ID || opened.Outcome != storage.Created {
 		t.Fatalf("atomic open=%+v error=%v", opened, err)
 	}
@@ -342,7 +342,7 @@ func TestIdentityCapabilityWrappersPreservePartialResultsAndReferences(t *testin
 	if _, ok := reference.Reference.(*nodeReference); !ok {
 		t.Fatalf("node reference was not wrapped: %T", reference.Reference)
 	}
-	child, err := wrapper.OpenChildRef(t.Context(), storage.ChildName{}, storage.NodeRefOptions{})
+	child, err := wrapper.OpenChildRef(t.Context(), storage.ChildSelection{Name: storage.ChildName{}}, storage.NodeRefOptions{})
 	if !errors.Is(err, failure) || child.Reference == nil || child.Attr.ID != attr.ID {
 		t.Fatalf("child reference=%+v error=%v", child, err)
 	}

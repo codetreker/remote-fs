@@ -19,14 +19,15 @@ var _ metastore.AtomicFileOpener = (*Store)(nil)
 
 func (s *Store) CheckAtomicFileOpen() error { return s.CheckFileStore() }
 
-func (s *Store) OpenAt(ctx context.Context, name storage.ChildName, options storage.OpenAtOptions) (metastore.OpenResult, error) {
-	if err := name.Check(); err != nil {
+func (s *Store) OpenAt(ctx context.Context, selection storage.ChildSelection, options storage.OpenAtOptions) (metastore.OpenResult, error) {
+	selection = selection.Clone()
+	if err := selection.Check(); err != nil {
 		return metastore.OpenResult{}, err
 	}
 	if err := options.Check(); err != nil {
 		return metastore.OpenResult{}, err
 	}
-	file, state, outcome, err := s.openAtomicChild(ctx, name, storage.NodeRegular, options.Read, options.Write,
+	file, state, outcome, err := s.openAtomicChild(ctx, selection, storage.NodeRegular, options.Read, options.Write,
 		storage.ReadMetadata|storage.WriteMetadata, options.Create, options.Exclusive, options.Target,
 		options.Use, options.Existing, options.Initial, options.CloseIntent)
 	if file == nil {
@@ -35,7 +36,7 @@ func (s *Store) OpenAt(ctx context.Context, name storage.ChildName, options stor
 	return metastore.OpenResult{File: file, State: state, Outcome: outcome}, err
 }
 
-func (s *Store) openAtomicChild(ctx context.Context, name storage.ChildName, kind storage.NodeKind, read, write bool,
+func (s *Store) openAtomicChild(ctx context.Context, selection storage.ChildSelection, kind storage.NodeKind, read, write bool,
 	metadata storage.MetadataPermissions, create, exclusive bool, target storage.ChildCondition,
 	use storage.UseClaim, existing storage.ExistingEffect,
 	initial storage.InitialState, closeIntent *storage.CloseIntent,
@@ -59,6 +60,10 @@ func (s *Store) openAtomicChild(ctx context.Context, name storage.ChildName, kin
 	var before metastore.Node
 	var found bool
 	inspect := func(tx *sql.Tx) error {
+		if err := s.checkNamespaceGuards(ctx, tx, selection.Guards); err != nil {
+			return err
+		}
+		name := selection.Name
 		if _, _, err := s.directoryTarget(ctx, tx, name.Parent, 0); err != nil {
 			return err
 		}
@@ -136,7 +141,7 @@ func (s *Store) openAtomicChild(ctx context.Context, name storage.ChildName, kin
 			return err
 		}
 		at := time.Now()
-		node, selected, err := s.applyAtomicOpen(ctx, tx, name, before, found, kind, existing, initial, at)
+		node, selected, err := s.applyAtomicOpen(ctx, tx, selection.Name, before, found, kind, existing, initial, at)
 		if err != nil {
 			return err
 		}

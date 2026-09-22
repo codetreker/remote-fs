@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -13,7 +14,7 @@ import (
 // a path-based open because the parent or child may be replaced between calls.
 type AtomicFileOpener interface {
 	CheckAtomicFileOpen() error
-	OpenAt(context.Context, ChildName, OpenAtOptions) (OpenResult, error)
+	OpenAt(context.Context, ChildSelection, OpenAtOptions) (OpenResult, error)
 }
 
 // NamespaceAccess addresses exact byte names beneath directory identities. A
@@ -55,7 +56,7 @@ type NodeReference interface {
 type NodeReferences interface {
 	CheckNodeReferences() error
 	OpenNodeRef(context.Context, uint64, NodeRefOptions) (NodeOpenResult, error)
-	OpenChildRef(context.Context, ChildName, NodeRefOptions) (NodeOpenResult, error)
+	OpenChildRef(context.Context, ChildSelection, NodeRefOptions) (NodeOpenResult, error)
 }
 
 // ReferenceStateAccess captures identity state and pending deletion together.
@@ -228,6 +229,36 @@ type DirectoryTarget struct {
 type ChildName struct {
 	Parent  DirectoryTarget
 	RawLeaf []byte
+}
+
+// ChildSelection couples one exact child name with the authoritative namespace
+// observations that justified selecting it. Guards are checked before the
+// child is selected, created, claimed, or armed for close-time deletion.
+type ChildSelection struct {
+	Name   ChildName
+	Guards *NamespaceGuards `json:",omitempty"`
+}
+
+func (s ChildSelection) Clone() ChildSelection {
+	s.Name.RawLeaf = bytes.Clone(s.Name.RawLeaf)
+	if s.Name.Parent.Scope != nil {
+		scope := *s.Name.Parent.Scope
+		s.Name.Parent.Scope = &scope
+	}
+	if s.Guards == nil {
+		return s
+	}
+	guards := *s.Guards
+	guards.Directories = append([]DirectoryObservation(nil), guards.Directories...)
+	for index := range guards.Directories {
+		guards.Directories[index].Revision = bytes.Clone(guards.Directories[index].Revision)
+	}
+	guards.Edges = append([]ObservedEdge(nil), guards.Edges...)
+	for index := range guards.Edges {
+		guards.Edges[index].RawLeaf = bytes.Clone(guards.Edges[index].RawLeaf)
+	}
+	s.Guards = &guards
+	return s
 }
 
 // DirectoryObservation identifies one complete authoritative capture of a

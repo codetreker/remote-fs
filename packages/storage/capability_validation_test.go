@@ -131,6 +131,26 @@ func TestIdentityParentedValuesRejectMalformedInputs(t *testing.T) {
 	if err := (ChildName{Parent: DirectoryTarget{NodeID: 1}, RawLeaf: []byte("x")}).Check(); err != nil {
 		t.Fatalf("valid child: %v", err)
 	}
+	selection := ChildSelection{
+		Name: ChildName{Parent: DirectoryTarget{NodeID: 1, Scope: &scope}, RawLeaf: []byte("child")},
+		Guards: &NamespaceGuards{
+			Directories: []DirectoryObservation{{ParentID: 1, Revision: []byte("revision")}},
+			Edges:       []ObservedEdge{{ParentID: 1, RawLeaf: []byte("edge"), ChildID: 2}},
+			RootID:      1,
+		},
+	}
+	if err := selection.Check(); err != nil {
+		t.Fatalf("valid child selection: %v", err)
+	}
+	cloned := selection.Clone()
+	selection.Name.RawLeaf[0] = 'X'
+	selection.Name.Parent.Scope.Token = "changed"
+	selection.Guards.Directories[0].Revision[0] = 'X'
+	selection.Guards.Edges[0].RawLeaf[0] = 'X'
+	if string(cloned.Name.RawLeaf) != "child" || cloned.Name.Parent.Scope.Token != "reference" ||
+		string(cloned.Guards.Directories[0].Revision) != "revision" || string(cloned.Guards.Edges[0].RawLeaf) != "edge" {
+		t.Fatalf("child selection clone retained caller storage: %+v", cloned)
+	}
 }
 
 func TestAtomicOpenAndNodeReferenceValidateEffects(t *testing.T) {

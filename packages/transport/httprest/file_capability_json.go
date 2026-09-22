@@ -22,10 +22,10 @@ func validateCapabilityArguments(req fileRequest) error {
 		}
 		return req.Acknowledge.storage().Check()
 	case storage.OpFileOpenAt:
-		if req.Child == nil || req.OpenAt == nil {
+		if req.Selection == nil || req.OpenAt == nil {
 			return syscall.EINVAL
 		}
-		if err := req.Child.storage().Check(); err != nil {
+		if err := req.Selection.storage().Check(); err != nil {
 			return err
 		}
 		return req.OpenAt.storage().Check()
@@ -35,10 +35,10 @@ func validateCapabilityArguments(req fileRequest) error {
 		}
 		return req.NodeRef.storage().Check()
 	case storage.OpFileOpenChildRef:
-		if req.Child == nil || req.NodeRef == nil {
+		if req.Selection == nil || req.NodeRef == nil {
 			return syscall.EINVAL
 		}
-		if err := req.Child.storage().Check(); err != nil {
+		if err := req.Selection.storage().Check(); err != nil {
 			return err
 		}
 		return req.NodeRef.storage().Check()

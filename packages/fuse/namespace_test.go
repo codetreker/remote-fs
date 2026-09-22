@@ -42,8 +42,8 @@ func (s *namespaceFixture) ReadDirNodeBounded(_ context.Context, target storage.
 	}
 	return s.readDirBounded(target, result)
 }
-func (s *namespaceFixture) OpenAt(_ context.Context, name storage.ChildName, options storage.OpenAtOptions) (storage.OpenResult, error) {
-	return s.open(name, options)
+func (s *namespaceFixture) OpenAt(_ context.Context, selection storage.ChildSelection, options storage.OpenAtOptions) (storage.OpenResult, error) {
+	return s.open(selection.Name, options)
 }
 func (s *namespaceFixture) MutateName(_ context.Context, command storage.NameCommand) (storage.NameResult, error) {
 	return s.mutate(command)

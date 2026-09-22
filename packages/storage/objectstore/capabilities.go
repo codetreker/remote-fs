@@ -73,25 +73,26 @@ func (fs *fileSession) CheckMetadataAccess() error {
 	return native.CheckMetadataAccess()
 }
 
-func (fs *fileSession) OpenAt(ctx context.Context, name storage.ChildName, options storage.OpenAtOptions) (storage.OpenResult, error) {
+func (fs *fileSession) OpenAt(ctx context.Context, selection storage.ChildSelection, options storage.OpenAtOptions) (storage.OpenResult, error) {
 	if err := fs.CheckAtomicFileOpen(); err != nil {
 		return storage.OpenResult{}, err
 	}
-	if err := name.Check(); err != nil {
+	selection = selection.Clone()
+	if err := selection.Check(); err != nil {
 		return storage.OpenResult{}, err
 	}
 	if err := options.Check(); err != nil {
 		return storage.OpenResult{}, err
 	}
-	input := openAtActionInput{Name: name, Options: options}
+	input := openAtActionInput{Selection: selection, Options: options}
 	return runFileAction(ctx, fs, options.Action, storage.OpFileOpenAt, input, cloneOpenResult,
 		func(result storage.OpenResult) bool {
 			return result.File != nil || result.Attr.ID != 0 || result.Outcome != 0
 		},
-		func() (storage.OpenResult, error) { return fs.openAt(ctx, name, options) })
+		func() (storage.OpenResult, error) { return fs.openAt(ctx, selection, options) })
 }
 
-func (fs *fileSession) openAt(ctx context.Context, name storage.ChildName, options storage.OpenAtOptions) (storage.OpenResult, error) {
+func (fs *fileSession) openAt(ctx context.Context, selection storage.ChildSelection, options storage.OpenAtOptions) (storage.OpenResult, error) {
 	ctx, cancel := fs.operationContext(ctx)
 	defer cancel()
 	ctx = metastore.WithFilePublicationGuard(ctx, fs.publicationAllowed)
@@ -100,7 +101,7 @@ func (fs *fileSession) openAt(ctx context.Context, name storage.ChildName, optio
 		return storage.OpenResult{}, err
 	}
 	defer done()
-	result, err := fs.native.(metastore.AtomicFileOpener).OpenAt(ctx, name, options)
+	result, err := fs.native.(metastore.AtomicFileOpener).OpenAt(ctx, selection, options)
 	opened := storage.OpenResult{Attr: result.State.Attr(), Outcome: result.Outcome}
 	if result.File == nil {
 		return opened, fs.finishOpen(nil, err)
@@ -136,24 +137,25 @@ func (fs *fileSession) OpenNodeRef(ctx context.Context, id uint64, options stora
 		})
 }
 
-func (fs *fileSession) OpenChildRef(ctx context.Context, name storage.ChildName, options storage.NodeRefOptions) (storage.NodeOpenResult, error) {
+func (fs *fileSession) OpenChildRef(ctx context.Context, selection storage.ChildSelection, options storage.NodeRefOptions) (storage.NodeOpenResult, error) {
 	if err := fs.CheckNodeReferences(); err != nil {
 		return storage.NodeOpenResult{}, err
 	}
-	if err := name.Check(); err != nil {
+	selection = selection.Clone()
+	if err := selection.Check(); err != nil {
 		return storage.NodeOpenResult{}, err
 	}
 	if err := options.Check(); err != nil {
 		return storage.NodeOpenResult{}, err
 	}
-	input := nodeRefActionInput{Name: &name, Options: options}
+	input := nodeRefActionInput{Selection: &selection, Options: options}
 	return runFileAction(ctx, fs, options.Action, storage.OpFileOpenChildRef, input, cloneNodeOpenResult,
 		func(result storage.NodeOpenResult) bool {
 			return result.Reference != nil || result.Attr.ID != 0 || result.Outcome != 0
 		},
 		func() (storage.NodeOpenResult, error) {
 			return fs.openNodeReference(ctx, func(ctx context.Context) (metastore.NodeOpenResult, error) {
-				return fs.native.(metastore.NodeReferences).OpenChildRef(ctx, name, options)
+				return fs.native.(metastore.NodeReferences).OpenChildRef(ctx, selection, options)
 			})
 		})
 }

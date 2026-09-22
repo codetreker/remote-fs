@@ -30,6 +30,7 @@ type fileRequest struct {
 	Options           storage.FileSessionOptions      `json:"options"`
 	Open              storage.FileOpenOptions         `json:"open"`
 	Child             *childName                      `json:"child,omitempty"`
+	Selection         *childSelection                 `json:"selection,omitempty"`
 	OpenAt            *openAtOptions                  `json:"openAt,omitempty"`
 	NodeRef           *nodeRefOptions                 `json:"nodeRef,omitempty"`
 	Name              *nameCommand                    `json:"name,omitempty"`

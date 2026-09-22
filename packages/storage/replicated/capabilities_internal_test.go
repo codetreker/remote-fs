@@ -244,7 +244,7 @@ func TestIdentityCapabilityChecksRejectAnAuthorityThatDoesNotAdvertiseThem(t *te
 			t.Fatalf("%s check=%v", name, err)
 		}
 	}
-	if _, err := session.OpenAt(t.Context(), storage.ChildName{}, storage.OpenAtOptions{}); !errors.Is(err, syscall.EOPNOTSUPP) {
+	if _, err := session.OpenAt(t.Context(), storage.ChildSelection{Name: storage.ChildName{}}, storage.OpenAtOptions{}); !errors.Is(err, syscall.EOPNOTSUPP) {
 		t.Fatalf("atomic open dispatch=%v", err)
 	}
 	if _, err := session.LookupAt(t.Context(), storage.ChildName{}); !errors.Is(err, syscall.EOPNOTSUPP) {

@@ -831,7 +831,7 @@ func (*mismatchedIdentitySession) CheckNodeReferences() error { return nil }
 func (*mismatchedIdentitySession) OpenNodeRef(context.Context, uint64, storage.NodeRefOptions) (storage.NodeOpenResult, error) {
 	return storage.NodeOpenResult{Reference: &mismatchedIdentityReference{}, Attr: storage.Attr{ID: 2, Kind: storage.NodeDirectory}, Outcome: storage.Opened}, nil
 }
-func (*mismatchedIdentitySession) OpenChildRef(context.Context, storage.ChildName, storage.NodeRefOptions) (storage.NodeOpenResult, error) {
+func (*mismatchedIdentitySession) OpenChildRef(context.Context, storage.ChildSelection, storage.NodeRefOptions) (storage.NodeOpenResult, error) {
 	panic("not called")
 }
 
@@ -843,7 +843,7 @@ func (*substitutedOpenNodeSession) OpenNodeRef(context.Context, uint64, storage.
 
 type substitutedChildSession struct{ mismatchedIdentitySession }
 
-func (*substitutedChildSession) OpenChildRef(context.Context, storage.ChildName, storage.NodeRefOptions) (storage.NodeOpenResult, error) {
+func (*substitutedChildSession) OpenChildRef(context.Context, storage.ChildSelection, storage.NodeRefOptions) (storage.NodeOpenResult, error) {
 	return storage.NodeOpenResult{Reference: &mismatchedIdentityReference{}, Attr: storage.Attr{ID: 3, Kind: storage.NodeDirectory}, Outcome: storage.Opened}, nil
 }
 
@@ -863,7 +863,7 @@ func (*mismatchedIdentityFile) Sync(context.Context) error { panic("not called")
 type substitutedAtomicSession struct{ storage.FileSession }
 
 func (*substitutedAtomicSession) CheckAtomicFileOpen() error { return nil }
-func (*substitutedAtomicSession) OpenAt(context.Context, storage.ChildName, storage.OpenAtOptions) (storage.OpenResult, error) {
+func (*substitutedAtomicSession) OpenAt(context.Context, storage.ChildSelection, storage.OpenAtOptions) (storage.OpenResult, error) {
 	return storage.OpenResult{File: &mismatchedIdentityFile{}, Attr: storage.Attr{ID: 3, Kind: storage.NodeRegular}, Outcome: storage.Opened}, nil
 }
 
@@ -881,7 +881,7 @@ type replacementAtomicSession struct {
 }
 
 func (*replacementAtomicSession) CheckAtomicFileOpen() error { return nil }
-func (session *replacementAtomicSession) OpenAt(context.Context, storage.ChildName, storage.OpenAtOptions) (storage.OpenResult, error) {
+func (session *replacementAtomicSession) OpenAt(context.Context, storage.ChildSelection, storage.OpenAtOptions) (storage.OpenResult, error) {
 	return storage.OpenResult{
 		File:    &replacementIdentityFile{id: session.id},
 		Attr:    storage.Attr{ID: session.id, Kind: storage.NodeRegular},
@@ -972,12 +972,12 @@ func TestServerRejectsSameNodeChildAndAtomicSubstitution(t *testing.T) {
 		{
 			name:    "child reference",
 			session: &substitutedChildSession{},
-			request: fileRequest{Op: storage.OpFileOpenChildRef, Child: childNameOf(child), NodeRef: nodeRefOptionsOf(storage.NodeRefOptions{Target: storage.ChildCondition{State: storage.SameNode, NodeID: 2}})},
+			request: fileRequest{Op: storage.OpFileOpenChildRef, Selection: childSelectionOf(storage.ChildSelection{Name: child}), NodeRef: nodeRefOptionsOf(storage.NodeRefOptions{Target: storage.ChildCondition{State: storage.SameNode, NodeID: 2}})},
 		},
 		{
 			name:    "atomic open",
 			session: &substitutedAtomicSession{},
-			request: fileRequest{Op: storage.OpFileOpenAt, Child: childNameOf(child), OpenAt: openAtOptionsOf(storage.OpenAtOptions{Target: storage.ChildCondition{State: storage.SameNode, NodeID: 2}, Existing: storage.Keep})},
+			request: fileRequest{Op: storage.OpFileOpenAt, Selection: childSelectionOf(storage.ChildSelection{Name: child}), OpenAt: openAtOptionsOf(storage.OpenAtOptions{Target: storage.ChildCondition{State: storage.SameNode, NodeID: 2}, Existing: storage.Keep})},
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -998,7 +998,7 @@ func TestServerRejectsSameNodeChildAndAtomicSubstitution(t *testing.T) {
 
 func TestServerRequiresReplacementIdentityAndOutcome(t *testing.T) {
 	child := storage.ChildName{Parent: storage.DirectoryTarget{NodeID: 1}, RawLeaf: []byte("file")}
-	request := fileRequest{Op: storage.OpFileOpenAt, Child: childNameOf(child), OpenAt: openAtOptionsOf(storage.OpenAtOptions{
+	request := fileRequest{Op: storage.OpFileOpenAt, Selection: childSelectionOf(storage.ChildSelection{Name: child}), OpenAt: openAtOptionsOf(storage.OpenAtOptions{
 		Target: storage.ChildCondition{State: storage.SameNode, NodeID: 2}, Existing: storage.ReplaceNode,
 	})}
 	for _, test := range []struct {

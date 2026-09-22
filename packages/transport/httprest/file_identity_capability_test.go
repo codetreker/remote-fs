@@ -113,12 +113,13 @@ func TestIdentityCapabilitiesRoundTripOverHTTP(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	opened, err := session.OpenAt(ctx, storage.ChildName{Parent: storage.DirectoryTarget{NodeID: parent.ID}, RawLeaf: []byte("file")}, storage.OpenAtOptions{
+	opened, err := session.OpenAt(ctx, storage.ChildSelection{Name: storage.ChildName{Parent: storage.DirectoryTarget{NodeID: parent.ID}, RawLeaf: []byte("file")}}, storage.OpenAtOptions{
 		Read: true, Write: true, Create: true, Exclusive: true,
 		Target: storage.ChildCondition{State: storage.Absent}, Action: openAction,
 		Use: storage.UseClaim{Uses: storage.ReadData | storage.WriteData | storage.DeleteName}, Existing: storage.Keep,
 		Initial: storage.InitialState{OnCreate: storage.InitialFields{Metadata: map[string][]byte{"client.empty": nil}}},
 	})
+
 	if err != nil || opened.File == nil || opened.Outcome != storage.Created || opened.Attr.ID == 0 {
 		t.Fatalf("open-at result=%+v err=%v", opened, err)
 	}
@@ -148,9 +149,10 @@ func TestIdentityCapabilitiesRoundTripOverHTTP(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	referenceResult, err := session.OpenChildRef(ctx, storage.ChildName{Parent: storage.DirectoryTarget{NodeID: parent.ID}, RawLeaf: []byte("file")}, storage.NodeRefOptions{
+	referenceResult, err := session.OpenChildRef(ctx, storage.ChildSelection{Name: storage.ChildName{Parent: storage.DirectoryTarget{NodeID: parent.ID}, RawLeaf: []byte("file")}}, storage.NodeRefOptions{
 		Kind: storage.NodeRegular, Target: storage.ChildCondition{State: storage.SameNode, NodeID: opened.Attr.ID}, Action: refAction, Use: storage.UseClaim{Uses: storage.ReadData}, MetadataAccess: storage.ReadMetadata,
 	})
+
 	if err != nil || referenceResult.Reference == nil {
 		t.Fatalf("node reference=%+v err=%v", referenceResult, err)
 	}
@@ -188,11 +190,12 @@ func TestIdentityCapabilitiesRoundTripOverHTTP(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	deleteOpen, err := session.OpenAt(ctx, storage.ChildName{Parent: storage.DirectoryTarget{NodeID: parent.ID}, RawLeaf: []byte("delete")}, storage.OpenAtOptions{
+	deleteOpen, err := session.OpenAt(ctx, storage.ChildSelection{Name: storage.ChildName{Parent: storage.DirectoryTarget{NodeID: parent.ID}, RawLeaf: []byte("delete")}}, storage.OpenAtOptions{
 		Read: true, Target: storage.ChildCondition{State: storage.SameNode, NodeID: deleteAttr.ID}, Action: deleteAction,
 		Use: storage.UseClaim{Uses: storage.ReadData | storage.DeleteName}, Existing: storage.Keep,
 		CloseIntent: &storage.CloseIntent{ID: deleteID, Trigger: storage.OnReferenceClose, Condition: storage.UnlinkFile},
 	})
+
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -217,6 +220,161 @@ func TestIdentityCapabilitiesRoundTripOverHTTP(t *testing.T) {
 	deleteStatus, err = session.QueryDeleteIntent(ctx, deleteID)
 	if err != nil || deleteStatus.Outcome != storage.DeleteIntentUnknown || deleteStatus.NodeID != 0 {
 		t.Fatalf("acknowledged delete status=%+v err=%v", deleteStatus, err)
+	}
+}
+
+func TestGuardedChildSelectionRoundTripsAndRejectsAStaleDirectory(t *testing.T) {
+	client, _, backend := retainedHTTPFixture(t, DefaultFileLimits())
+	if err := backend.Write(t.Context(), "file", []byte("body")); err != nil {
+		t.Fatal(err)
+	}
+	root, err := backend.Stat(t.Context(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	file, err := backend.Stat(t.Context(), "file")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessionValue, err := client.NewFileSession(t.Context(), storage.DefaultFileSessionOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sessionValue.Close(context.Background())
+	session := sessionValue.(*remoteFileSession)
+	observed, err := session.ReadDirNode(t.Context(), storage.DirectoryTarget{NodeID: root.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	selection := storage.ChildSelection{
+		Name:   storage.ChildName{Parent: storage.DirectoryTarget{NodeID: root.ID}, RawLeaf: []byte("file")},
+		Guards: &storage.NamespaceGuards{Directories: []storage.DirectoryObservation{observed.Observation}},
+	}
+	status, err := session.Status(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	action, err := storage.NewFileActionID(status.ActionEpoch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	opened, err := session.OpenAt(t.Context(), selection, storage.OpenAtOptions{
+		Read: true, Target: storage.ChildCondition{State: storage.SameNode, NodeID: file.ID},
+		Action: action, Use: storage.UseClaim{Uses: storage.ReadData}, Existing: storage.Keep,
+	})
+	if err != nil {
+		t.Fatalf("fresh guarded open: %v", err)
+	}
+	if err := opened.File.Close(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	changedSelection := selection.Clone()
+	changedSelection.Guards.Directories[0].Revision[0]++
+	if result, err := session.OpenAt(t.Context(), changedSelection, storage.OpenAtOptions{
+		Read: true, Target: storage.ChildCondition{State: storage.SameNode, NodeID: file.ID},
+		Action: action, Use: storage.UseClaim{Uses: storage.ReadData}, Existing: storage.Keep,
+	}); !errors.Is(err, syscall.EINVAL) || result.File != nil {
+		t.Fatalf("changed guarded replay = %+v, %v", result, err)
+	}
+	if err := backend.Write(t.Context(), "FILE", nil); err != nil {
+		t.Fatal(err)
+	}
+	status, err = session.Status(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	action, err = storage.NewFileActionID(status.ActionEpoch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := session.OpenAt(t.Context(), selection, storage.OpenAtOptions{
+		Read: true, Target: storage.ChildCondition{State: storage.SameNode, NodeID: file.ID},
+		Action: action, Use: storage.UseClaim{Uses: storage.ReadData}, Existing: storage.Keep,
+	})
+	if !errors.Is(err, storage.ErrConditionConflict) || result.File != nil || result.Attr.ID != 0 || result.Outcome != 0 {
+		t.Fatalf("stale guarded HTTP open = %+v, %v", result, err)
+	}
+}
+
+func TestGuardedOpenReplayDoesNotReevaluateACompletedSelection(t *testing.T) {
+	client, _, backend := retainedHTTPFixture(t, DefaultFileLimits())
+	if err := backend.Write(t.Context(), "file", []byte("body")); err != nil {
+		t.Fatal(err)
+	}
+	root, err := backend.Stat(t.Context(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	file, err := backend.Stat(t.Context(), "file")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessionValue, err := client.NewFileSession(t.Context(), storage.DefaultFileSessionOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sessionValue.Close(context.Background())
+	session := sessionValue.(*remoteFileSession)
+	observed, err := session.ReadDirNode(t.Context(), storage.DirectoryTarget{NodeID: root.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	status, err := session.Status(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	action, err := storage.NewFileActionID(status.ActionEpoch)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	original := client.http.Transport
+	var calls atomic.Int32
+	var mutationErr error
+	client.http.Transport = fileRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+		response, roundTripErr := original.RoundTrip(request)
+		if roundTripErr != nil {
+			return response, roundTripErr
+		}
+		var envelope struct {
+			Op storage.Operation `json:"op"`
+		}
+		if request.GetBody != nil {
+			body, bodyErr := request.GetBody()
+			if bodyErr != nil {
+				return nil, bodyErr
+			}
+			decodeErr := json.NewDecoder(body).Decode(&envelope)
+			_ = body.Close()
+			if decodeErr != nil {
+				return nil, decodeErr
+			}
+		}
+		if envelope.Op != storage.OpFileOpenAt || calls.Add(1) != 1 {
+			return response, nil
+		}
+		_, _ = io.Copy(io.Discard, response.Body)
+		_ = response.Body.Close()
+		mutationErr = backend.Write(t.Context(), "changed", nil)
+		return nil, errors.New("lost guarded open response")
+	})
+	t.Cleanup(func() { client.http.Transport = original })
+
+	opened, err := session.OpenAt(t.Context(), storage.ChildSelection{
+		Name:   storage.ChildName{Parent: storage.DirectoryTarget{NodeID: root.ID}, RawLeaf: []byte("file")},
+		Guards: &storage.NamespaceGuards{Directories: []storage.DirectoryObservation{observed.Observation}},
+	}, storage.OpenAtOptions{
+		Read: true, Target: storage.ChildCondition{State: storage.SameNode, NodeID: file.ID},
+		Action: action, Use: storage.UseClaim{Uses: storage.ReadData}, Existing: storage.Keep,
+	})
+	if mutationErr != nil {
+		t.Fatal(mutationErr)
+	}
+	if err != nil || opened.File == nil || opened.Attr.ID != file.ID || calls.Load() != 2 {
+		t.Fatalf("guarded replay = %+v, calls=%d, error=%v", opened, calls.Load(), err)
+	}
+	if err := opened.File.Close(t.Context()); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -259,10 +417,11 @@ func TestLostSemanticOpenResponsesReplayTheOriginalCapability(t *testing.T) {
 			open := func() (retainedReference, error) {
 				switch operation {
 				case storage.OpFileOpenAt:
-					result, openErr := session.OpenAt(t.Context(), storage.ChildName{Parent: storage.DirectoryTarget{NodeID: parent.ID}, RawLeaf: []byte("file")}, storage.OpenAtOptions{
+					result, openErr := session.OpenAt(t.Context(), storage.ChildSelection{Name: storage.ChildName{Parent: storage.DirectoryTarget{NodeID: parent.ID}, RawLeaf: []byte("file")}}, storage.OpenAtOptions{
 						Read: true, Target: storage.ChildCondition{State: storage.SameNode, NodeID: file.ID}, Action: action,
 						Use: storage.UseClaim{Uses: storage.ReadData}, Existing: storage.Keep,
 					})
+
 					return result.File, openErr
 				case storage.OpFileOpenNodeRef:
 					result, openErr := session.OpenNodeRef(t.Context(), file.ID, storage.NodeRefOptions{
@@ -271,10 +430,11 @@ func TestLostSemanticOpenResponsesReplayTheOriginalCapability(t *testing.T) {
 					})
 					return result.Reference, openErr
 				default:
-					result, openErr := session.OpenChildRef(t.Context(), storage.ChildName{Parent: storage.DirectoryTarget{NodeID: parent.ID}, RawLeaf: []byte("file")}, storage.NodeRefOptions{
+					result, openErr := session.OpenChildRef(t.Context(), storage.ChildSelection{Name: storage.ChildName{Parent: storage.DirectoryTarget{NodeID: parent.ID}, RawLeaf: []byte("file")}}, storage.NodeRefOptions{
 						Kind: storage.NodeRegular, Target: storage.ChildCondition{State: storage.SameNode, NodeID: file.ID}, Action: action,
 						Use: storage.UseClaim{Uses: storage.ReadData}, MetadataAccess: storage.ReadMetadata,
 					})
+
 					return result.Reference, openErr
 				}
 			}
@@ -334,8 +494,8 @@ func TestSemanticOpenReplayGetsAFreshAcknowledgementWindow(t *testing.T) {
 		t.Fatal(err)
 	}
 	request := fileRequest{
-		Op:    storage.OpFileOpenAt,
-		Child: childNameOf(storage.ChildName{Parent: storage.DirectoryTarget{NodeID: root.ID}, RawLeaf: []byte("file")}),
+		Op:        storage.OpFileOpenAt,
+		Selection: childSelectionOf(storage.ChildSelection{Name: storage.ChildName{Parent: storage.DirectoryTarget{NodeID: root.ID}, RawLeaf: []byte("file")}}),
 		OpenAt: openAtOptionsOf(storage.OpenAtOptions{
 			Read: true, Target: storage.ChildCondition{State: storage.SameNode, NodeID: file.ID}, Action: action,
 			Use: storage.UseClaim{Uses: storage.ReadData}, Existing: storage.Keep,
@@ -429,10 +589,11 @@ func TestOpenCapabilityClosesTheReferenceWhenAcknowledgementIsDenied(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	opened, err := session.OpenAt(t.Context(), storage.ChildName{Parent: storage.DirectoryTarget{NodeID: root.ID}, RawLeaf: []byte("file")}, storage.OpenAtOptions{
+	opened, err := session.OpenAt(t.Context(), storage.ChildSelection{Name: storage.ChildName{Parent: storage.DirectoryTarget{NodeID: root.ID}, RawLeaf: []byte("file")}}, storage.OpenAtOptions{
 		Read: true, Target: storage.ChildCondition{State: storage.SameNode, NodeID: file.ID}, Action: action,
 		Use: storage.UseClaim{Uses: storage.ReadData}, Existing: storage.Keep,
 	})
+
 	if storage.ErrnoOf(err) != syscall.EIO || opened.File != nil || opened.Attr.ID != file.ID {
 		t.Fatalf("open result=%+v error=%v", opened, err)
 	}
@@ -909,10 +1070,10 @@ func TestIdentityCapabilityWireKeepsRequestConditionsSeparateFromResponseVersion
 	request := fileRequest{
 		Op:      storage.OpFileOpenAt,
 		Session: strings.Repeat("a", 64),
-		Child: childNameOf(storage.ChildName{
+		Selection: childSelectionOf(storage.ChildSelection{Name: storage.ChildName{
 			Parent:  storage.DirectoryTarget{NodeID: 7},
 			RawLeaf: []byte("file"),
-		}),
+		}}),
 		OpenAt: openAtOptionsOf(storage.OpenAtOptions{
 			Read:     true,
 			Create:   true,
