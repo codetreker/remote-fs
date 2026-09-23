@@ -21,13 +21,13 @@ func (s *fileSession) CheckAtomicFileOpen() error {
 	return err
 }
 
-func (s *fileSession) OpenAt(ctx context.Context, name storage.ChildName, options storage.OpenAtOptions) (storage.OpenResult, error) {
+func (s *fileSession) OpenAt(ctx context.Context, selection storage.ChildSelection, options storage.OpenAtOptions) (storage.OpenResult, error) {
 	backing, err := capability(s.FileSession, storage.AtomicFileOpener.CheckAtomicFileOpen)
 	if err != nil {
 		return storage.OpenResult{}, err
 	}
 	result, err := fileMutation(s.storage, ctx, "atomic open", func(ctx context.Context) (storage.OpenResult, error) {
-		return backing.OpenAt(ctx, name, options)
+		return backing.OpenAt(ctx, selection, options)
 	})
 	result.File = wrapFile(s.storage, result.File)
 	return result, err
@@ -152,13 +152,13 @@ func (s *fileSession) OpenNodeRef(ctx context.Context, id uint64, options storag
 	return result, err
 }
 
-func (s *fileSession) OpenChildRef(ctx context.Context, name storage.ChildName, options storage.NodeRefOptions) (storage.NodeOpenResult, error) {
+func (s *fileSession) OpenChildRef(ctx context.Context, selection storage.ChildSelection, options storage.NodeRefOptions) (storage.NodeOpenResult, error) {
 	backing, err := capability(s.FileSession, storage.NodeReferences.CheckNodeReferences)
 	if err != nil {
 		return storage.NodeOpenResult{}, err
 	}
 	result, err := fileMutation(s.storage, ctx, "child reference", func(ctx context.Context) (storage.NodeOpenResult, error) {
-		return backing.OpenChildRef(ctx, name, options)
+		return backing.OpenChildRef(ctx, selection, options)
 	})
 	result.Reference = wrapNodeReference(s.storage, result.Reference)
 	return result, err

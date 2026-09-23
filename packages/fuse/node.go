@@ -348,7 +348,8 @@ func (n *node) openFile(ctx context.Context, name storage.ChildName, options sto
 		Target: target, Action: action, Existing: effect, Use: storage.UseClaim{Uses: uses},
 		Initial: storage.InitialState{OnCreate: storage.InitialFields{Metadata: options.InitialMetadata}},
 	}
-	result, err := opener.OpenAt(ctx, name, request)
+	selection := storage.ChildSelection{Name: name}
+	result, err := opener.OpenAt(ctx, selection, request)
 	replayed := false
 	if result.File == nil && result.Outcome == 0 && err != nil && (errnoOf(err) == syscall.EINTR || errnoOf(err) == syscall.EIO) {
 		replay, reconcileErr := n.volume.reconcileFileAction(ctx, action, storage.OpFileOpenAt, err)
@@ -356,7 +357,7 @@ func (n *node) openFile(ctx context.Context, name storage.ChildName, options sto
 			return nil, storage.Attr{}, reconcileErr
 		}
 		completion, cancel := n.volume.cleanupContext(ctx)
-		result, err = opener.OpenAt(completion, name, request)
+		result, err = opener.OpenAt(completion, selection, request)
 		cancel()
 		replayed = true
 	}

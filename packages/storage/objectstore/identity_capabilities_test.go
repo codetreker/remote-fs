@@ -34,6 +34,11 @@ func TestAtomicOpenJournalPreservesIdentityAndRejectsChangedIntent(t *testing.T)
 	if err := volume.Write(t.Context(), "file", []byte("body")); err != nil {
 		t.Fatal(err)
 	}
+	for _, name := range []string{"a", "b"} {
+		if err := volume.Mkdir(t.Context(), name); err != nil {
+			t.Fatal(err)
+		}
+	}
 	root, err := volume.Stat(t.Context(), "")
 	if err != nil {
 		t.Fatal(err)
@@ -44,28 +49,89 @@ func TestAtomicOpenJournalPreservesIdentityAndRejectsChangedIntent(t *testing.T)
 	}
 	session := fileSessionFor(t, volume, storage.DefaultFileSessionOptions())
 	opener := session.(storage.AtomicFileOpener)
+	reader := session.(storage.DirectoryReader)
+	rootObservation, err := reader.ReadDirNode(t.Context(), storage.DirectoryTarget{NodeID: root.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, err := volume.Stat(t.Context(), "a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := volume.Stat(t.Context(), "b")
+	if err != nil {
+		t.Fatal(err)
+	}
 	action := fileActionFor(t, session)
 	name := storage.ChildName{Parent: storage.DirectoryTarget{NodeID: root.ID}, RawLeaf: []byte("file")}
+	selection := storage.ChildSelection{Name: name, Guards: &storage.NamespaceGuards{
+		Directories: []storage.DirectoryObservation{rootObservation.Observation},
+		Edges: []storage.ObservedEdge{
+			{ParentID: root.ID, RawLeaf: []byte("a"), ChildID: a.ID},
+			{ParentID: root.ID, RawLeaf: []byte("b"), ChildID: b.ID},
+		},
+		RootID: root.ID,
+	}}
 	options := storage.OpenAtOptions{
 		Read: true, Target: storage.ChildCondition{State: storage.SameNode, NodeID: want.ID},
 		Action: action, Use: storage.UseClaim{Uses: storage.ReadData}, Existing: storage.Keep,
 	}
-	first, err := opener.OpenAt(t.Context(), name, options)
+	first, err := opener.OpenAt(t.Context(), selection, options)
 	if err != nil || first.File == nil || first.Attr.ID != want.ID || first.Outcome != storage.Opened {
 		t.Fatalf("first open=%+v error=%v", first, err)
 	}
-	replayed, err := opener.OpenAt(t.Context(), name, options)
+	reordered := selection.Clone()
+	reordered.Guards.Edges[0], reordered.Guards.Edges[1] = reordered.Guards.Edges[1], reordered.Guards.Edges[0]
+	replayed, err := opener.OpenAt(t.Context(), reordered, options)
 	if err != nil || replayed.File != first.File || replayed.Attr.ID != want.ID || replayed.Outcome != storage.Opened {
 		t.Fatalf("replayed open=%+v error=%v", replayed, err)
 	}
-	changed := options
-	changed.Use.Deny = storage.WriteData
-	if result, err := opener.OpenAt(t.Context(), name, changed); !errors.Is(err, syscall.EINVAL) || result.File != nil {
+	changedSelection := selection.Clone()
+	changedSelection.Guards.Directories[0].Revision[0]++
+	if result, err := opener.OpenAt(t.Context(), changedSelection, options); !errors.Is(err, syscall.EINVAL) || result.File != nil {
 		t.Fatalf("changed action intent=%+v error=%v", result, err)
+	}
+	changedOptions := options
+	changedOptions.Use.Deny = storage.WriteData
+	if result, err := opener.OpenAt(t.Context(), selection, changedOptions); !errors.Is(err, syscall.EINVAL) || result.File != nil {
+		t.Fatalf("changed open options=%+v error=%v", result, err)
 	}
 	receipt, err := session.(storage.FileActions).QueryFileAction(t.Context(), action)
 	if err != nil || receipt.Operation != storage.OpFileOpenAt || receipt.Outcome != storage.FileActionCompleted {
 		t.Fatalf("action receipt=%+v error=%v", receipt, err)
+	}
+	if err := first.File.Close(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAtomicOpenJournalTreatsEmptyAndAbsentGuardsAsTheSameIntent(t *testing.T) {
+	volume, _ := fileVolume(t, memory.New(), 4096, nil)
+	if err := volume.Write(t.Context(), "file", []byte("body")); err != nil {
+		t.Fatal(err)
+	}
+	root, err := volume.Stat(t.Context(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	file, err := volume.Stat(t.Context(), "file")
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := fileSessionFor(t, volume, storage.DefaultFileSessionOptions())
+	opener := session.(storage.AtomicFileOpener)
+	options := storage.OpenAtOptions{
+		Read: true, Target: storage.ChildCondition{State: storage.SameNode, NodeID: file.ID},
+		Action: fileActionFor(t, session), Use: storage.UseClaim{Uses: storage.ReadData}, Existing: storage.Keep,
+	}
+	name := storage.ChildName{Parent: storage.DirectoryTarget{NodeID: root.ID}, RawLeaf: []byte("file")}
+	first, err := opener.OpenAt(t.Context(), storage.ChildSelection{Name: name}, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replayed, err := opener.OpenAt(t.Context(), storage.ChildSelection{Name: name, Guards: &storage.NamespaceGuards{}}, options)
+	if err != nil || replayed.File != first.File {
+		t.Fatalf("empty guard replay=%+v error=%v", replayed, err)
 	}
 	if err := first.File.Close(t.Context()); err != nil {
 		t.Fatal(err)
@@ -95,9 +161,9 @@ func TestDurableCloseIntentDeletesOriginalIdentityAndCanBeAcknowledged(t *testin
 		Action: fileActionFor(t, session), Use: storage.UseClaim{Uses: storage.ReadData | storage.DeleteName}, Existing: storage.Keep,
 		CloseIntent: &storage.CloseIntent{ID: intent, Trigger: storage.OnReferenceClose, Condition: storage.UnlinkFile},
 	}
-	opened, err := session.(storage.AtomicFileOpener).OpenAt(t.Context(), storage.ChildName{
+	opened, err := session.(storage.AtomicFileOpener).OpenAt(t.Context(), storage.ChildSelection{Name: storage.ChildName{
 		Parent: storage.DirectoryTarget{NodeID: root.ID}, RawLeaf: []byte("file"),
-	}, options)
+	}}, options)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -157,9 +223,9 @@ func TestNonemptyDirectoryCloseIntentReleasesReferenceWithTerminalResult(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
-	opened, err := session.(storage.NodeReferences).OpenChildRef(t.Context(), storage.ChildName{
+	opened, err := session.(storage.NodeReferences).OpenChildRef(t.Context(), storage.ChildSelection{Name: storage.ChildName{
 		Parent: storage.DirectoryTarget{NodeID: root.ID}, RawLeaf: []byte("dir"),
-	}, storage.NodeRefOptions{
+	}}, storage.NodeRefOptions{
 		Kind: storage.NodeDirectory, Target: storage.ChildCondition{State: storage.SameNode, NodeID: directory.ID},
 		Action: fileActionFor(t, session), Use: storage.UseClaim{Uses: storage.DeleteName}, MetadataAccess: storage.ReadMetadata,
 		CloseIntent: &storage.CloseIntent{ID: intent, Trigger: storage.OnReferenceClose, Condition: storage.UnlinkIfEmpty},
@@ -245,9 +311,9 @@ func TestReferenceActionJournalRejectsAnotherReceiver(t *testing.T) {
 		t.Fatal(err)
 	}
 	openDirectory := func(name string, attr storage.Attr) storage.NodeReference {
-		opened, err := session.(storage.NodeReferences).OpenChildRef(t.Context(), storage.ChildName{
+		opened, err := session.(storage.NodeReferences).OpenChildRef(t.Context(), storage.ChildSelection{Name: storage.ChildName{
 			Parent: storage.DirectoryTarget{NodeID: root.ID}, RawLeaf: []byte(name),
-		}, storage.NodeRefOptions{
+		}}, storage.NodeRefOptions{
 			Kind: storage.NodeDirectory, Target: storage.ChildCondition{State: storage.SameNode, NodeID: attr.ID},
 			Action: fileActionFor(t, session), Use: storage.UseClaim{Uses: storage.DeleteName}, MetadataAccess: storage.ReadMetadata,
 		})
@@ -291,9 +357,9 @@ func TestNodeReferenceConditionalMutationPreservesKindAndActionIdentity(t *testi
 				t.Fatal(err)
 			}
 			session := fileSessionFor(t, volume, storage.DefaultFileSessionOptions())
-			opened, err := session.(storage.NodeReferences).OpenChildRef(t.Context(), storage.ChildName{
+			opened, err := session.(storage.NodeReferences).OpenChildRef(t.Context(), storage.ChildSelection{Name: storage.ChildName{
 				Parent: storage.DirectoryTarget{NodeID: root.ID}, RawLeaf: []byte(test.name),
-			}, storage.NodeRefOptions{
+			}}, storage.NodeRefOptions{
 				Kind: test.kind, Target: storage.ChildCondition{State: storage.Absent}, Action: fileActionFor(t, session),
 				Create: true, Exclusive: true, InitialState: test.initial,
 				MetadataAccess: storage.ReadMetadata | storage.WriteMetadata,

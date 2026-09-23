@@ -93,13 +93,13 @@ func (s *fileSession) AcknowledgeDeleteIntent(ctx context.Context, command stora
 	return err
 }
 
-func (s *fileSession) OpenAt(ctx context.Context, name storage.ChildName, options storage.OpenAtOptions) (storage.OpenResult, error) {
+func (s *fileSession) OpenAt(ctx context.Context, selection storage.ChildSelection, options storage.OpenAtOptions) (storage.OpenResult, error) {
 	return sessionCapability(ctx, s, true, func(ctx context.Context, capability httprest.AtomicFileOpenerWithBarrier) (storage.OpenResult, error) {
 		var result storage.OpenResult
 		err := s.confirm(ctx, "open-at", func(ctx context.Context) (*httprest.MutationBarrier, error) {
 			var barrier *httprest.MutationBarrier
 			var err error
-			result, barrier, err = capability.OpenAtWithBarrier(ctx, name, options)
+			result, barrier, err = capability.OpenAtWithBarrier(ctx, selection, options)
 			return barrier, err
 		})
 		return s.wrapOpenResult(result, err)
@@ -222,10 +222,10 @@ func (s *fileSession) OpenNodeRef(ctx context.Context, id uint64, options storag
 	})
 }
 
-func (s *fileSession) OpenChildRef(ctx context.Context, name storage.ChildName, options storage.NodeRefOptions) (storage.NodeOpenResult, error) {
+func (s *fileSession) OpenChildRef(ctx context.Context, selection storage.ChildSelection, options storage.NodeRefOptions) (storage.NodeOpenResult, error) {
 	return sessionCapability(ctx, s, true, func(ctx context.Context, capability httprest.NodeReferencesWithBarrier) (storage.NodeOpenResult, error) {
 		return s.openReference(ctx, func(ctx context.Context) (storage.NodeOpenResult, *httprest.MutationBarrier, error) {
-			return capability.OpenChildRefWithBarrier(ctx, name, options)
+			return capability.OpenChildRefWithBarrier(ctx, selection, options)
 		})
 	})
 }

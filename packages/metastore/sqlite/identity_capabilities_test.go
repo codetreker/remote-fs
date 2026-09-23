@@ -22,6 +22,10 @@ func fileAction(t *testing.T) storage.FileActionID {
 	return id
 }
 
+func selectChild(name storage.ChildName) storage.ChildSelection {
+	return storage.ChildSelection{Name: name}
+}
+
 func accountingContext(t *testing.T, calls *[][2]int64) context.Context {
 	t.Helper()
 	return storage.WithPublicationAccounting(t.Context(), func(previous, next int64) (storage.PublicationSettlement, error) {
@@ -101,7 +105,7 @@ func TestIdentityAddressedNamespaceAndAtomicOpenPreserveTheSelectedNode(t *testi
 		t.Fatal(err)
 	}
 	name := storage.ChildName{Parent: storage.DirectoryTarget{NodeID: directory.Attr().ID}, RawLeaf: []byte("file")}
-	opened, err := store.OpenAt(t.Context(), name, storage.OpenAtOptions{
+	opened, err := store.OpenAt(t.Context(), selectChild(name), storage.OpenAtOptions{
 		Read: true, Write: true, Create: true, Exclusive: true,
 		Target: storage.ChildCondition{State: storage.Absent}, Action: fileAction(t),
 		Use: storage.UseClaim{Uses: storage.ReadData | storage.WriteData}, Existing: storage.Keep,
@@ -172,7 +176,7 @@ func TestAtomicIdentityOpensCheckAuthoritativeMetadataPredicates(t *testing.T) {
 		open func(storage.ChildCondition) (func() error, error)
 	}{
 		{"OpenAt", func(condition storage.ChildCondition) (func() error, error) {
-			result, err := store.OpenAt(t.Context(), name, storage.OpenAtOptions{
+			result, err := store.OpenAt(t.Context(), selectChild(name), storage.OpenAtOptions{
 				Read: true, Target: condition, Action: fileAction(t), Existing: storage.Keep,
 				Use: storage.UseClaim{Uses: storage.ReadData},
 			})
@@ -182,7 +186,7 @@ func TestAtomicIdentityOpensCheckAuthoritativeMetadataPredicates(t *testing.T) {
 			return func() error { return result.File.Close(t.Context()) }, err
 		}},
 		{"OpenChildRef", func(condition storage.ChildCondition) (func() error, error) {
-			result, err := store.OpenChildRef(t.Context(), name, storage.NodeRefOptions{
+			result, err := store.OpenChildRef(t.Context(), selectChild(name), storage.NodeRefOptions{
 				Kind: storage.NodeRegular, Target: condition, Action: fileAction(t),
 				Use: storage.UseClaim{Uses: storage.ReadData}, MetadataAccess: storage.ReadMetadata,
 			})
@@ -227,7 +231,7 @@ func TestUncertainIdentityMutationsPreserveTheirCapturedResults(t *testing.T) {
 		}
 		acceptErr := errors.New("open acceptance unavailable")
 		store.witness = &retainedFailureWitness{failure: acceptErr}
-		result, err := store.OpenAt(t.Context(), storage.ChildName{Parent: directoryTarget(root), RawLeaf: []byte("file")}, storage.OpenAtOptions{
+		result, err := store.OpenAt(t.Context(), selectChild(storage.ChildName{Parent: directoryTarget(root), RawLeaf: []byte("file")}), storage.OpenAtOptions{
 			Read: true, Create: true, Exclusive: true, Existing: storage.Keep, Action: fileAction(t),
 			Target: storage.ChildCondition{State: storage.Absent}, Use: storage.UseClaim{Uses: storage.ReadData},
 		})
@@ -299,7 +303,7 @@ func TestNodeReferenceRetainsSymlinkTargetAfterUnlink(t *testing.T) {
 		t.Fatal(err)
 	}
 	name := storage.ChildName{Parent: directoryTarget(root), RawLeaf: []byte("link")}
-	opened, err := store.OpenChildRef(t.Context(), name, storage.NodeRefOptions{
+	opened, err := store.OpenChildRef(t.Context(), selectChild(name), storage.NodeRefOptions{
 		Kind: storage.NodeSymlink, Target: storage.ChildCondition{State: storage.Absent}, Action: fileAction(t),
 		Create: true, Exclusive: true, MetadataAccess: storage.ReadMetadata,
 		InitialState: storage.InitialState{OnCreate: storage.InitialFields{LinkTarget: []byte("target")}},
@@ -338,7 +342,7 @@ func TestCloseDeleteIntentFollowsRenameWithoutDeletingTheSuccessor(t *testing.T)
 	}
 	name := storage.ChildName{Parent: directoryTarget(root), RawLeaf: []byte("name")}
 	intentID := storage.DeleteIntentID("0123456789abcdef0123456789abcdef")
-	opened, err := store.OpenAt(metastore.WithReferenceSession(t.Context(), nil), name, storage.OpenAtOptions{
+	opened, err := store.OpenAt(metastore.WithReferenceSession(t.Context(), nil), selectChild(name), storage.OpenAtOptions{
 		Read: true, Create: true, Exclusive: true, Target: storage.ChildCondition{State: storage.Absent},
 		Action: fileAction(t), Existing: storage.Keep,
 		Use:         storage.UseClaim{Uses: storage.ReadData | storage.DeleteName},
@@ -452,7 +456,7 @@ func TestDeleteCleanupFailureIsReportedAndRetryable(t *testing.T) {
 		t.Fatal(err)
 	}
 	intentID := storage.DeleteIntentID("11111111111111111111111111111111")
-	opened, err := store.OpenAt(t.Context(), storage.ChildName{Parent: directoryTarget(root), RawLeaf: []byte("victim")}, storage.OpenAtOptions{
+	opened, err := store.OpenAt(t.Context(), selectChild(storage.ChildName{Parent: directoryTarget(root), RawLeaf: []byte("victim")}), storage.OpenAtOptions{
 		Read: true, Create: true, Exclusive: true, Existing: storage.Keep, Action: fileAction(t),
 		Target:      storage.ChildCondition{State: storage.Absent},
 		Use:         storage.UseClaim{Uses: storage.ReadData | storage.DeleteName},
@@ -537,7 +541,7 @@ func TestNotExecutedCloseIntentStillReleasesTheReference(t *testing.T) {
 		t.Fatal(err)
 	}
 	intentID := storage.DeleteIntentID("22222222222222222222222222222222")
-	opened, err := store.OpenChildRef(t.Context(), storage.ChildName{Parent: directoryTarget(root), RawLeaf: []byte("dir")}, storage.NodeRefOptions{
+	opened, err := store.OpenChildRef(t.Context(), selectChild(storage.ChildName{Parent: directoryTarget(root), RawLeaf: []byte("dir")}), storage.NodeRefOptions{
 		Kind: storage.NodeDirectory, Target: storage.ChildCondition{State: storage.SameNode, NodeID: uint64(directory.ID)},
 		Action: fileAction(t), Use: storage.UseClaim{Uses: storage.DeleteName}, MetadataAccess: storage.ReadMetadata,
 		CloseIntent: &storage.CloseIntent{ID: intentID, Trigger: storage.OnReferenceClose, Condition: storage.UnlinkIfEmpty},
@@ -588,7 +592,7 @@ func TestIdentityRemovalPublishesOnlyRegularContentBytes(t *testing.T) {
 		t.Fatal(err)
 	}
 	var replacement [][2]int64
-	replaced, err := store.OpenAt(accountingContext(t, &replacement), storage.ChildName{Parent: directoryTarget(root), RawLeaf: []byte("file")}, storage.OpenAtOptions{
+	replaced, err := store.OpenAt(accountingContext(t, &replacement), selectChild(storage.ChildName{Parent: directoryTarget(root), RawLeaf: []byte("file")}), storage.OpenAtOptions{
 		Read: true, Create: true, Target: storage.ChildCondition{State: storage.SameNode, NodeID: uint64(current.ID)},
 		Action: fileAction(t), Existing: storage.ReplaceNode,
 		Use: storage.UseClaim{Uses: storage.ReadData | storage.DeleteName},
@@ -602,7 +606,7 @@ func TestIdentityRemovalPublishesOnlyRegularContentBytes(t *testing.T) {
 	}
 
 	linkName := storage.ChildName{Parent: directoryTarget(root), RawLeaf: []byte("link")}
-	link, err := store.OpenChildRef(t.Context(), linkName, storage.NodeRefOptions{
+	link, err := store.OpenChildRef(t.Context(), selectChild(linkName), storage.NodeRefOptions{
 		Kind: storage.NodeSymlink, Target: storage.ChildCondition{State: storage.Absent}, Action: fileAction(t),
 		Create: true, InitialState: storage.InitialState{OnCreate: storage.InitialFields{LinkTarget: []byte("target")}},
 	})
@@ -651,7 +655,7 @@ func TestPendingDeletePublishesTheRemovedRegularBytes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	opened, err := store.OpenAt(t.Context(), storage.ChildName{Parent: directoryTarget(root), RawLeaf: []byte("victim")}, storage.OpenAtOptions{
+	opened, err := store.OpenAt(t.Context(), selectChild(storage.ChildName{Parent: directoryTarget(root), RawLeaf: []byte("victim")}), storage.OpenAtOptions{
 		Read: true, Write: true, Create: true, Exclusive: true, Existing: storage.Keep, Action: fileAction(t),
 		Target:      storage.ChildCondition{State: storage.Absent},
 		Use:         storage.UseClaim{Uses: storage.ReadData | storage.WriteData | storage.DeleteName},

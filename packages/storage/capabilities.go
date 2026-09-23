@@ -13,7 +13,7 @@ import (
 // a path-based open because the parent or child may be replaced between calls.
 type AtomicFileOpener interface {
 	CheckAtomicFileOpen() error
-	OpenAt(context.Context, ChildName, OpenAtOptions) (OpenResult, error)
+	OpenAt(context.Context, ChildSelection, OpenAtOptions) (OpenResult, error)
 }
 
 // NamespaceAccess addresses exact byte names beneath directory identities. A
@@ -55,7 +55,7 @@ type NodeReference interface {
 type NodeReferences interface {
 	CheckNodeReferences() error
 	OpenNodeRef(context.Context, uint64, NodeRefOptions) (NodeOpenResult, error)
-	OpenChildRef(context.Context, ChildName, NodeRefOptions) (NodeOpenResult, error)
+	OpenChildRef(context.Context, ChildSelection, NodeRefOptions) (NodeOpenResult, error)
 }
 
 // ReferenceStateAccess captures identity state and pending deletion together.
@@ -228,6 +228,14 @@ type DirectoryTarget struct {
 type ChildName struct {
 	Parent  DirectoryTarget
 	RawLeaf []byte
+}
+
+// ChildSelection binds one raw child name to the namespace facts that justified
+// selecting it. The authority validates the guards before selecting the child
+// or applying any open effect.
+type ChildSelection struct {
+	Name   ChildName
+	Guards *NamespaceGuards `json:",omitempty"`
 }
 
 // DirectoryObservation identifies one complete authoritative capture of a

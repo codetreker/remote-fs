@@ -20,7 +20,7 @@ type OpenResult struct {
 
 type AtomicFileOpener interface {
 	CheckAtomicFileOpen() error
-	OpenAt(context.Context, storage.ChildName, storage.OpenAtOptions) (OpenResult, error)
+	OpenAt(context.Context, storage.ChildSelection, storage.OpenAtOptions) (OpenResult, error)
 }
 
 // NodeReference shares native retention and session lifetime without granting
@@ -46,7 +46,7 @@ type NodeOpenResult struct {
 type NodeReferences interface {
 	CheckNodeReferences() error
 	OpenNodeRef(context.Context, uint64, storage.NodeRefOptions) (NodeOpenResult, error)
-	OpenChildRef(context.Context, storage.ChildName, storage.NodeRefOptions) (NodeOpenResult, error)
+	OpenChildRef(context.Context, storage.ChildSelection, storage.NodeRefOptions) (NodeOpenResult, error)
 }
 
 type NamespaceAccess interface {

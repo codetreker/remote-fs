@@ -1685,8 +1685,8 @@ func (s *decoratedSession) listedPath(parent string, leaf []byte) string {
 	return parent + "/" + string(leaf)
 }
 
-func (s *decoratedSession) OpenAt(ctx context.Context, name storage.ChildName, options storage.OpenAtOptions) (storage.OpenResult, error) {
-	path := s.childPath(name)
+func (s *decoratedSession) OpenAt(ctx context.Context, selection storage.ChildSelection, options storage.OpenAtOptions) (storage.OpenResult, error) {
+	path := s.childPath(selection.Name)
 	if err := s.hooks.check("OpenFile", path); err != nil {
 		return storage.OpenResult{}, err
 	}
@@ -1695,7 +1695,7 @@ func (s *decoratedSession) OpenAt(ctx context.Context, name storage.ChildName, o
 			return storage.OpenResult{}, err
 		}
 	}
-	result, err := s.AtomicFileOpener.OpenAt(ctx, name, options)
+	result, err := s.AtomicFileOpener.OpenAt(ctx, selection, options)
 	if result.File != nil {
 		result.File = &decoratedFile{File: result.File, hooks: s.hooks, path: path}
 	}
@@ -1752,12 +1752,12 @@ func (s *decoratedSession) OpenNodeRef(ctx context.Context, id uint64, options s
 	return result, err
 }
 
-func (s *decoratedSession) OpenChildRef(ctx context.Context, name storage.ChildName, options storage.NodeRefOptions) (storage.NodeOpenResult, error) {
-	path := s.childPath(name)
+func (s *decoratedSession) OpenChildRef(ctx context.Context, selection storage.ChildSelection, options storage.NodeRefOptions) (storage.NodeOpenResult, error) {
+	path := s.childPath(selection.Name)
 	if err := s.hooks.check("OpenNode", path); err != nil {
 		return storage.NodeOpenResult{}, err
 	}
-	result, err := s.NodeReferences.OpenChildRef(ctx, name, options)
+	result, err := s.NodeReferences.OpenChildRef(ctx, selection, options)
 	if result.Reference != nil {
 		result.Reference = &decoratedNodeReference{NodeReference: result.Reference, hooks: s.hooks, path: path}
 	}

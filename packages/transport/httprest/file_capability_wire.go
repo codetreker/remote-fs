@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"sort"
 	"strings"
 
 	"github.com/codetreker/remote-fs/packages/storage"
@@ -13,7 +14,7 @@ import (
 
 type AtomicFileOpenerWithBarrier interface {
 	storage.AtomicFileOpener
-	OpenAtWithBarrier(context.Context, storage.ChildName, storage.OpenAtOptions) (storage.OpenResult, *MutationBarrier, error)
+	OpenAtWithBarrier(context.Context, storage.ChildSelection, storage.OpenAtOptions) (storage.OpenResult, *MutationBarrier, error)
 }
 
 type NamespaceAccessWithBarrier interface {
@@ -24,7 +25,7 @@ type NamespaceAccessWithBarrier interface {
 type NodeReferencesWithBarrier interface {
 	storage.NodeReferences
 	OpenNodeRefWithBarrier(context.Context, uint64, storage.NodeRefOptions) (storage.NodeOpenResult, *MutationBarrier, error)
-	OpenChildRefWithBarrier(context.Context, storage.ChildName, storage.NodeRefOptions) (storage.NodeOpenResult, *MutationBarrier, error)
+	OpenChildRefWithBarrier(context.Context, storage.ChildSelection, storage.NodeRefOptions) (storage.NodeOpenResult, *MutationBarrier, error)
 }
 
 type NodeReferenceWithBarrier interface {
@@ -86,6 +87,40 @@ func (value childCondition) storage() storage.ChildCondition {
 type childName struct {
 	Parent  storage.DirectoryTarget `json:"parent"`
 	RawLeaf canonicalBytes          `json:"rawLeaf"`
+}
+
+func childSelectionWire(value storage.ChildSelection) (*childName, *namespaceGuards) {
+	value = canonicalChildSelection(value)
+	return childNameOf(value.Name), namespaceGuardsOf(value.Guards)
+}
+
+func childSelectionStorage(name *childName, guards *namespaceGuards) storage.ChildSelection {
+	return canonicalChildSelection(storage.ChildSelection{Name: name.storage(), Guards: guards.storage()})
+}
+
+func canonicalChildSelection(value storage.ChildSelection) storage.ChildSelection {
+	value = value.Clone()
+	if value.Guards == nil {
+		return value
+	}
+	if value.Guards.RootID == 0 && len(value.Guards.Directories) == 0 && len(value.Guards.Edges) == 0 {
+		value.Guards = nil
+		return value
+	}
+	sort.Slice(value.Guards.Directories, func(left, right int) bool {
+		return value.Guards.Directories[left].ParentID < value.Guards.Directories[right].ParentID
+	})
+	sort.Slice(value.Guards.Edges, func(left, right int) bool {
+		leftEdge, rightEdge := value.Guards.Edges[left], value.Guards.Edges[right]
+		if leftEdge.ParentID != rightEdge.ParentID {
+			return leftEdge.ParentID < rightEdge.ParentID
+		}
+		if compared := bytes.Compare(leftEdge.RawLeaf, rightEdge.RawLeaf); compared != 0 {
+			return compared < 0
+		}
+		return leftEdge.ChildID < rightEdge.ChildID
+	})
+	return value
 }
 
 func childNameOf(value storage.ChildName) *childName {

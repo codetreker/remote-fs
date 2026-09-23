@@ -111,7 +111,7 @@ mutation 成功后，replicated client 从严格验证过的 response 取得 `(i
 
 ## 三、打开的是对象引用
 
-一个打开的目录 handle 保存 `storage.NodeReference` 及其 Scope，一个普通文件 handle 保存 `storage.File`、访问方式和 Scope。Create 的 OpenAt 及 Opendir/Readlink 的 OpenNodeRef 从 FileSession action epoch 生成 `FileActionID`；已有 inode 的 Open 使用旧 OpenNode 协议。OpenAt 把存在性、身份/metadata 条件、创建、POSIX 初始 metadata、Use claim 和返回对象交给一次权威动作；已有文件的 `O_TRUNC` 由 OpenNode 在返回前完成，即使之后没有任何 write。OpenChildRef 保留给编程入口。
+一个打开的目录 handle 保存 `storage.NodeReference` 及其 Scope，一个普通文件 handle 保存 `storage.File`、访问方式和 Scope。Create 的 OpenAt 及 Opendir/Readlink 的 OpenNodeRef 从 FileSession action epoch 生成 `FileActionID`；已有 inode 的 Open 使用旧 OpenNode 协议。FUSE 把精确字节叶名放入不带 guards 的 `ChildSelection`；OpenAt 把存在性、身份/metadata 条件、创建、POSIX 初始 metadata、Use claim 和返回对象交给一次权威动作。已有文件的 `O_TRUNC` 由 OpenNode 在返回前完成，即使之后没有任何 write。OpenChildRef 保留给编程入口。
 
 ```
 打开   ──▶ OpenAt / OpenNode，取得对象引用，不取内容
@@ -235,7 +235,7 @@ volume 报出自己的容量，挂载呈现层把它换算成内核要的块数�
 
 同步写入不在离线时返回成功，不把未知失败重试为新写入。原生补丁实现可在已知未提交的 revision 竞争后有界重试；这与应用重做一个结果未知的修改不同。普通 fd 没有隐含的内容版本前置条件，显式版本工作流仍独立。
 
-目录子项 Lookup、mutation 与 Readdir 使用 NodeID 和可选 NodeReference Scope；reference current-name、完整有界 directory metadata observation 与持久 authority directory revision/guard 由[有界权威名字观察](../../../.agents/notes/implemented/architecture/2026-09-20-bounded-authoritative-name-observations.md)提供。guards 只约束回源的只读观察，不与 SQLite replica 的本地 revision 比较，也不进入名字 mutation 或当前路径遍历。目录 revision 不是通知游标，挂载层不据此实现缓存失效或恢复。
+目录子项 Lookup、mutation 与 Readdir 使用 NodeID 和可选 NodeReference Scope；reference current-name、完整有界 directory metadata observation 与持久 authority directory revision/guard 由[有界权威名字观察](../../../.agents/notes/implemented/architecture/2026-09-20-bounded-authoritative-name-observations.md)提供。[权威子项选择](../../../.agents/notes/implemented/architecture/2026-09-22-guard-authoritative-child-selection.md)允许 OpenAt 与 OpenChildRef 把这些 guards 带回最终 authority transaction。guards 不与 SQLite replica 的本地 revision 比较；FUSE 不从副本合成它们，名字 mutation 与当前路径遍历也仍不接受它们。目录 revision 不是通知游标，挂载层不据此实现缓存失效或恢复。
 
 标准 advisory 通过中立 range 表达 flock 与传统 POSIX 范围锁，完整 `F_OFD_*` 和 mmap 行为不由此推出。enforced range 为其它平台保留，当前 Linux 不把它冒充 advisory。显式 S/X 仍单独取得，挂载不自动选择 Strong 策略。SMB endpoint 提供协议、安全会话与 share 生命周期；Windows create/share/disposition 映射、文件与目录命令、通知、WNet 发布和 cache 验收不在其支持面，不能据此宣称 Windows 支持完成。
 

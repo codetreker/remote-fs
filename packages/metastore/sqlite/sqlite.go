@@ -801,6 +801,18 @@ func (s *Store) mutateTransaction(admissionContext, ctx context.Context, intent 
 
 // The caller holds commit ordering across retention or retirement and publication.
 func (s *Store) mutateTransactionLocked(ctx, transactionContext context.Context, intent *volumeIntent, f func(tx *sql.Tx) error) (returnErr error) {
+	return s.mutatePlannedTransactionLocked(ctx, transactionContext, func(*sql.Tx) (*volumeIntent, bool, error) {
+		return intent, true, nil
+	}, f)
+}
+
+// The caller holds commit ordering. plan reads the transaction to select the
+// exact publication target before the native mutation begins. A false mutate
+// result promises that apply has no persistent effect, so the transaction is
+// rolled back after the read and in-memory reference admission complete.
+func (s *Store) mutatePlannedTransactionLocked(ctx, transactionContext context.Context,
+	plan func(*sql.Tx) (*volumeIntent, bool, error), apply func(*sql.Tx) error,
+) (returnErr error) {
 	if err := s.coordinator.healthy(); err != nil {
 		return err
 	}
@@ -813,18 +825,25 @@ func (s *Store) mutateTransactionLocked(ctx, transactionContext context.Context,
 		returnErr = s.finishMutationTransaction(tx, returnErr, observationHeld)
 	}()
 
-	var publication *volumePublication
+	intent, mutate, err := plan(tx.Tx)
+	if err != nil {
+		return err
+	}
+	if !mutate {
+		return apply(tx.Tx)
+	}
 	metadataBefore, err := s.metadataUsage(ctx, tx.Tx)
 	if err != nil {
 		return err
 	}
+	var publication *volumePublication
 	if intent != nil {
 		publication, err = s.prepareVolumePublication(ctx, tx.Tx, *intent)
 		if err != nil {
 			return err
 		}
 	}
-	if err := f(tx.Tx); err != nil {
+	if err := apply(tx.Tx); err != nil {
 		return err
 	}
 	if publication != nil {

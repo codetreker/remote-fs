@@ -34,7 +34,7 @@ FUSE 同时要求 NamespaceAccess 与 DirectoryReader：前者处理 Lookup 和 
 
 `NamespaceGuards` 可以携带目录 revision、确切的 `(ParentID, RawLeaf, ChildID)` 边，以及可选 RootID。每个目录、child 和父／叶槽在一组 guard 中只能出现一次；边不能成环，RootID 存在时全部 guard 必须形成以它为根的可验证祖先关系。调用本身与所有 guards、目标 observation 和可选当前名字在同一 SQLite read transaction 与 publication gate 内核对；任何不符返回 `ErrConditionConflict`，不暴露部分结果。
 
-guards 只进入 ObserveDirectoryMetadata 与 ObserveName。OpenAt、OpenChildRef、NameCommand、FileMutation 与 delete intent 的输入没有 guards，当前路径遍历也不消费这些证据。把 guard 用于修改时必须在最终名字效果的同一事务中增加字段和检查，不能在调用前预检后继续执行既有 mutation。
+本决定交付时，guards 只进入 ObserveDirectoryMetadata 与 ObserveName。后续的[权威子项选择](2026-09-22-guard-authoritative-child-selection.md)让 OpenAt 与 OpenChildRef 以 `ChildSelection` 接受同一证据，并在最终选择事务中核对。NameCommand、FileMutation、显式 delete-intent 命令与当前路径遍历仍不消费 guards；任何继续扩展的入口都必须在最终名字效果的同一事务中增加字段和检查，不能在调用前预检后继续执行既有 mutation。
 
 ### revision 持久化并随名字集合推进
 
@@ -58,7 +58,7 @@ limited、locked、objectstore、localstore 与 replicated 分别转发 Namespac
 
 范围外是 guarded mutation、当前路径遍历、通知、overflow/rescan、缓存失效与恢复、Windows 名字映射、SMB 文件适配和原生 Windows 验收。协议、安全会话与 share 生命周期由[安全且有界的本机 SMB 端点](2026-09-21-secure-bounded-smb-endpoint.md)独立交付。
 
-这些延后项保持可加：guards 是独立、平台中立的证据类型，既有 mutation 请求不接受它们，接入时必须在最终名字效果的同一事务增加检查；revision 只可比等，不作为事件游标，观察 API 不建立 watcher，client 不从 token 推导持续缓存；核心保存原始名字，不做 UTF-8、大小写或保留名判定，平台适配在完整目录观察之上执行自己的无歧义检查。
+这些延后项保持可加：guards 是独立、平台中立的证据类型；[权威子项选择](2026-09-22-guard-authoritative-child-selection.md)只把它们接入 OpenAt 与 OpenChildRef，其余 mutation 接入时仍必须在最终名字效果的同一事务增加检查。revision 只可比等，不作为事件游标，观察 API 不建立 watcher，client 不从 token 推导持续缓存；核心保存原始名字，不做 UTF-8、大小写或保留名判定，平台适配在完整目录观察之上执行自己的无歧义检查。
 
 ## 备选方案
 
@@ -72,4 +72,4 @@ limited、locked、objectstore、localstore 与 replicated 分别转发 Namespac
 
 已打开目录的应用枚举、完整目录 metadata 与引用当前名字都有身份绑定、权威、有限且 fail-closed 的答案。目录 revision 为后续条件名字操作提供持久证据，Root／Linked／Detached 使平台无需从旧路径或缺失数据猜测当前绑定。代价是 SQLite 增加 v8 持久字段和计量，三项新的授权／HTTP 操作及所有包装层都必须维护独立预算，FUSE directory handle 会为一次枚举保留完整捕获直到 handle 释放。
 
-本决定接续[持久节点身份与原子文件操作](2026-09-20-durable-identity-and-atomic-file-operations.md)预留的目录观察与当前名字边界，并使[中立元数据与访问控制](2026-09-16-neutral-metadata-and-access-controls.md)中的 DirectoryMetadata 与 ReferenceName 协商位成为实际能力。它只部分满足[Windows 系统网络驱动器](../../proposed/feature/2026-09-16-windows-network-drive-support.md)需要的权威名字事实；[安全且有界的本机 SMB 端点](2026-09-21-secure-bounded-smb-endpoint.md)交付协议与会话基础，平台名字规则、guarded mutation、文件命令、通知、缓存恢复和原生 Windows 验收仍由该提案及后续决定拥有。
+本决定接续[持久节点身份与原子文件操作](2026-09-20-durable-identity-and-atomic-file-operations.md)预留的目录观察与当前名字边界，并使[中立元数据与访问控制](2026-09-16-neutral-metadata-and-access-controls.md)中的 DirectoryMetadata 与 ReferenceName 协商位成为实际能力。[权威子项选择](2026-09-22-guard-authoritative-child-selection.md)随后把这份证据接入 OpenAt 与 OpenChildRef。它们只部分满足[Windows 系统网络驱动器](../../proposed/feature/2026-09-16-windows-network-drive-support.md)需要的权威名字事实；[安全且有界的本机 SMB 端点](2026-09-21-secure-bounded-smb-endpoint.md)交付协议与会话基础，平台名字规则、其余 guarded mutation、文件命令、通知、缓存恢复和原生 Windows 验收仍由该提案及后续决定拥有。

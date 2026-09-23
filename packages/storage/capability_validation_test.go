@@ -131,6 +131,70 @@ func TestIdentityParentedValuesRejectMalformedInputs(t *testing.T) {
 	if err := (ChildName{Parent: DirectoryTarget{NodeID: 1}, RawLeaf: []byte("x")}).Check(); err != nil {
 		t.Fatalf("valid child: %v", err)
 	}
+	selection := ChildSelection{
+		Name: ChildName{Parent: DirectoryTarget{NodeID: 1, Scope: &scope}, RawLeaf: []byte("child")},
+		Guards: &NamespaceGuards{
+			RootID:      1,
+			Directories: []DirectoryObservation{{ParentID: 1, Revision: []byte("revision")}},
+			Edges:       []ObservedEdge{{ParentID: 1, RawLeaf: []byte("edge"), ChildID: 2}},
+		},
+	}
+	if err := selection.Check(); err != nil {
+		t.Fatalf("valid child selection: %v", err)
+	}
+	invalidName := selection.Clone()
+	invalidName.Name.RawLeaf = nil
+	if !errors.Is(invalidName.Check(), syscall.EINVAL) {
+		t.Fatalf("selection with invalid name accepted: %+v", invalidName)
+	}
+	invalidGuards := selection.Clone()
+	invalidGuards.Guards.Edges[0].ChildID = invalidGuards.Guards.Edges[0].ParentID
+	if !errors.Is(invalidGuards.Check(), syscall.EINVAL) {
+		t.Fatalf("selection with invalid guards accepted: %+v", invalidGuards)
+	}
+}
+
+func TestChildSelectionCloneOwnsNameScopeAndGuards(t *testing.T) {
+	scope := UseScope{Token: "reference"}
+	selection := ChildSelection{
+		Name: ChildName{Parent: DirectoryTarget{NodeID: 1, Scope: &scope}, RawLeaf: []byte("child")},
+		Guards: &NamespaceGuards{
+			RootID:      1,
+			Directories: []DirectoryObservation{{ParentID: 1, Revision: []byte("revision")}},
+			Edges:       []ObservedEdge{{ParentID: 1, RawLeaf: []byte("edge"), ChildID: 2}},
+		},
+	}
+	cloned := selection.Clone()
+
+	selection.Name.RawLeaf[0] = 'X'
+	selection.Name.Parent.Scope.Token = "changed"
+	selection.Guards.Directories[0].Revision[0] = 'X'
+	selection.Guards.Edges[0].RawLeaf[0] = 'X'
+	selection.Guards.RootID = 9
+
+	if string(cloned.Name.RawLeaf) != "child" || cloned.Name.Parent.Scope == selection.Name.Parent.Scope || cloned.Name.Parent.Scope.Token != "reference" {
+		t.Fatalf("clone retained child-name storage: %+v", cloned.Name)
+	}
+	if cloned.Guards == selection.Guards || cloned.Guards.RootID != 1 || string(cloned.Guards.Directories[0].Revision) != "revision" || string(cloned.Guards.Edges[0].RawLeaf) != "edge" {
+		t.Fatalf("clone retained namespace-guard storage: %+v", cloned.Guards)
+	}
+
+	withoutGuards := ChildSelection{Name: ChildName{Parent: DirectoryTarget{NodeID: 1}, RawLeaf: []byte("child")}}
+	if err := withoutGuards.Check(); err != nil {
+		t.Fatalf("unguarded child selection: %v", err)
+	}
+	if cloned := withoutGuards.Clone(); cloned.Guards != nil {
+		t.Fatalf("nil guards became present: %+v", cloned.Guards)
+	}
+	presentEmpty := ChildSelection{Name: withoutGuards.Name, Guards: &NamespaceGuards{}}
+	if cloned := presentEmpty.Clone(); cloned.Guards == nil || cloned.Guards == presentEmpty.Guards {
+		t.Fatalf("present empty guards were not independently retained: %+v", cloned.Guards)
+	}
+	oversized := withoutGuards
+	oversized.Guards = &NamespaceGuards{Directories: make([]DirectoryObservation, MaxNamespaceGuards+1)}
+	if !errors.Is(oversized.Check(), syscall.EFBIG) {
+		t.Fatalf("selection with oversized guards was accepted: %+v", oversized.Guards)
+	}
 }
 
 func TestAtomicOpenAndNodeReferenceValidateEffects(t *testing.T) {

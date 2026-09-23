@@ -52,6 +52,13 @@ func (n ChildName) Check() error {
 	return CheckLeaf(n.RawLeaf)
 }
 
+func (s ChildSelection) Check() error {
+	if err := s.Name.Check(); err != nil {
+		return err
+	}
+	return s.Guards.Check()
+}
+
 func (d DirectoryObservation) Check() error {
 	if d.ParentID == 0 || len(d.Revision) == 0 || len(d.Revision) > MaxObservationTokenBytes {
 		return syscall.EINVAL

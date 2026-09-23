@@ -79,7 +79,7 @@ func (s *directorySessionFixture) OpenNodeRef(ctx context.Context, id uint64, op
 	}
 	return storage.NodeOpenResult{Reference: s.reference, Attr: s.reference.attr, Outcome: storage.Opened}, nil
 }
-func (s *directorySessionFixture) OpenChildRef(context.Context, storage.ChildName, storage.NodeRefOptions) (storage.NodeOpenResult, error) {
+func (s *directorySessionFixture) OpenChildRef(context.Context, storage.ChildSelection, storage.NodeRefOptions) (storage.NodeOpenResult, error) {
 	panic("known inode was reopened through a parent name")
 }
 func (s *directorySessionFixture) CheckMetadataAccess() error { return nil }

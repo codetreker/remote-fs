@@ -121,22 +121,23 @@ func (s *remoteFileSession) openCapability(ctx context.Context, req fileRequest)
 	return reference, response, callErr
 }
 
-func (s *remoteFileSession) OpenAt(ctx context.Context, name storage.ChildName, options storage.OpenAtOptions) (storage.OpenResult, error) {
-	result, _, err := s.OpenAtWithBarrier(ctx, name, options)
+func (s *remoteFileSession) OpenAt(ctx context.Context, selection storage.ChildSelection, options storage.OpenAtOptions) (storage.OpenResult, error) {
+	result, _, err := s.OpenAtWithBarrier(ctx, selection, options)
 	return result, err
 }
 
-func (s *remoteFileSession) OpenAtWithBarrier(ctx context.Context, name storage.ChildName, options storage.OpenAtOptions) (storage.OpenResult, *MutationBarrier, error) {
+func (s *remoteFileSession) OpenAtWithBarrier(ctx context.Context, selection storage.ChildSelection, options storage.OpenAtOptions) (storage.OpenResult, *MutationBarrier, error) {
 	if err := s.CheckAtomicFileOpen(); err != nil {
 		return storage.OpenResult{}, nil, err
 	}
-	if err := name.Check(); err != nil {
+	if err := selection.Check(); err != nil {
 		return storage.OpenResult{}, nil, err
 	}
 	if err := options.Check(); err != nil {
 		return storage.OpenResult{}, nil, err
 	}
-	reference, response, err := s.openCapability(ctx, fileRequest{Op: storage.OpFileOpenAt, Child: childNameOf(name), OpenAt: openAtOptionsOf(options)})
+	child, guards := childSelectionWire(selection)
+	reference, response, err := s.openCapability(ctx, fileRequest{Op: storage.OpFileOpenAt, Child: child, Guards: guards, OpenAt: openAtOptionsOf(options)})
 	result := openResultOf(reference, response)
 	return result, response.Barrier, err
 }
@@ -193,13 +194,23 @@ func (s *remoteFileSession) OpenNodeRefWithBarrier(ctx context.Context, node uin
 	return s.openNodeReference(ctx, fileRequest{Op: storage.OpFileOpenNodeRef, Node: node, NodeRef: nodeRefOptionsOf(options)})
 }
 
-func (s *remoteFileSession) OpenChildRef(ctx context.Context, name storage.ChildName, options storage.NodeRefOptions) (storage.NodeOpenResult, error) {
-	result, _, err := s.OpenChildRefWithBarrier(ctx, name, options)
+func (s *remoteFileSession) OpenChildRef(ctx context.Context, selection storage.ChildSelection, options storage.NodeRefOptions) (storage.NodeOpenResult, error) {
+	result, _, err := s.OpenChildRefWithBarrier(ctx, selection, options)
 	return result, err
 }
 
-func (s *remoteFileSession) OpenChildRefWithBarrier(ctx context.Context, name storage.ChildName, options storage.NodeRefOptions) (storage.NodeOpenResult, *MutationBarrier, error) {
-	return s.openNodeReference(ctx, fileRequest{Op: storage.OpFileOpenChildRef, Child: childNameOf(name), NodeRef: nodeRefOptionsOf(options)})
+func (s *remoteFileSession) OpenChildRefWithBarrier(ctx context.Context, selection storage.ChildSelection, options storage.NodeRefOptions) (storage.NodeOpenResult, *MutationBarrier, error) {
+	if err := s.CheckNodeReferences(); err != nil {
+		return storage.NodeOpenResult{}, nil, err
+	}
+	if err := selection.Check(); err != nil {
+		return storage.NodeOpenResult{}, nil, err
+	}
+	if err := options.Check(); err != nil {
+		return storage.NodeOpenResult{}, nil, err
+	}
+	child, guards := childSelectionWire(selection)
+	return s.openNodeReference(ctx, fileRequest{Op: storage.OpFileOpenChildRef, Child: child, Guards: guards, NodeRef: nodeRefOptionsOf(options)})
 }
 
 func (s *remoteFileSession) openNodeReference(ctx context.Context, req fileRequest) (storage.NodeOpenResult, *MutationBarrier, error) {

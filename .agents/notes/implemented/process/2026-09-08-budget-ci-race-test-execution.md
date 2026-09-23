@@ -14,7 +14,7 @@ SQLite、metastore 契约测试及 Go 依赖未变的两次先前运行，包耗
 
 [CI workflow](../../../../.github/workflows/ci.yml)中，checks 作业总上限为二十分钟，contract / unit 步骤的 `go test -timeout` 为十分钟。后者约束每个包测试二进制的累计执行，不是单个操作的允许延迟。
 
-race、`-count=1`、严格 verdict 检查与包划分保持原义。单项 deadline、副本可见性验收的三分钟进程预算与一秒可见性断言、覆盖率门禁及受保护的交付检查均不放宽。预算与判据的分工见[测试策略](../../../../docs/testing.md#ci-执行预算)。
+race、`-count=1`、严格 verdict 检查与包划分保持原义。单项 deadline、副本可见性验收的一秒可见性断言、覆盖率门禁及受保护的交付检查均不放宽。当时的验收进程预算为三分钟；当前的作业与验收预算见[全负载执行预算](2026-09-23-budget-ci-full-load-execution.md)。预算与判据的分工见[测试策略](../../../../docs/testing.md#ci-执行预算)。
 
 ## 备选方案
 
