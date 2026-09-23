@@ -2,17 +2,25 @@ package replicated
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"sync"
+	"syscall"
 
 	"github.com/codetreker/remote-fs/packages/storage"
 	"github.com/codetreker/remote-fs/packages/transport/httprest"
 )
 
 type nodeReference struct {
-	session *fileSession
-	remote  httprest.NodeReferenceWithBarrier
-	mu      sync.Mutex
-	closed  bool
+	session           *fileSession
+	remote            httprest.NodeReferenceWithBarrier
+	mu                sync.Mutex
+	closed            bool
+	closeResult       storage.ReferenceCloseResult
+	closeErr          error
+	closeBarrier      *httprest.MutationBarrier
+	closeAuthorityErr error
+	closeRun          chan struct{}
 }
 
 func referenceCall[C, R any](ctx context.Context, session *fileSession, remote any, call func(context.Context, C) (R, error)) (R, error) {
@@ -39,28 +47,81 @@ func (r *nodeReference) SetAttr(ctx context.Context, change storage.AttrChange) 
 }
 
 func (r *nodeReference) Close(ctx context.Context) error {
+	_, err := r.CloseWithResult(ctx)
+	return err
+}
+
+func (r *nodeReference) CloseWithResult(ctx context.Context) (storage.ReferenceCloseResult, error) {
 	r.mu.Lock()
-	closed := r.closed
-	r.mu.Unlock()
-	r.session.mu.Lock()
-	closed = closed || r.session.closed
-	r.session.mu.Unlock()
-	if closed {
-		return nil
-	}
-	_, err := fileCall(ctx, r.session, false, func(ctx context.Context) (struct{}, error) {
-		barrier, err := r.remote.CloseWithBarrier(ctx)
-		if err != nil {
-			return struct{}{}, err
+	for r.closeRun != nil {
+		run := r.closeRun
+		r.mu.Unlock()
+		select {
+		case <-run:
+		case <-ctx.Done():
+			return storage.ReferenceCloseResult{}, ctx.Err()
 		}
-		return struct{}{}, r.session.confirmCleanup(ctx, "close-reference", barrier)
-	})
-	if err == nil {
+		r.mu.Lock()
+	}
+	if r.closed {
+		result, err := r.closeResult, r.closeErr
+		r.mu.Unlock()
+		return result, err
+	}
+	previous := r.closeResult
+	previousBarrier := r.closeBarrier
+	previousAuthorityErr := r.closeAuthorityErr
+	r.closeRun = make(chan struct{})
+	r.mu.Unlock()
+	defer func() {
+		r.mu.Lock()
+		close(r.closeRun)
+		r.closeRun = nil
+		r.mu.Unlock()
+	}()
+	r.session.mu.Lock()
+	sessionClosed := r.session.closed
+	r.session.mu.Unlock()
+	if sessionClosed && !previous.Released {
+		result := storage.ReferenceCloseResult{Released: true}
 		r.mu.Lock()
 		r.closed = true
+		r.closeResult = result
 		r.mu.Unlock()
+		return result, nil
 	}
-	return err
+	var result storage.ReferenceCloseResult
+	var barrier *httprest.MutationBarrier
+	var authorityErr error
+	if previous.Released && previousBarrier != nil {
+		result, barrier, authorityErr = previous, previousBarrier, previousAuthorityErr
+	} else if previous.Released {
+		result, barrier, authorityErr = r.remote.CloseWithBarrier(ctx)
+	} else {
+		result, authorityErr = fileCall(ctx, r.session, false, func(ctx context.Context) (storage.ReferenceCloseResult, error) {
+			var callErr error
+			result, barrier, callErr = r.remote.CloseWithBarrier(ctx)
+			return result, callErr
+		})
+	}
+	if previous.Released && !result.Released {
+		return previous, errors.Join(authorityErr, fmt.Errorf("released reference close lost barrier replay: %w", syscall.EIO))
+	}
+	err := errors.Join(authorityErr, result.Check(authorityErr))
+	if !result.Released {
+		return result, err
+	}
+	settled, err := r.session.base.confirmReleasedClose(ctx, "close-reference", barrier, authorityErr)
+	r.mu.Lock()
+	r.closeResult = result
+	r.closeBarrier = barrier
+	r.closeAuthorityErr = authorityErr
+	if settled {
+		r.closed = true
+		r.closeErr = err
+	}
+	r.mu.Unlock()
+	return result, err
 }
 
 func (r *nodeReference) CheckScopedReference() error {
@@ -208,16 +269,21 @@ func (f *retainedFile) MutateFile(ctx context.Context, command storage.FileMutat
 // A failed capability negotiation can still transfer a reference whose cleanup
 // failed. Only Close remains usable until that retained resource is released.
 type failedOpenReference struct {
-	native  interface{ Close(context.Context) error }
+	close   func(context.Context) (storage.ReferenceCloseResult, bool, error)
 	failure error
+	mu      sync.Mutex
+	run     chan struct{}
+	result  storage.ReferenceCloseResult
+	err     error
+	settled bool
 }
 
-func newFailedOpenReference(native storage.NodeReference, failure error) storage.NodeReference {
-	return &failedOpenReference{native: native, failure: failure}
+func newFailedOpenReference(failure error, result storage.ReferenceCloseResult, close func(context.Context) (storage.ReferenceCloseResult, bool, error)) storage.NodeReference {
+	return &failedOpenReference{close: close, failure: failure, result: result}
 }
 
-func newFailedOpenFile(native storage.File, failure error) storage.File {
-	return &failedOpenFile{failedOpenReference: failedOpenReference{native: native, failure: failure}}
+func newFailedOpenFile(failure error, result storage.ReferenceCloseResult, close func(context.Context) (storage.ReferenceCloseResult, bool, error)) storage.File {
+	return &failedOpenFile{failedOpenReference: failedOpenReference{close: close, failure: failure, result: result}}
 }
 
 func (r *failedOpenReference) Stat(context.Context) (storage.Attr, error) {
@@ -236,7 +302,51 @@ func (r *failedOpenReference) CheckReferenceState() error { return r.failure }
 func (r *failedOpenReference) State(context.Context) (storage.ReferenceState, error) {
 	return storage.ReferenceState{}, r.failure
 }
-func (r *failedOpenReference) Close(ctx context.Context) error { return r.native.Close(ctx) }
+func (r *failedOpenReference) Close(ctx context.Context) error {
+	_, err := r.CloseWithResult(ctx)
+	return err
+}
+
+func (r *failedOpenReference) CloseWithResult(ctx context.Context) (storage.ReferenceCloseResult, error) {
+	r.mu.Lock()
+	for r.run != nil {
+		run := r.run
+		r.mu.Unlock()
+		select {
+		case <-run:
+		case <-ctx.Done():
+			return storage.ReferenceCloseResult{}, ctx.Err()
+		}
+		r.mu.Lock()
+	}
+	if r.settled {
+		result, err := r.result, r.err
+		r.mu.Unlock()
+		return result, err
+	}
+	previous := r.result
+	r.run = make(chan struct{})
+	r.mu.Unlock()
+	result, settled, err := r.close(ctx)
+	if previous.Released && !result.Released {
+		result = previous
+		settled = false
+		err = errors.Join(err, fmt.Errorf("released failed-open reference lost barrier replay: %w", syscall.EIO))
+	}
+	err = errors.Join(err, result.Check(err))
+	r.mu.Lock()
+	if result.Released {
+		r.result = result
+	}
+	if settled {
+		r.err = err
+		r.settled = true
+	}
+	close(r.run)
+	r.run = nil
+	r.mu.Unlock()
+	return result, err
+}
 
 type failedOpenFile struct{ failedOpenReference }
 

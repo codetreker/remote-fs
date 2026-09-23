@@ -114,7 +114,7 @@ func TestWitnessedRetainedMigrationPreservesNodesAndAcceptedState(t *testing.T) 
 				}
 			})
 			assertHistoricalLeaseVolume(t, store, "A")
-			assertHistoricalLeaseSchemaVersion(t, path, 8)
+			assertHistoricalLeaseSchemaVersion(t, path, 9)
 			db := raw(t, path)
 			defer db.Close()
 			var total, initialized int
@@ -234,7 +234,7 @@ func TestNeutralMetadataMigrationWitnessFailurePreservesRecoveryState(t *testing
 	if !errors.Is(err, failure) || !errors.Is(err, syscall.EIO) {
 		t.Fatalf("unaccepted migration = %v; want original witness failure and EIO", err)
 	}
-	assertHistoricalLeaseSchemaVersion(t, path, 8)
+	assertHistoricalLeaseSchemaVersion(t, path, 9)
 	want := historicalLeaseDurableState
 	want.Generation++
 	accepted, visible := witness.accepts()

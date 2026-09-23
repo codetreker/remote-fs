@@ -2,17 +2,25 @@ package replicated
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"sync"
+	"syscall"
 
 	"github.com/codetreker/remote-fs/packages/storage"
 	"github.com/codetreker/remote-fs/packages/transport/httprest"
 )
 
 type retainedFile struct {
-	session *fileSession
-	remote  httprest.FileWithBarrier
-	mu      sync.Mutex
-	closed  bool
+	session           *fileSession
+	remote            httprest.FileWithBarrier
+	mu                sync.Mutex
+	closed            bool
+	closeResult       storage.ReferenceCloseResult
+	closeErr          error
+	closeBarrier      *httprest.MutationBarrier
+	closeAuthorityErr error
+	closeRun          chan struct{}
 }
 
 func fileCall[T any](ctx context.Context, session *fileSession, ordinary bool, call func(context.Context) (T, error)) (T, error) {
@@ -79,26 +87,79 @@ func (f *retainedFile) Sync(ctx context.Context) error {
 }
 
 func (f *retainedFile) Close(ctx context.Context) error {
+	_, err := f.CloseWithResult(ctx)
+	return err
+}
+
+func (f *retainedFile) CloseWithResult(ctx context.Context) (storage.ReferenceCloseResult, error) {
 	f.mu.Lock()
-	closed := f.closed
-	f.mu.Unlock()
-	f.session.mu.Lock()
-	closed = closed || f.session.closed
-	f.session.mu.Unlock()
-	if closed {
-		return nil
-	}
-	_, err := fileCall(ctx, f.session, false, func(ctx context.Context) (struct{}, error) {
-		barrier, err := f.remote.CloseWithBarrier(ctx)
-		if err != nil {
-			return struct{}{}, err
+	for f.closeRun != nil {
+		run := f.closeRun
+		f.mu.Unlock()
+		select {
+		case <-run:
+		case <-ctx.Done():
+			return storage.ReferenceCloseResult{}, ctx.Err()
 		}
-		return struct{}{}, f.session.confirmCleanup(ctx, "close-file", barrier)
-	})
-	if err == nil {
+		f.mu.Lock()
+	}
+	if f.closed {
+		result, err := f.closeResult, f.closeErr
+		f.mu.Unlock()
+		return result, err
+	}
+	previous := f.closeResult
+	previousBarrier := f.closeBarrier
+	previousAuthorityErr := f.closeAuthorityErr
+	f.closeRun = make(chan struct{})
+	f.mu.Unlock()
+	defer func() {
+		f.mu.Lock()
+		close(f.closeRun)
+		f.closeRun = nil
+		f.mu.Unlock()
+	}()
+	f.session.mu.Lock()
+	sessionClosed := f.session.closed
+	f.session.mu.Unlock()
+	if sessionClosed && !previous.Released {
+		result := storage.ReferenceCloseResult{Released: true}
 		f.mu.Lock()
 		f.closed = true
+		f.closeResult = result
 		f.mu.Unlock()
+		return result, nil
 	}
-	return err
+	var result storage.ReferenceCloseResult
+	var barrier *httprest.MutationBarrier
+	var authorityErr error
+	if previous.Released && previousBarrier != nil {
+		result, barrier, authorityErr = previous, previousBarrier, previousAuthorityErr
+	} else if previous.Released {
+		result, barrier, authorityErr = f.remote.CloseWithBarrier(ctx)
+	} else {
+		result, authorityErr = fileCall(ctx, f.session, false, func(ctx context.Context) (storage.ReferenceCloseResult, error) {
+			var callErr error
+			result, barrier, callErr = f.remote.CloseWithBarrier(ctx)
+			return result, callErr
+		})
+	}
+	if previous.Released && !result.Released {
+		return previous, errors.Join(authorityErr, fmt.Errorf("released file close lost barrier replay: %w", syscall.EIO))
+	}
+	err := errors.Join(authorityErr, result.Check(authorityErr))
+	if !result.Released {
+		return result, err
+	}
+	settled, err := f.session.base.confirmReleasedClose(ctx, "close-file", barrier, authorityErr)
+	f.mu.Lock()
+	f.closeResult = result
+	f.closeBarrier = barrier
+	f.closeAuthorityErr = authorityErr
+	if settled {
+		f.closed = true
+		f.closeErr = err
+	}
+	f.mu.Unlock()
+	return result, err
 }

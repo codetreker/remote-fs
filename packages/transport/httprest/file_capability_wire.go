@@ -30,7 +30,7 @@ type NodeReferencesWithBarrier interface {
 
 type NodeReferenceWithBarrier interface {
 	storage.NodeReference
-	CloseWithBarrier(context.Context) (*MutationBarrier, error)
+	CloseWithBarrier(context.Context) (storage.ReferenceCloseResult, *MutationBarrier, error)
 	SetAttrWithBarrier(context.Context, storage.AttrChange) (storage.Attr, *MutationBarrier, error)
 }
 
@@ -151,6 +151,7 @@ func (value renameTarget) storage() storage.RenameTarget {
 
 type closeIntent struct {
 	ID               storage.DeleteIntentID     `json:"id"`
+	Owner            storage.DeleteIntentOwner  `json:"owner"`
 	Trigger          storage.CloseTrigger       `json:"trigger"`
 	Condition        storage.UnlinkCondition    `json:"condition"`
 	ExpectedMetadata map[string]metadataVersion `json:"expectedMetadata,omitempty"`
@@ -161,11 +162,11 @@ func closeIntentOf(value *storage.CloseIntent) *closeIntent {
 	if value == nil {
 		return nil
 	}
-	return &closeIntent{ID: value.ID, Trigger: value.Trigger, Condition: value.Condition, ExpectedMetadata: metadataVersionsOf(value.ExpectedMetadata), Uses: value.Uses}
+	return &closeIntent{ID: value.ID, Owner: value.Owner, Trigger: value.Trigger, Condition: value.Condition, ExpectedMetadata: metadataVersionsOf(value.ExpectedMetadata), Uses: value.Uses}
 }
 
 func (value closeIntent) storage() storage.CloseIntent {
-	return storage.CloseIntent{ID: value.ID, Trigger: value.Trigger, Condition: value.Condition, ExpectedMetadata: metadataVersionsStorage(value.ExpectedMetadata), Uses: value.Uses}
+	return storage.CloseIntent{ID: value.ID, Owner: value.Owner, Trigger: value.Trigger, Condition: value.Condition, ExpectedMetadata: metadataVersionsStorage(value.ExpectedMetadata), Uses: value.Uses}
 }
 
 func metadataPayloadsOf(values map[string][]byte) map[string]metadataPayload {
@@ -405,16 +406,59 @@ type deleteIntentStatus struct {
 }
 
 type acknowledgeDeleteIntentCommand struct {
-	Action storage.FileActionID   `json:"action"`
-	Intent storage.DeleteIntentID `json:"intent"`
+	Action storage.FileActionID      `json:"action"`
+	Owner  storage.DeleteIntentOwner `json:"owner"`
+	Intent storage.DeleteIntentID    `json:"intent"`
 }
 
 func acknowledgeDeleteIntentCommandOf(value storage.AcknowledgeDeleteIntentCommand) *acknowledgeDeleteIntentCommand {
-	return &acknowledgeDeleteIntentCommand{Action: value.Action, Intent: value.Intent}
+	return &acknowledgeDeleteIntentCommand{Action: value.Action, Owner: value.Owner, Intent: value.Intent}
 }
 
 func (value acknowledgeDeleteIntentCommand) storage() storage.AcknowledgeDeleteIntentCommand {
-	return storage.AcknowledgeDeleteIntentCommand{Action: value.Action, Intent: value.Intent}
+	return storage.AcknowledgeDeleteIntentCommand{Action: value.Action, Owner: value.Owner, Intent: value.Intent}
+}
+
+type deleteIntentPage struct {
+	Intents []deleteIntentStatus       `json:"intents"`
+	Next    storage.DeleteIntentCursor `json:"next"`
+}
+
+type referenceCloseResult struct {
+	Released       bool `json:"released"`
+	BarrierPending bool `json:"barrierPending,omitempty"`
+}
+
+func referenceCloseResultOf(value storage.ReferenceCloseResult) *referenceCloseResult {
+	return &referenceCloseResult{Released: value.Released}
+}
+
+func (value referenceCloseResult) storage() storage.ReferenceCloseResult {
+	return storage.ReferenceCloseResult{Released: value.Released}
+}
+
+func deleteIntentPageOf(value storage.DeleteIntentPage) (*deleteIntentPage, error) {
+	result := &deleteIntentPage{Intents: make([]deleteIntentStatus, 0, len(value.Intents)), Next: value.Next}
+	for _, intent := range value.Intents {
+		status, err := deleteIntentStatusOf(intent)
+		if err != nil {
+			return nil, err
+		}
+		result.Intents = append(result.Intents, *status)
+	}
+	return result, nil
+}
+
+func (value deleteIntentPage) storage() (storage.DeleteIntentPage, error) {
+	result := storage.DeleteIntentPage{Intents: make([]storage.DeleteIntentStatus, 0, len(value.Intents)), Next: value.Next}
+	for _, wire := range value.Intents {
+		status, err := wire.storage()
+		if err != nil {
+			return storage.DeleteIntentPage{}, err
+		}
+		result.Intents = append(result.Intents, status)
+	}
+	return result, nil
 }
 
 func deleteIntentStatusOf(value storage.DeleteIntentStatus) (*deleteIntentStatus, error) {

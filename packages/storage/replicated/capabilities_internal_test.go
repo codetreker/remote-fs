@@ -49,36 +49,47 @@ type referenceCapabilityStub struct {
 
 type cleanupFileStub struct {
 	storage.File
-	closeErr error
-	closes   int
+	closeErr        error
+	closes          int
+	releasedOnError bool
 }
 
 func (f *cleanupFileStub) Close(context.Context) error {
 	f.closes++
 	return f.closeErr
 }
+func (f *cleanupFileStub) CloseWithResult(ctx context.Context) (storage.ReferenceCloseResult, error) {
+	err := f.Close(ctx)
+	return storage.ReferenceCloseResult{Released: err == nil || f.releasedOnError}, err
+}
 
 type cleanupReferenceStub struct {
 	storage.NodeReference
-	closeErr error
-	closes   int
+	closeErr        error
+	closes          int
+	releasedOnError bool
 }
 
 func (r *cleanupReferenceStub) Close(context.Context) error {
 	r.closes++
 	return r.closeErr
 }
+func (r *cleanupReferenceStub) CloseWithResult(ctx context.Context) (storage.ReferenceCloseResult, error) {
+	err := r.Close(ctx)
+	return storage.ReferenceCloseResult{Released: err == nil || r.releasedOnError}, err
+}
 
 type barrierReferenceStub struct {
 	storage.NodeReference
-	closeErr      error
-	closes        int
-	checkErr      error
-	mutation      storage.Attr
-	mutationErr   error
-	barrier       *httprest.MutationBarrier
-	lastMutation  storage.FileMutation
-	mutationCalls int
+	closeErr         error
+	closes           int
+	checkErr         error
+	mutation         storage.Attr
+	mutationErr      error
+	barrier          *httprest.MutationBarrier
+	omitCloseBarrier bool
+	lastMutation     storage.FileMutation
+	mutationCalls    int
 }
 
 func (r *barrierReferenceStub) Close(context.Context) error {
@@ -86,9 +97,63 @@ func (r *barrierReferenceStub) Close(context.Context) error {
 	return r.closeErr
 }
 
-func (r *barrierReferenceStub) CloseWithBarrier(context.Context) (*httprest.MutationBarrier, error) {
+func (r *barrierReferenceStub) CloseWithBarrier(context.Context) (storage.ReferenceCloseResult, *httprest.MutationBarrier, error) {
 	r.closes++
-	return &httprest.MutationBarrier{Incarnation: "log"}, r.closeErr
+	barrier := r.barrier
+	if barrier == nil && !r.omitCloseBarrier {
+		barrier = &httprest.MutationBarrier{Incarnation: "log"}
+	}
+	return storage.ReferenceCloseResult{Released: r.closeErr == nil}, barrier, r.closeErr
+}
+
+func TestReleasedNodeReferenceCloseRetriesBarrierConfirmation(t *testing.T) {
+	session := retainedTestSession(t, nil)
+	remote := &barrierReferenceStub{barrier: &httprest.MutationBarrier{Incarnation: "log", Position: 1}}
+	reference := &nodeReference{session: session, remote: remote}
+	cut, cancel := context.WithCancel(t.Context())
+	cancel()
+	if result, err := reference.CloseWithResult(cut); !result.Released || !errors.Is(err, syscall.EIO) || reference.closed {
+		t.Fatalf("unconfirmed node close=%+v %v closed=%t", result, err, reference.closed)
+	}
+	session.base.mu.Lock()
+	session.base.at = 1
+	session.base.wake()
+	session.base.mu.Unlock()
+	if result, err := reference.CloseWithResult(t.Context()); !result.Released || err != nil || !reference.closed || remote.closes != 1 {
+		t.Fatalf("reconciled node close=%+v %v closed=%t remote calls=%d", result, err, reference.closed, remote.closes)
+	}
+}
+
+type pendingFailedOpenReferenceStub struct {
+	*barrierReferenceStub
+}
+
+func (r *pendingFailedOpenReferenceStub) CloseWithBarrier(context.Context) (storage.ReferenceCloseResult, *httprest.MutationBarrier, error) {
+	r.closes++
+	if r.closes == 1 {
+		return storage.ReferenceCloseResult{Released: true}, nil, &httprest.CloseBarrierPendingError{Cause: syscall.EIO}
+	}
+	if r.closes == 2 {
+		return storage.ReferenceCloseResult{}, nil, syscall.EIO
+	}
+	return storage.ReferenceCloseResult{Released: true}, &httprest.MutationBarrier{Incarnation: "log"}, nil
+}
+
+func TestFailedNodeOpenRetainsPendingBarrierReconciliation(t *testing.T) {
+	session := retainedTestSession(t, nil)
+	remote := &pendingFailedOpenReferenceStub{barrierReferenceStub: &barrierReferenceStub{}}
+	opened, err := session.openReference(t.Context(), func(context.Context) (storage.NodeOpenResult, *httprest.MutationBarrier, error) {
+		return storage.NodeOpenResult{Reference: remote, Attr: storage.Attr{ID: 23}}, nil, syscall.EIO
+	})
+	if opened.Reference == nil || !errors.Is(err, syscall.EIO) || remote.closes != 1 {
+		t.Fatalf("failed open pending barrier=%+v %v remote calls=%d", opened, err, remote.closes)
+	}
+	if result, err := opened.Reference.CloseWithResult(t.Context()); !result.Released || !errors.Is(err, syscall.EIO) || remote.closes != 2 {
+		t.Fatalf("failed open transient replay=%+v %v remote calls=%d", result, err, remote.closes)
+	}
+	if result, err := opened.Reference.CloseWithResult(t.Context()); !result.Released || err != nil || remote.closes != 3 {
+		t.Fatalf("failed open barrier replay=%+v %v remote calls=%d", result, err, remote.closes)
+	}
 }
 
 func (*barrierReferenceStub) SetAttrWithBarrier(context.Context, storage.AttrChange) (storage.Attr, *httprest.MutationBarrier, error) {
@@ -310,8 +375,25 @@ func TestAtomicOpenRetainsAReferenceWhenFailureCleanupIsUnknown(t *testing.T) {
 
 	barrierFile := &fileAuthorityStub{close: func(context.Context) error { return cleanupFailure }}
 	partial, err = session.wrapOpenResult(storage.OpenResult{File: barrierFile, Attr: storage.Attr{ID: 18}}, openFailure)
-	if _, ok := partial.File.(*retainedFile); !ok || !errors.Is(err, openFailure) || !errors.Is(err, cleanupFailure) {
+	if _, ok := partial.File.(*failedOpenFile); !ok || !errors.Is(err, openFailure) || !errors.Is(err, cleanupFailure) {
 		t.Fatalf("barrier-capable partial open=%T error=%v", partial.File, err)
+	}
+}
+
+func TestFailedOpenDoesNotReturnReleasedReferences(t *testing.T) {
+	session := retainedTestSession(t, nil)
+	openFailure := errors.New("open result was unconfirmed")
+	file := &cleanupFileStub{closeErr: syscall.ENOTEMPTY, releasedOnError: true}
+	opened, err := session.wrapOpenResult(storage.OpenResult{File: file, Attr: storage.Attr{ID: 17}}, openFailure)
+	if opened.File != nil || !errors.Is(err, openFailure) || !errors.Is(err, syscall.ENOTEMPTY) || file.closes != 1 {
+		t.Fatalf("released file=%+v %v, closes %d", opened, err, file.closes)
+	}
+	reference := &cleanupReferenceStub{closeErr: syscall.ENOTEMPTY, releasedOnError: true}
+	result, err := session.openReference(t.Context(), func(context.Context) (storage.NodeOpenResult, *httprest.MutationBarrier, error) {
+		return storage.NodeOpenResult{Reference: reference, Attr: storage.Attr{ID: 23}}, nil, openFailure
+	})
+	if result.Reference != nil || !errors.Is(err, openFailure) || !errors.Is(err, syscall.ENOTEMPTY) || reference.closes != 1 {
+		t.Fatalf("released reference=%+v %v, closes %d", result, err, reference.closes)
 	}
 }
 
@@ -352,7 +434,7 @@ func TestNodeOpenRetainsAReferenceWhenFailureCleanupIsUnknown(t *testing.T) {
 	result, err = session.openReference(t.Context(), func(context.Context) (storage.NodeOpenResult, *httprest.MutationBarrier, error) {
 		return storage.NodeOpenResult{Reference: barrierReference, Attr: storage.Attr{ID: 24}}, nil, openFailure
 	})
-	if _, ok := result.Reference.(*nodeReference); !ok || !errors.Is(err, openFailure) || !errors.Is(err, cleanupFailure) || barrierReference.closes != 1 {
+	if _, ok := result.Reference.(*failedOpenReference); !ok || !errors.Is(err, openFailure) || !errors.Is(err, cleanupFailure) || barrierReference.closes != 1 {
 		t.Fatalf("barrier-capable partial node open=%T error=%v closes=%d", result.Reference, err, barrierReference.closes)
 	}
 }

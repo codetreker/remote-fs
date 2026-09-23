@@ -29,7 +29,7 @@ func openRetainedFixture(t *testing.T, client *Storage) (*remoteFileSession, *re
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		if err := s.Close(context.Background()); err != nil {
+		if err := s.Close(context.Background()); err != nil && !errors.Is(err, syscall.ESTALE) && !errors.Is(err, syscall.EAGAIN) {
 			t.Error(err)
 		}
 	})
@@ -703,6 +703,7 @@ type closeOrderBackend struct {
 	entered chan struct{}
 	release chan struct{}
 	once    sync.Once
+	calls   atomic.Int32
 }
 
 type closeOrderSession struct {
@@ -718,13 +719,18 @@ func (b *closeOrderBackend) NewFileSession(ctx context.Context, o storage.FileSe
 	return &closeOrderSession{FileSession: s, backend: b}, nil
 }
 func (s *closeOrderSession) Close(ctx context.Context) error {
+	_, err := s.CloseWithResult(ctx)
+	return err
+}
+func (s *closeOrderSession) CloseWithResult(ctx context.Context) (storage.ReferenceCloseResult, error) {
+	s.backend.calls.Add(1)
 	s.backend.once.Do(func() { close(s.backend.entered) })
 	select {
 	case <-s.backend.release:
 	case <-ctx.Done():
-		return ctx.Err()
+		return storage.ReferenceCloseResult{}, ctx.Err()
 	}
-	return s.FileSession.Close(ctx)
+	return s.FileSession.CloseWithResult(ctx)
 }
 
 func TestRetainedHTTPQueuedCloseDuringStopCannotAcknowledgeUndrainedCleanup(t *testing.T) {
@@ -958,6 +964,10 @@ func (s *pendingCloseSession) OpenFile(ctx context.Context, path string, o stora
 	return &pendingCloseFile{File: f, backend: s.backend}, nil
 }
 func (f *pendingCloseFile) Close(ctx context.Context) error {
+	_, err := f.CloseWithResult(ctx)
+	return err
+}
+func (f *pendingCloseFile) CloseWithResult(ctx context.Context) (storage.ReferenceCloseResult, error) {
 	switch f.backend.calls.Add(1) {
 	case 1:
 		close(f.backend.first)
@@ -967,9 +977,9 @@ func (f *pendingCloseFile) Close(ctx context.Context) error {
 	select {
 	case <-f.backend.release:
 	case <-ctx.Done():
-		return ctx.Err()
+		return storage.ReferenceCloseResult{}, ctx.Err()
 	}
-	return f.File.Close(ctx)
+	return f.File.CloseWithResult(ctx)
 }
 
 func TestRetainedHTTPPendingExpiryRetainsCapabilityAndChargeUntilNativeClose(t *testing.T) {
@@ -1034,8 +1044,12 @@ func TestRetainedHTTPPendingExpiryRetainsCapabilityAndChargeUntilNativeClose(t *
 		t.Fatalf("pending close refunded native bytes: %d, %v", usage, err)
 	}
 	outcome := make(chan error, 1)
+	closeAction, err := storage.NewLockRequestID(remote.epoch)
+	if err != nil {
+		t.Fatal(err)
+	}
 	go func() {
-		_, err := client.fileCall(ctx, fileRequest{Op: storage.OpFileClose, Session: remote.id, File: opened.File})
+		_, err := client.fileCall(ctx, fileRequest{Op: storage.OpFileClose, Session: remote.id, File: opened.File, Action: closeAction})
 		outcome <- err
 	}()
 	select {

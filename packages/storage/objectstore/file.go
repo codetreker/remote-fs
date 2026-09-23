@@ -13,17 +13,18 @@ import (
 )
 
 type openFile struct {
-	session    *fileSession
-	native     metastore.File
-	uses       referenceUses
-	options    storage.FileOpenOptions
-	active     bool
-	operations sync.WaitGroup
-	retireMu   sync.Mutex
-	retired    bool
-	closeMu    sync.Mutex
-	closeDone  chan struct{}
-	closeErr   error
+	session     *fileSession
+	native      metastore.File
+	uses        referenceUses
+	options     storage.FileOpenOptions
+	active      bool
+	operations  sync.WaitGroup
+	retireMu    sync.Mutex
+	retired     bool
+	closeMu     sync.Mutex
+	closeDone   chan struct{}
+	closeErr    error
+	closeResult storage.ReferenceCloseResult
 }
 
 var _ storage.File = (*openFile)(nil)
@@ -373,10 +374,9 @@ func (f *openFile) drainAndRelease() error {
 	f.operations.Wait()
 	ctx, cancel := f.session.operationContext(f.session.cleanup)
 	defer cancel()
-	if err := f.native.DropUse(ctx); err != nil {
-		return err
-	}
-	return f.session.retireReferenceOwners(&f.uses)
+	dropErr := f.native.DropUse(ctx)
+	ownerErr := f.session.retireReferenceOwners(&f.uses)
+	return errors.Join(dropErr, ownerErr)
 }
 
 func (f *openFile) startClose() <-chan struct{} {
@@ -385,7 +385,7 @@ func (f *openFile) startClose() <-chan struct{} {
 	if f.closeDone != nil {
 		select {
 		case <-f.closeDone:
-			if f.closeErr == nil {
+			if f.closeResult.Released {
 				return f.closeDone
 			}
 		default:
@@ -399,6 +399,7 @@ func (f *openFile) startClose() <-chan struct{} {
 
 func (f *openFile) finishClose() {
 	err := f.retire()
+	var result storage.ReferenceCloseResult
 	if err == nil {
 		err = f.drainAndRelease()
 	}
@@ -406,10 +407,11 @@ func (f *openFile) finishClose() {
 		// Cleanup keeps the creation-time accounting hooks. Attaching Close's
 		// context again would reserve and settle the same outer quota twice.
 		ctx, cancel := f.session.operationContext(f.session.cleanup)
-		err = errors.Join(err, f.native.Close(ctx))
+		result, err = f.native.CloseWithResult(ctx)
 		cancel()
+		err = errors.Join(err, result.Check(err))
 	}
-	if err == nil {
+	if result.Released {
 		f.session.mu.Lock()
 		delete(f.session.files, f)
 		f.session.mu.Unlock()
@@ -417,18 +419,24 @@ func (f *openFile) finishClose() {
 	}
 	f.closeMu.Lock()
 	f.closeErr = err
+	f.closeResult = result
 	close(f.closeDone)
 	f.closeMu.Unlock()
 }
 
 func (f *openFile) Close(ctx context.Context) error {
+	_, err := f.CloseWithResult(ctx)
+	return err
+}
+
+func (f *openFile) CloseWithResult(ctx context.Context) (storage.ReferenceCloseResult, error) {
 	done := f.startClose()
 	select {
 	case <-done:
 		f.closeMu.Lock()
 		defer f.closeMu.Unlock()
-		return f.closeErr
+		return f.closeResult, f.closeErr
 	case <-ctx.Done():
-		return ctx.Err()
+		return storage.ReferenceCloseResult{}, ctx.Err()
 	}
 }

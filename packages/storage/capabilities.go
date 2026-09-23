@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"syscall"
 	"unicode/utf8"
 )
@@ -47,6 +48,18 @@ type NodeReference interface {
 	Stat(context.Context) (Attr, error)
 	SetAttr(context.Context, AttrChange) (Attr, error)
 	Close(context.Context) error
+	CloseWithResult(context.Context) (ReferenceCloseResult, error)
+}
+
+// ReferenceCloseResult reports whether the caller still owns a reference after
+// close returns. A semantic deletion error can coexist with a released reference.
+type ReferenceCloseResult struct{ Released bool }
+
+func (r ReferenceCloseResult) Check(err error) error {
+	if !r.Released && err == nil {
+		return errors.New("close retained ownership without an error: invalid result")
+	}
+	return nil
 }
 
 // NodeReferences opens retained identities directly or as an exact child of a
@@ -75,7 +88,8 @@ type ReferenceStateAccess interface {
 type FileActions interface {
 	CheckFileActions() error
 	QueryFileAction(context.Context, FileActionID) (FileActionReceipt, error)
-	QueryDeleteIntent(context.Context, DeleteIntentID) (DeleteIntentStatus, error)
+	QueryDeleteIntent(context.Context, DeleteIntentOwner, DeleteIntentID) (DeleteIntentStatus, error)
+	ListDeleteIntents(context.Context, DeleteIntentOwner, DeleteIntentCursor, int) (DeleteIntentPage, error)
 	AcknowledgeDeleteIntent(context.Context, AcknowledgeDeleteIntentCommand) error
 }
 
@@ -416,6 +430,7 @@ const (
 
 type CloseIntent struct {
 	ID               DeleteIntentID
+	Owner            DeleteIntentOwner
 	Trigger          CloseTrigger
 	Condition        UnlinkCondition
 	ExpectedMetadata map[string][]byte `json:",omitempty"`
@@ -495,7 +510,11 @@ type FileActionReceipt struct {
 	Outcome   FileActionOutcome
 }
 
-const DeleteIntentIDBytes = 32
+const (
+	DeleteIntentIDBytes        = 32
+	MaxDeleteIntentOwnerBytes  = 128
+	MaxDeleteIntentPageEntries = 256
+)
 
 // DeleteIntentID identifies one accepted close-time deletion obligation across
 // process and authority restart. It is opaque and caller-generated.
@@ -508,6 +527,20 @@ func NewDeleteIntentID() (DeleteIntentID, error) {
 	}
 	return DeleteIntentID(hex.EncodeToString(nonce[:])), nil
 }
+
+// DeleteIntentOwner is a caller-held discovery namespace, not an authorization
+// credential. The caller must retain it across its own restart.
+type DeleteIntentOwner string
+
+func NewDeleteIntentOwner() (DeleteIntentOwner, error) {
+	var nonce [16]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return "", err
+	}
+	return DeleteIntentOwner(hex.EncodeToString(nonce[:])), nil
+}
+
+type DeleteIntentCursor uint64
 
 type DeleteIntentOutcome uint8
 
@@ -528,8 +561,14 @@ type DeleteIntentStatus struct {
 	Failure syscall.Errno `json:",omitempty"`
 }
 
+type DeleteIntentPage struct {
+	Intents []DeleteIntentStatus
+	Next    DeleteIntentCursor
+}
+
 type AcknowledgeDeleteIntentCommand struct {
 	Action FileActionID
+	Owner  DeleteIntentOwner
 	Intent DeleteIntentID
 }
 

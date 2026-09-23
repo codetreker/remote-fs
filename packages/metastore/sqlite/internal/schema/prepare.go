@@ -27,7 +27,8 @@ import (
 // 0006_neutral_metadata.sql separates node kind and adds common times, canonical opaque
 // metadata, and exact retained-metadata accounting; 0007_durable_identity.sql adds
 // symbolic-link data and durable, restart-queryable deletion obligations;
-// 0008_directory_revisions.sql adds persistent directory name-set revisions.
+// 0008_directory_revisions.sql adds persistent directory name-set revisions;
+// 0009_delete_intent_owners.sql adds owner-scoped intent discovery.
 //
 // packages/sqliteschema documents what a numbered set of files buys and what rule they are kept
 // under: a file that has landed is never edited, and a schema change is a new file.
@@ -48,6 +49,8 @@ const firstNeutralMetadataSchemaVersion = 6
 const firstDurableIdentitySchemaVersion = 7
 
 const firstDirectoryRevisionSchemaVersion = 8
+
+const firstDeleteIntentOwnerSchemaVersion = 9
 
 // VolumeOpenMode decides whether preparation may create the named volume.
 type VolumeOpenMode uint8

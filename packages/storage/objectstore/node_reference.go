@@ -3,6 +3,7 @@ package objectstore
 import (
 	"bytes"
 	"context"
+	"errors"
 	"sync"
 	"syscall"
 
@@ -11,17 +12,17 @@ import (
 )
 
 type nodeReference struct {
-	session    *fileSession
-	native     metastore.NodeReference
-	uses       referenceUses
-	active     bool
-	operations sync.WaitGroup
-	retireMu   sync.Mutex
-	retired    bool
-	closeMu    sync.Mutex
-	closeDone  chan struct{}
-	closeErr   error
-	closeFinal bool
+	session     *fileSession
+	native      metastore.NodeReference
+	uses        referenceUses
+	active      bool
+	operations  sync.WaitGroup
+	retireMu    sync.Mutex
+	retired     bool
+	closeMu     sync.Mutex
+	closeDone   chan struct{}
+	closeErr    error
+	closeResult storage.ReferenceCloseResult
 }
 
 func (r *nodeReference) begin(ctx context.Context) (context.Context, func(), error) {
@@ -92,10 +93,9 @@ func (r *nodeReference) drainAndRelease() error {
 	r.operations.Wait()
 	ctx, cancel := r.session.operationContext(r.session.cleanup)
 	defer cancel()
-	if err := r.native.DropUse(ctx); err != nil {
-		return err
-	}
-	return r.session.retireReferenceOwners(&r.uses)
+	dropErr := r.native.DropUse(ctx)
+	ownerErr := r.session.retireReferenceOwners(&r.uses)
+	return errors.Join(dropErr, ownerErr)
 }
 
 func (r *nodeReference) startClose() <-chan struct{} {
@@ -104,7 +104,7 @@ func (r *nodeReference) startClose() <-chan struct{} {
 	if r.closeDone != nil {
 		select {
 		case <-r.closeDone:
-			if r.closeFinal {
+			if r.closeResult.Released {
 				return r.closeDone
 			}
 		default:
@@ -118,16 +118,17 @@ func (r *nodeReference) startClose() <-chan struct{} {
 
 func (r *nodeReference) finishClose() {
 	err := r.retire()
+	var result storage.ReferenceCloseResult
 	if err == nil {
 		err = r.drainAndRelease()
 	}
 	if err == nil {
 		ctx, cancel := r.session.operationContext(r.session.cleanup)
-		err = r.native.Close(ctx)
+		result, err = r.native.CloseWithResult(ctx)
 		cancel()
+		err = errors.Join(err, result.Check(err))
 	}
-	final := err == nil || storage.ErrnoOf(err) == syscall.ENOTEMPTY
-	if final {
+	if result.Released {
 		r.session.mu.Lock()
 		delete(r.session.files, r)
 		r.session.mu.Unlock()
@@ -135,20 +136,25 @@ func (r *nodeReference) finishClose() {
 	}
 	r.closeMu.Lock()
 	r.closeErr = err
-	r.closeFinal = final
+	r.closeResult = result
 	close(r.closeDone)
 	r.closeMu.Unlock()
 }
 
 func (r *nodeReference) Close(ctx context.Context) error {
+	_, err := r.CloseWithResult(ctx)
+	return err
+}
+
+func (r *nodeReference) CloseWithResult(ctx context.Context) (storage.ReferenceCloseResult, error) {
 	done := r.startClose()
 	select {
 	case <-done:
 		r.closeMu.Lock()
 		defer r.closeMu.Unlock()
-		return r.closeErr
+		return r.closeResult, r.closeErr
 	case <-ctx.Done():
-		return ctx.Err()
+		return storage.ReferenceCloseResult{}, ctx.Err()
 	}
 }
 

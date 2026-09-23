@@ -107,7 +107,7 @@ mutation 成功后，replicated client 从严格验证过的 response 取得 `(i
 
 副本的建立、作废与恢复规则，以及写入方等待 mutation barrier 的原因，见[元数据复制](../../../.agents/notes/implemented/architecture/2026-08-27-metadata-replication.md)。
 
-文件能力与 scoped 视图共同转发原 FileSession；File、NodeReference、目录捕获、current-name、action receipt、delete intent、metadata 与 range 控制不从名字副本重建。名字观察与目录捕获在确认副本健康后回源 authority；名字或属性修改使用同一远端 authority，并通过现有 confirmation barrier 核对 volume 进度。detached 对象修改不制造路径事件。
+文件能力与 scoped 视图共同转发原 FileSession；File、NodeReference、目录捕获、current-name、action receipt、按 owner 发现的 delete intent、metadata 与 range 控制不从名字副本重建。关闭结果中的 Released 原样穿过包装层。名字观察与目录捕获在确认副本健康后回源 authority；名字或属性修改使用同一远端 authority，并通过现有 confirmation barrier 核对 volume 进度。detached 对象修改不制造路径事件。
 
 ## 三、打开的是对象引用
 
@@ -223,7 +223,7 @@ volume 报出自己的容量，挂载呈现层把它换算成内核要的块数�
 
 ## 九、生命周期
 
-一次挂载拥有一个 FileSession。`Options.FileSession` 未提供时使用默认 options，显式 options 在建立前验证；实际 MaxFileSize 与挂载大小界限一致。后台续期在上一份已确认 lease 内完成，成功状态只以保守的请求起点更新 deadline。authority 重启、会话退役或期限耗尽使 File、NodeReference、UseOwner、range 与有限 FileAction history 全部失效；挂载不按路径重开引用，也不自动重新取得 range。durable DeleteIntent 由新 session 按 ID 查询和继续清理，但不恢复旧 handle。节点事实和 opaque metadata 可由新会话再次读取，旧持有者连续性不能由这些持久事实推导。
+一次挂载拥有一个 FileSession。`Options.FileSession` 未提供时使用默认 options，显式 options 在建立前验证；实际 MaxFileSize 与挂载大小界限一致。后台续期在上一份已确认 lease 内完成，成功状态只以保守的请求起点更新 deadline。authority 重启、会话退役或期限耗尽使 File、NodeReference、UseOwner、range 与有限 FileAction history 全部失效；挂载不按路径重开引用，也不自动重新取得 range。durable DeleteIntent 由新 session 按 owner 分页发现、按 ID 查询和继续清理，但不恢复旧 handle。节点事实和 opaque metadata 可由新会话再次读取，旧持有者连续性不能由这些持久事实推导。
 
 `Unmount` 失败，例如仍有使用者而返回 `EBUSY` 时，会话继续续期。内核连接退出后，挂载停止续期并尝试排空全部引用；个别 Release 缺失也由会话清理覆盖。`Mount.Done()` 在这次清理尝试结束后关闭，`Mount.Wait()` 返回它的错误，Done 关闭不意味着清理成功。独立 client 等待 Done 后才释放 replica，释放失败保留其目录与错误。
 

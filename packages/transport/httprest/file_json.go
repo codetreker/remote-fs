@@ -57,7 +57,7 @@ func validateFileRequest(r fileRequest) error {
 	} else if !validFileCapability(r.Session) {
 		return errors.New("invalid file session capability")
 	}
-	if fileActionRequired(r.Op) || r.Action != "" && (r.Op == storage.OpFileClose || r.Op == storage.OpFileSessionClose) {
+	if fileActionRequired(r.Op) {
 		if _, err := r.Action.Epoch(); err != nil {
 			return err
 		}
@@ -72,7 +72,12 @@ func validateFileRequest(r fileRequest) error {
 	case storage.OpFileQueryAction:
 		expected.FileAction = r.FileAction
 	case storage.OpFileQueryDeleteIntent:
+		expected.DeleteOwner = r.DeleteOwner
 		expected.DeleteIntent = r.DeleteIntent
+	case storage.OpFileListDeleteIntents:
+		expected.DeleteOwner = r.DeleteOwner
+		expected.DeleteAfter = r.DeleteAfter
+		expected.DeleteLimit = r.DeleteLimit
 	case storage.OpFileAcknowledgeDeleteIntent:
 		expected.Acknowledge = r.Acknowledge
 	case storage.OpFileOpen:
@@ -260,6 +265,8 @@ func validateFileResponse(req fileRequest, r fileResponse) error {
 			expected.ActionReceipt = r.ActionReceipt
 		case storage.OpFileQueryDeleteIntent:
 			expected.DeleteStatus = r.DeleteStatus
+		case storage.OpFileListDeleteIntents:
+			expected.DeletePage = r.DeletePage
 		case storage.OpFileOpen, storage.OpFileOpenNode:
 			expected.Node = r.Node
 			expected.File = r.File
@@ -286,8 +293,11 @@ func validateFileResponse(req fileRequest, r fileResponse) error {
 		case storage.OpFileMutateName:
 			expected.Attr = r.Attr
 			expected.Barrier = r.Barrier
-		case storage.OpFileSync, storage.OpFileClose, storage.OpFileSessionClose:
+		case storage.OpFileSync:
 			expected.Barrier = r.Barrier
+		case storage.OpFileClose, storage.OpFileSessionClose:
+			expected.Barrier = r.Barrier
+			expected.CloseResult = r.CloseResult
 		case storage.OpFileScope:
 			expected.Scope = r.Scope
 		case storage.OpFileState:
@@ -334,6 +344,21 @@ func validateFileResponse(req fileRequest, r fileResponse) error {
 		}
 		if _, err := r.DeleteStatus.storage(); err != nil {
 			return err
+		}
+	case storage.OpFileListDeleteIntents:
+		if r.DeletePage == nil {
+			return errors.New("delete intent listing returned no page")
+		}
+		page, err := r.DeletePage.storage()
+		if err != nil {
+			return err
+		}
+		if err := page.Check(req.DeleteOwner, req.DeleteAfter, req.DeleteLimit); err != nil {
+			return err
+		}
+	case storage.OpFileClose, storage.OpFileSessionClose:
+		if r.CloseResult == nil || !r.CloseResult.Released || r.CloseResult.BarrierPending {
+			return errors.New("close response does not prove release")
 		}
 	case storage.OpFileOpen, storage.OpFileOpenNode:
 		if !validFileCapability(r.File) || r.Capabilities == nil {
@@ -495,6 +520,27 @@ func validatePartialFileResponse(req fileRequest, response fileResponse) error {
 		}
 		if _, err := response.DeleteStatus.storage(); err != nil {
 			return err
+		}
+	case storage.OpFileListDeleteIntents:
+		expected.DeletePage = response.DeletePage
+		if response.DeletePage == nil {
+			return errors.New("partial delete intent page is absent")
+		}
+		page, err := response.DeletePage.storage()
+		if err != nil {
+			return err
+		}
+		if err := page.Check(req.DeleteOwner, req.DeleteAfter, req.DeleteLimit); err != nil {
+			return err
+		}
+	case storage.OpFileClose, storage.OpFileSessionClose:
+		expected.CloseResult = response.CloseResult
+		expected.Barrier = response.Barrier
+		if response.CloseResult == nil {
+			return errors.New("partial close result is absent")
+		}
+		if response.CloseResult.BarrierPending && (!response.CloseResult.Released || response.Barrier != nil) {
+			return errors.New("partial close result has inconsistent barrier state")
 		}
 	case storage.OpFileOpenAt, storage.OpFileOpenNodeRef, storage.OpFileOpenChildRef:
 		expected.File = response.File

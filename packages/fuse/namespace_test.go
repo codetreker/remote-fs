@@ -70,6 +70,9 @@ func (f *retainedNamespaceFile) Close(ctx context.Context) error {
 	f.clean = ctx.Err() == nil && deadline
 	return nil
 }
+func (f *retainedNamespaceFile) CloseWithResult(ctx context.Context) (storage.ReferenceCloseResult, error) {
+	return storage.ReferenceCloseResult{Released: true}, f.Close(ctx)
+}
 
 func namespaceRoot(session storage.FileSession) *node {
 	v := &volume{
@@ -158,8 +161,11 @@ func (s *replayingNamespaceFixture) QueryFileAction(_ context.Context, action st
 	s.receipt.Action = action
 	return s.receipt, nil
 }
-func (s *replayingNamespaceFixture) QueryDeleteIntent(context.Context, storage.DeleteIntentID) (storage.DeleteIntentStatus, error) {
+func (s *replayingNamespaceFixture) QueryDeleteIntent(context.Context, storage.DeleteIntentOwner, storage.DeleteIntentID) (storage.DeleteIntentStatus, error) {
 	panic("file open queried a delete intent")
+}
+func (s *replayingNamespaceFixture) ListDeleteIntents(context.Context, storage.DeleteIntentOwner, storage.DeleteIntentCursor, int) (storage.DeleteIntentPage, error) {
+	panic("file open listed delete intents")
 }
 func (s *replayingNamespaceFixture) AcknowledgeDeleteIntent(context.Context, storage.AcknowledgeDeleteIntentCommand) error {
 	panic("file open acknowledged a delete intent")
@@ -329,6 +335,9 @@ func (f *identityOpenFile) Stat(context.Context) (storage.Attr, error) { return 
 func (f *identityOpenFile) Close(context.Context) error {
 	f.closed = true
 	return nil
+}
+func (f *identityOpenFile) CloseWithResult(ctx context.Context) (storage.ReferenceCloseResult, error) {
+	return storage.ReferenceCloseResult{Released: true}, f.Close(ctx)
 }
 
 func TestTruncatingIdentityOpenDoesNotExposeRetryablePostMutationFailure(t *testing.T) {

@@ -21,6 +21,7 @@ const deleteIntentCrashRootEnvironment = "REMOTE_FS_DELETE_INTENT_CRASH_ROOT"
 type deleteIntentCrashReceipt struct {
 	Node   uint64
 	Intent storage.DeleteIntentID
+	Owner  storage.DeleteIntentOwner
 }
 
 func deleteIntentCrashConfig(root string, initialize bool) Config {
@@ -56,7 +57,7 @@ func TestDeleteIntentSurvivesSIGKILLAndRecovers(t *testing.T) {
 		_ = command.Wait()
 		t.Fatalf("child reached no durable-intent boundary: %v", err)
 	}
-	if receipt.Node == 0 || receipt.Intent.Check() != nil {
+	if receipt.Node == 0 || receipt.Intent.Check() != nil || receipt.Owner.Check() != nil {
 		_ = command.Process.Kill()
 		_ = command.Wait()
 		t.Fatalf("invalid child receipt: %+v", receipt)
@@ -88,9 +89,13 @@ func TestDeleteIntentSurvivesSIGKILLAndRecovers(t *testing.T) {
 		}
 	})
 	actions := session.(storage.FileActions)
+	page, err := actions.ListDeleteIntents(t.Context(), receipt.Owner, 0, 1)
+	if err != nil || len(page.Intents) != 1 || page.Intents[0].ID != receipt.Intent || page.Next == 0 {
+		t.Fatalf("recovered owner discovery = %+v, %v", page, err)
+	}
 	deadline := time.Now().Add(10 * time.Second)
 	for {
-		status, err := actions.QueryDeleteIntent(t.Context(), receipt.Intent)
+		status, err := actions.QueryDeleteIntent(t.Context(), receipt.Owner, receipt.Intent)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -122,10 +127,10 @@ func TestDeleteIntentSurvivesSIGKILLAndRecovers(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := actions.AcknowledgeDeleteIntent(t.Context(), storage.AcknowledgeDeleteIntentCommand{Action: action, Intent: receipt.Intent}); err != nil {
+	if err := actions.AcknowledgeDeleteIntent(t.Context(), storage.AcknowledgeDeleteIntentCommand{Action: action, Owner: receipt.Owner, Intent: receipt.Intent}); err != nil {
 		t.Fatal(err)
 	}
-	acknowledged, err := actions.QueryDeleteIntent(t.Context(), receipt.Intent)
+	acknowledged, err := actions.QueryDeleteIntent(t.Context(), receipt.Owner, receipt.Intent)
 	if err != nil || acknowledged.Outcome != storage.DeleteIntentUnknown || acknowledged.NodeID != 0 {
 		t.Fatalf("acknowledged intent=%+v error=%v", acknowledged, err)
 	}
@@ -167,17 +172,21 @@ func runDeleteIntentCrashChild(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	owner, err := storage.NewDeleteIntentOwner()
+	if err != nil {
+		t.Fatal(err)
+	}
 	opened, err := session.(storage.AtomicFileOpener).OpenAt(t.Context(), storage.ChildSelection{Name: storage.ChildName{
 		Parent: storage.DirectoryTarget{NodeID: rootAttr.ID}, RawLeaf: []byte("victim"),
 	}}, storage.OpenAtOptions{
 		Read: true, Target: storage.ChildCondition{State: storage.SameNode, NodeID: victim.ID},
 		Action: action, Existing: storage.Keep, Use: storage.UseClaim{Uses: storage.ReadData | storage.DeleteName},
-		CloseIntent: &storage.CloseIntent{ID: intent, Trigger: storage.OnReferenceClose, Condition: storage.UnlinkFile},
+		CloseIntent: &storage.CloseIntent{ID: intent, Owner: owner, Trigger: storage.OnReferenceClose, Condition: storage.UnlinkFile},
 	})
 	if err != nil || opened.File == nil {
 		t.Fatalf("arm durable close intent: %+v %v", opened, err)
 	}
-	if err := json.NewEncoder(os.Stdout).Encode(deleteIntentCrashReceipt{Node: victim.ID, Intent: intent}); err != nil {
+	if err := json.NewEncoder(os.Stdout).Encode(deleteIntentCrashReceipt{Node: victim.ID, Intent: intent, Owner: owner}); err != nil {
 		t.Fatal(err)
 	}
 	select {}

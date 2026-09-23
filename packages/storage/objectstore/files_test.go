@@ -1055,12 +1055,15 @@ func TestRetainedSessionCloseCanRetryKnownAccountingRefusal(t *testing.T) {
 	if err := volume.Close(); !errors.Is(err, failure) {
 		t.Fatalf("first close=%v", err)
 	}
+	if result, err := session.CloseWithResult(t.Context()); result.Released || !errors.Is(err, failure) {
+		t.Fatalf("failed close retained ownership=%+v %v", result, err)
+	}
 	refuse.Store(false)
 	if err := volume.Close(); err != nil {
 		t.Fatalf("retry close=%v", err)
 	}
-	if err := session.Close(context.Background()); err != nil {
-		t.Fatal(err)
+	if result, err := session.CloseWithResult(context.Background()); !result.Released || err != nil {
+		t.Fatalf("settled close=%+v %v", result, err)
 	}
 }
 

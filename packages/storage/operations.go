@@ -38,6 +38,7 @@ const (
 	OpFileOpenChildRef            Operation = "file.open-child-ref"
 	OpFileQueryAction             Operation = "file.query-action"
 	OpFileQueryDeleteIntent       Operation = "file.query-delete-intent"
+	OpFileListDeleteIntents       Operation = "file.list-delete-intents"
 	OpFileAcknowledgeDeleteIntent Operation = "file.acknowledge-delete-intent"
 	OpFileAck                     Operation = "file.ack"
 	OpFileStat                    Operation = "file.stat"
