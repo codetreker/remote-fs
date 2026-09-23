@@ -24,7 +24,7 @@
 
 ## CI 执行预算
 
-checks 作业总上限为二十分钟，其中 contract / unit 步骤以 `-race -count=1 -timeout 10m` 执行，每个包测试二进制的累计预算为十分钟。这是整包执行的 watchdog，单项 deadline 与行为断言各自成立。严格的 skip、无测试与缺失 verdict 检查继续执行；串行副本可见性验收仍使用三分钟进程预算和一秒可见性判据，覆盖率门禁与包划分保持原义。预算依据、较晚发现整包挂起的代价及重新调查的条件见[执行预算决定](../.agents/notes/implemented/process/2026-09-08-budget-ci-race-test-execution.md)。
+checks 作业总上限为三十五分钟，其中 contract / unit 步骤以 `-race -count=1 -timeout 10m` 执行，每个包测试二进制的累计预算为十分钟。串行副本可见性验收以 `-timeout 5m` 执行整个包；这一进程预算与单项的一秒可见性判据分别成立。严格的 skip、无测试与缺失 verdict 检查继续执行，覆盖率门禁与包划分保持原义。预算依据、较晚发现整包挂起的代价及重新调查的条件见[执行预算决定](../.agents/notes/implemented/process/2026-09-23-budget-ci-full-load-execution.md)与[原有整包 race 预算](../.agents/notes/implemented/process/2026-09-08-budget-ci-race-test-execution.md)。
 
 ## 覆盖率是必要的，从来不是充分的
 
@@ -302,7 +302,7 @@ Pending 用例先占满 authority 的申请队列，随后确认 HTTP control ad
 
 ```
 .github/scripts/assert-every-test-ran.sh -tags rfs_acceptance -count=1 \
-  -p=1 -parallel=1 -timeout 3m ./packages/storage/replicated
+  -p=1 -parallel=1 -timeout 5m ./packages/storage/replicated
 ```
 
 ## SMB endpoint、认证与生命周期

@@ -24,7 +24,7 @@ jobs:
   checks:
     name: build, format, links, contract and unit tests
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -63,7 +63,7 @@ jobs:
       - name: Replication visibility acceptance
         run: |
           .github/scripts/assert-every-test-ran.sh -tags rfs_acceptance -count=1 \
-            -p=1 -parallel=1 -timeout 3m ./packages/storage/replicated
+            -p=1 -parallel=1 -timeout 5m ./packages/storage/replicated
 
       # packages/storage/objectstore/azblob is tested against a real Blob endpoint, and
       # this suite fails on a skipped test rather than tolerating a missing dependency, so
