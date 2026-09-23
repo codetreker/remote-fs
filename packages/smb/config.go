@@ -27,8 +27,10 @@ type Config struct {
 // defaults explicitly; an omitted individual field never means unbounded.
 type Limits struct {
 	MaxExports, MaxConnections, MaxSessions, MaxTrees int
+	MaxHandles                                        int
 	MaxRequests, MaxCompound, MaxContexts             int
 	MaxFrameBytes, MaxIOBytes, MaxTokenBytes          int
+	MaxDirectoryBytes                                 int64
 	HandshakeTimeout, RequestTimeout, CleanupTimeout  time.Duration
 	FileSession                                       storage.FileSessionOptions
 }
@@ -36,6 +38,7 @@ type Limits struct {
 func DefaultLimits() Limits {
 	return Limits{
 		MaxExports: 32, MaxConnections: 16, MaxSessions: 16, MaxTrees: 32,
+		MaxHandles: 256, MaxDirectoryBytes: 8 << 20,
 		MaxRequests: 128, MaxCompound: 32, MaxContexts: 16,
 		MaxFrameBytes: 2 << 20, MaxIOBytes: 1 << 20, MaxTokenBytes: 65535,
 		HandshakeTimeout: 30 * time.Second, RequestTimeout: time.Minute,
@@ -45,6 +48,7 @@ func DefaultLimits() Limits {
 
 func (l Limits) check() error {
 	if l.MaxExports < 1 || l.MaxConnections < 1 || l.MaxSessions < 1 || l.MaxTrees < 1 ||
+		l.MaxHandles < 1 || l.MaxHandles > 65535 || l.MaxDirectoryBytes < 1 || l.MaxDirectoryBytes > storage.MaxDirectoryBytes ||
 		l.MaxRequests < 1 || l.MaxRequests > 65535 || l.MaxCompound < 1 || l.MaxCompound > 128 || l.MaxCompound > l.MaxRequests ||
 		l.MaxContexts < 1 || l.MaxIOBytes < 65536 || l.MaxIOBytes > 8<<20 ||
 		l.MaxFrameBytes < l.MaxIOBytes+65536 || l.MaxFrameBytes > 0xffffff ||
@@ -67,6 +71,6 @@ type Share struct {
 type Status struct {
 	Serving, Stopping, Stopped                                 bool
 	Exports, StoppingExports, Connections, RetainedConnections int
-	Sessions, ExpiredSessions, Trees, PendingRequests          int
+	Sessions, ExpiredSessions, Trees, Handles, PendingRequests int
 	FencedAuthorities, CleanupFailures                         int
 }

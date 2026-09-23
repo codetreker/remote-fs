@@ -15,6 +15,8 @@ import (
 
 type Server struct {
 	config Config
+	// Package tests can select a deterministic comparer on non-Windows hosts.
+	nameComparer nameComparer
 
 	mu              sync.Mutex
 	exports         map[string]*Export

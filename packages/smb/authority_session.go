@@ -85,9 +85,15 @@ func (a *authoritySession) close(ctx context.Context) error {
 			return nil
 		}
 		if a.raw != nil {
-			if err := a.raw.Close(WithPrincipal(ctx, a.principal)); err != nil {
+			result, err := a.raw.CloseWithResult(WithPrincipal(ctx, a.principal))
+			err = errors.Join(err, result.Check(err))
+			if !result.Released {
 				return err
 			}
+			a.installMu.Lock()
+			a.closed = true
+			a.installMu.Unlock()
+			return err
 		}
 		a.installMu.Lock()
 		a.closed = true
@@ -285,6 +291,9 @@ func (c *connection) connectVolume(ctx context.Context, s *session, key string, 
 			if err == nil {
 				err = authority.acceptStatus(current)
 			}
+		}
+		if err == nil {
+			err = checkCreateCapabilities(raw)
 		}
 		authority.initErr = err
 		if err == nil {

@@ -368,7 +368,7 @@ func TestNativeIdentityExpiryFencesWorkAndAllowsReauthentication(t *testing.T) {
 	}
 	echo := signedParsedRequest(t, key, requestPacket(wire.Header{Command: wire.Echo, MessageID: 1, SessionID: s.id}, wire.EmptyResponseBody()))
 	header := echo.Header
-	if _, status, signer := connection.dispatch(t.Context(), echo, echo, &header); status != statusNetworkSessionExpired || signer != key {
+	if _, status, signer := connection.dispatch(t.Context(), echo, echo, &header, wire.FileID{}, nil); status != statusNetworkSessionExpired || signer != key {
 		t.Fatalf("expired ordinary request = %#x signer=%p", status, signer)
 	}
 	server.config.Authenticator = &protocolAuthenticator{}
@@ -387,7 +387,7 @@ func TestNativeIdentityExpiryFencesWorkAndAllowsReauthentication(t *testing.T) {
 	}
 	echo = signedParsedRequest(t, key, requestPacket(wire.Header{Command: wire.Echo, MessageID: 4, SessionID: s.id}, wire.EmptyResponseBody()))
 	header = echo.Header
-	if _, status, signer := connection.dispatch(t.Context(), echo, echo, &header); status != statusOK || signer != key {
+	if _, status, signer := connection.dispatch(t.Context(), echo, echo, &header, wire.FileID{}, nil); status != statusOK || signer != key {
 		t.Fatalf("reauthenticated request = %#x signer=%p", status, signer)
 	}
 }

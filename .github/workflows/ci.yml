@@ -174,9 +174,9 @@ jobs:
           exit "$leaked"
 
   windows-sspi:
-    name: native Windows SSPI tests
-    # This hosted label is Windows Server 2025. It exercises the native SSPI API,
-    # not the Windows 11 redirector or WNet acceptance owned by later work.
+    name: native Windows SMB tests
+    # This hosted label is Windows Server 2025. It exercises SMB name handling
+    # and the native SSPI API. Windows 11 redirector and WNet acceptance follow later.
     # https://github.com/actions/runner-images/blob/9d7eec51794bb688d6c7ce00550cda5a134c88a3/README.md#available-images
     runs-on: windows-2025
     timeout-minutes: 10
@@ -186,8 +186,8 @@ jobs:
           persist-credentials: false
       - uses: ./.github/actions/setup-go
 
-      - name: Test the native SSPI adapter
-        run: go test -count=1 -race ./packages/smb/windows
+      - name: Test the SMB endpoint and native SSPI adapter
+        run: go test -count=1 -race ./packages/smb/...
 
-      - name: Vet the native SSPI adapter
-        run: go vet ./packages/smb/windows
+      - name: Vet the SMB endpoint and native SSPI adapter
+        run: go vet ./packages/smb/...

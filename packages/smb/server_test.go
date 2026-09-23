@@ -183,6 +183,34 @@ func (s *endpointFileSession) CloseWithResult(ctx context.Context) (storage.Refe
 	err := s.Close(ctx)
 	return storage.ReferenceCloseResult{Released: err == nil}, err
 }
+func (*endpointFileSession) CheckAtomicFileOpen() error { return nil }
+func (*endpointFileSession) OpenAt(context.Context, storage.ChildSelection, storage.OpenAtOptions) (storage.OpenResult, error) {
+	return storage.OpenResult{}, syscall.ENOSYS
+}
+func (*endpointFileSession) CheckNodeReferences() error { return nil }
+func (*endpointFileSession) OpenNodeRef(context.Context, uint64, storage.NodeRefOptions) (storage.NodeOpenResult, error) {
+	return storage.NodeOpenResult{}, syscall.ENOSYS
+}
+func (*endpointFileSession) OpenChildRef(context.Context, storage.ChildSelection, storage.NodeRefOptions) (storage.NodeOpenResult, error) {
+	return storage.NodeOpenResult{}, syscall.ENOSYS
+}
+func (*endpointFileSession) CheckDirectoryMetadataObservation() error { return nil }
+func (*endpointFileSession) ObserveDirectoryMetadata(context.Context, storage.DirectoryTarget, storage.DirectoryMetadataOptions, *storage.ListResult) (storage.DirectoryMetadataObservation, error) {
+	return storage.DirectoryMetadataObservation{}, syscall.ENOSYS
+}
+func (*endpointFileSession) CheckFileActions() error { return nil }
+func (*endpointFileSession) QueryFileAction(context.Context, storage.FileActionID) (storage.FileActionReceipt, error) {
+	return storage.FileActionReceipt{}, syscall.ENOSYS
+}
+func (*endpointFileSession) QueryDeleteIntent(context.Context, storage.DeleteIntentOwner, storage.DeleteIntentID) (storage.DeleteIntentStatus, error) {
+	return storage.DeleteIntentStatus{}, syscall.ENOSYS
+}
+func (*endpointFileSession) ListDeleteIntents(context.Context, storage.DeleteIntentOwner, storage.DeleteIntentCursor, int) (storage.DeleteIntentPage, error) {
+	return storage.DeleteIntentPage{}, syscall.ENOSYS
+}
+func (*endpointFileSession) AcknowledgeDeleteIntent(context.Context, storage.AcknowledgeDeleteIntentCommand) error {
+	return syscall.ENOSYS
+}
 
 func endpointConfig() Config {
 	return Config{
@@ -204,6 +232,8 @@ func TestEndpointConfigurationAndExportReservation(t *testing.T) {
 		"authorizer":          func(c *Config) { c.Authorize = nil },
 		"frame":               func(c *Config) { c.Limits.MaxFrameBytes = c.Limits.MaxIOBytes },
 		"sessions":            func(c *Config) { c.Limits.MaxSessions = 0 },
+		"handles":             func(c *Config) { c.Limits.MaxHandles = 0 },
+		"directory budget":    func(c *Config) { c.Limits.MaxDirectoryBytes = 0 },
 		"timeout":             func(c *Config) { c.Limits.CleanupTimeout = 0 },
 	} {
 		t.Run(name, func(t *testing.T) {

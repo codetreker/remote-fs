@@ -50,4 +50,4 @@ FUSE 把 Linux 的精确字节叶名包装成不带 guards 的 `ChildSelection`�
 
 平台入口可以把一次完整目录观察转成一个原子、可核对的子项选择；观察以后发生的任何相关目录 revision 或 edge 变化都会使新动作在产生部分效果前冲突。代价是所有 `AtomicFileOpener`、`NodeReferences` 实现和 HTTP peer 都迁移到 `ChildSelection`，且目录中与目标无关但会推进 revision 的名字变化也会保守地拒绝旧选择。
 
-本决定部分接续并取代[有界权威名字观察](2026-09-20-bounded-authoritative-name-observations.md)中“guards 只进入只读观察”的范围边界，也扩展[持久节点身份与原子文件操作](2026-09-20-durable-identity-and-atomic-file-operations.md)定义的子项选择输入；两份决定的 observation、身份、action 与原子效果语义保持不变。它只交付[Windows 系统网络驱动器](../../proposed/feature/2026-09-16-windows-network-drive-support.md)所需的中立选择保证，不交付 Windows 名字规则、其它 guarded mutation、SMB 文件命令、通知、缓存恢复或原生验收。
+本决定部分接续并取代[有界权威名字观察](2026-09-20-bounded-authoritative-name-observations.md)中“guards 只进入只读观察”的范围边界，也扩展[持久节点身份与原子文件操作](2026-09-20-durable-identity-and-atomic-file-operations.md)定义的子项选择输入；两份决定的 observation、身份、action 与原子效果语义保持不变。它只交付[Windows 系统网络驱动器](../../proposed/feature/2026-09-16-windows-network-drive-support.md)所需的中立选择保证；[有界 SMB 文件引用](2026-09-23-bounded-smb-file-handles.md)接续 Windows 名字选择和 SMB CREATE/CLOSE。其它 guarded mutation、文件数据、通知、缓存恢复及原生验收不由本决定交付。

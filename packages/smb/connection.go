@@ -106,6 +106,7 @@ type session struct {
 	signer                       *signing.Session
 	preauth                      [64]byte
 	openingTrees                 int
+	nextFileID                   uint64
 	trees                        map[uint32]*tree
 	authorities                  map[*Export]*authoritySession
 	authDeadline                 time.Time
@@ -120,16 +121,21 @@ const (
 )
 
 type tree struct {
-	kind      treeKind
-	id        uint32
-	sessionID uint64
-	export    *Export
-	authority *authoritySession
-	closeMu   sync.Mutex
-	cleanup   cleanupGate
-	closed    bool
-	done      chan struct{}
-	stopOnce  sync.Once
+	kind         treeKind
+	id           uint32
+	sessionID    uint64
+	export       *Export
+	authority    *authoritySession
+	closeMu      sync.Mutex
+	cleanup      cleanupGate
+	closed       bool
+	done         chan struct{}
+	stopOnce     sync.Once
+	fileMu       sync.Mutex
+	fileStopping bool
+	fileActive   int
+	fileIdle     chan struct{}
+	handles      map[wire.FileID]*fileHandle
 }
 
 func newConnection(server *Server, network net.Conn) *connection {
@@ -323,7 +329,13 @@ func (c *connection) process(requests []wire.Request) error {
 	var output []byte
 	var inheritedSession uint64
 	var inheritedTree uint32
+	var inheritedFileID wire.FileID
 	var previousStatus uint32
+	responseBytes := 0
+	for _, request := range requests {
+		responseBytes += responseBudget(request)
+	}
+	responseFits := responseBytes <= c.server.config.Limits.MaxFrameBytes
 	for index, request := range requests {
 		original := request
 		if request.Header.Flags&wire.FlagRelated != 0 {
@@ -350,8 +362,9 @@ func (c *connection) process(requests []wire.Request) error {
 
 		var body []byte
 		var signer *signing.Session
+		var createdFileID wire.FileID
 		if request.Header.Flags&wire.FlagRelated != 0 && previousStatus != 0 || ctx.Err() != nil ||
-			responseBudget(request) > c.server.config.Limits.MaxFrameBytes-len(output)-80*(len(requests)-index-1) {
+			!responseFits {
 			header.Status = statusResources
 			if ctx.Err() != nil {
 				header.Status = statusError(ctx.Err())
@@ -372,7 +385,7 @@ func (c *connection) process(requests []wire.Request) error {
 				}
 			}
 		} else {
-			body, header.Status, signer = c.dispatch(ctx, request, original, &header)
+			body, header.Status, signer = c.dispatch(ctx, request, original, &header, inheritedFileID, &createdFileID)
 		}
 		pending.cancel()
 		if pending.async {
@@ -384,6 +397,10 @@ func (c *connection) process(requests []wire.Request) error {
 			body = wire.ErrorResponseBody()
 		}
 		inheritedSession, inheritedTree, previousStatus = header.SessionID, header.TreeID, header.Status
+		inheritedFileID = wire.FileID{}
+		if header.Command == wire.Create && header.Status == statusOK {
+			inheritedFileID = createdFileID
+		}
 		if request.Header.Flags&wire.FlagRelated != 0 {
 			header.Flags |= wire.FlagRelated
 		}
@@ -532,6 +549,10 @@ func responseBudget(request wire.Request) int {
 	switch request.Header.Command {
 	case wire.SessionSetup, wire.Negotiate:
 		return 72 + 65535
+	case wire.Create:
+		return 152
+	case wire.Close:
+		return 128
 	default:
 		return 128
 	}
@@ -588,11 +609,20 @@ func (c *connection) addStatus(status *Status) {
 		}
 		session.mu.Lock()
 		status.Trees += len(session.trees) + session.openingTrees
+		trees := make([]*tree, 0, len(session.trees))
+		for _, tree := range session.trees {
+			trees = append(trees, tree)
+		}
 		authorities := make([]*authoritySession, 0, len(session.authorities))
 		for _, authority := range session.authorities {
 			authorities = append(authorities, authority)
 		}
 		session.mu.Unlock()
+		for _, tree := range trees {
+			tree.fileMu.Lock()
+			status.Handles += len(tree.handles)
+			tree.fileMu.Unlock()
+		}
 		for _, authority := range authorities {
 			if authority.isStopping() {
 				status.FencedAuthorities++
