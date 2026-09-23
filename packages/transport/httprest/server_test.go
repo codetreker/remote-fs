@@ -1210,11 +1210,11 @@ func TestMalformedRequestsGetTheirOwnStatus(t *testing.T) {
 		uri    string
 		want   int
 	}{
-		{"an operation that does not exist", http.MethodGet, "/v4/teleport?path=a", http.StatusNotFound},
+		{"an operation that does not exist", http.MethodGet, "/v5/teleport?path=a", http.StatusNotFound},
 		{"nothing under the prefix", http.MethodGet, "/", http.StatusNotFound},
-		{"the wrong method", http.MethodGet, "/v4/remove?path=a", http.StatusMethodNotAllowed},
-		{"a query that does not parse", http.MethodGet, "/v4/stat?path=%zz", http.StatusBadRequest},
-		{"no path operand", http.MethodGet, "/v4/stat", http.StatusBadRequest},
+		{"the wrong method", http.MethodGet, "/v5/remove?path=a", http.StatusMethodNotAllowed},
+		{"a query that does not parse", http.MethodGet, "/v5/stat?path=%zz", http.StatusBadRequest},
+		{"no path operand", http.MethodGet, "/v5/stat", http.StatusBadRequest},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

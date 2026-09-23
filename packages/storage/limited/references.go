@@ -19,6 +19,11 @@ func wrapNodeReference(s *Storage, inner storage.NodeReference) storage.NodeRefe
 	return &nodeReference{NodeReference: inner, referenceCapabilities: referenceCapabilities{backing: inner, storage: s}}
 }
 
+func (r *nodeReference) Stat(ctx context.Context) (storage.Attr, error) {
+	attr, err := r.NodeReference.Stat(allocationContext(ctx))
+	return maskAllocation(attr), err
+}
+
 func (r *nodeReference) SetAttr(ctx context.Context, change storage.AttrChange) (storage.Attr, error) {
 	return fileMutation(r.storage, ctx, "retained node", func(ctx context.Context) (storage.Attr, error) {
 		return r.NodeReference.SetAttr(ctx, change)

@@ -181,11 +181,11 @@ func TestSpaceCountsWhatTheVolumeHolds(t *testing.T) {
 		t.Fatalf("an empty volume reports %+v, want the whole allowance free", space)
 	}
 
-	if err := volume.Write(ctx, "f", make([]byte, 1000)); err != nil {
+	if err := volume.Write(ctx, "f", make([]byte, 5000)); err != nil {
 		t.Fatalf("write: %v", err)
 	}
-	if space, err = volume.Space(ctx); err != nil || space.Used != 1000 {
-		t.Fatalf("after writing 1000 bytes space is %+v (%v), want 1000 taken", space, err)
+	if space, err = volume.Space(ctx); err != nil || space.Used != 8192 {
+		t.Fatalf("after writing 5000 bytes space is %+v (%v), want 8192 taken", space, err)
 	}
 
 	// Shrinking a file gives the bytes back, and replacing it does not charge for both
@@ -193,8 +193,8 @@ func TestSpaceCountsWhatTheVolumeHolds(t *testing.T) {
 	if err := volume.Write(ctx, "f", make([]byte, 10)); err != nil {
 		t.Fatalf("write: %v", err)
 	}
-	if space, err = volume.Space(ctx); err != nil || space.Used != 10 {
-		t.Fatalf("after shrinking to 10 bytes space is %+v (%v), want 10 taken", space, err)
+	if space, err = volume.Space(ctx); err != nil || space.Used != 4096 {
+		t.Fatalf("after shrinking to 10 bytes space is %+v (%v), want 4096 taken", space, err)
 	}
 
 	if err := volume.Remove(ctx, "f"); err != nil {

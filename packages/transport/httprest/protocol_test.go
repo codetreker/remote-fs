@@ -164,7 +164,7 @@ func TestRequestURLKeepsTheBasePrefix(t *testing.T) {
 		if err != nil {
 			t.Fatalf("URL under %q: %v", raw, err)
 		}
-		if want := "/under/here/v4/stat"; u.Path != want {
+		if want := "/under/here/v5/stat"; u.Path != want {
 			t.Fatalf("base %q gave path %q, want %q", raw, u.Path, want)
 		}
 	}
@@ -179,7 +179,7 @@ func TestSpaceIsAddressedWithNoOperands(t *testing.T) {
 	if err != nil {
 		t.Fatalf("URL for space: %v", err)
 	}
-	if want := "/v4/space"; u.RequestURI() != want {
+	if want := "/v5/space"; u.RequestURI() != want {
 		t.Fatalf("space is requested as %q, want %q", u.RequestURI(), want)
 	}
 	got, err := httprest.ParseRequest(http.MethodGet, u)
@@ -241,39 +241,39 @@ func TestParseRequestRejectsMalformedRequests(t *testing.T) {
 		// url.Values.Get reports a query it could not parse as an absent key, and an
 		// absent path reads as the root — so the whole volume would answer for a
 		// request nobody could decode.
-		{"a query that does not parse", http.MethodGet, "/v4/stat?path=%zz", httprest.ErrOperands},
-		{"no path at all", http.MethodGet, "/v4/stat", httprest.ErrOperands},
-		{"an empty query", http.MethodGet, "/v4/stat?", httprest.ErrOperands},
-		{"the path given twice", http.MethodGet, "/v4/stat?path=a&path=b", httprest.ErrOperands},
-		{"an operand nobody asked for", http.MethodGet, "/v4/stat?path=a&to=b", httprest.ErrOperands},
-		{"rename without a destination", http.MethodPost, "/v4/rename?path=a", httprest.ErrOperands},
-		{"rename with the destination twice", http.MethodPost, "/v4/rename?path=a&to=b&to=c", httprest.ErrOperands},
+		{"a query that does not parse", http.MethodGet, "/v5/stat?path=%zz", httprest.ErrOperands},
+		{"no path at all", http.MethodGet, "/v5/stat", httprest.ErrOperands},
+		{"an empty query", http.MethodGet, "/v5/stat?", httprest.ErrOperands},
+		{"the path given twice", http.MethodGet, "/v5/stat?path=a&path=b", httprest.ErrOperands},
+		{"an operand nobody asked for", http.MethodGet, "/v5/stat?path=a&to=b", httprest.ErrOperands},
+		{"rename without a destination", http.MethodPost, "/v5/rename?path=a", httprest.ErrOperands},
+		{"rename with the destination twice", http.MethodPost, "/v5/rename?path=a&to=b&to=c", httprest.ErrOperands},
 		// Space describes the whole volume, so a path beside it is a question nothing
 		// can answer rather than one to answer about the root.
-		{"space with a path", http.MethodGet, "/v4/space?path=a", httprest.ErrOperands},
-		{"space with an empty path", http.MethodGet, "/v4/space?path=", httprest.ErrOperands},
-		{"an operation that does not exist", http.MethodGet, "/v4/teleport?path=a", httprest.ErrUnknownOp},
+		{"space with a path", http.MethodGet, "/v5/space?path=a", httprest.ErrOperands},
+		{"space with an empty path", http.MethodGet, "/v5/space?path=", httprest.ErrOperands},
+		{"an operation that does not exist", http.MethodGet, "/v5/teleport?path=a", httprest.ErrUnknownOp},
 		{"no version prefix", http.MethodGet, "/stat?path=a", httprest.ErrUnknownOp},
 		{"obsolete protocol version", http.MethodGet, "/v3/stat?path=a", httprest.ErrUnknownOp},
-		{"a deeper path under the prefix", http.MethodGet, "/v4/stat/extra?path=a", httprest.ErrUnknownOp},
-		{"reading with a write method", http.MethodPost, "/v4/stat?path=a", httprest.ErrMethod},
-		{"writing with a read method", http.MethodGet, "/v4/remove?path=a", httprest.ErrMethod},
-		{"space with a write method", http.MethodPost, "/v4/space", httprest.ErrMethod},
+		{"a deeper path under the prefix", http.MethodGet, "/v5/stat/extra?path=a", httprest.ErrUnknownOp},
+		{"reading with a write method", http.MethodPost, "/v5/stat?path=a", httprest.ErrMethod},
+		{"writing with a read method", http.MethodGet, "/v5/remove?path=a", httprest.ErrMethod},
+		{"space with a write method", http.MethodPost, "/v5/space", httprest.ErrMethod},
 		// A resume point that does not parse must not degrade into one that does. Position
 		// zero is where a replica that has seen nothing resumes from, so a damaged one
 		// read as zero asks for the whole log — or, once the log no longer reaches that
 		// far back, produces a rebuild nobody can account for.
-		{"a position that is not a number", http.MethodGet, "/v4/resubscribe?incarnation=x&position=soon", httprest.ErrOperands},
-		{"a position that is empty", http.MethodGet, "/v4/resubscribe?incarnation=x&position=", httprest.ErrOperands},
-		{"a position before the first one", http.MethodGet, "/v4/resubscribe?incarnation=x&position=-1", httprest.ErrOperands},
-		{"a position no int64 holds", http.MethodGet, "/v4/resubscribe?incarnation=x&position=99999999999999999999", httprest.ErrOperands},
-		{"a resume point with no incarnation", http.MethodGet, "/v4/resubscribe?position=7", httprest.ErrOperands},
-		{"a resume point with no position", http.MethodGet, "/v4/resubscribe?incarnation=x", httprest.ErrOperands},
+		{"a position that is not a number", http.MethodGet, "/v5/resubscribe?incarnation=x&position=soon", httprest.ErrOperands},
+		{"a position that is empty", http.MethodGet, "/v5/resubscribe?incarnation=x&position=", httprest.ErrOperands},
+		{"a position before the first one", http.MethodGet, "/v5/resubscribe?incarnation=x&position=-1", httprest.ErrOperands},
+		{"a position no int64 holds", http.MethodGet, "/v5/resubscribe?incarnation=x&position=99999999999999999999", httprest.ErrOperands},
+		{"a resume point with no incarnation", http.MethodGet, "/v5/resubscribe?position=7", httprest.ErrOperands},
+		{"a resume point with no position", http.MethodGet, "/v5/resubscribe?incarnation=x", httprest.ErrOperands},
 		// Subscribing means "from now", which is a question with no operands. A resume
 		// point sent beside it is a request to continue from somewhere, and answering it
 		// from the tail instead would lose everything in between.
-		{"subscribing with a resume point", http.MethodGet, "/v4/subscribe?incarnation=x&position=7", httprest.ErrOperands},
-		{"a snapshot of a path", http.MethodGet, "/v4/snapshot?path=a", httprest.ErrOperands},
+		{"subscribing with a resume point", http.MethodGet, "/v5/subscribe?incarnation=x&position=7", httprest.ErrOperands},
+		{"a snapshot of a path", http.MethodGet, "/v5/snapshot?path=a", httprest.ErrOperands},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -293,7 +293,7 @@ func TestParseRequestRejectsMalformedRequests(t *testing.T) {
 // one. Losing that distinction turns every request with a damaged query into a request
 // against the whole volume.
 func TestParseRequestAcceptsTheRoot(t *testing.T) {
-	u, err := url.ParseRequestURI("/v4/list?path=")
+	u, err := url.ParseRequestURI("/v5/list?path=")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -310,5 +310,5 @@ func ExampleRequest_URL() {
 	base, _ := url.Parse("http://server.example:8080")
 	u, _ := httprest.Request{Op: httprest.OpRead, Path: "notes/one two.txt"}.URL(base)
 	fmt.Println(u)
-	// Output: http://server.example:8080/v4/read?path=notes%2Fone+two.txt
+	// Output: http://server.example:8080/v5/read?path=notes%2Fone+two.txt
 }

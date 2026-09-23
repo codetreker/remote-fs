@@ -540,7 +540,7 @@ func TestExternalKernelTeardownRetiresReferencesWithoutRelease(t *testing.T) {
 		t.Fatal(err)
 	}
 	space, err := backing.Space(t.Context())
-	if err != nil || space.Used != int64(len(contents)) {
+	if err != nil || space.Used != 4096 {
 		t.Fatalf("detached reference charge before teardown: %+v, %v", space, err)
 	}
 	bin, err := exec.LookPath("fusermount3")

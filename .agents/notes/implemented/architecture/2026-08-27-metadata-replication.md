@@ -274,7 +274,7 @@ R-CON-4 要求写入方自己以及同机其它进程**立即**看到已写入�
 
 只要 handler 持有非空 `Log`，每个 mutation-shaped operation 成功后都先唤醒 publisher，再从 `Log.Barrier` 原子读取 `(incarnation, committed position)` 放进 response。这也包括语义上不改变状态的 operation：它们得到的是当前 barrier，position 可以为 0。对真正产生变更的 mutation，barrier position 可以是本次提交的尾位置，也可以因并发提交而更晚，但到达它必然已经应用本次 mutation。barrier 查询或编码失败发生在 operation 已成功之后，因此 response 以 `EIO` 失败，不把已执行的 mutation 说成未发生。没有日志的 handler 可以省略 barrier；replicated client 的普通 mutation 方法会解码并忽略可选 barrier，`*WithBarrier` 方法则要求它存在且格式有效。
 
-引入这个 response 形状时，HTTP protocol 升为 v2：prefix 是 `/v2/`，header 是 `Remote-Fs-Protocol: 2`。v1 的 mutation success 是空 body，无法被 v2 的严格 `MutationResponse` decoder 接受，因此当时拒绝旧 route 与双版本 fallback。v3 随后增加 Strong 控制与 mutation scope；当前[文件锁协议](../../../../docs/design/server/file-locks.md#http-v4-编码)使用 `/v4/` 与 `Remote-Fs-Protocol: 4`，保留 mutation barrier body，并采用中立 Attr、metadata 与 range DTO。旧版本不能作为省略检查的兼容路径，陌生或空的成功 body 仍是协议失败。
+引入这个 response 形状时，HTTP protocol 升为 v2：prefix 是 `/v2/`，header 是 `Remote-Fs-Protocol: 2`。v1 的 mutation success 是空 body，无法被 v2 的严格 `MutationResponse` decoder 接受，因此当时拒绝旧 route 与双版本 fallback。v3 随后增加 Strong 控制与 mutation scope；当前[文件锁协议](../../../../docs/design/server/file-locks.md#http-v5-编码)使用 `/v5/` 与 `Remote-Fs-Protocol: 5`，保留 mutation barrier body，并采用中立 Attr、metadata 与 range DTO。旧版本不能作为省略检查的兼容路径，陌生或空的成功 body 仍是协议失败。
 
 replicated storage 在发送 request 前只 admission 一条 fixed-size confirmation record，不保留目标 path、direction 或 touched-name history。`replicated.Options` 默认 `ConfirmationGrace = 10s`、`MaxActiveConfirmations = 64`、`MaxWaitingConfirmations = 64`；active/waiter 的 `math.MaxInt` sentinel 被拒绝。active 名额不足时有限等待；纯调用方取消为 `EINTR`，deadline 为 `EIO`，实际容量饱和或 storage 开始关闭时为 `EAGAIN`，这些拒绝都保留原始原因且不发送 request。该分类与 [FUSE 请求中断](../bug-fix/2026-08-22-eio-from-a-freshly-mounted-mountpoint.md)共用操作阶段规则。`cmd/remote-fs` 以 `-confirmation-grace`、`-max-active-mutation-confirmations` 与 `-max-waiting-mutation-confirmations` 暴露三项配置，并在连接 server 或创建 replica directory 之前验证。
 
@@ -311,7 +311,7 @@ type Storage struct {
 }
 ```
 
-路径 `Stat` 走本地；`List`、`ListBounded`、`Read`、`Write`、`Create`、`Mkdir`、`Remove`、`RemoveDir`、`Rename`、`SetAttr` 与 `Space` 走远端。公开目录读取仍先检查副本可用性，再由 authority 执行当前用途限制与完整枚举。副本保存 authority 给出的 NodeKind、共同时间与 opaque metadata，不生成未知 BirthTime/ChangeTime，也不解释平台 namespace。HTTP v4 replication 的 Node wire 不携带 DirectoryRevision；SQLite replica 接受该缺席，为本地目录生成 opaque token，并在 replay 名字变化时替换它。这份 token 只保护本地实现内部，不作为 authority guard 或 observation 返回。
+路径 `Stat` 走本地；`List`、`ListBounded`、`Read`、`Write`、`Create`、`Mkdir`、`Remove`、`RemoveDir`、`Rename`、`SetAttr` 与 `Space` 走远端。公开目录读取仍先检查副本可用性，再由 authority 执行当前用途限制与完整枚举。副本保存 authority 给出的 NodeKind、共同时间与 opaque metadata，不生成未知 BirthTime/ChangeTime，也不解释平台 namespace。HTTP v5 replication 的 Node wire 携带[虚拟分配账](2026-09-23-virtual-allocation-ledger.md)的分配事实，但不携带 DirectoryRevision；SQLite replica 接受该缺席，为本地目录生成 opaque token，并在 replay 名字变化时替换它。这份 token 只保护本地实现内部，不作为 authority guard 或 observation 返回。
 
 FileStorage capability 传播到权威服务：FileSession.OpenNode、StatNode、SetNodeAttr、ReadDirNode、DirectoryMetadataObserver、metadata CAS、scope/range 与 File／NodeReference 的内容、属性和 current-name 操作都不按副本里的名字重新寻址，已经 detached 的对象不要求本地树仍有对应 entry。ReadDirNode、完整目录 metadata 与 current-name 在检查副本可用状态后直接查询 remote authority，绝不返回本地 revision。普通身份 I/O 与名字观察仍检查副本可用状态；续期、动作核对、取消和清理不依赖具名副本存在，失去观察不能阻止释放资源。
 

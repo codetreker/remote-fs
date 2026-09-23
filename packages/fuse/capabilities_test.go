@@ -20,19 +20,21 @@ type capableTestSession struct {
 	storage.RangeControl
 	storage.NodeReferences
 	storage.FileActions
+	storage.AllocationReporting
 }
 
 func testSessionCapabilities(session storage.FileSession) capableTestSession {
 	return capableTestSession{
-		FileSession:      session,
-		NamespaceAccess:  session.(storage.NamespaceAccess),
-		DirectoryReader:  session.(storage.DirectoryReader),
-		AtomicFileOpener: session.(storage.AtomicFileOpener),
-		MetadataAccess:   session.(storage.MetadataAccess),
-		UseOwners:        session.(storage.UseOwners),
-		RangeControl:     session.(storage.RangeControl),
-		NodeReferences:   session.(storage.NodeReferences),
-		FileActions:      session.(storage.FileActions),
+		FileSession:         session,
+		NamespaceAccess:     session.(storage.NamespaceAccess),
+		DirectoryReader:     session.(storage.DirectoryReader),
+		AtomicFileOpener:    session.(storage.AtomicFileOpener),
+		MetadataAccess:      session.(storage.MetadataAccess),
+		UseOwners:           session.(storage.UseOwners),
+		RangeControl:        session.(storage.RangeControl),
+		NodeReferences:      session.(storage.NodeReferences),
+		FileActions:         session.(storage.FileActions),
+		AllocationReporting: session.(storage.AllocationReporting),
 	}
 }
 
@@ -46,6 +48,7 @@ type facetSession struct {
 	storage.RangeControl
 	storage.NodeReferences
 	storage.FileActions
+	storage.AllocationReporting
 	fail             string
 	failure          error
 	closes, statuses int
@@ -59,14 +62,15 @@ func (s *facetSession) check(name string) error {
 	return nil
 }
 
-func (s *facetSession) CheckNamespaceAccess() error { return s.check("namespace") }
-func (s *facetSession) CheckDirectoryRead() error   { return s.check("directory") }
-func (s *facetSession) CheckAtomicFileOpen() error  { return s.check("open") }
-func (s *facetSession) CheckMetadataAccess() error  { return s.check("metadata") }
-func (s *facetSession) CheckUseOwners() error       { return s.check("owners") }
-func (s *facetSession) CheckRangeControl() error    { return s.check("ranges") }
-func (s *facetSession) CheckNodeReferences() error  { return s.check("references") }
-func (s *facetSession) CheckFileActions() error     { return s.check("actions") }
+func (s *facetSession) CheckNamespaceAccess() error     { return s.check("namespace") }
+func (s *facetSession) CheckDirectoryRead() error       { return s.check("directory") }
+func (s *facetSession) CheckAtomicFileOpen() error      { return s.check("open") }
+func (s *facetSession) CheckMetadataAccess() error      { return s.check("metadata") }
+func (s *facetSession) CheckUseOwners() error           { return s.check("owners") }
+func (s *facetSession) CheckRangeControl() error        { return s.check("ranges") }
+func (s *facetSession) CheckNodeReferences() error      { return s.check("references") }
+func (s *facetSession) CheckFileActions() error         { return s.check("actions") }
+func (s *facetSession) CheckAllocationReporting() error { return s.check("allocation") }
 func (s *facetSession) Close(ctx context.Context) error {
 	s.closes++
 	_, deadline := ctx.Deadline()
@@ -89,11 +93,23 @@ func (s facetStorage) NewFileSession(context.Context, storage.FileSessionOptions
 }
 
 func TestMountAdmissionRejectsMissingRequiredSessionCapabilities(t *testing.T) {
-	for _, missing := range []string{"namespace", "directory", "open", "metadata", "owners", "ranges", "references", "actions"} {
+	for _, missing := range []string{"namespace", "directory", "open", "metadata", "owners", "ranges", "references", "actions", "allocation"} {
 		t.Run(missing, func(t *testing.T) {
 			full := &facetSession{}
 			var session storage.FileSession
 			switch missing {
+			case "allocation":
+				session = &struct {
+					storage.FileSession
+					storage.NamespaceAccess
+					storage.DirectoryReader
+					storage.AtomicFileOpener
+					storage.MetadataAccess
+					storage.UseOwners
+					storage.RangeControl
+					storage.NodeReferences
+					storage.FileActions
+				}{full, full, full, full, full, full, full, full, full}
 			case "namespace":
 				session = &struct {
 					storage.FileSession
@@ -193,7 +209,7 @@ func TestMountAdmissionRejectsMissingRequiredSessionCapabilities(t *testing.T) {
 
 func TestMountAdmissionPreservesCapabilityFailure(t *testing.T) {
 	cause := errors.New("backing authority cannot provide capability")
-	for _, capability := range []string{"namespace", "directory", "open", "metadata", "owners", "ranges", "references", "actions"} {
+	for _, capability := range []string{"allocation", "namespace", "directory", "open", "metadata", "owners", "ranges", "references", "actions"} {
 		t.Run(capability, func(t *testing.T) {
 			session := &facetSession{fail: capability, failure: cause}
 			volume, err := newVolume(t.Context(), facetStorage{session: session}, Options{FlushTimeout: time.Second}, nil)

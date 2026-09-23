@@ -71,6 +71,21 @@ func TestNamespaceCapabilityIsIndependentOfDirectoryRead(t *testing.T) {
 	}
 }
 
+func (p *capabilitySessionProbe) CheckAllocationReporting() error { return p.checkErr }
+
+func TestAllocationReportingFollowsWrappedSession(t *testing.T) {
+	if err := (&fileSession{FileSession: namespaceOnlyProbe{}}).CheckAllocationReporting(); !errors.Is(err, syscall.EOPNOTSUPP) {
+		t.Fatalf("missing backend allocation capability = %v", err)
+	}
+	cause := errors.New("allocation ledger unavailable")
+	if err := (&fileSession{FileSession: &capabilitySessionProbe{checkErr: cause}}).CheckAllocationReporting(); !errors.Is(err, cause) {
+		t.Fatalf("backend allocation failure = %v", err)
+	}
+	if err := (&fileSession{FileSession: &capabilitySessionProbe{}}).CheckAllocationReporting(); err != nil {
+		t.Fatalf("available allocation capability = %v", err)
+	}
+}
+
 func (p *capabilitySessionProbe) capture(ctx context.Context) {
 	p.observed = locking.ScopeFromContext(ctx)
 }

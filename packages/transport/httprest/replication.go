@@ -18,21 +18,21 @@ import (
 // 2262 and a volume is asked to hold instants outside that. A name is a byte sequence,
 // because encoding/json substitutes U+FFFD for any byte that is not valid UTF-8 when it
 // writes a string, and a replica that recorded such a name would address a node that is
-// not there. Anything whose absence is indistinguishable from its zero value travels by
-// pointer and is refused when it is missing, because a replica applies what arrives here
-// without asking anything back: there is no revalidation behind these messages and no
-// timeout that repairs one that was wrong.
+// not there. Presence-sensitive facts are refused when missing: a replica applies what
+// arrives here without asking the authority again, and no timeout repairs a wrong row.
 
 // Node is metastore.Node on the wire.
 type Node struct {
-	ID         int64                    `json:"id"`
-	Kind       storage.NodeKind         `json:"kind"`
-	BirthTime  *Time                    `json:"birth_time,omitempty"`
-	ChangeTime *Time                    `json:"change_time,omitempty"`
-	Metadata   map[string]OpaquePayload `json:"metadata,omitempty"`
-	Size       int64                    `json:"size"`
-	AccessTime Time                     `json:"access_time"`
-	ModTime    Time                     `json:"mod_time"`
+	ID              int64                    `json:"id"`
+	Kind            storage.NodeKind         `json:"kind"`
+	BirthTime       *Time                    `json:"birth_time,omitempty"`
+	ChangeTime      *Time                    `json:"change_time,omitempty"`
+	Metadata        map[string]OpaquePayload `json:"metadata,omitempty"`
+	Size            int64                    `json:"size"`
+	AllocationSize  int64                    `json:"allocation_size"`
+	AllocationKnown bool                     `json:"allocation_known"`
+	AccessTime      Time                     `json:"access_time"`
+	ModTime         Time                     `json:"mod_time"`
 
 	// Content is the key of the object holding a file's bytes, and empty for a directory
 	// and for a file that has never been written. It travels as bytes rather than as a
@@ -51,6 +51,15 @@ func (n *Node) UnmarshalJSON(data []byte) error {
 	if err := decodeFileJSON(data, &decoded); err != nil {
 		return err
 	}
+	var members map[string]json.RawMessage
+	if err := json.Unmarshal(data, &members); err != nil {
+		return err
+	}
+	for _, name := range []string{"allocation_size", "allocation_known"} {
+		if value, ok := members[name]; !ok || bytes.Equal(value, []byte("null")) {
+			return fmt.Errorf("node carries no %s", name)
+		}
+	}
 	got := Node(decoded)
 	if err := got.check(); err != nil {
 		return err
@@ -65,6 +74,9 @@ func (n Node) check() error {
 	}
 	if n.Size < 0 {
 		return fmt.Errorf("node %d carries negative size %d", n.ID, n.Size)
+	}
+	if err := (storage.Attr{AllocationKnown: n.AllocationKnown, AllocationSize: n.AllocationSize}).CheckAllocation(); err != nil {
+		return fmt.Errorf("node %d carries invalid allocation: %w", n.ID, err)
 	}
 	if err := checkWireTime("access", n.AccessTime); err != nil {
 		return fmt.Errorf("node %d: %w", n.ID, err)
@@ -114,32 +126,36 @@ func checkWireTime(name string, instant Time) error {
 // NodeOf renders n for the wire.
 func NodeOf(n metastore.Node) *Node {
 	return &Node{
-		ID:         n.ID,
-		Kind:       n.Kind,
-		BirthTime:  optionalTimeOf(n.BirthTime),
-		ChangeTime: optionalTimeOf(n.ChangeTime),
-		Metadata:   metadataOf(n.Metadata),
-		Size:       n.Size,
-		AccessTime: TimeOf(n.AccessTime),
-		ModTime:    TimeOf(n.ModTime),
-		Content:    append([]byte{}, n.Content...),
-		LinkTarget: append([]byte{}, n.LinkTarget...),
+		ID:              n.ID,
+		Kind:            n.Kind,
+		BirthTime:       optionalTimeOf(n.BirthTime),
+		ChangeTime:      optionalTimeOf(n.ChangeTime),
+		Metadata:        metadataOf(n.Metadata),
+		Size:            n.Size,
+		AllocationSize:  n.AllocationSize,
+		AllocationKnown: n.AllocationKnown,
+		AccessTime:      TimeOf(n.AccessTime),
+		ModTime:         TimeOf(n.ModTime),
+		Content:         append([]byte{}, n.Content...),
+		LinkTarget:      append([]byte{}, n.LinkTarget...),
 	}
 }
 
 // Metastore returns the node n carries.
 func (n Node) Metastore() metastore.Node {
 	return metastore.Node{
-		ID:         n.ID,
-		Kind:       n.Kind,
-		BirthTime:  optionalTimeStorage(n.BirthTime),
-		ChangeTime: optionalTimeStorage(n.ChangeTime),
-		Metadata:   metadataStorage(n.Metadata),
-		Size:       n.Size,
-		AccessTime: n.AccessTime.Time(),
-		ModTime:    n.ModTime.Time(),
-		Content:    metastore.Key(n.Content),
-		LinkTarget: append([]byte{}, n.LinkTarget...),
+		ID:              n.ID,
+		Kind:            n.Kind,
+		BirthTime:       optionalTimeStorage(n.BirthTime),
+		ChangeTime:      optionalTimeStorage(n.ChangeTime),
+		Metadata:        metadataStorage(n.Metadata),
+		Size:            n.Size,
+		AllocationSize:  n.AllocationSize,
+		AllocationKnown: n.AllocationKnown,
+		AccessTime:      n.AccessTime.Time(),
+		ModTime:         n.ModTime.Time(),
+		Content:         metastore.Key(n.Content),
+		LinkTarget:      append([]byte{}, n.LinkTarget...),
 	}
 }
 

@@ -93,6 +93,7 @@ func await(t *testing.T, description string, ready func() bool) {
 }
 
 func TestSpaceUsesTheTighterMeasuredAvailability(t *testing.T) {
+	const allowance = 2 * limited.MinLimit
 	for _, test := range []struct {
 		name          string
 		available     int64
@@ -100,8 +101,8 @@ func TestSpaceUsesTheTighterMeasuredAvailability(t *testing.T) {
 		wantAvailable int64
 	}{
 		{name: "physical storage is tighter", available: 25, wantAvailable: 25},
-		{name: "volume quota is tighter", available: 10000, wantAvailable: limited.MinLimit - 30},
-		{name: "object store has no figure", availableErr: syscall.ENOSYS, wantAvailable: limited.MinLimit - 30},
+		{name: "volume quota is tighter", available: 10000, wantAvailable: limited.MinLimit},
+		{name: "object store has no figure", availableErr: syscall.ENOSYS, wantAvailable: limited.MinLimit},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			objects := &measuredObjects{
@@ -109,7 +110,7 @@ func TestSpaceUsesTheTighterMeasuredAvailability(t *testing.T) {
 				available:    test.available,
 				availableErr: test.availableErr,
 			}
-			volume, _ := composedStore(t, limited.MinLimit, objects)
+			volume, _ := composedStore(t, allowance, objects)
 			if err := volume.Write(t.Context(), "f", make([]byte, 30)); err != nil {
 				t.Fatalf("writing the measured content: %v", err)
 			}
@@ -118,7 +119,7 @@ func TestSpaceUsesTheTighterMeasuredAvailability(t *testing.T) {
 			if err != nil {
 				t.Fatalf("space: %v", err)
 			}
-			want := storage.Space{Total: limited.MinLimit, Used: 30, Avail: test.wantAvailable}
+			want := storage.Space{Total: allowance, Used: limited.MinLimit, Avail: test.wantAvailable}
 			if space != want {
 				t.Fatalf("space reported %+v, want %+v", space, want)
 			}
@@ -703,7 +704,7 @@ func putDirect(t *testing.T, meta metastore.Store, objects objectstore.Objects, 
 }
 
 func TestSweepPreservesObjectAndMetastoreFailures(t *testing.T) {
-	meta, err := sqlite.Open(t.Context(), filepath.Join(t.TempDir(), "meta.db"), "workspace", limited.MinLimit, sqlite.DefaultWindow())
+	meta, err := sqlite.Open(t.Context(), filepath.Join(t.TempDir(), "meta.db"), "workspace", 2*limited.MinLimit, sqlite.DefaultWindow())
 	if err != nil {
 		t.Fatalf("opening the metastore: %v", err)
 	}

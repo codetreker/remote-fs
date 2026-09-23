@@ -1309,10 +1309,48 @@ func TestAStreamThatIsNotThisProtocolIsRefused(t *testing.T) {
 // aNode is a well-formed node on the wire, for the message cases that vary everything else.
 func aNode() map[string]any {
 	return map[string]any{
-		"id": 2, "kind": storage.NodeRegular, "size": 3,
+		"id": 2, "kind": storage.NodeRegular, "size": 3, "allocation_size": 4096, "allocation_known": true,
 		"access_time": map[string]any{"unix_sec": 1755000000, "nanos": 1},
 		"mod_time":    map[string]any{"unix_sec": 1755000001, "nanos": 2},
 		"content":     []byte("key"),
+	}
+}
+
+func TestReplicationNodePreservesAllocationKnowledge(t *testing.T) {
+	for _, known := range []bool{false, true} {
+		node := metastore.Node{ID: 2, Kind: storage.NodeRegular, Size: 1, AllocationKnown: known}
+		if known {
+			node.AllocationSize = 4096
+		}
+		encoded, err := json.Marshal(httprest.NodeOf(node))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var wire httprest.Node
+		if err := json.Unmarshal(encoded, &wire); err != nil {
+			t.Fatal(err)
+		}
+		if got := wire.Metastore(); got.AllocationKnown != node.AllocationKnown || got.AllocationSize != node.AllocationSize {
+			t.Fatalf("node allocation changed through wire: %+v", got)
+		}
+		var fields map[string]any
+		if err := json.Unmarshal(encoded, &fields); err != nil {
+			t.Fatal(err)
+		}
+		for _, missing := range []string{"allocation_size", "allocation_known"} {
+			delete(fields, missing)
+			if err := decodesInto(t, fields, &wire); err == nil {
+				t.Fatalf("node without %s was accepted", missing)
+			}
+			if err := json.Unmarshal(encoded, &fields); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	contradiction := aNode()
+	contradiction["allocation_known"] = false
+	if err := decodesInto(t, contradiction, new(httprest.Node)); err == nil {
+		t.Fatal("unknown nonzero node allocation was accepted")
 	}
 }
 
@@ -1385,18 +1423,18 @@ func TestReplicationNodesRejectInvalidSymbolicLinkPayloads(t *testing.T) {
 	}
 }
 
-func TestV4ReplicationKeepsDirectoryRevisionOutOfTheWire(t *testing.T) {
+func TestV5ReplicationKeepsDirectoryRevisionOutOfTheWire(t *testing.T) {
 	wire := httprest.NodeOf(metastore.Node{ID: 2, Kind: storage.NodeDirectory, DirectoryRevision: []byte{1}})
 	encoded, err := json.Marshal(wire)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if strings.Contains(string(encoded), "directory_revision") {
-		t.Fatalf("v4 node exposed a local directory revision: %s", encoded)
+		t.Fatalf("v5 node exposed a local directory revision: %s", encoded)
 	}
 	var legacy httprest.Node
 	if err := json.Unmarshal(encoded, &legacy); err != nil {
-		t.Fatalf("v4 node without a directory revision was rejected: %v", err)
+		t.Fatalf("v5 node without a directory revision was rejected: %v", err)
 	}
 	var extended map[string]any
 	if err := json.Unmarshal(encoded, &extended); err != nil {
@@ -1404,7 +1442,7 @@ func TestV4ReplicationKeepsDirectoryRevisionOutOfTheWire(t *testing.T) {
 	}
 	extended["directory_revision"] = []byte{1}
 	if err := decodesInto(t, extended, &legacy); err == nil {
-		t.Fatal("v4 decoder accepted a directory revision extension")
+		t.Fatal("v5 decoder accepted a directory revision extension")
 	}
 }
 
@@ -2596,7 +2634,7 @@ func TestAPictureEndedByAShutdownIsNotAnnouncedAsWhole(t *testing.T) {
 	srv := httptest.NewServer(h)
 	defer srv.Close()
 
-	resp, err := srv.Client().Get(srv.URL + "/v4/snapshot")
+	resp, err := srv.Client().Get(srv.URL + "/v5/snapshot")
 	if err != nil {
 		t.Fatalf("ask for a picture: %v", err)
 	}

@@ -125,14 +125,16 @@ func optionalTimeStorage(value *Time) *time.Time {
 // Attr is storage.Attr on the wire. Optional times distinguish unknown facts from
 // every representable instant; opaque metadata is never interpreted by transport.
 type Attr struct {
-	ID         uint64                   `json:"id"`
-	Kind       storage.NodeKind         `json:"kind"`
-	Size       int64                    `json:"size"`
-	AccessTime Time                     `json:"access_time"`
-	ModTime    Time                     `json:"mod_time"`
-	BirthTime  *Time                    `json:"birth_time,omitempty"`
-	ChangeTime *Time                    `json:"change_time,omitempty"`
-	Metadata   map[string]OpaquePayload `json:"metadata,omitempty"`
+	ID              uint64                   `json:"id"`
+	Kind            storage.NodeKind         `json:"kind"`
+	Size            int64                    `json:"size"`
+	AllocationSize  int64                    `json:"allocation_size"`
+	AllocationKnown bool                     `json:"allocation_known"`
+	AccessTime      Time                     `json:"access_time"`
+	ModTime         Time                     `json:"mod_time"`
+	BirthTime       *Time                    `json:"birth_time,omitempty"`
+	ChangeTime      *Time                    `json:"change_time,omitempty"`
+	Metadata        map[string]OpaquePayload `json:"metadata,omitempty"`
 }
 
 // AttrOf renders a for the wire.
@@ -145,6 +147,7 @@ type Attr struct {
 // in the UnmarshalJSON methods below, where no decoder of these messages can omit them.
 func AttrOf(a storage.Attr) *Attr {
 	return &Attr{ID: a.ID, Kind: a.Kind, Size: a.Size,
+		AllocationSize: a.AllocationSize, AllocationKnown: a.AllocationKnown,
 		AccessTime: TimeOf(a.AccessTime), ModTime: TimeOf(a.ModTime),
 		BirthTime: optionalTimeOf(a.BirthTime), ChangeTime: optionalTimeOf(a.ChangeTime),
 		Metadata: metadataOf(a.Metadata)}
@@ -153,6 +156,7 @@ func AttrOf(a storage.Attr) *Attr {
 // Storage returns the attributes a carries.
 func (a Attr) Storage() storage.Attr {
 	return storage.Attr{ID: a.ID, Kind: a.Kind, Size: a.Size,
+		AllocationSize: a.AllocationSize, AllocationKnown: a.AllocationKnown,
 		AccessTime: a.AccessTime.Time(), ModTime: a.ModTime.Time(),
 		BirthTime: optionalTimeStorage(a.BirthTime), ChangeTime: optionalTimeStorage(a.ChangeTime),
 		Metadata: metadataStorage(a.Metadata)}
@@ -164,6 +168,9 @@ func (a Attr) check() error {
 	}
 	if a.Size < 0 {
 		return errors.New("the attributes carry a negative size")
+	}
+	if err := (storage.Attr{AllocationSize: a.AllocationSize, AllocationKnown: a.AllocationKnown}).CheckAllocation(); err != nil {
+		return err
 	}
 	if err := a.Kind.Check(); err != nil {
 		return fmt.Errorf("the attributes carry an invalid node kind: %w", err)
@@ -190,6 +197,16 @@ func (a *Attr) UnmarshalJSON(data []byte) error {
 	var decoded attr
 	if err := decodeFileJSON(data, &decoded); err != nil {
 		return err
+	}
+	var members map[string]json.RawMessage
+	if err := json.Unmarshal(data, &members); err != nil {
+		return err
+	}
+	for _, name := range []string{"allocation_size", "allocation_known"} {
+		value, ok := members[name]
+		if !ok || bytes.Equal(value, []byte("null")) {
+			return fmt.Errorf("attributes carry no %s", name)
+		}
 	}
 	got := Attr(decoded)
 	if err := got.check(); err != nil {
@@ -365,6 +382,16 @@ func decodeListingAttr(decoder *json.Decoder) (Attr, error) {
 			}
 		case "size":
 			result.Size, err = decodeListingInt64(decoder)
+		case "allocation_size":
+			result.AllocationSize, err = decodeListingInt64(decoder)
+		case "allocation_known":
+			value, decodeErr := decoder.Token()
+			known, ok := value.(bool)
+			if decodeErr != nil || !ok {
+				err = errors.New("listing allocation knowledge is not a boolean")
+			} else {
+				result.AllocationKnown = known
+			}
 		case "access_time":
 			result.AccessTime, err = decodeListingTime(decoder)
 		case "mod_time":
@@ -387,7 +414,7 @@ func decodeListingAttr(decoder *json.Decoder) (Attr, error) {
 	if token, err = decoder.Token(); err != nil || token != json.Delim('}') {
 		return Attr{}, errors.New("listing attributes object did not end")
 	}
-	for _, required := range []string{"id", "kind", "size", "access_time", "mod_time"} {
+	for _, required := range []string{"id", "kind", "size", "allocation_size", "allocation_known", "access_time", "mod_time"} {
 		if !seen[required] {
 			return Attr{}, fmt.Errorf("listing attributes carry no %s", required)
 		}

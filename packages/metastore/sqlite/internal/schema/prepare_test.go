@@ -138,12 +138,17 @@ func testFile(t *testing.T, db *sql.DB, volume, parent int64, name string, size 
 	key := fmt.Sprintf("content-%d", id)
 	execute(t, tx, `INSERT INTO objects (key, volume, state, size, created_sec, created_nsec)
 		VALUES (?, ?, ?, ?, 0, 0)`, key, volume, StateReferenced, size)
-	execute(t, tx, `INSERT INTO nodes (id,volume,kind,size,atime_sec,atime_nsec,mtime_sec,mtime_nsec,content,detached)
-		VALUES (?,?,1,?,0,0,0,0,?,?)`, id, volume, size, key, detached)
+	allocation, err := expectedAllocation(1, size)
+	if err != nil {
+		t.Fatal(err)
+	}
+	execute(t, tx, `INSERT INTO nodes (id,volume,kind,size,allocation_size,atime_sec,atime_nsec,mtime_sec,mtime_nsec,content,detached)
+		VALUES (?,?,1,?,?,0,0,0,0,?,?)`, id, volume, size, allocation, key, detached)
 	if !detached {
 		execute(t, tx, `INSERT INTO entries (volume, parent, name, node) VALUES (?, ?, ?, ?)`, volume, parent, []byte(name), id)
 	}
 	execute(t, tx, `UPDATE volumes SET used = used + ? WHERE id = ?`, size, volume)
+	execute(t, tx, `UPDATE volumes SET allocated_used = allocated_used + ? WHERE id = ?`, allocation, volume)
 	if err := tx.Commit(); err != nil {
 		t.Fatal(err)
 	}

@@ -26,7 +26,7 @@ flowchart LR
         Fuse -. 文件引用、Uses 与范围 .-> Replica
     end
     subgraph server[server]
-        HTTP[HTTP v4]
+        HTTP[HTTP v5]
         subgraph Pair[同一授权方的 volume 与锁服务]
             volume[enforcing volume] --> Backend[原生 backend]
             Authority[强 S/X 与动作历史]
@@ -89,13 +89,13 @@ Windows client 内的 SMB endpoint 同样停在这条边界：SMB 3.1.1、SSPI�
 
 `storage.BoundedStorage` 在不改变上述十一个操作的前提下增加三项 server-backend 义务：`CheckBounded` 在服务前验证所有依赖都能接收结果预算；`ReadBounded` 在完整 payload 分配前按 byte bound 拒绝；`ListBounded` 把 entry 逐项交给调用方持有的 `ListResult`，在保留超限 entry 之前失败。普通 `Read` 与 `List` 仍是直接调用者可用的整份结果 API；只有要把 volume 从可嵌入 server 发布出去的调用方必须依赖有界扩展（R-INT-3、R-INT-6）。
 
-属性包含非零 NodeID、NodeKind、Size、AccessTime、ModTime、可选 BirthTime/ChangeTime 与有界 opaque metadata。身份只可比较相等；未知可选时间不以其它时刻填充。调用方可设置 BirthTime、AccessTime 和 ModTime，ChangeTime 只由 authority 在状态实际改变时推进。平台权限位位于自己的 metadata namespace，不进入共同 Attr 字段。一次基础 `SetAttr` 点名多个共同时间时仍可能部分生效。列目录内联属性使得列出 n 个条目花一次调用而不是 n+1 次（R-WS-4）。
+属性包含非零 NodeID、NodeKind、Size、可选的 AllocationSize、AccessTime、ModTime、可选 BirthTime/ChangeTime 与有界 opaque metadata。`AllocationKnown` 明确区分未知分配量与已知为零；已知分配量不能为负，未知时值必须为零。`FileSession` 可通过 `AllocationReporting.CheckAllocationReporting()` 保证其返回的每份属性都有已知分配量；依赖该事实的入口先检查完整包装链，再核验实际返回值，缺失时明确失败。身份只可比较相等；未知可选时间不以其它时刻填充。调用方可设置 BirthTime、AccessTime 和 ModTime，ChangeTime 只由 authority 在状态实际改变时推进。平台权限位位于自己的 metadata namespace，不进入共同 Attr 字段。一次基础 `SetAttr` 点名多个共同时间时仍可能部分生效。列目录内联属性使得列出 n 个条目花一次调用而不是 n+1 次（R-WS-4）。
 
 metadata 每节点最多 16 个 namespace、规范编码总长最多 64 KiB；一个值最多 32 KiB，namespace 名最多 128 字节。authority 为每个 namespace 分配独立版本，CAS 只改变一个 key，空 expected version 要求缺席，空 payload 仍表示存在。返回属性在加载变长 metadata 前接受调用方结果预算。
 
 根不是任何调用方建出来的节点，删除它、移动它、把别的东西放到它的位置，都不是这个接口提供的操作。若允许，一个根被删掉的 volume 此后对一切回答 `ENOENT` —— 那句话说的是「那个文件不在」，而事实是 volume 不在。
 
-**容量描述整个 volume**，不描述其中某个子树 —— 一个 volume 就是一个 volume，「这个子目录还剩多少」是这份契约答不出的问题。三个数各自实测，互不推导（R-WS-5）：还能写入的量不是总量减已用，底下若有更紧的限制就报更紧的那个，因为配额是「还允许写多少」，不是「这些字节一定放得下」。已用可以超过总量 —— 那是配额被下调到已写内容之下的样子，此时还能写入的量是零。
+**容量描述整个 volume**，不描述其中某个子树 —— 一个 volume 就是一个 volume，「这个子目录还剩多少」是这份契约答不出的问题。三个数各自实测，互不推导（R-WS-5）：还能写入的量不是总量减已用，底下若有更紧的限制就报更紧的那个，因为配额是「还允许写多少」，不是「这些字节一定放得下」。内置 volume 的 `Space.Used` 是节点虚拟分配量的总和，包含 detached 文件；`Usage()` 单独报告精确 payload 长度。已用可以超过总量 —— 那是配额被下调或既有内容按分配量迁移后超额的样子，此时还能写入的量是零。
 
 **自己没有容量可报的 volume 以 `ENOSYS` 拒绝。** 这是实现的固有属性，不是这一次调用的状况：会答的一直会答，不会答的从来不答。因此上层既不得把这个拒绝当作可重试的暂时故障，也不得替它推算一个数字。
 
@@ -120,11 +120,11 @@ metadata 每节点最多 16 个 namespace、规范编码总长最多 64 KiB；�
 
 **保留文件接口**：`FileStorage.NewFileSession` 建立有限会话，`OpenFile` 按路径打开，`OpenNode` 按身份打开；`OpenAt` 与 `OpenChildRef` 使用包含父身份、原始叶名和可选 `NamespaceGuards` 的 `ChildSelection` 返回原子捕获的对象引用，`OpenNodeRef` 直接按节点身份选择。`File` 提供当前属性、区间读取、同步补丁、截断、Sync 与 Close；`NodeReference` 提供属性、Scope、State 与 Close，没有字节方法。身份 namespace、条件 mutation、pending deletion 与 session action query 都在相同 authority 顺序中执行。失去名字的对象仍存活并收费，直到引用退役、操作排空和最后释放完成。完整契约见[打开的文件](server/file-handles.md)。
 
-`DirectoryReader.ReadDirNode` 以 DirectoryTarget 的 NodeID 和可选 Scope 返回一次完整、有界的目录捕获，并执行 `ReadEntries` Use 检查；只有 exact scoped read 能继续枚举 detached 空目录，裸 NodeID 与 DirectoryMetadataObserver 都拒绝该目标。`DirectoryMetadataObserver` 在独立授权操作下返回同一捕获的 entries、opaque directory revision 与可选目录自身名字；NamespaceAccess、DirectoryReader 和 DirectoryMetadataObserver 三个 Go capability 可以独立实现。HTTP v4 的预留 DirectoryMetadata bit 只在两个目录 facet 的完整 backing chain 都可用时宣告，避免只支持旧 Namespace 子集的 peer 误通过目录读取 preflight；Namespace bit 仍只表示 LookupAt 与 MutateName。File 和 NodeReference 的 `ReferenceNameObserver` 返回 Root、Linked 或 Detached。可选 NamespaceGuards 在观察的同一权威读取中核对目录 revision、确切名字边和根关系，也可随 `ChildSelection` 在 OpenAt／OpenChildRef 的最终 authority transaction 中约束子项选择；其它 mutation 输入不因此获得 guards。完整契约见[打开的文件](server/file-handles.md#名字与目录观察)。
+`DirectoryReader.ReadDirNode` 以 DirectoryTarget 的 NodeID 和可选 Scope 返回一次完整、有界的目录捕获，并执行 `ReadEntries` Use 检查；只有 exact scoped read 能继续枚举 detached 空目录，裸 NodeID 与 DirectoryMetadataObserver 都拒绝该目标。`DirectoryMetadataObserver` 在独立授权操作下返回同一捕获的 entries、opaque directory revision 与可选目录自身名字；NamespaceAccess、DirectoryReader 和 DirectoryMetadataObserver 三个 Go capability 可以独立实现。HTTP v5 的预留 DirectoryMetadata bit 只在两个目录 facet 的完整 backing chain 都可用时宣告，避免只支持旧 Namespace 子集的 peer 误通过目录读取 preflight；Namespace bit 仍只表示 LookupAt 与 MutateName。File 和 NodeReference 的 `ReferenceNameObserver` 返回 Root、Linked 或 Detached。可选 NamespaceGuards 在观察的同一权威读取中核对目录 revision、确切名字边和根关系，也可随 `ChildSelection` 在 OpenAt／OpenChildRef 的最终 authority transaction 中约束子项选择；其它 mutation 输入不因此获得 guards。完整契约见[打开的文件](server/file-handles.md#名字与目录观察)。
 
 **强 S/X 控制接口**：显式创建 Session / Owner，解析现有普通文件，取得、续期、解除与核对 S/X 授予。修改只使用调用方给出的有界不可变 proof 集合，普通读取不声称 grant 有效。所有修改，包括匿名调用，都在原生最终转换处遵守占有顺序；重启通过持久最大时长证据与恢复屏障保留已确认保护。身份、动作结果、当前 grant 状态与内容版本分别定义，完整契约见 [文件锁设计](server/file-locks.md)。
 
-**HTTP 接口**：跨角色的实际边界。v4 转发中立 Attr、基础 storage、保留文件、身份目录枚举、名字观察、metadata/range 与显式 S/X 控制，以及复制的订阅、续订、快照和 checkpoint。v3 不作为兼容旁路，并必须满足：
+**HTTP 接口**：跨角色的实际边界。v5 转发中立 Attr、基础 storage、保留文件、身份目录枚举、名字观察、metadata/range 与显式 S/X 控制，以及复制的订阅、续订、快照和 checkpoint。每份 Attr 明确携带 `allocation_size` 与 `allocation_known`，包括列目录与打开结果；快照和 change 的通用 Node 带 `allocation_size` 与 `allocation_known`，容许来源分配量未知；会话能力还转发 AllocationReporting 的完整链检查。路径前缀与响应 marker 同时升为 5，缺失新字段的 v4 响应不得被解读为已知零。旧版协议不作为兼容旁路，并必须满足：
 
 | 义务 | 违反的后果 |
 |---|---|
@@ -151,7 +151,7 @@ client 侧的 remote storage 实现 storage 接口，凡是不满足上述任何
 
 **内核查名字与修改子项到达 storage**：目录项、属性与负项超时都是 0。首次路径定位可由 client 的 SQLite 副本答复；FUSE 的子项 Lookup、打开、创建、删除与 rename 使用父 NodeID 到达 authority，已 Opendir 的目录 handle 还附带其 NodeReference Scope。Readdir 以该身份取得一次完整、有界的权威目录捕获；公开路径 List/ListBounded 继续在确认副本可用后回源。普通文件使用 direct I/O，每次读取返回服务端保留对象的当前状态。
 
-副本保存名字、NodeKind、共同时间、opaque metadata 和大小，不复制文件内容。HTTP v4 replication 不携带 authority DirectoryRevision；SQLite replica 为本地目录树维护不可导出的 opaque revision，并在 replay 名字变化时使相应 token 失效。所有公开目录／名字观察回源 authority。打开只取得对象引用，字节在每次 ReadAt 时读取。
+副本保存名字、NodeKind、共同时间、opaque metadata、大小和来源分配事实，已知值保留来源单位，未知保持未知；副本不自行提供 `Space`，不复制文件内容。HTTP v5 replication 不携带 authority DirectoryRevision；SQLite replica 为本地目录树维护不可导出的 opaque revision，并在 replay 名字变化时使相应 token 失效。所有公开目录／名字观察回源 authority。打开只取得对象引用，字节在每次 ReadAt 时读取。
 
 server 每个 volume 记一条有序的变更日志，位置与树的改动在同一个事务里分配；client 先订阅、再取一次一致性快照，此后由流喂着。副本在观测到流断开时整份作废，到达 replicated storage 的操作以 EIO 失败，没有过期时间或基于间隔的刷新。本地副本在读写阶段之间交接，持续查询不能让已登记的更新一直等待读者空闲；首次构建与重建在快照 EOF 后读取固定 checkpoint，并用原订阅回放到该位置才恢复作答，见 [client 设计](client/architecture.md#二路径起点来自副本子项操作到达权威)。
 
