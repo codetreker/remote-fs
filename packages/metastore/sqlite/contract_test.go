@@ -213,7 +213,7 @@ func TestContractFactoryKeepsSequentialVolumesIsolated(t *testing.T) {
 	var savedStatus sqlite.ObjectStatus
 	var savedBarrier, savedNeighbourBarrier metastore.LogBarrier
 	t.Run("populated volume", func(t *testing.T) {
-		first = factory(t, 128).(withNeighbour)
+		first = factory(t, 8192).(withNeighbour)
 		key, err := first.Reserve(t.Context(), "same", 7)
 		if err != nil {
 			t.Fatal(err)
@@ -243,8 +243,11 @@ func TestContractFactoryKeepsSequentialVolumesIsolated(t *testing.T) {
 			t.Fatalf("first node=%+v, error=%v", savedNode, err)
 		}
 		savedSpace, err = first.Space(t.Context())
-		if err != nil || savedSpace != (storage.Space{Total: 128, Used: 7, Avail: 121}) {
+		if err != nil || savedSpace != (storage.Space{Total: 8192, Used: 4096, Avail: 4096}) {
 			t.Fatalf("first quota=%+v, error=%v", savedSpace, err)
+		}
+		if used, err := first.Usage(t.Context()); err != nil || used != 7 {
+			t.Fatalf("first logical usage=%d, error=%v; want 7", used, err)
 		}
 		savedStatus, err = first.ObjectStatus(t.Context())
 		want := sqlite.ObjectStatus{ReservedCount: 1, ReservedBytes: 3, UnresolvedCount: 1, UnresolvedBytes: 4, GarbageCount: 1, GarbageBytes: 5}
@@ -271,14 +274,14 @@ func TestContractFactoryKeepsSequentialVolumesIsolated(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Run("fresh volume", func(t *testing.T) {
-		second = factory(t, 256).(withNeighbour)
+		second = factory(t, 4096).(withNeighbour)
 		if children, err := second.List(t.Context(), ""); err != nil || len(children) != 0 {
 			t.Fatalf("fresh volume lists %+v, error=%v", children, err)
 		}
 		if _, err := second.Stat(t.Context(), "same"); !errors.Is(err, syscall.ENOENT) {
 			t.Fatalf("fresh volume inherited a name: %v", err)
 		}
-		if space, err := second.Space(t.Context()); err != nil || space != (storage.Space{Total: 256, Avail: 256}) {
+		if space, err := second.Space(t.Context()); err != nil || space != (storage.Space{Total: 4096, Avail: 4096}) {
 			t.Fatalf("fresh quota=%+v, error=%v", space, err)
 		}
 		if status, err := second.ObjectStatus(t.Context()); err != nil || status != (sqlite.ObjectStatus{}) {
@@ -337,7 +340,7 @@ func TestContractFactoryKeepsSequentialVolumesIsolated(t *testing.T) {
 	if err != nil || after.DatabaseID != before.DatabaseID || after.Generation <= before.Generation || after.NodeHighWater <= before.NodeHighWater || after.ChangeHighWater <= before.ChangeHighWater {
 		t.Fatalf("shared database state before=%+v after=%+v, error=%v", before, after, err)
 	}
-	reopened := open(t, path, "volume-1", 128)
+	reopened := open(t, path, "volume-1", 8192)
 	if node, err := reopened.Stat(t.Context(), "same"); err != nil || !reflect.DeepEqual(node, savedNode) {
 		t.Fatalf("second child changed first node: %+v, error=%v; want %+v", node, err, savedNode)
 	}

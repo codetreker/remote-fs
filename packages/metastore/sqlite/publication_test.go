@@ -254,7 +254,7 @@ type publicationFixture struct {
 
 func newPublicationFixture(t *testing.T) publicationFixture {
 	t.Helper()
-	store, err := Open(t.Context(), filepath.Join(t.TempDir(), "store.db"), "workspace", 4096, DefaultWindow())
+	store, err := Open(t.Context(), filepath.Join(t.TempDir(), "store.db"), "workspace", 1<<20, DefaultWindow())
 	if err != nil {
 		t.Fatal(err)
 	}

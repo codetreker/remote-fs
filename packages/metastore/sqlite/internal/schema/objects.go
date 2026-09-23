@@ -68,6 +68,28 @@ func validateObjectRelationships(
 	return validateObjectRelationshipsVersion(ctx, db, volume, schema.Version())
 }
 
+func validateReplicaObjectAbsence(ctx context.Context, db sqlvalue.Queryer, volume *int64) error {
+	condition := ""
+	nodeCondition := " WHERE content IS NOT NULL"
+	var args []any
+	if volume != nil {
+		condition = " WHERE volume=?"
+		nodeCondition = " WHERE volume=? AND content IS NOT NULL"
+		args = []any{*volume}
+	}
+	var nodes, objects int64
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM nodes`+nodeCondition, args...).Scan(&nodes); err != nil {
+		return err
+	}
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM objects`+condition, args...).Scan(&objects); err != nil {
+		return err
+	}
+	if nodes != 0 || objects != 0 {
+		return fmt.Errorf("replica metadata contains %d object references and %d object records: %w", nodes, objects, syscall.EIO)
+	}
+	return nil
+}
+
 func validateObjectRelationshipsVersion(ctx context.Context, db sqlvalue.Queryer, volume *int64, version int) error {
 	nodeWhere := ""
 	objectWhere := ""

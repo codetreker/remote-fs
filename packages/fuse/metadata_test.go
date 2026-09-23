@@ -137,7 +137,7 @@ func TestActualChangeTimeWinsOverLinuxHistoricalPresentation(t *testing.T) {
 	changed := time.Unix(200, 456)
 	v := &volume{}
 	for _, actual := range []*time.Time{nil, &changed} {
-		attr := storage.Attr{ID: 1, Kind: storage.NodeRegular, ModTime: modified, AccessTime: modified, ChangeTime: actual}
+		attr := storage.Attr{ID: 1, Kind: storage.NodeRegular, AllocationKnown: true, ModTime: modified, AccessTime: modified, ChangeTime: actual}
 		var out gofuse.Attr
 		if errno := v.fillAttr(&out, attr); errno != 0 {
 			t.Fatal(errno)
@@ -151,6 +151,29 @@ func TestActualChangeTimeWinsOverLinuxHistoricalPresentation(t *testing.T) {
 		}
 		if out.Mtime != 100 || out.Mtimensec != 123 || attr.ChangeTime != actual {
 			t.Fatal("presentation changed authoritative times")
+		}
+	}
+}
+
+func TestAllocatedBytesBecomeLinuxBlocks(t *testing.T) {
+	v := &volume{}
+	for _, test := range []struct {
+		attr   storage.Attr
+		blocks uint64
+		errno  syscall.Errno
+	}{
+		{attr: storage.Attr{ID: 1, Kind: storage.NodeRegular, Size: 1, AllocationSize: 4096, AllocationKnown: true}, blocks: 8},
+		{attr: storage.Attr{ID: 2, Kind: storage.NodeRegular, Size: 4097, AllocationSize: 8192, AllocationKnown: true}, blocks: 16},
+		{attr: storage.Attr{ID: 3, Kind: storage.NodeRegular, AllocationKnown: true}, blocks: 0},
+		{attr: storage.Attr{ID: 7, Kind: storage.NodeRegular, Size: 1, AllocationSize: 1, AllocationKnown: true}, errno: syscall.EIO},
+		{attr: storage.Attr{ID: 8, Kind: storage.NodeRegular, Size: 1, AllocationSize: 513, AllocationKnown: true}, errno: syscall.EIO},
+		{attr: storage.Attr{ID: 4, Kind: storage.NodeRegular, AllocationSize: -1, AllocationKnown: true}, errno: syscall.EIO},
+		{attr: storage.Attr{ID: 5, Kind: storage.NodeRegular, AllocationSize: 4096}, errno: syscall.EIO},
+		{attr: storage.Attr{ID: 6, Kind: storage.NodeRegular}, errno: syscall.EIO},
+	} {
+		var out gofuse.Attr
+		if got := v.fillAttr(&out, test.attr); got != test.errno || got == 0 && out.Blocks != test.blocks {
+			t.Fatalf("allocation %+v projected as %d blocks with %v, want %d blocks with %v", test.attr, out.Blocks, got, test.blocks, test.errno)
 		}
 	}
 }

@@ -86,7 +86,7 @@ CREATE TABLE changes (
 	content           TEXT,
 	recorded_sec      INTEGER NOT NULL,
 	recorded_nsec     INTEGER NOT NULL
-	, node_kind INTEGER, birth_sec INTEGER, birth_nsec INTEGER, change_sec INTEGER, change_nsec INTEGER, metadata BLOB, link_target BLOB, directory_revision BLOB);
+	, node_kind INTEGER, birth_sec INTEGER, birth_nsec INTEGER, change_sec INTEGER, change_nsec INTEGER, metadata BLOB, link_target BLOB, directory_revision BLOB, allocation_size INTEGER);
 
 CREATE TABLE database_state (
 	singleton         INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -161,7 +161,8 @@ CREATE TABLE nodes (
 	content    TEXT REFERENCES objects(key)
 	, detached INTEGER NOT NULL DEFAULT 0, content_revision INTEGER NOT NULL DEFAULT 1, kind INTEGER NOT NULL DEFAULT 1, birth_sec INTEGER, birth_nsec INTEGER, change_sec INTEGER, change_nsec INTEGER, metadata BLOB NOT NULL DEFAULT X'52464d010000', link_target BLOB NOT NULL DEFAULT X'', pending_unlink INTEGER NOT NULL DEFAULT 0
 	CHECK (pending_unlink IN (0, 1)), pending_generation INTEGER NOT NULL DEFAULT 0
-	CHECK (pending_generation >= 0), directory_revision BLOB NOT NULL DEFAULT X'');
+	CHECK (pending_generation >= 0), directory_revision BLOB NOT NULL DEFAULT X'', allocation_size INTEGER
+	CHECK (allocation_size IS NULL OR (typeof(allocation_size) = 'integer' AND allocation_size >= 0)));
 
 CREATE TABLE objects (
 	key          TEXT PRIMARY KEY,
@@ -184,7 +185,16 @@ CREATE TABLE volumes (
 	used INTEGER NOT NULL
 	, metadata_used INTEGER NOT NULL DEFAULT 0
 	CHECK (typeof(metadata_used) = 'integer' AND metadata_used >= 0), delete_intent_high_water INTEGER NOT NULL DEFAULT 0
-	CHECK (delete_intent_high_water >= 0));
+	CHECK (delete_intent_high_water >= 0), allocated_used INTEGER NOT NULL DEFAULT 0
+	CHECK (typeof(allocated_used) = 'integer' AND allocated_used >= 0));
+
+CREATE TRIGGER changes_allocation_insert AFTER INSERT ON changes BEGIN
+	UPDATE changes SET allocation_size = CASE
+	WHEN NEW.node IS NULL THEN NULL
+	WHEN NEW.node_kind = 1 AND NEW.size > 0 THEN ((NEW.size + 4095) / 4096) * 4096
+	ELSE 0
+	END WHERE position = NEW.position;
+	END;
 
 CREATE TRIGGER changes_metadata_delete AFTER DELETE ON changes BEGIN
 	UPDATE volumes SET metadata_used = metadata_used - coalesce(length(OLD.metadata),0) - coalesce(length(OLD.link_target),0) - coalesce(length(OLD.directory_revision),0)

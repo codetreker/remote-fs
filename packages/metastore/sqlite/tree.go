@@ -701,7 +701,10 @@ func (s *Store) discardNode(ctx context.Context, tx *sql.Tx, node metastore.Node
 		}
 	}
 	if node.Kind == storage.NodeRegular {
-		return s.charge(ctx, tx, -node.Size)
+		if err := s.charge(ctx, tx, -node.Size); err != nil {
+			return err
+		}
+		return s.chargeAllocation(ctx, tx, -node.AllocationSize)
 	}
 	return nil
 }

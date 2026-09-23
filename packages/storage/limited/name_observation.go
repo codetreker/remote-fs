@@ -34,6 +34,9 @@ func (s *fileSession) ObserveDirectoryMetadata(ctx context.Context, target stora
 	if err != nil {
 		return observation, err
 	}
+	if err := result.ProjectAttrs(maskAllocation); err != nil {
+		return observation, err
+	}
 	observation, returned = backing.ObserveDirectoryMetadata(ctx, target, options, result)
 	if returned == nil {
 		returned = observation.Check(target, options)

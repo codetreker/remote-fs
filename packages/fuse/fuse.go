@@ -111,7 +111,7 @@ func New(mountpoint string, s storage.Storage, opts Options) (*Mount, error) {
 	ask, cancel := context.WithTimeout(context.Background(), v.flushTimeout)
 	attr, err := s.Stat(ask, "")
 	cancel()
-	if err == nil && (attr.ID == 0 || !attr.IsDir()) {
+	if err == nil && (attr.ID == 0 || !attr.IsDir() || !attr.AllocationKnown || attr.CheckAllocation() != nil || attr.AllocationSize%linuxStatBlockSize != 0) {
 		err = syscall.EIO
 	}
 	if err == nil {

@@ -14,7 +14,7 @@ Status: implemented
 
 ### 机制与策略分开
 
-`packages/locking` 持有有限授权、Session / Owner、生存期、动作历史与发布排序；`packages/storage/locked` 将它与支持原生发布检查的 volume 配对。HTTP v4 发布显式控制操作与 mutation scope；保留的 localstore 与 Azure 两种形态都在实际修改处执行保护。完整接口与状态流见[文件锁设计](../../../../docs/design/server/file-locks.md)。
+`packages/locking` 持有有限授权、Session / Owner、生存期、动作历史与发布排序；`packages/storage/locked` 将它与支持原生发布检查的 volume 配对。HTTP v5 发布显式控制操作与 mutation scope；保留的 localstore 与 Azure 两种形态都在实际修改处执行保护。完整接口与状态流见[文件锁设计](../../../../docs/design/server/file-locks.md)。
 
 现有普通文件可以取得 `S` 或 `X`。多个 S 相容；X 排斥其他持有者的授权与修改。S 持有者自己也不能只凭 S 修改。显式共同时间与 opaque metadata 修改受同一修改检查；普通读取的平台 atime 副作用不是稳定 atime 的承诺。匿名修改只在不冲突于已授予保护时允许，普通读取不因 X 而变成受锁访问控制的操作。
 

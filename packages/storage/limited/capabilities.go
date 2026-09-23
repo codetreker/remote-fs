@@ -21,6 +21,10 @@ func (s *fileSession) CheckAtomicFileOpen() error {
 	return err
 }
 
+func (s *fileSession) CheckAllocationReporting() error {
+	return syscall.EOPNOTSUPP
+}
+
 func (s *fileSession) OpenAt(ctx context.Context, selection storage.ChildSelection, options storage.OpenAtOptions) (storage.OpenResult, error) {
 	backing, err := capability(s.FileSession, storage.AtomicFileOpener.CheckAtomicFileOpen)
 	if err != nil {
@@ -48,7 +52,8 @@ func (s *fileSession) LookupAt(ctx context.Context, name storage.ChildName) (sto
 	if err != nil {
 		return storage.Attr{}, err
 	}
-	return backing.LookupAt(ctx, name)
+	attr, err := backing.LookupAt(allocationContext(ctx), name)
+	return maskAllocation(attr), err
 }
 
 func (s *fileSession) ReadDirNode(ctx context.Context, target storage.DirectoryTarget) (storage.ObservedDirectory, error) {
@@ -66,7 +71,7 @@ func (s *fileSession) ReadDirNode(ctx context.Context, target storage.DirectoryT
 	if observed.Observation.ParentID != target.NodeID {
 		return storage.ObservedDirectory{}, syscall.EIO
 	}
-	return observed, nil
+	return maskObservedDirectory(observed), nil
 }
 
 func (s *fileSession) ReadDirNodeBounded(ctx context.Context, target storage.DirectoryTarget, result *storage.ListResult) (observation storage.DirectoryObservation, returned error) {
@@ -81,6 +86,9 @@ func (s *fileSession) ReadDirNodeBounded(ctx context.Context, target storage.Dir
 	}()
 	backing, err := capability(s.FileSession, storage.DirectoryReader.CheckDirectoryRead)
 	if err != nil {
+		return storage.DirectoryObservation{}, err
+	}
+	if err := result.ProjectAttrs(maskAllocation); err != nil {
 		return storage.DirectoryObservation{}, err
 	}
 	observation, returned = backing.ReadDirNodeBounded(ctx, target, result)
@@ -296,7 +304,8 @@ func (r *referenceCapabilities) State(ctx context.Context) (storage.ReferenceSta
 	if err != nil {
 		return storage.ReferenceState{}, err
 	}
-	return backing.State(ctx)
+	state, err := backing.State(allocationContext(ctx))
+	return maskResult(state), err
 }
 
 func (r *referenceCapabilities) CheckDeleteIntent() error {

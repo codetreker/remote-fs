@@ -71,7 +71,8 @@ func (s *Store) insertNode(
 		return metastore.Node{}, err
 	}
 	if err := storage.CheckAttrResultBudget(ctx, storage.Attr{
-		ID: uint64(id), Kind: kind, Size: int64(len(initial.LinkTarget)), AccessTime: access, ModTime: modified, BirthTime: &birth, ChangeTime: &changed,
+		ID: uint64(id), Kind: kind, Size: int64(len(initial.LinkTarget)), AllocationKnown: true,
+		AccessTime: access, ModTime: modified, BirthTime: &birth, ChangeTime: &changed,
 	}, int64(len(encoded))); err != nil {
 		return metastore.Node{}, err
 	}
@@ -85,14 +86,15 @@ func (s *Store) insertNode(
 		directoryRevision = initialDirectoryRevision()
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO nodes
-		(id,volume,kind,size,atime_sec,atime_nsec,mtime_sec,mtime_nsec,content,
+		(id,volume,kind,size,allocation_size,atime_sec,atime_nsec,mtime_sec,mtime_nsec,content,
 		 birth_sec,birth_nsec,change_sec,change_nsec,metadata,link_target,directory_revision)
-		VALUES(?,?,?,?,?,?,?,?,NULL,?,?,?,?,?,?,?)`,
-		id, s.volume, int64(kind), len(initial.LinkTarget), accessSec, accessNsec, modifiedSec, modifiedNsec,
+		VALUES(?,?,?,?,?,?,?,?,?,NULL,?,?,?,?,?,?,?)`,
+		id, s.volume, int64(kind), len(initial.LinkTarget), int64(0), accessSec, accessNsec, modifiedSec, modifiedNsec,
 		birthSec, birthNsec, changeSec, changeNsec, encoded, target, directoryRevision); err != nil {
 		return metastore.Node{}, err
 	}
-	return metastore.Node{ID: id, Kind: kind, Size: int64(len(initial.LinkTarget)), AccessTime: access, ModTime: modified,
+	return metastore.Node{ID: id, Kind: kind, Size: int64(len(initial.LinkTarget)), AllocationKnown: true,
+		AccessTime: access, ModTime: modified,
 		BirthTime: &birth, ChangeTime: &changed, Metadata: metadata, LinkTarget: bytes.Clone(initial.LinkTarget),
 		DirectoryRevision: bytes.Clone(directoryRevision)}, nil
 }

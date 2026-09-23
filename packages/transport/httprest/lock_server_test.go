@@ -256,7 +256,7 @@ func TestLockServerProtocolAndControlBodies(t *testing.T) {
 	request := httptest.NewRequest(http.MethodPost, "/v2/create?path=f", nil)
 	answer := httptest.NewRecorder()
 	h.ServeHTTP(answer, request)
-	if answer.Code != http.StatusNotFound || answer.Header().Get(HeaderProtocol) != "4" {
+	if answer.Code != http.StatusNotFound || answer.Header().Get(HeaderProtocol) != "5" {
 		t.Fatalf("v2 status = %d", answer.Code)
 	}
 	for _, body := range []string{`null`, `{"extra":1}`, `{} {}`, strings.Repeat("x", int(DefaultMaxLockControlBytes)+1)} {

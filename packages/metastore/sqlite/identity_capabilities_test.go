@@ -118,7 +118,8 @@ func TestIdentityAddressedNamespaceAndAtomicOpenPreserveTheSelectedNode(t *testi
 	}
 	defer opened.File.Close(t.Context())
 	original := opened.State.Clone()
-	if opened.Outcome != storage.Created || original.ID == 0 || !bytes.Equal(original.Metadata["test.identity"].Data, []byte("first")) {
+	if opened.Outcome != storage.Created || original.ID == 0 || !original.AllocationKnown || original.AllocationSize != 0 ||
+		!bytes.Equal(original.Metadata["test.identity"].Data, []byte("first")) {
 		t.Fatalf("atomic create = %+v", opened)
 	}
 

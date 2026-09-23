@@ -65,7 +65,7 @@ func TestFileJSONDirectoryListsDoNotInheritLockBatchLimit(t *testing.T) {
 	}
 }
 
-func TestV4ResponsesRejectAmbiguousJSONAndNoncanonicalBytes(t *testing.T) {
+func TestV5ResponsesRejectAmbiguousJSONAndNoncanonicalBytes(t *testing.T) {
 	attr := AttrOf(storage.Attr{ID: 1, Kind: storage.NodeRegular, AccessTime: time.Unix(1, 0), ModTime: time.Unix(2, 0)})
 	entry, _ := json.Marshal(Entry{Name: []byte("a"), Attr: attr})
 	metadataAttr := *attr
@@ -128,7 +128,7 @@ func TestV4ResponsesRejectAmbiguousJSONAndNoncanonicalBytes(t *testing.T) {
 	}
 }
 
-func TestV4ErrorEnvelopeRejectsAmbiguousMembers(t *testing.T) {
+func TestV5ErrorEnvelopeRejectsAmbiguousMembers(t *testing.T) {
 	client := &Storage{}
 	for _, body := range []string{
 		`{"errno":"ENOENT","errno":"ENOENT","message":"missing"}`,

@@ -263,8 +263,8 @@ func (s *Store) applyAtomicOpen(ctx context.Context, tx *sql.Tx, name storage.Ch
 	if err != nil {
 		return metastore.Node{}, 0, err
 	}
-	if node.Size != 0 {
-		if err := s.account(ctx, tx, node.Size); err != nil {
+	if node.Kind == storage.NodeRegular && node.Size != 0 {
+		if err := s.accountFileChange(ctx, tx, 0, node.Size); err != nil {
 			return metastore.Node{}, 0, err
 		}
 	}

@@ -46,7 +46,7 @@ Status: implemented
 
 SQLite migration 7 为节点和 change 增加符号链接目标与 pending generation，并持久保存 delete intents、原对象／名字关联、请求摘要、状态和失败分类。link target 与 metadata 共用每 volume 的持久 metadata budget；[有界权威名字观察](2026-09-20-bounded-authoritative-name-observations.md)加入的 directory revision 也进入同一计数。迁移保留 NodeID、高水位、内容、名字、用量和日志事实，继续经过 Commit 与 witness Accept。
 
-`metastore/sqlite` 持有身份解析、条件比较、名字事务、pending 状态与恢复扫描；`storage/objectstore` 持有内容 staging、引用 drain 和条件内容重建；limited、locked、replicated 与 HTTP 包装器逐层转发能力、action、scope、部分打开结果和清理所有权。恢复 orphan/pending cleanup 时，`PublicationAccountingChain` 只复制不可变配额 hook；新 cleanup context 保留自己的 deadline/cancel cause，不暴露原请求的授权、scope、proof 或其它值。`MaintenanceAccounting` 在恢复前绑定当前完整计费链。HTTP v4 使用原 file session registry 与 action epoch，不另建只属于 transport 的正确性来源。
+`metastore/sqlite` 持有身份解析、条件比较、名字事务、pending 状态与恢复扫描；`storage/objectstore` 持有内容 staging、引用 drain 和条件内容重建；limited、locked、replicated 与 HTTP 包装器逐层转发能力、action、scope、部分打开结果和清理所有权。恢复 orphan/pending cleanup 时，`PublicationAccountingChain` 只复制不可变配额 hook；新 cleanup context 保留自己的 deadline/cancel cause，不暴露原请求的授权、scope、proof 或其它值。`MaintenanceAccounting` 在恢复前绑定当前完整计费链。HTTP v5 使用原 file session registry 与 action epoch，不另建只属于 transport 的正确性来源。
 
 FUSE 的已有 inode Open 使用 OpenNode，Create 使用 OpenAt，Opendir 与 Readlink 使用 OpenNodeRef；Lookup 与 create/mkdir/symlink/unlink/rmdir/rename 使用父目录 NodeID 到达 authority，只有已打开 directory handle 的 Lookup 再附带活 Scope。OpenChildRef 保留给需要原子取得任意子节点引用的编程入口。普通文件 fd 继续持有 File；Readdir 由独立的[有界权威名字观察](2026-09-20-bounded-authoritative-name-observations.md)使用已打开目录的身份与 Scope。组合 Setattr 仍由多个调用组成，ConditionalFileMutation 没有被 FUSE 冒充为整项事务。
 

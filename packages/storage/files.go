@@ -24,6 +24,13 @@ type FileStorage interface {
 	NewFileSession(context.Context, FileSessionOptions) (FileSession, error)
 }
 
+// AllocationReporting promises authoritative allocation in every Attr returned
+// by a file session, including the result of an atomic open. Check this before
+// an operation whose effect cannot be undone if allocation is unavailable.
+type AllocationReporting interface {
+	CheckAllocationReporting() error
+}
+
 // FileSession owns file references, advisory owners, and action history until
 // explicit close or its confirmed finite lifetime expires. Retirement fences
 // new operations and final publication before admitted operations are drained.

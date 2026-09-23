@@ -58,6 +58,23 @@ func fileSessionFor(t *testing.T, volume storage.FileStorage, options storage.Fi
 	return session
 }
 
+func TestSQLiteFileSessionPromisesAllocationReporting(t *testing.T) {
+	volume, _ := fileVolume(t, memory.New(), 1<<20, nil)
+	session := fileSessionFor(t, volume, storage.DefaultFileSessionOptions())
+	reporter, ok := session.(storage.AllocationReporting)
+	if !ok {
+		t.Fatal("file session does not expose allocation reporting")
+	}
+	if err := reporter.CheckAllocationReporting(); err != nil {
+		t.Fatal(err)
+	}
+	file := openFileFor(t, session, "file", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true, Create: true}})
+	attr, err := file.WriteAt(t.Context(), 0, []byte("x"))
+	if err != nil || !attr.AllocationKnown || attr.AllocationSize != 4096 {
+		t.Fatalf("advertised allocation fact after write = %+v, %v", attr, err)
+	}
+}
+
 func openFileFor(t *testing.T, session storage.FileSession, name string, options storage.FileOpenOptions) storage.File {
 	t.Helper()
 	f, err := session.OpenFile(t.Context(), name, options)
@@ -121,7 +138,7 @@ func readFileFor(t *testing.T, file storage.File, want string) storage.Attr {
 }
 
 func TestRetainedFileReadsCurrentObjectThroughNameChanges(t *testing.T) {
-	volume, _ := fileVolume(t, memory.New(), 4096, nil)
+	volume, _ := fileVolume(t, memory.New(), 8192, nil)
 	session := fileSessionFor(t, volume, storage.DefaultFileSessionOptions())
 	f := openFileFor(t, session, "first", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true, Create: true}, InitialMetadata: map[string][]byte{"test.retained": []byte("initial")}})
 	if _, err := f.WriteAt(t.Context(), 0, []byte("initial")); err != nil {

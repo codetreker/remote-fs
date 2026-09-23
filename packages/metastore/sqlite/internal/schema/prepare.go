@@ -28,7 +28,8 @@ import (
 // metadata, and exact retained-metadata accounting; 0007_durable_identity.sql adds
 // symbolic-link data and durable, restart-queryable deletion obligations;
 // 0008_directory_revisions.sql adds persistent directory name-set revisions;
-// 0009_delete_intent_owners.sql adds owner-scoped intent discovery.
+// 0009_delete_intent_owners.sql adds owner-scoped intent discovery;
+// 0010_virtual_allocation.sql records virtual allocation and its volume total.
 //
 // packages/sqliteschema documents what a numbered set of files buys and what rule they are kept
 // under: a file that has landed is never edited, and a schema change is a new file.
@@ -51,6 +52,8 @@ const firstDurableIdentitySchemaVersion = 7
 const firstDirectoryRevisionSchemaVersion = 8
 
 const firstDeleteIntentOwnerSchemaVersion = 9
+
+const firstVirtualAllocationSchemaVersion = 10
 
 // VolumeOpenMode decides whether preparation may create the named volume.
 type VolumeOpenMode uint8
@@ -182,8 +185,10 @@ func PrepareConfiguredWithMetadataPolicy(
 		if err := validateIntegrityBytes(ctx, tx, nil, maxIntegrityBytes, version); err != nil {
 			return 0, 0, dbstate.State{}, err
 		}
-		if err := validateLegacyObjectIntegrity(ctx, tx, version); err != nil {
-			return 0, 0, dbstate.State{}, err
+		if !opaqueMetadataVersions {
+			if err := validateLegacyObjectIntegrity(ctx, tx, version); err != nil {
+				return 0, 0, dbstate.State{}, err
+			}
 		}
 		if err := dbstate.ValidateLegacySequences(ctx, tx, version); err != nil {
 			return 0, 0, dbstate.State{}, err
@@ -228,6 +233,11 @@ func PrepareConfiguredWithMetadataPolicy(
 	if err := schema.Reach(ctx, tx); err != nil {
 		return 0, 0, dbstate.State{}, err
 	}
+	if recorded && version > 0 && version < firstVirtualAllocationSchemaVersion && !opaqueMetadataVersions {
+		if err := backfillAuthorityAllocation(ctx, tx); err != nil {
+			return 0, 0, dbstate.State{}, err
+		}
+	}
 	// Version 1 did not carry volume on entries. Validate the global rooted tree and used
 	// accounting after the migrations normalize that table, while the same transaction can
 	// still roll every schema change back on refusal.
@@ -256,6 +266,11 @@ func PrepareConfiguredWithMetadataPolicy(
 		}
 	case err != nil:
 		return 0, 0, dbstate.State{}, err
+	}
+	if opaqueMetadataVersions && (!recorded || version == 0) {
+		if _, err := tx.ExecContext(ctx, `UPDATE nodes SET allocation_size=NULL WHERE id=? AND volume=?`, root, id); err != nil {
+			return 0, 0, dbstate.State{}, err
+		}
 	}
 	if err := validateIntegrityWithMetadataPolicy(ctx, tx, &id, maxIntegrityRecords, maxIntegrityBytes,
 		schema.Version(), maxMetadataBytes, opaqueMetadataVersions); err != nil {
@@ -405,9 +420,9 @@ func createVolume(ctx context.Context, tx *sql.Tx, volume string) (id, root int6
 		return 0, 0, err
 	}
 	_, err = tx.ExecContext(ctx, `
-		INSERT INTO nodes (id, volume, kind, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec,
+		INSERT INTO nodes (id, volume, kind, size, allocation_size, atime_sec, atime_nsec, mtime_sec, mtime_nsec,
 		                   content, birth_sec, birth_nsec, change_sec, change_nsec, directory_revision)
-		VALUES (?, ?, 2, 0, ?, ?, ?, ?, NULL, ?, ?, ?, ?, X'0000000000000001')`,
+		VALUES (?, ?, 2, 0, 0, ?, ?, ?, ?, NULL, ?, ?, ?, ?, X'0000000000000001')`,
 		root, id, sec, nsec, sec, nsec, sec, nsec, sec, nsec)
 	if err != nil {
 		return 0, 0, err
