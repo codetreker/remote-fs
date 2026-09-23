@@ -25,9 +25,9 @@ func metadataTestValue(t *testing.T, value windowsMetadata) map[string]storage.O
 func TestCreateMetadataUsesCapturedFacts(t *testing.T) {
 	modified := time.Date(2026, 9, 23, 1, 2, 3, 456700000, time.UTC)
 	created := time.Date(2020, 1, 2, 3, 4, 5, 0, time.UTC)
-	attr := storage.Attr{ID: 4, Kind: storage.NodeRegular, Size: 123, AccessTime: modified, ModTime: modified, BirthTime: &created, Metadata: metadataTestValue(t, windowsMetadata{Attributes: dosHidden | dosArchive})}
+	attr := storage.Attr{ID: 4, Kind: storage.NodeRegular, Size: 123, AllocationKnown: true, AllocationSize: 4096, AccessTime: modified, ModTime: modified, BirthTime: &created, Metadata: metadataTestValue(t, windowsMetadata{Attributes: dosHidden | dosArchive})}
 	got, err := projectCreateMetadata(attr)
-	if err != nil || got.Attributes != dosHidden|dosArchive || got.EndOfFile != 123 || got.ChangeTime != 0 {
+	if err != nil || got.Attributes != dosHidden|dosArchive || got.EndOfFile != 123 || got.AllocationSize != 4096 || got.ChangeTime != 0 {
 		t.Fatalf("CREATE facts: %+v %v", got, err)
 	}
 	if got.CreationTime == 0 || got.LastAccessTime != got.LastWriteTime || got.LastWriteTime%10_000_000 != 4_567_000 {
@@ -35,8 +35,9 @@ func TestCreateMetadataUsesCapturedFacts(t *testing.T) {
 	}
 	attr.Kind = storage.NodeDirectory
 	attr.Size = 99 // Directory size is unspecified by storage.
+	attr.AllocationSize = 0
 	got, err = projectCreateMetadata(attr)
-	if err != nil || got.Attributes != dosHidden|dosArchive|dosDirectory || got.EndOfFile != 0 {
+	if err != nil || got.Attributes != dosHidden|dosArchive|dosDirectory || got.EndOfFile != 0 || got.AllocationSize != 0 {
 		t.Fatalf("directory projection used unspecified size: %+v %v", got, err)
 	}
 	attr.Kind = storage.NodeRegular
@@ -53,7 +54,7 @@ func TestCreateMetadataUsesCapturedFacts(t *testing.T) {
 
 func TestCreateAttrBudgetRefusesUnencodablePreEffectResults(t *testing.T) {
 	stamp := time.Date(2026, 9, 23, 1, 2, 3, 0, time.UTC)
-	attr := storage.Attr{ID: 4, Kind: storage.NodeRegular, Size: 7, AccessTime: stamp, ModTime: stamp}
+	attr := storage.Attr{ID: 4, Kind: storage.NodeRegular, Size: 7, AllocationKnown: true, AllocationSize: 4096, AccessTime: stamp, ModTime: stamp}
 	budget := createAttrBudget(2048)
 	if err := budget(attr, 6); err != nil {
 		t.Fatalf("valid scalar rejected: %v", err)
@@ -65,6 +66,47 @@ func TestCreateAttrBudgetRefusesUnencodablePreEffectResults(t *testing.T) {
 	}
 	if err := budget(attr, storage.MaxMetadataBytes); !errors.Is(err, syscall.EFBIG) {
 		t.Fatalf("oversized retained metadata accepted: %v", err)
+	}
+}
+
+func TestCreateAllocationProjectionUsesAuthoritativeCapture(t *testing.T) {
+	stamp := time.Date(2026, 9, 23, 1, 2, 3, 0, time.UTC)
+	base := storage.Attr{ID: 4, Kind: storage.NodeRegular, AllocationKnown: true, AccessTime: stamp, ModTime: stamp}
+	budget := createAttrBudget(2048)
+	for _, test := range []struct {
+		size, allocated int64
+	}{
+		{0, 0}, {1, 4096}, {4096, 4096}, {4097, 8192},
+	} {
+		attr := base
+		attr.Size, attr.AllocationSize = test.size, test.allocated
+		if err := budget(attr, 6); err != nil {
+			t.Fatalf("pre-effect budget for size %d: %v", test.size, err)
+		}
+		got, err := projectCreateMetadata(attr)
+		if err != nil || got.EndOfFile != uint64(test.size) || got.AllocationSize != uint64(test.allocated) {
+			t.Fatalf("captured size %d allocation %d projected as %+v: %v", test.size, test.allocated, got, err)
+		}
+	}
+	for _, test := range []struct {
+		name      string
+		known     bool
+		allocated int64
+	}{
+		{"unknown", false, 0},
+		{"unknown nonzero", false, 4096},
+		{"negative", true, -4096},
+		{"unaligned", true, 4097},
+	} {
+		attr := base
+		attr.Size = 1
+		attr.AllocationKnown, attr.AllocationSize = test.known, test.allocated
+		if err := budget(attr, 6); !errors.Is(err, syscall.EIO) {
+			t.Fatalf("%s reached effect: %v", test.name, err)
+		}
+		if projected, err := projectCreateMetadata(attr); !errors.Is(err, syscall.EIO) || projected != (createMetadata{}) {
+			t.Fatalf("%s projected: %+v %v", test.name, projected, err)
+		}
 	}
 }
 

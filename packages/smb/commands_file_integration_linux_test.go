@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"syscall"
 	"testing"
@@ -272,5 +273,43 @@ func TestCreateAuthorizationDenialHasNoNameEffect(t *testing.T) {
 	}
 	if _, err := fixture.volume.Stat(t.Context(), "denied"); !errors.Is(err, syscall.ENOENT) {
 		t.Fatalf("denied CREATE changed namespace: %v", err)
+	}
+}
+
+func TestCreateAndCloseReportAuthoritativeAllocation(t *testing.T) {
+	fixture := newRealSMBFixture(t)
+	for _, test := range []struct {
+		size, allocated int
+	}{
+		{0, 0}, {1, 4096}, {4096, 4096}, {4097, 8192},
+	} {
+		name := fmt.Sprintf("size-%d", test.size)
+		if err := fixture.volume.Write(t.Context(), name, make([]byte, test.size)); err != nil {
+			t.Fatal(err)
+		}
+		created, status, id := fixture.connection.createFile(t.Context(), fixture.session, fixture.tree, createRequestForTest(name, 1, accessReadData))
+		if status != statusOK || len(created) != 88 || binary.LittleEndian.Uint64(created[40:]) != uint64(test.allocated) || binary.LittleEndian.Uint64(created[48:]) != uint64(test.size) {
+			t.Fatalf("CREATE size=%d: status=%#x body=%v", test.size, status, created)
+		}
+		closeBody := make([]byte, 24)
+		binary.LittleEndian.PutUint16(closeBody, 24)
+		binary.LittleEndian.PutUint16(closeBody[2:], 1)
+		copy(closeBody[8:], id[:])
+		closed, status := fixture.connection.closeFile(t.Context(), fixture.session, fixture.tree, wire.Request{Header: wire.Header{Command: wire.Close}, Body: closeBody}, wire.FileID{})
+		if status != statusOK || len(closed) != 60 || binary.LittleEndian.Uint16(closed[2:]) != 1 || binary.LittleEndian.Uint64(closed[40:]) != uint64(test.allocated) || binary.LittleEndian.Uint64(closed[48:]) != uint64(test.size) {
+			t.Fatalf("CLOSE size=%d: status=%#x body=%v", test.size, status, closed)
+		}
+	}
+}
+
+func TestCreateWithoutAllocationCapabilityHasNoEffect(t *testing.T) {
+	fixture := newRealSMBFixture(t)
+	fixture.tree.authority.raw = &noAllocationSession{FileSession: fixture.raw}
+	_, status, _ := fixture.connection.createFile(t.Context(), fixture.session, fixture.tree, createRequestForTest("unreported", 3, accessReadData))
+	if status != statusUnsupported {
+		t.Fatalf("missing allocation capability status = %#x", status)
+	}
+	if _, err := fixture.volume.Stat(t.Context(), "unreported"); !errors.Is(err, syscall.ENOENT) {
+		t.Fatalf("missing allocation capability changed namespace: %v", err)
 	}
 }

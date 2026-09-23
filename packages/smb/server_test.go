@@ -183,7 +183,8 @@ func (s *endpointFileSession) CloseWithResult(ctx context.Context) (storage.Refe
 	err := s.Close(ctx)
 	return storage.ReferenceCloseResult{Released: err == nil}, err
 }
-func (*endpointFileSession) CheckAtomicFileOpen() error { return nil }
+func (*endpointFileSession) CheckAtomicFileOpen() error      { return nil }
+func (*endpointFileSession) CheckAllocationReporting() error { return nil }
 func (*endpointFileSession) OpenAt(context.Context, storage.ChildSelection, storage.OpenAtOptions) (storage.OpenResult, error) {
 	return storage.OpenResult{}, syscall.ENOSYS
 }

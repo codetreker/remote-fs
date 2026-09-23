@@ -30,6 +30,14 @@ func TestCreateIntentMapsWindowsShareBothDirections(t *testing.T) {
 	}
 }
 
+type noAllocationSession struct{ storage.FileSession }
+
+func TestCreateRejectsMissingAllocationCapabilityBeforeEffect(t *testing.T) {
+	if err := checkCreateCapabilities(&noAllocationSession{FileSession: newEndpointFileSession()}); !errors.Is(err, syscall.EOPNOTSUPP) {
+		t.Fatalf("missing allocation capability: %v", err)
+	}
+}
+
 func TestCloseRetiresFileIDAndRejectsReuse(t *testing.T) {
 	s := &session{id: 12}
 	server := &Server{config: Config{Authorize: authz.AuthorizerFunc(func(context.Context, authz.AccessRequest) error { return nil })}}

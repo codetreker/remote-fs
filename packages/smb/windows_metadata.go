@@ -124,7 +124,18 @@ type createMetadata struct {
 	LastAccessTime uint64
 	LastWriteTime  uint64
 	ChangeTime     uint64
+	AllocationSize uint64
 	EndOfFile      uint64
+}
+
+func checkCreateAllocation(attr storage.Attr) error {
+	if err := attr.CheckAllocation(); err != nil {
+		return err
+	}
+	if !attr.AllocationKnown || attr.AllocationSize%4096 != 0 {
+		return fmt.Errorf("CREATE requires known 4096-byte allocation: %w", syscall.EIO)
+	}
+	return nil
 }
 
 const filetimeUnixOffset = int64(11644473600)
@@ -154,6 +165,9 @@ func optionalFiletime(value *time.Time) (uint64, error) {
 }
 
 func projectCreateMetadata(attr storage.Attr) (createMetadata, error) {
+	if err := checkCreateAllocation(attr); err != nil {
+		return createMetadata{}, err
+	}
 	attributes, err := projectWindowsAttributes(attr)
 	if err != nil {
 		return createMetadata{}, err
@@ -177,7 +191,7 @@ func projectCreateMetadata(attr storage.Attr) (createMetadata, error) {
 	if err != nil {
 		return createMetadata{}, err
 	}
-	result := createMetadata{Attributes: attributes, CreationTime: creation, LastAccessTime: access, LastWriteTime: write, ChangeTime: change}
+	result := createMetadata{Attributes: attributes, CreationTime: creation, LastAccessTime: access, LastWriteTime: write, ChangeTime: change, AllocationSize: uint64(attr.AllocationSize)}
 	if attr.Kind == storage.NodeRegular {
 		result.EndOfFile = uint64(attr.Size)
 	}
@@ -191,6 +205,9 @@ func createAttrBudget(limit int64) storage.AttrResultBudget {
 	return func(attr storage.Attr, metadataBytes int64) error {
 		if attr.ID == 0 || attr.Kind.Check() != nil || attr.Size < 0 {
 			return syscall.EIO
+		}
+		if err := checkCreateAllocation(attr); err != nil {
+			return err
 		}
 		for _, value := range []*time.Time{attr.BirthTime, &attr.AccessTime, &attr.ModTime, attr.ChangeTime} {
 			if value != nil {

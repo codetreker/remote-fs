@@ -312,11 +312,18 @@ func (c *connection) createFile(ctx context.Context, s *session, t *tree, reques
 	}
 	response := wire.CreateResponse{CreateAction: uint32(outcome), CreationTime: metadata.CreationTime,
 		LastAccessTime: metadata.LastAccessTime, LastWriteTime: metadata.LastWriteTime, ChangeTime: metadata.ChangeTime,
-		EndOfFile: metadata.EndOfFile, Attributes: metadata.Attributes, FileID: handle.id}
+		AllocationSize: metadata.AllocationSize, EndOfFile: metadata.EndOfFile, Attributes: metadata.Attributes, FileID: handle.id}
 	return wire.CreateResponseBody(response), statusOK, handle.id
 }
 
 func checkCreateCapabilities(session storage.FileSession) error {
+	reporter, ok := session.(storage.AllocationReporting)
+	if !ok {
+		return syscall.EOPNOTSUPP
+	}
+	if err := reporter.CheckAllocationReporting(); err != nil {
+		return err
+	}
 	if err := checkCreateNameCapability(session); err != nil {
 		return err
 	}
@@ -435,7 +442,7 @@ func (c *connection) closeFile(ctx context.Context, s *session, t *tree, request
 				if err == nil {
 					response.Flags = 1
 					response.CreationTime, response.LastAccessTime, response.LastWriteTime, response.ChangeTime = metadata.CreationTime, metadata.LastAccessTime, metadata.LastWriteTime, metadata.ChangeTime
-					response.EndOfFile, response.Attributes = metadata.EndOfFile, metadata.Attributes
+					response.AllocationSize, response.EndOfFile, response.Attributes = metadata.AllocationSize, metadata.EndOfFile, metadata.Attributes
 				}
 			}
 		}

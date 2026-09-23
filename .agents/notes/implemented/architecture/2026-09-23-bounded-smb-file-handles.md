@@ -14,7 +14,7 @@ tree、session 和 connection 关闭会与已经接纳的 CREATE/CLOSE 交错。
 
 `packages/smb` 在既有签名 session/tree 上处理有界 CREATE 与 CLOSE。CREATE 通过完整的目录 metadata observation 逐层应用 Windows 本机大小写无关 ordinal 比较，拒绝任一目录中的非法、不可表示或等价名字。解析保留 root、每层 directory revision 与已选择 edge；最终的 `ChildSelection`、SameNode／Absent 条件及既有目标 `smb.windows` metadata 版本或缺席在 `OpenAt` 或 `OpenChildRef` 的同一权威动作中核对。后续观察带上此前的 guards；已知 guard 冲突无部分效果，未知结果只核对或重投原 action。
 
-普通文件数据引用由 `OpenAt` 保留；目录及 metadata-only 引用由 `OpenChildRef` 保留。打开声明的 access 与 share 映射为中立的 `UseClaim{Uses,Deny}`，随打开一起由 authority 与所有入口的 claim 双向比较。句柄另存获授 access，不能把 Use claim 当成 File 方法权限。新建普通文件的 Windows ARCHIVE 和初始属性保存在独立的 `smb.windows` opaque namespace，与创建同次提交；CREATE 响应只投影原动作的 `Attr`、`OpenOutcome`、真实时间、EndOfFile 与已知 AllocationSize，历史未知创建／变更时间为零。SMB 在打开前要求 `AllocationReporting.CheckAllocationReporting` 通过，并对原子打开结果再校验已知分配量；零不代表未知。
+普通文件数据引用由 `OpenAt` 保留；目录及 metadata-only 引用由 `OpenChildRef` 保留。打开声明的 access 与 share 映射为中立的 `UseClaim{Uses,Deny}`，随打开一起由 authority 与所有入口的 claim 双向比较。句柄另存获授 access，不能把 Use claim 当成 File 方法权限。新建普通文件的 Windows ARCHIVE 和初始属性保存在独立的 `smb.windows` opaque namespace，与创建同次提交；CREATE 响应只投影原动作的 `Attr`、`OpenOutcome`、真实时间、EndOfFile 与已知 AllocationSize，历史未知创建／变更时间为零。SMB 在打开前要求 `AllocationReporting.CheckAllocationReporting` 通过，并对原子打开结果再校验已知、非负且按端点 4096 字节 cluster 几何对齐的分配量；不相容的结果在效果前失败。中立的 `AllocationReporting` 不承诺这一粒度，零也不代表未知。
 
 每棵 tree 有独立的 `MaxHandles` 槽位，默认 256；一次 CREATE 在权威效果前预留槽位和 SMB session 内单调唯一的 16 字节 FileId。在途打开、已返回的引用及清理未确认者都计入 `Status.Handles`。FileId 指一次打开，只在所属 tree 查找；稳定节点身份始终来自 authority NodeID，不能从 FileId、名字或连接推导。`MaxDirectoryBytes` 默认 8 MiB，约束每层完整观察和名字投影的驻留，超额结果整体失败。
 
