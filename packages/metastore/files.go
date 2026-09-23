@@ -21,7 +21,8 @@ type FileStore interface {
 	SetNodeAttr(context.Context, uint64, storage.AttrChange) (Node, error)
 	// QueryDeleteIntent observes one durable close-time deletion obligation even
 	// after the reference or authority process that accepted it has gone away.
-	QueryDeleteIntent(context.Context, storage.DeleteIntentID) (storage.DeleteIntentStatus, error)
+	QueryDeleteIntent(context.Context, storage.DeleteIntentOwner, storage.DeleteIntentID) (storage.DeleteIntentStatus, error)
+	ListDeleteIntents(context.Context, storage.DeleteIntentOwner, storage.DeleteIntentCursor, int) (storage.DeleteIntentPage, error)
 	AcknowledgeDeleteIntent(context.Context, storage.AcknowledgeDeleteIntentCommand) error
 	Usage(context.Context) (int64, error)
 }
@@ -60,6 +61,7 @@ type File interface {
 	// Close is idempotent and retires the reference before releasing its pin.
 	// Last-close accounting uses its context and the actual remaining file size.
 	Close(context.Context) error
+	CloseWithResult(context.Context) (storage.ReferenceCloseResult, error)
 }
 
 type filePublicationGuardKey struct{}

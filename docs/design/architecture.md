@@ -159,7 +159,7 @@ server 每个 volume 记一条有序的变更日志，位置与树的改动在�
 
 **绕过 server 的改动不产生变更事件。** 保留的本地持久对象存储不支持旁路修改其私有格式；无法验证的对象或组合状态以 I/O 错误暴露。第三方 backend 同样须明确自己的外部写入边界，不能让旁路改动冒充已记录的 volume mutation。
 
-FileSession、File、NodeReference、Use claim、range owner 与有限 action history 属于挂载和当前 authority incarnation，不是 volume 副本，也不跨 authority 重启恢复。节点事实、opaque metadata、pending generation 与 delete intent 进入持久树；后者可由新 session 按 durable intent ID 查询。容量由 Statfs 单独查询；同步 WriteAt、Truncate 与条件 mutation 在服务端发布时取得配额的权威结果。复制与内容操作各自保持资源上限，边界见[client 设计](client/architecture.md)。
+FileSession、File、NodeReference、Use claim、range owner 与有限 action history 属于挂载和当前 authority incarnation，不是 volume 副本，也不跨 authority 重启恢复。关闭结果明确报告引用是否已经释放；节点事实、opaque metadata、pending generation 与 delete intent 进入持久树，后者可由新 session 按 owner 分页发现并按 durable intent ID 查询。容量由 Statfs 单独查询；同步 WriteAt、Truncate 与条件 mutation 在服务端发布时取得配额的权威结果。复制与内容操作各自保持资源上限，边界见[client 设计](client/architecture.md)。
 
 代价：提供 change log 的 volume 在副本建好之前不可用。集成方未提供日志时，复制操作以 `ENOSYS` 说明没有副本，每次 metadata 查询仍是一次远端请求；随附的两种服务端形态都提供日志。
 

@@ -2,6 +2,7 @@ package locked
 
 import (
 	"context"
+	"errors"
 	"syscall"
 
 	"github.com/codetreker/remote-fs/packages/storage"
@@ -89,7 +90,13 @@ func (s *fileSession) Status(ctx context.Context) (storage.FileSessionStatus, er
 }
 
 func (s *fileSession) Close(ctx context.Context) error {
-	return s.FileSession.Close(readContext(ctx))
+	_, err := s.CloseWithResult(ctx)
+	return err
+}
+
+func (s *fileSession) CloseWithResult(ctx context.Context) (storage.ReferenceCloseResult, error) {
+	result, err := s.FileSession.CloseWithResult(readContext(ctx))
+	return result, errors.Join(err, result.Check(err))
 }
 
 type file struct {
@@ -125,7 +132,13 @@ func (r *nodeReference) SetAttr(ctx context.Context, change storage.AttrChange) 
 }
 
 func (r *nodeReference) Close(ctx context.Context) error {
-	return r.NodeReference.Close(readContext(ctx))
+	_, err := r.CloseWithResult(ctx)
+	return err
+}
+
+func (r *nodeReference) CloseWithResult(ctx context.Context) (storage.ReferenceCloseResult, error) {
+	result, err := r.NodeReference.CloseWithResult(readContext(ctx))
+	return result, errors.Join(err, result.Check(err))
 }
 
 func (r *nodeReference) CheckScopedReference() error {
@@ -171,5 +184,11 @@ func (f *file) Sync(ctx context.Context) error {
 }
 
 func (f *file) Close(ctx context.Context) error {
-	return f.File.Close(readContext(ctx))
+	_, err := f.CloseWithResult(ctx)
+	return err
+}
+
+func (f *file) CloseWithResult(ctx context.Context) (storage.ReferenceCloseResult, error) {
+	result, err := f.File.CloseWithResult(readContext(ctx))
+	return result, errors.Join(err, result.Check(err))
 }

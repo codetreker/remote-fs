@@ -2,6 +2,7 @@ package limited
 
 import (
 	"context"
+	"errors"
 
 	"github.com/codetreker/remote-fs/packages/storage"
 )
@@ -25,7 +26,13 @@ func (r *nodeReference) SetAttr(ctx context.Context, change storage.AttrChange) 
 }
 
 func (r *nodeReference) Close(ctx context.Context) error {
-	return r.storage.publicationError(r.NodeReference.Close(ctx))
+	_, err := r.CloseWithResult(ctx)
+	return err
+}
+
+func (r *nodeReference) CloseWithResult(ctx context.Context) (storage.ReferenceCloseResult, error) {
+	result, err := r.NodeReference.CloseWithResult(ctx)
+	return result, r.storage.publicationError(errors.Join(err, result.Check(err)))
 }
 
 func (r *nodeReference) CheckScopedReference() error {

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"math"
 	"syscall"
+	"unicode/utf8"
 )
 
 const (
@@ -283,6 +284,9 @@ func (i CloseIntent) Check() error {
 	if err := i.ID.Check(); err != nil {
 		return err
 	}
+	if err := i.Owner.Check(); err != nil {
+		return err
+	}
 	if err := checkMetadataConditions(i.ExpectedMetadata); err != nil {
 		return err
 	}
@@ -498,7 +502,7 @@ func (r FileActionReceipt) Check() error {
 	switch r.Operation {
 	case OpFileOpenAt, OpFileMutateName, OpFileOpenNodeRef, OpFileOpenChildRef,
 		OpFileSetPendingUnlink, OpFileClearPendingUnlink, OpFileMutate,
-		OpFileAcknowledgeDeleteIntent:
+		OpFileAcknowledgeDeleteIntent, OpFileClose, OpFileSessionClose:
 	default:
 		return syscall.EINVAL
 	}
@@ -544,8 +548,46 @@ func (s DeleteIntentStatus) Check() error {
 	return nil
 }
 
+func (owner DeleteIntentOwner) Check() error {
+	if len(owner) == 0 || len(owner) > MaxDeleteIntentOwnerBytes || !utf8.ValidString(string(owner)) {
+		return syscall.EINVAL
+	}
+	for i := range owner {
+		if owner[i] == 0 {
+			return syscall.EINVAL
+		}
+	}
+	return nil
+}
+
+func (p DeleteIntentPage) Check(owner DeleteIntentOwner, after DeleteIntentCursor, limit int) error {
+	if err := owner.Check(); err != nil {
+		return err
+	}
+	if uint64(after) > math.MaxInt64 || uint64(p.Next) > math.MaxInt64 || limit < 1 || limit > MaxDeleteIntentPageEntries || len(p.Intents) > limit || p.Next < after {
+		return syscall.EINVAL
+	}
+	if len(p.Intents) == 0 && p.Next != after || len(p.Intents) != 0 && p.Next == after {
+		return syscall.EINVAL
+	}
+	seen := make(map[DeleteIntentID]struct{}, len(p.Intents))
+	for _, status := range p.Intents {
+		if err := status.Check(); err != nil {
+			return err
+		}
+		if _, exists := seen[status.ID]; exists {
+			return syscall.EINVAL
+		}
+		seen[status.ID] = struct{}{}
+	}
+	return nil
+}
+
 func (c AcknowledgeDeleteIntentCommand) Check() error {
 	if err := c.Action.Check(); err != nil {
+		return err
+	}
+	if err := c.Owner.Check(); err != nil {
 		return err
 	}
 	return c.Intent.Check()

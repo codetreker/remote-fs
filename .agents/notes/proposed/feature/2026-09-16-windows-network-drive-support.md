@@ -2,7 +2,7 @@
 
 Status: proposed
 
-[持久节点身份与原子文件操作](../../implemented/architecture/2026-09-20-durable-identity-and-atomic-file-operations.md)已经交付本提案依赖的 NodeReference、父身份名字操作、条件 mutation、action receipt 与 durable delete intent；[有界权威名字观察](../../implemented/architecture/2026-09-20-bounded-authoritative-name-observations.md)已经交付完整目录 metadata、directory revision 和 reference current-name；[权威子项选择](../../implemented/architecture/2026-09-22-guard-authoritative-child-selection.md)已经让 OpenAt 与 OpenChildRef 在最终选择处核对这些证据；[安全且有界的本机 SMB 端点](../../implemented/architecture/2026-09-21-secure-bounded-smb-endpoint.md)已经交付 SMB 3.1.1、SSPI、签名、loopback listener 和 session/tree/export 生命周期。其它 guarded mutation、Windows 文件／名字适配与 WNet 映射、共享语义翻译、通知、缓存恢复和原生验收仍属于本提案。
+[持久节点身份与原子文件操作](../../implemented/architecture/2026-09-20-durable-identity-and-atomic-file-operations.md)已经交付本提案依赖的 NodeReference、父身份名字操作、条件 mutation、action receipt 与 durable delete intent；[可恢复的引用关闭与删除义务归属](../../implemented/architecture/2026-09-23-recoverable-close-ownership.md)使关闭报告释放事实，并让新会话按持久 owner 找回未 ACK 的义务；[有界权威名字观察](../../implemented/architecture/2026-09-20-bounded-authoritative-name-observations.md)已经交付完整目录 metadata、directory revision 和 reference current-name；[权威子项选择](../../implemented/architecture/2026-09-22-guard-authoritative-child-selection.md)已经让 OpenAt 与 OpenChildRef 在最终选择处核对这些证据；[安全且有界的本机 SMB 端点](../../implemented/architecture/2026-09-21-secure-bounded-smb-endpoint.md)已经交付 SMB 3.1.1、SSPI、签名、loopback listener 和 session/tree/export 生命周期。其它 guarded mutation、Windows 文件／名字适配与 WNet 映射、共享语义翻译、通知、缓存恢复和原生验收仍属于本提案。
 
 ## 问题
 

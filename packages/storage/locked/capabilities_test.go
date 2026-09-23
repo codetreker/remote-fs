@@ -176,9 +176,13 @@ func (p *capabilitySessionProbe) QueryFileAction(ctx context.Context, _ storage.
 	p.capture(ctx)
 	return p.action, p.failure
 }
-func (p *capabilitySessionProbe) QueryDeleteIntent(ctx context.Context, _ storage.DeleteIntentID) (storage.DeleteIntentStatus, error) {
+func (p *capabilitySessionProbe) QueryDeleteIntent(ctx context.Context, _ storage.DeleteIntentOwner, _ storage.DeleteIntentID) (storage.DeleteIntentStatus, error) {
 	p.capture(ctx)
 	return p.deleted, p.failure
+}
+func (p *capabilitySessionProbe) ListDeleteIntents(ctx context.Context, _ storage.DeleteIntentOwner, _ storage.DeleteIntentCursor, _ int) (storage.DeleteIntentPage, error) {
+	p.capture(ctx)
+	return storage.DeleteIntentPage{Intents: []storage.DeleteIntentStatus{p.deleted}, Next: 1}, p.failure
 }
 func (p *capabilitySessionProbe) AcknowledgeDeleteIntent(ctx context.Context, _ storage.AcknowledgeDeleteIntentCommand) error {
 	p.capture(ctx)
@@ -204,6 +208,10 @@ func (p *capabilityFileProbe) SetAttr(ctx context.Context, _ storage.AttrChange)
 func (p *capabilityFileProbe) Close(ctx context.Context) error {
 	p.observed = locking.ScopeFromContext(ctx)
 	return p.failure
+}
+func (p *capabilityFileProbe) CloseWithResult(ctx context.Context) (storage.ReferenceCloseResult, error) {
+	p.observed = locking.ScopeFromContext(ctx)
+	return storage.ReferenceCloseResult{Released: p.failure == nil}, p.failure
 }
 
 func (p *capabilityFileProbe) CheckScopedReference() error { return p.checkErr }
@@ -441,10 +449,13 @@ func TestIdentityWrappersSeparateReadAndMutationScopes(t *testing.T) {
 	if receipt, err := session.QueryFileAction(locking.WithScope(t.Context(), proof), action); !errors.Is(err, failure) || receipt.Action != action || !reflect.DeepEqual(probe.observed, locking.MutationScope{}) {
 		t.Fatalf("action receipt=%+v error=%v scope=%+v", receipt, err, probe.observed)
 	}
-	if status, err := session.QueryDeleteIntent(locking.WithScope(t.Context(), proof), intent); !errors.Is(err, failure) || status.ID != intent || !reflect.DeepEqual(probe.observed, locking.MutationScope{}) {
+	if status, err := session.QueryDeleteIntent(locking.WithScope(t.Context(), proof), "owner", intent); !errors.Is(err, failure) || status.ID != intent || !reflect.DeepEqual(probe.observed, locking.MutationScope{}) {
 		t.Fatalf("delete status=%+v error=%v scope=%+v", status, err, probe.observed)
 	}
-	if err := session.AcknowledgeDeleteIntent(t.Context(), storage.AcknowledgeDeleteIntentCommand{Action: action, Intent: intent}); !errors.Is(err, failure) || !reflect.DeepEqual(probe.observed, proof) {
+	if page, err := session.ListDeleteIntents(locking.WithScope(t.Context(), proof), "owner", 0, 1); !errors.Is(err, failure) || len(page.Intents) != 1 || page.Intents[0].ID != intent || !reflect.DeepEqual(probe.observed, locking.MutationScope{}) {
+		t.Fatalf("delete intents=%+v error=%v scope=%+v", page, err, probe.observed)
+	}
+	if err := session.AcknowledgeDeleteIntent(t.Context(), storage.AcknowledgeDeleteIntentCommand{Action: action, Owner: "owner", Intent: intent}); !errors.Is(err, failure) || !reflect.DeepEqual(probe.observed, proof) {
 		t.Fatalf("delete acknowledgement=%v scope=%+v", err, probe.observed)
 	}
 	if err := result.Reference.Close(locking.WithScope(t.Context(), proof)); !errors.Is(err, failure) || !reflect.DeepEqual(reference.observed, locking.MutationScope{}) {

@@ -14,7 +14,7 @@ const MaxFileControlBytes int64 = 256 << 10
 
 func fileControl(op storage.Operation) bool {
 	switch op {
-	case storage.OpFileStatus, storage.OpFileRenew, storage.OpFileSessionClose, storage.OpFileQueryAction, storage.OpFileQueryDeleteIntent, storage.OpFileAcknowledgeDeleteIntent, storage.OpFileClose, storage.OpFileAck, storage.OpFileState, storage.OpFileScope, storage.OpFileNewUseOwner, storage.OpFileRetireUseOwner, storage.OpFileRangeGetConflict, storage.OpFileRangeApply, storage.OpFileRangeQuery, storage.OpFileRangeCancel, storage.OpFileRangeDrop, storage.OpFileSetPendingUnlink, storage.OpFileClearPendingUnlink:
+	case storage.OpFileStatus, storage.OpFileRenew, storage.OpFileSessionClose, storage.OpFileQueryAction, storage.OpFileQueryDeleteIntent, storage.OpFileListDeleteIntents, storage.OpFileAcknowledgeDeleteIntent, storage.OpFileClose, storage.OpFileAck, storage.OpFileState, storage.OpFileScope, storage.OpFileNewUseOwner, storage.OpFileRetireUseOwner, storage.OpFileRangeGetConflict, storage.OpFileRangeApply, storage.OpFileRangeQuery, storage.OpFileRangeCancel, storage.OpFileRangeDrop, storage.OpFileSetPendingUnlink, storage.OpFileClearPendingUnlink:
 		return true
 	}
 	return false
@@ -52,6 +52,9 @@ type fileRequest struct {
 	Mutation          *fileMutationOptions            `json:"mutation,omitempty"`
 	FileAction        storage.FileActionID            `json:"fileAction"`
 	DeleteIntent      storage.DeleteIntentID          `json:"deleteIntent"`
+	DeleteOwner       storage.DeleteIntentOwner       `json:"deleteOwner"`
+	DeleteAfter       storage.DeleteIntentCursor      `json:"deleteAfter"`
+	DeleteLimit       int                             `json:"deleteLimit"`
 	Acknowledge       *acknowledgeDeleteIntentCommand `json:"acknowledge,omitempty"`
 	Directory         *storage.DirectoryTarget        `json:"directory,omitempty"`
 	DirectoryMetadata *directoryMetadataOptions       `json:"directoryMetadata,omitempty"`
@@ -107,6 +110,8 @@ type fileResponse struct {
 	State           *referenceState            `json:"state,omitempty"`
 	ActionReceipt   *storage.FileActionReceipt `json:"actionReceipt,omitempty"`
 	DeleteStatus    *deleteIntentStatus        `json:"deleteStatus,omitempty"`
+	DeletePage      *deleteIntentPage          `json:"deletePage,omitempty"`
+	CloseResult     *referenceCloseResult      `json:"closeResult,omitempty"`
 	Directory       *observedDirectory         `json:"directory,omitempty"`
 	NameObservation *nameObservation           `json:"nameObservation,omitempty"`
 }
@@ -124,7 +129,7 @@ func fileActionRequired(op storage.Operation) bool {
 	case storage.OpFileOpen, storage.OpFileOpenNode, storage.OpFileOpenAt, storage.OpFileOpenNodeRef, storage.OpFileOpenChildRef,
 		storage.OpFileSetNodeAttr, storage.OpFileMutateName, storage.OpFileWrite, storage.OpFileTruncate, storage.OpFileSetAttr,
 		storage.OpFileSync, storage.OpFileSetNodeMetadata, storage.OpFileSetMetadata, storage.OpFileSetPendingUnlink,
-		storage.OpFileClearPendingUnlink, storage.OpFileMutate, storage.OpFileAcknowledgeDeleteIntent,
+		storage.OpFileClearPendingUnlink, storage.OpFileMutate, storage.OpFileClose, storage.OpFileSessionClose, storage.OpFileAcknowledgeDeleteIntent,
 		storage.OpFileNewUseOwner, storage.OpFileRetireUseOwner, storage.OpFileRangeDrop:
 		return true
 	}
@@ -172,7 +177,7 @@ type FileWithBarrier interface {
 	WriteAtWithBarrier(context.Context, int64, []byte) (storage.Attr, *MutationBarrier, error)
 	TruncateWithBarrier(context.Context, int64) (storage.Attr, *MutationBarrier, error)
 	SetAttrWithBarrier(context.Context, storage.AttrChange) (storage.Attr, *MutationBarrier, error)
-	CloseWithBarrier(context.Context) (*MutationBarrier, error)
+	CloseWithBarrier(context.Context) (storage.ReferenceCloseResult, *MutationBarrier, error)
 }
 
 type FileSessionWithBarrier interface {
@@ -180,7 +185,7 @@ type FileSessionWithBarrier interface {
 	OpenFileWithBarrier(context.Context, string, storage.FileOpenOptions) (storage.File, *MutationBarrier, error)
 	OpenNodeWithBarrier(context.Context, uint64, storage.FileOpenOptions) (storage.File, *MutationBarrier, error)
 	SetNodeAttrWithBarrier(context.Context, uint64, storage.AttrChange) (storage.Attr, *MutationBarrier, error)
-	CloseWithBarrier(context.Context) (*MutationBarrier, error)
+	CloseWithBarrier(context.Context) (storage.ReferenceCloseResult, *MutationBarrier, error)
 }
 
 type fileCapabilities struct {

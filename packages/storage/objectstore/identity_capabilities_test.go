@@ -156,10 +156,14 @@ func TestDurableCloseIntentDeletesOriginalIdentityAndCanBeAcknowledged(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
+	owner, err := storage.NewDeleteIntentOwner()
+	if err != nil {
+		t.Fatal(err)
+	}
 	options := storage.OpenAtOptions{
 		Read: true, Target: storage.ChildCondition{State: storage.SameNode, NodeID: want.ID},
 		Action: fileActionFor(t, session), Use: storage.UseClaim{Uses: storage.ReadData | storage.DeleteName}, Existing: storage.Keep,
-		CloseIntent: &storage.CloseIntent{ID: intent, Trigger: storage.OnReferenceClose, Condition: storage.UnlinkFile},
+		CloseIntent: &storage.CloseIntent{ID: intent, Owner: owner, Trigger: storage.OnReferenceClose, Condition: storage.UnlinkFile},
 	}
 	opened, err := session.(storage.AtomicFileOpener).OpenAt(t.Context(), storage.ChildSelection{Name: storage.ChildName{
 		Parent: storage.DirectoryTarget{NodeID: root.ID}, RawLeaf: []byte("file"),
@@ -174,11 +178,28 @@ func TestDurableCloseIntentDeletesOriginalIdentityAndCanBeAcknowledged(t *testin
 		t.Fatalf("close intent left the name: %v", err)
 	}
 	actions := session.(storage.FileActions)
-	status, err := actions.QueryDeleteIntent(t.Context(), intent)
+	status, err := actions.QueryDeleteIntent(t.Context(), owner, intent)
 	if err != nil || status.NodeID != want.ID || status.Outcome != storage.DeleteIntentCompleted {
 		t.Fatalf("delete intent=%+v error=%v", status, err)
 	}
-	ack := storage.AcknowledgeDeleteIntentCommand{Action: fileActionFor(t, session), Intent: intent}
+	page, err := actions.ListDeleteIntents(t.Context(), owner, 0, 1)
+	if err != nil || len(page.Intents) != 1 || page.Intents[0] != status || page.Next == 0 {
+		t.Fatalf("owned delete intents=%+v error=%v", page, err)
+	}
+	otherOwner, err := storage.NewDeleteIntentOwner()
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherPage, err := actions.ListDeleteIntents(t.Context(), otherOwner, 0, 1)
+	if err != nil || len(otherPage.Intents) != 0 {
+		t.Fatalf("another owner's delete intents=%+v error=%v", otherPage, err)
+	}
+	recoveredSession := fileSessionFor(t, volume, storage.DefaultFileSessionOptions())
+	recoveredPage, err := recoveredSession.(storage.FileActions).ListDeleteIntents(t.Context(), owner, 0, 1)
+	if err != nil || len(recoveredPage.Intents) != 1 || recoveredPage.Intents[0] != status {
+		t.Fatalf("new session's delete intents=%+v error=%v", recoveredPage, err)
+	}
+	ack := storage.AcknowledgeDeleteIntentCommand{Action: fileActionFor(t, session), Owner: owner, Intent: intent}
 	if err := actions.AcknowledgeDeleteIntent(t.Context(), ack); err != nil {
 		t.Fatal(err)
 	}
@@ -193,10 +214,10 @@ func TestDurableCloseIntentDeletesOriginalIdentityAndCanBeAcknowledged(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := actions.AcknowledgeDeleteIntent(t.Context(), storage.AcknowledgeDeleteIntentCommand{Action: ack.Action, Intent: otherIntent}); !errors.Is(err, syscall.EINVAL) {
+	if err := actions.AcknowledgeDeleteIntent(t.Context(), storage.AcknowledgeDeleteIntentCommand{Action: ack.Action, Owner: owner, Intent: otherIntent}); !errors.Is(err, syscall.EINVAL) {
 		t.Fatalf("changed acknowledgement intent=%v", err)
 	}
-	status, err = actions.QueryDeleteIntent(t.Context(), intent)
+	status, err = actions.QueryDeleteIntent(t.Context(), owner, intent)
 	if err != nil || status.ID != intent || status.NodeID != 0 || status.Outcome != storage.DeleteIntentUnknown {
 		t.Fatalf("acknowledged intent=%+v error=%v", status, err)
 	}
@@ -223,26 +244,30 @@ func TestNonemptyDirectoryCloseIntentReleasesReferenceWithTerminalResult(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
+	owner, err := storage.NewDeleteIntentOwner()
+	if err != nil {
+		t.Fatal(err)
+	}
 	opened, err := session.(storage.NodeReferences).OpenChildRef(t.Context(), storage.ChildSelection{Name: storage.ChildName{
 		Parent: storage.DirectoryTarget{NodeID: root.ID}, RawLeaf: []byte("dir"),
 	}}, storage.NodeRefOptions{
 		Kind: storage.NodeDirectory, Target: storage.ChildCondition{State: storage.SameNode, NodeID: directory.ID},
 		Action: fileActionFor(t, session), Use: storage.UseClaim{Uses: storage.DeleteName}, MetadataAccess: storage.ReadMetadata,
-		CloseIntent: &storage.CloseIntent{ID: intent, Trigger: storage.OnReferenceClose, Condition: storage.UnlinkIfEmpty},
+		CloseIntent: &storage.CloseIntent{ID: intent, Owner: owner, Trigger: storage.OnReferenceClose, Condition: storage.UnlinkIfEmpty},
 	})
 	if err != nil || opened.Reference == nil {
 		t.Fatalf("open directory reference=%+v error=%v", opened, err)
 	}
-	if err := opened.Reference.Close(t.Context()); !errors.Is(err, syscall.ENOTEMPTY) {
-		t.Fatalf("close nonempty directory=%v", err)
+	if result, err := opened.Reference.CloseWithResult(t.Context()); !result.Released || !errors.Is(err, syscall.ENOTEMPTY) {
+		t.Fatalf("close nonempty directory=%+v %v", result, err)
 	}
-	if err := opened.Reference.Close(t.Context()); !errors.Is(err, syscall.ENOTEMPTY) {
-		t.Fatalf("replayed terminal close=%v", err)
+	if result, err := opened.Reference.CloseWithResult(t.Context()); !result.Released || !errors.Is(err, syscall.ENOTEMPTY) {
+		t.Fatalf("replayed terminal close=%+v %v", result, err)
 	}
 	if _, err := opened.Reference.Stat(t.Context()); !errors.Is(err, syscall.EBADF) {
 		t.Fatalf("closed reference remained active: %v", err)
 	}
-	status, err := session.(storage.FileActions).QueryDeleteIntent(t.Context(), intent)
+	status, err := session.(storage.FileActions).QueryDeleteIntent(t.Context(), owner, intent)
 	if err != nil || status.NodeID != directory.ID || status.Outcome != storage.DeleteIntentNotExecuted {
 		t.Fatalf("delete intent=%+v error=%v", status, err)
 	}

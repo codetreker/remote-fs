@@ -112,6 +112,7 @@ type Storage struct {
 	closing             bool
 	closeMu             sync.Mutex
 	fileSessions        map[*fileSession]struct{}
+	fileCleanupSessions map[*failedOpenSession]struct{}
 	fileSessionOpening  int
 }
 

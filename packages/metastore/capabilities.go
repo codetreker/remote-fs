@@ -35,6 +35,7 @@ type NodeReference interface {
 	Retire(context.Context) error
 	DropUse(context.Context) error
 	Close(context.Context) error
+	CloseWithResult(context.Context) (storage.ReferenceCloseResult, error)
 }
 
 type NodeOpenResult struct {

@@ -3,6 +3,7 @@ package httprest
 import (
 	"context"
 	"errors"
+	"math"
 	"syscall"
 	"time"
 
@@ -54,14 +55,17 @@ func (s *remoteFileSession) QueryFileAction(ctx context.Context, action storage.
 	return *response.ActionReceipt, err
 }
 
-func (s *remoteFileSession) QueryDeleteIntent(ctx context.Context, intent storage.DeleteIntentID) (storage.DeleteIntentStatus, error) {
+func (s *remoteFileSession) QueryDeleteIntent(ctx context.Context, owner storage.DeleteIntentOwner, intent storage.DeleteIntentID) (storage.DeleteIntentStatus, error) {
 	if err := s.CheckFileActions(); err != nil {
+		return storage.DeleteIntentStatus{}, err
+	}
+	if err := owner.Check(); err != nil {
 		return storage.DeleteIntentStatus{}, err
 	}
 	if err := intent.Check(); err != nil {
 		return storage.DeleteIntentStatus{}, err
 	}
-	response, err := s.call(ctx, fileRequest{Op: storage.OpFileQueryDeleteIntent, DeleteIntent: intent})
+	response, err := s.call(ctx, fileRequest{Op: storage.OpFileQueryDeleteIntent, DeleteOwner: owner, DeleteIntent: intent})
 	if response.DeleteStatus == nil {
 		if err == nil {
 			err = unreachable(Request{Op: OpFile}, errors.New("delete intent query returned no status"))
@@ -71,6 +75,30 @@ func (s *remoteFileSession) QueryDeleteIntent(ctx context.Context, intent storag
 	result, decodeErr := response.DeleteStatus.storage()
 	if decodeErr != nil {
 		return storage.DeleteIntentStatus{}, unreachable(Request{Op: OpFileControl}, decodeErr)
+	}
+	return result, err
+}
+
+func (s *remoteFileSession) ListDeleteIntents(ctx context.Context, owner storage.DeleteIntentOwner, after storage.DeleteIntentCursor, limit int) (storage.DeleteIntentPage, error) {
+	if err := s.CheckFileActions(); err != nil {
+		return storage.DeleteIntentPage{}, err
+	}
+	if err := owner.Check(); err != nil {
+		return storage.DeleteIntentPage{}, err
+	}
+	if after > storage.DeleteIntentCursor(math.MaxInt64) || limit < 1 || limit > storage.MaxDeleteIntentPageEntries {
+		return storage.DeleteIntentPage{}, syscall.EINVAL
+	}
+	response, err := s.call(ctx, fileRequest{Op: storage.OpFileListDeleteIntents, DeleteOwner: owner, DeleteAfter: after, DeleteLimit: limit})
+	if response.DeletePage == nil {
+		if err == nil {
+			err = unreachable(Request{Op: OpFileControl}, errors.New("delete intent listing returned no page"))
+		}
+		return storage.DeleteIntentPage{}, err
+	}
+	result, decodeErr := response.DeletePage.storage()
+	if decodeErr != nil {
+		return storage.DeleteIntentPage{}, unreachable(Request{Op: OpFileControl}, decodeErr)
 	}
 	return result, err
 }
@@ -93,13 +121,13 @@ func (s *remoteFileSession) openCapability(ctx context.Context, req fileRequest)
 	}
 	if response.Capabilities == nil {
 		cleanup, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		_, cleanupErr := s.storage.fileCall(cleanup, fileRequest{Op: storage.OpFileClose, Session: s.id, File: response.File})
+		cleanupErr := s.closeUnclaimedFile(cleanup, response.File, response.Epoch)
 		cancel()
 		return nil, response, errors.Join(callErr, cleanupErr, unreachable(Request{Op: OpFile}, errors.New("retained reference response has no capabilities")))
 	}
 	if callErr == nil && (response.Attr == nil || response.Outcome < storage.Opened || response.Outcome > storage.Replaced) {
 		cleanup, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		_, cleanupErr := s.storage.fileCall(cleanup, fileRequest{Op: storage.OpFileClose, Session: s.id, File: response.File})
+		cleanupErr := s.closeUnclaimedFile(cleanup, response.File, response.Epoch)
 		cancel()
 		return nil, response, errors.Join(cleanupErr, unreachable(Request{Op: OpFile}, errors.New("retained reference response is incomplete")))
 	}
@@ -111,7 +139,7 @@ func (s *remoteFileSession) openCapability(ctx context.Context, req fileRequest)
 	_, ackErr := s.call(ctx, fileRequest{Op: storage.OpFileAck, File: response.File})
 	if ackErr != nil {
 		cleanup, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		_, cleanupErr := s.storage.fileCall(cleanup, fileRequest{Op: storage.OpFileClose, Session: s.id, File: response.File})
+		cleanupErr := s.closeUnclaimedFile(cleanup, response.File, response.Epoch)
 		cancel()
 		if cleanupErr != nil && !errors.Is(cleanupErr, syscall.ESTALE) {
 			ackErr = errors.Join(ackErr, cleanupErr)
@@ -363,7 +391,10 @@ func (r *remoteNodeReference) SetAttrWithBarrier(ctx context.Context, change sto
 	return r.file.setAttrWithBarrier(ctx, change, false)
 }
 func (r *remoteNodeReference) Close(ctx context.Context) error { return r.file.Close(ctx) }
-func (r *remoteNodeReference) CloseWithBarrier(ctx context.Context) (*MutationBarrier, error) {
+func (r *remoteNodeReference) CloseWithResult(ctx context.Context) (storage.ReferenceCloseResult, error) {
+	return r.file.CloseWithResult(ctx)
+}
+func (r *remoteNodeReference) CloseWithBarrier(ctx context.Context) (storage.ReferenceCloseResult, *MutationBarrier, error) {
 	return r.file.CloseWithBarrier(ctx)
 }
 func (r *remoteNodeReference) CheckScopedReference() error { return r.file.CheckScopedReference() }

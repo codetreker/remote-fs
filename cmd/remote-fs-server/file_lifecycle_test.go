@@ -119,9 +119,14 @@ type delayedFileSession struct {
 }
 
 func (s *delayedFileSession) Close(ctx context.Context) error {
+	_, err := s.CloseWithResult(ctx)
+	return err
+}
+
+func (s *delayedFileSession) CloseWithResult(ctx context.Context) (storage.ReferenceCloseResult, error) {
 	s.storage.once.Do(func() { close(s.storage.entered) })
 	<-s.storage.release
-	return s.FileSession.Close(ctx)
+	return s.FileSession.CloseWithResult(ctx)
 }
 
 func TestRegistryTimeoutRetainsNativeOwnershipUntilCleanupIsKnown(t *testing.T) {

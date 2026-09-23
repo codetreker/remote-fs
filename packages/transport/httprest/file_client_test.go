@@ -293,11 +293,15 @@ type openACKFile struct {
 }
 
 func (f *openACKFile) Close(ctx context.Context) error {
+	_, err := f.CloseWithResult(ctx)
+	return err
+}
+func (f *openACKFile) CloseWithResult(ctx context.Context) (storage.ReferenceCloseResult, error) {
 	f.backend.closed.Add(1)
 	if errno := f.backend.closeError.Load(); errno != 0 {
-		return syscall.Errno(errno)
+		return storage.ReferenceCloseResult{}, syscall.Errno(errno)
 	}
-	return f.File.Close(ctx)
+	return f.File.CloseWithResult(ctx)
 }
 
 type openACKRequest struct {

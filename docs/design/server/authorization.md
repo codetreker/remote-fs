@@ -63,6 +63,7 @@ storage.Operation 是覆盖路径、文件会话、复制和锁控制的 transpo
 | `file.open-child-ref` | `/v4/file`，`file.open-child-ref` | 按父身份打开或创建节点引用 |
 | `file.query-action` | `/v4/file-control`，`file.query-action` | 核对 FileSession 内的有限动作回执 |
 | `file.query-delete-intent` | `/v4/file-control`，`file.query-delete-intent` | 查询 durable 删除义务状态 |
+| `file.list-delete-intents` | `/v4/file-control`，`file.list-delete-intents` | 按持久 owner 分页发现 durable 删除义务 |
 | `file.acknowledge-delete-intent` | `/v4/file-control`，同名动作 | 幂等确认并释放 durable 删除终态记录 |
 | `file.ack` | `/v4/file-control`，`file.ack` | 确认已交付的打开引用 |
 | `file.stat` | `/v4/file`，`file.stat` | 查询保留引用的属性 |
@@ -102,7 +103,7 @@ storage.Operation 是覆盖路径、文件会话、复制和锁控制的 transpo
 
 副本构建还需要 replication.checkpoint 的明确许可；允许订阅或快照不隐含这项权限。Checkpoint 是一次普通读取，遵循入口授权、通用传输预算和安全错误规则，不建立持续输出。
 
-`FileOpenOptions` 嵌入共享的 `storage.OpenAccess`；file.open／file.open-node 继续把这五项意图放入 `AccessRequest.Open`。OpenAt、OpenNodeRef 与 OpenChildRef 也携带由 metadata 权限、Use 与打开效果导出的 OpenAccess。OpenAt/OpenChildRef 的顶层 child/guards 在进入策略前完成结构和 guard 上限校验，server 再把它们组装为 `ChildSelection`；guards 是 authority 核对的名字证据，不增加授权 Operation，也不作为策略资源。一个复杂动作按固定顺序产生基础 Operation 及它实际包含的 remove、set-attr、set-metadata 或 set-pending 等补充 Operation；每项分别调用同一 Authorizer，任一拒绝都发生在 native action 前。NodeID、Scope、metadata token、namespace guard、action ID 和 delete-intent ID 不作为业务身份。带 Create 的打开即使最终选择已有对象，也报告创建意图。
+`FileOpenOptions` 嵌入共享的 `storage.OpenAccess`；file.open／file.open-node 继续把这五项意图放入 `AccessRequest.Open`。OpenAt、OpenNodeRef 与 OpenChildRef 也携带由 metadata 权限、Use 与打开效果导出的 OpenAccess。OpenAt/OpenChildRef 的顶层 child/guards 在进入策略前完成结构和 guard 上限校验，server 再把它们组装为 `ChildSelection`；guards 是 authority 核对的名字证据，不增加授权 Operation，也不作为策略资源。一个复杂动作按固定顺序产生基础 Operation 及它实际包含的 remove、set-attr、set-metadata 或 set-pending 等补充 Operation；每项分别调用同一 Authorizer，任一拒绝都发生在 native action 前。NodeID、Scope、metadata token、namespace guard、action ID、delete-intent owner、cursor 和 ID 不作为业务身份。带 Create 的打开即使最终选择已有对象，也报告创建意图。
 
 `volume.write` 可以创建缺失文件，单独拒绝 volume.create 不能禁止创建。应用枚举、完整目录 metadata 与 reference current-name 分别授权；允许 `file.read-dir-node` 不授予另两项，DirectoryMetadataObserver 也不从 `ReadEntries` 或 `ReadMetadata` 推导权限。metadata、range apply 与 range drop 同样分别授权；查询、取消或已有 owner 不能绕过本次策略。range mode 不代替内容读写权限，后续数据访问仍检查 file.read / file.write。FUSE 的 flock/POSIX 解释不进入 AccessRequest。
 
@@ -115,7 +116,7 @@ storage.Operation 是覆盖路径、文件会话、复制和锁控制的 transpo
 3. handler 从已解码语义构造一个 AccessRequest，执行一次入口 Authorize。
 4. 允许后才读取或触碰 capability、分配引用或动作、重放回执、读取 Log、取得订阅／snapshot／page 资源或访问 backend。存储权限、配额、锁与原有取消分类继续生效。
 
-格式合法但不存在的 capability、action receipt、delete intent、无 Log（包括 publisher 为 nil）或错误续订游标，在拒绝时只返回授权错误；允许后才返回原有 ESTALE／ENOSYS 等结果。旧 action ID、成功过的动作、durable intent ID 与已有 capability 均不能省略检查。ack、renew、status、metadata、query、cancel、drop、release、retire 与 close 各自可被拒绝。已经接受的 CloseIntent 后续触发是原动作固定效果，不因原会话消失或权限撤销而重新授权；对其状态的新查询仍独立授权。
+格式合法但不存在的 capability、action receipt、delete intent、无 Log（包括 publisher 为 nil）或错误续订游标，在拒绝时只返回授权错误；允许后才返回原有 ESTALE／ENOSYS 等结果。旧 action ID、成功过的动作、durable intent ID 与已有 capability 均不能省略检查。ack、renew、status、metadata、query、list、cancel、drop、release、retire 与 close 各自可被拒绝；intent list、query 与 ACK 各执行自己的授权。已经接受的 CloseIntent 后续触发是原动作固定效果，不因原会话消失或权限撤销而重新授权；对其状态的新查询仍独立授权。
 
 拒绝只说明本次尝试未获准，不能证明此前超时的动作未执行。client 无法获准核对时保留原来的未知结果，不合成 Cancelled、Released、NotApplied 或已记录的 rejection。请求 cleanup 被拒绝仍报告拒绝；服务器自主 lease 到期、退休、shutdown 与资源回收由原拥有者执行，不重新请求该访问身份的权限。
 

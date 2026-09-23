@@ -278,13 +278,17 @@ func verifyDeleteIntentLifecycle(t *testing.T, session storage.FileSession, acti
 	if err != nil {
 		t.Fatal(err)
 	}
+	owner, err := storage.NewDeleteIntentOwner()
+	if err != nil {
+		t.Fatal(err)
+	}
 	createAction := replicatedFileActionFor(t, session)
 	opened, err := opener.OpenAt(t.Context(), storage.ChildSelection{Name: storage.ChildName{
 		Parent: storage.DirectoryTarget{NodeID: parent}, RawLeaf: []byte("delete-on-close"),
 	}}, storage.OpenAtOptions{
 		Read: true, Create: true, Exclusive: true, Target: storage.ChildCondition{State: storage.Absent},
 		Action: createAction, Use: storage.UseClaim{Uses: storage.ReadData | storage.DeleteName}, Existing: storage.Keep,
-		CloseIntent: &storage.CloseIntent{ID: intent, Trigger: storage.OnReferenceClose, Condition: storage.UnlinkFile},
+		CloseIntent: &storage.CloseIntent{ID: intent, Owner: owner, Trigger: storage.OnReferenceClose, Condition: storage.UnlinkFile},
 	})
 	if err != nil || opened.File == nil || opened.Outcome != storage.Created {
 		t.Fatalf("close-intent open=%+v error=%v", opened, err)
@@ -292,12 +296,28 @@ func verifyDeleteIntentLifecycle(t *testing.T, session storage.FileSession, acti
 	if err := opened.File.Close(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	status, err := actions.QueryDeleteIntent(t.Context(), intent)
+	status, err := actions.QueryDeleteIntent(t.Context(), owner, intent)
 	if err != nil || status.NodeID != opened.Attr.ID || status.Outcome != storage.DeleteIntentCompleted {
 		t.Fatalf("delete intent=%+v error=%v", status, err)
 	}
+	page, err := actions.ListDeleteIntents(t.Context(), owner, 0, 1)
+	if err != nil || len(page.Intents) != 1 || page.Intents[0] != status || page.Next == 0 {
+		t.Fatalf("owned delete intents=%+v error=%v", page, err)
+	}
+	continuation, err := actions.ListDeleteIntents(t.Context(), owner, page.Next, 1)
+	if err != nil || len(continuation.Intents) != 0 {
+		t.Fatalf("delete intent continuation=%+v error=%v", continuation, err)
+	}
+	otherOwner, err := storage.NewDeleteIntentOwner()
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherPage, err := actions.ListDeleteIntents(t.Context(), otherOwner, 0, 1)
+	if err != nil || len(otherPage.Intents) != 0 {
+		t.Fatalf("another owner's delete intents=%+v error=%v", otherPage, err)
+	}
 	ackAction := replicatedFileActionFor(t, session)
-	if err := actions.AcknowledgeDeleteIntent(t.Context(), storage.AcknowledgeDeleteIntentCommand{Action: ackAction, Intent: intent}); err != nil {
+	if err := actions.AcknowledgeDeleteIntent(t.Context(), storage.AcknowledgeDeleteIntentCommand{Action: ackAction, Owner: owner, Intent: intent}); err != nil {
 		t.Fatal(err)
 	}
 	receipt, err := actions.QueryFileAction(t.Context(), ackAction)
