@@ -239,6 +239,9 @@ func (s *Store) fileState(ctx context.Context, tx *sql.Tx, id int64) (metastore.
 	if err != nil {
 		return metastore.FileState{}, err
 	}
+	if err := s.validateLoadedNode(node); err != nil {
+		return metastore.FileState{}, err
+	}
 	return metastore.FileState{Node: node, Revision: uint64(revision), Detached: detached}, nil
 }
 
@@ -295,7 +298,11 @@ func (f *retainedFile) Reserve(ctx context.Context, size int64) (metastore.Key, 
 		if err != nil {
 			return err
 		}
-		if err := f.store.roomFor(ctx, tx, size-node.Size); err != nil {
+		allocation, err := allocatedSize(storage.NodeRegular, size)
+		if err != nil {
+			return err
+		}
+		if err := f.store.roomFor(ctx, tx, allocation-node.AllocationSize); err != nil {
 			return err
 		}
 		return f.store.reserveObject(ctx, tx, key, size, sec, nsec)
@@ -376,12 +383,16 @@ func (s *Store) replaceNodeContentFields(ctx context.Context, tx *sql.Tx, node m
 	if err := s.advanceContentRevision(ctx, tx, node.ID); err != nil {
 		return err
 	}
-	if err := s.account(ctx, tx, object.Size-node.Size); err != nil {
+	if err := s.accountFileChange(ctx, tx, node.Size, object.Size); err != nil {
+		return err
+	}
+	allocation, err := allocatedSize(storage.NodeRegular, object.Size)
+	if err != nil {
 		return err
 	}
 	sec, nsec := sqlvalue.StoredTime(object.ModTime)
 	changeSec, changeNsec := sqlvalue.StoredTime(at)
-	if _, err := tx.ExecContext(ctx, `UPDATE nodes SET size=?,mtime_sec=?,mtime_nsec=?,content=?,change_sec=?,change_nsec=? WHERE volume=? AND id=?`, object.Size, sec, nsec, sqlvalue.StoredKey(object.Key), changeSec, changeNsec, s.volume, node.ID); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE nodes SET size=?,allocation_size=?,mtime_sec=?,mtime_nsec=?,content=?,change_sec=?,change_nsec=? WHERE volume=? AND id=?`, object.Size, allocation, sec, nsec, sqlvalue.StoredKey(object.Key), changeSec, changeNsec, s.volume, node.ID); err != nil {
 		return err
 	}
 	if object.Key != "" {

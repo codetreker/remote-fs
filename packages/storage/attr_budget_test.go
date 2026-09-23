@@ -42,6 +42,29 @@ func TestAttributeResultBudgetUsesUnloadedFactsAndCurrentRequest(t *testing.T) {
 	}
 }
 
+func TestAttributeResultProjectionPrecedesBudgetAndPreservesLimit(t *testing.T) {
+	base := storage.WithBoundedAttrResult(t.Context(), 128, func(attr storage.Attr, bytes int64) error {
+		if attr.AllocationKnown || attr.AllocationSize != 0 || attr.ID != 7 || bytes != 6 {
+			t.Fatalf("budget saw unprojected attributes: %+v, bytes=%d", attr, bytes)
+		}
+		return syscall.EFBIG
+	})
+	projected := storage.WithAttrResultProjection(base, func(attr storage.Attr) storage.Attr {
+		attr.AllocationKnown = false
+		attr.AllocationSize = 0
+		return attr
+	})
+	if limit, ok := storage.AttrResultByteLimit(projected); !ok || limit != 128 {
+		t.Fatalf("projection lost byte limit: %d, present=%v", limit, ok)
+	}
+	if err := storage.CheckAttrResultBudget(projected, storage.Attr{ID: 7, AllocationKnown: true, AllocationSize: 4096}, 6); !errors.Is(err, syscall.EFBIG) {
+		t.Fatalf("projected refusal = %v", err)
+	}
+	if err := storage.CheckAttrResultBudget(storage.WithAttrResultProjection(t.Context(), func(attr storage.Attr) storage.Attr { return attr }), storage.Attr{}, 6); err != nil {
+		t.Fatalf("unbudgeted projection changed admission: %v", err)
+	}
+}
+
 func TestAttributeResultBudgetRejectsPayloadBeforeCallback(t *testing.T) {
 	calls := 0
 	ctx := storage.WithAttrResultBudget(t.Context(), func(storage.Attr, int64) error { calls++; return nil })

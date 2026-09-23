@@ -369,7 +369,14 @@ func checkSessionCapabilities(files storage.FileSession) error {
 	if !ok {
 		return syscall.EOPNOTSUPP
 	}
-	return actions.CheckFileActions()
+	if err := actions.CheckFileActions(); err != nil {
+		return err
+	}
+	allocation, ok := files.(storage.AllocationReporting)
+	if !ok {
+		return syscall.EOPNOTSUPP
+	}
+	return allocation.CheckAllocationReporting()
 }
 
 func minTime(a, b time.Time) time.Time {

@@ -92,7 +92,7 @@ func TestExactLookupAndCreateUseParentIdentityAndCapturedOpenResult(t *testing.T
 		if target.Parent.NodeID != 7 || target.Parent.Scope != nil || string(target.RawLeaf) != name {
 			t.Fatalf("lookup target = %+v", target)
 		}
-		return storage.Attr{ID: 11, Kind: storage.NodeRegular}, nil
+		return storage.Attr{ID: 11, Kind: storage.NodeRegular, AllocationKnown: true}, nil
 	}
 	if _, errno := root.Lookup(t.Context(), name, &gofuse.EntryOut{}); errno != 0 {
 		t.Fatal(errno)
@@ -115,7 +115,7 @@ func TestExactLookupAndCreateUseParentIdentityAndCapturedOpenResult(t *testing.T
 		}
 		return storage.OpenResult{
 			File: file,
-			Attr: storage.Attr{ID: 12, Kind: storage.NodeRegular, Metadata: map[string]storage.OpaquePayload{
+			Attr: storage.Attr{ID: 12, Kind: storage.NodeRegular, AllocationKnown: true, Metadata: map[string]storage.OpaquePayload{
 				posix.Namespace: {Version: []byte{1}, Data: options.Initial.OnCreate.Metadata[posix.Namespace]},
 			}},
 			Outcome: storage.Created,
@@ -190,7 +190,7 @@ func TestInterruptedAtomicOpenReplaysTheSameCompletedAction(t *testing.T) {
 		if options.Action != first {
 			t.Fatalf("replay changed action %q to %q", first, options.Action)
 		}
-		return storage.OpenResult{File: file, Attr: storage.Attr{ID: 12, Kind: storage.NodeRegular, Metadata: map[string]storage.OpaquePayload{
+		return storage.OpenResult{File: file, Attr: storage.Attr{ID: 12, Kind: storage.NodeRegular, AllocationKnown: true, Metadata: map[string]storage.OpaquePayload{
 			posix.Namespace: {Version: []byte{1}, Data: options.Initial.OnCreate.Metadata[posix.Namespace]},
 		}}, Outcome: storage.Created}, nil
 	}
@@ -246,7 +246,7 @@ func TestNamespaceMutationsCarryAtomicInitialStateAndActionIdentity(t *testing.T
 	var commands []storage.NameCommand
 	session.mutate = func(command storage.NameCommand) (storage.NameResult, error) {
 		commands = append(commands, command)
-		attr := storage.Attr{ID: uint64(20 + len(commands)), Kind: storage.NodeDirectory}
+		attr := storage.Attr{ID: uint64(20 + len(commands)), Kind: storage.NodeDirectory, AllocationKnown: true}
 		if command.Kind == storage.NameSymlink {
 			attr.Kind = storage.NodeSymlink
 			attr.Size = int64(len(command.Initial.LinkTarget))
@@ -301,7 +301,7 @@ func TestChildLookupKeepsParentIdentityAfterParentRenameAndNameReuse(t *testing.
 		if name.Parent.NodeID != 8 || string(name.RawLeaf) != "child" {
 			t.Fatalf("lookup rebound to replacement parent: %+v", name)
 		}
-		return storage.Attr{ID: 10, Kind: storage.NodeRegular}, nil
+		return storage.Attr{ID: 10, Kind: storage.NodeRegular, AllocationKnown: true}, nil
 	}
 	if _, errno := oldNode.Lookup(t.Context(), "child", &gofuse.EntryOut{}); errno != 0 {
 		t.Fatal(errno)
@@ -353,7 +353,7 @@ func TestTruncatingIdentityOpenDoesNotExposeRetryablePostMutationFailure(t *test
 }
 
 func TestExistingInodeOpenKeepsIdentityAfterParentRenameAndNameReuse(t *testing.T) {
-	file := &identityOpenFile{attr: storage.Attr{ID: 8, Kind: storage.NodeRegular}}
+	file := &identityOpenFile{attr: storage.Attr{ID: 8, Kind: storage.NodeRegular, AllocationKnown: true}}
 	session := &identityOpenSession{file: file}
 	root := namespaceRoot(session)
 	old := root.child(t.Context(), "file", syscall.S_IFREG|0644, 8)

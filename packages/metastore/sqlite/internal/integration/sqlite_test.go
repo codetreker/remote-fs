@@ -363,8 +363,8 @@ func openUnder(t *testing.T, path, volume string, allowance int64, window sqlite
 // is not a name in the other, and neither is the other's allowance.
 func TestVolumesInOneDatabaseAreSeparate(t *testing.T) {
 	path := database(t)
-	first := open(t, path, "first", 1000)
-	second := open(t, path, "second", 2000)
+	first := open(t, path, "first", 4096)
+	second := open(t, path, "second", 8192)
 
 	if err := first.Create(t.Context(), "mine"); err != nil {
 		t.Fatalf("creating a file in the first volume: %v", err)
@@ -382,8 +382,8 @@ func TestVolumesInOneDatabaseAreSeparate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if space.Total != 2000 || space.Used != 0 {
-		t.Fatalf("the second volume reports %+v, want its own 2000 byte allowance with nothing used", space)
+	if space.Total != 8192 || space.Used != 0 {
+		t.Fatalf("the second volume reports %+v, want its own 8192 byte allowance with nothing used", space)
 	}
 
 	// An object reserved in one volume is not one the other may commit or collect.
@@ -397,7 +397,7 @@ func TestVolumesInOneDatabaseAreSeparate(t *testing.T) {
 	}
 }
 
-// The tree, the attributes, the object records and the byte counter all live in the
+// The tree, the attributes, the object records and both byte counters all live in the
 // database rather than in the Store, so a volume is exactly what the last Store left
 // when the next one opens it.
 func TestAVolumeOutlivesTheStoreThatMadeIt(t *testing.T) {
@@ -435,8 +435,11 @@ func TestAVolumeOutlivesTheStoreThatMadeIt(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if space.Used != 700 {
-		t.Fatalf("the reopened volume reports %d bytes used, want 700", space.Used)
+	if space.Used != 4096 {
+		t.Fatalf("the reopened volume reports %d allocated bytes, want 4096", space.Used)
+	}
+	if logical, err := second.Usage(t.Context()); err != nil || logical != 700 {
+		t.Fatalf("the reopened volume holds %d logical bytes, %v; want 700", logical, err)
 	}
 }
 
@@ -478,17 +481,16 @@ func TestOpenReportsADatabaseItCannotCreate(t *testing.T) {
 	}
 }
 
-// Every mutation reads before it writes — the quota check reads the counter it is about to
-// move — so concurrent writers are where a lost update would show. The allowance is exactly
-// what the writers together ask for, which makes an over-count refuse a write that should
-// have fitted and an under-count accept one that should not have.
+// Concurrent writers can expose a lost allocation update. The allowance exactly fits their
+// combined reservations, so an over-count refuses a write that fits and an under-count admits
+// the extra reservation below.
 func TestConcurrentCommitsEachTakeTheirOwnBytes(t *testing.T) {
 	const (
 		writers = 8
 		each    = 16
 		size    = 64
 	)
-	store := open(t, database(t), "workspace", writers*each*size)
+	store := open(t, database(t), "workspace", writers*each*4096)
 
 	var wg sync.WaitGroup
 	failures := make(chan error, writers*each)
@@ -522,8 +524,11 @@ func TestConcurrentCommitsEachTakeTheirOwnBytes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := int64(writers * each * size); space.Used != want {
-		t.Fatalf("the volume reports %d bytes used, want %d", space.Used, want)
+	if want := int64(writers * each * 4096); space.Used != want {
+		t.Fatalf("the volume reports %d allocated bytes used, want %d", space.Used, want)
+	}
+	if logical, err := store.Usage(t.Context()); err != nil || logical != writers*each*size {
+		t.Fatalf("the volume holds %d logical bytes, %v; want %d", logical, err, writers*each*size)
 	}
 	if space.Avail != 0 {
 		t.Fatalf("the volume reports %d bytes available, want none", space.Avail)

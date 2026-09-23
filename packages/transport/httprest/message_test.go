@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"math"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -15,7 +16,7 @@ func TestAttrSurvivesJSON(t *testing.T) {
 	cases := []storage.Attr{
 		{ID: 9, Kind: storage.NodeRegular, Size: 0, AccessTime: time.Unix(0, 0), ModTime: time.Unix(0, 0)},
 		{ID: 9, Kind: storage.NodeDirectory, Size: 4096, AccessTime: time.Now(), ModTime: time.Now()},
-		{ID: 9, Kind: storage.NodeRegular, Size: 1 << 40, AccessTime: time.Unix(1600000000, 1), ModTime: time.Unix(1755000000, 123456789)},
+		{ID: 9, Kind: storage.NodeRegular, Size: 1 << 40, AllocationSize: 1 << 40, AllocationKnown: true, AccessTime: time.Unix(1600000000, 1), ModTime: time.Unix(1755000000, 123456789)},
 		{ID: 9, Kind: storage.NodeRegular, Size: 1},
 	}
 	for _, want := range cases {
@@ -29,11 +30,50 @@ func TestAttrSurvivesJSON(t *testing.T) {
 		}
 		got := wire.Storage()
 		if got.Kind != want.Kind || !reflect.DeepEqual(got.Metadata, want.Metadata) || got.Size != want.Size ||
+			got.AllocationSize != want.AllocationSize || got.AllocationKnown != want.AllocationKnown ||
 			!got.AccessTime.Equal(want.AccessTime) || !got.ModTime.Equal(want.ModTime) {
 			t.Fatalf("round trip of %+v through %s gave %+v", want, encoded, got)
 		}
 		if got.IsDir() != want.IsDir() {
 			t.Fatalf("round trip lost the directory bit of %v", want.Kind)
+		}
+	}
+}
+
+func TestAllocationFactWireRejectsMissingOrContradictoryValues(t *testing.T) {
+	valid := `{"id":9,"kind":1,"size":1,"allocation_size":4096,"allocation_known":true,"access_time":{"unix_sec":0,"nanos":0},"mod_time":{"unix_sec":0,"nanos":0}}`
+	for name, body := range map[string]string{
+		"missing size":          strings.Replace(valid, `"allocation_size":4096,`, "", 1),
+		"missing knowledge":     strings.Replace(valid, `"allocation_known":true,`, "", 1),
+		"null size":             strings.Replace(valid, `"allocation_size":4096`, `"allocation_size":null`, 1),
+		"null knowledge":        strings.Replace(valid, `"allocation_known":true`, `"allocation_known":null`, 1),
+		"negative size":         strings.Replace(valid, `"allocation_size":4096`, `"allocation_size":-1`, 1),
+		"unsupported with size": strings.Replace(valid, `"allocation_known":true`, `"allocation_known":false`, 1),
+	} {
+		t.Run(name, func(t *testing.T) {
+			for _, envelope := range []string{body, `{"entries":[{"name":"Zg==","attr":` + body + `}]}`} {
+				var target any = new(httprest.Attr)
+				if strings.HasPrefix(envelope, `{"entries"`) {
+					target = new(httprest.ListResponse)
+				}
+				if err := json.Unmarshal([]byte(envelope), target); err == nil {
+					t.Fatalf("accepted invalid allocation fact: %s", envelope)
+				}
+			}
+		})
+	}
+	for _, known := range []bool{false, true} {
+		attr := storage.Attr{ID: 9, Kind: storage.NodeRegular, Size: 1, AllocationKnown: known}
+		if known {
+			attr.AllocationSize = 4096
+		}
+		encoded, err := json.Marshal(httprest.AttrOf(attr))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got httprest.Attr
+		if err := json.Unmarshal(encoded, &got); err != nil || got.Storage().AllocationKnown != known || got.Storage().AllocationSize != attr.AllocationSize {
+			t.Fatalf("allocation fact did not round trip: %s: %v", encoded, err)
 		}
 	}
 }
@@ -270,7 +310,7 @@ func TestABodyThatCarriesNoAttributes(t *testing.T) {
 		// returns equal, so a peer that omits it reads as saying every node is one node.
 		`{"attr":{"mode":0}}`:                   false,
 		`{"attr":{"id":0,"mode":420,"size":7}}`: false,
-		`{"attr":{"id":9,"kind":1,"size":0,"access_time":{"unix_sec":0,"nanos":0},"mod_time":{"unix_sec":0,"nanos":0}}}`: true,
+		`{"attr":{"id":9,"kind":1,"size":0,"allocation_size":0,"allocation_known":false,"access_time":{"unix_sec":0,"nanos":0},"mod_time":{"unix_sec":0,"nanos":0}}}`: true,
 		`{"attr":{"id":9,"kind":1,"size":7}}`:     false,
 		`{"attr":{"id":9,"kind":1},"entries":[]}`: false,
 		`{"attr":{"id":9,"kind":2,"size":0}}`:     false,
@@ -293,7 +333,7 @@ func TestABodyThatCarriesNoAttributes(t *testing.T) {
 		`{"entries":[{"name":7,"attr":{"mode":0}}]}`: false,
 		`{"entries":[]}`: true,
 		`{"entries":[{"name":"Zg==","attr":{"mode":0}}]}`: false,
-		`{"entries":[{"name":"Zg==","attr":{"id":9,"kind":1,"size":0,"access_time":{"unix_sec":0,"nanos":0},"mod_time":{"unix_sec":0,"nanos":0}}}]}`: true,
+		`{"entries":[{"name":"Zg==","attr":{"id":9,"kind":1,"size":0,"allocation_size":0,"allocation_known":false,"access_time":{"unix_sec":0,"nanos":0},"mod_time":{"unix_sec":0,"nanos":0}}}]}`: true,
 	}
 	for body, want := range listCases {
 		t.Run("list "+body, func(t *testing.T) {
@@ -344,7 +384,7 @@ func TestTheWireForm(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
-	want := `{"attr":{"id":77,"kind":2,"size":4096,` +
+	want := `{"attr":{"id":77,"kind":2,"size":4096,"allocation_size":0,"allocation_known":false,` +
 		`"access_time":{"unix_sec":1700000000,"nanos":1},` +
 		`"mod_time":{"unix_sec":1755000000,"nanos":123456789}}}`
 	if string(encoded) != want {
@@ -418,7 +458,7 @@ func TestMetadataFactsPreserveUnknownAndOpaqueBytes(t *testing.T) {
 }
 
 func TestMetadataWireRejectsIncompleteOrNoncanonicalFacts(t *testing.T) {
-	base := `{"id":9,"kind":1,"size":0,"access_time":{"unix_sec":0,"nanos":0},"mod_time":{"unix_sec":0,"nanos":0}`
+	base := `{"id":9,"kind":1,"size":0,"allocation_size":0,"allocation_known":false,"access_time":{"unix_sec":0,"nanos":0},"mod_time":{"unix_sec":0,"nanos":0}`
 	for name, suffix := range map[string]string{
 		"unknown kind":        `,"kind":255}`,
 		"duplicate identity":  `,"id":9}`,

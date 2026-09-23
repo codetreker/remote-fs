@@ -674,8 +674,13 @@ func (n *node) child(ctx context.Context, name string, mode uint32, nodeID uint6
 
 // --- attributes ----------------------------------------------------------------------
 
+const linuxStatBlockSize = 512
+
 func (v *volume) fillAttr(out *gofuse.Attr, attr storage.Attr) syscall.Errno {
 	if attr.ID == 0 || !attr.IsDir() && attr.Size < 0 {
+		return syscall.EIO
+	}
+	if err := attr.CheckAllocation(); err != nil || !attr.AllocationKnown || attr.AllocationSize%linuxStatBlockSize != 0 {
 		return syscall.EIO
 	}
 	mode, errno := attributeMode(attr)
@@ -686,6 +691,7 @@ func (v *volume) fillAttr(out *gofuse.Attr, attr storage.Attr) syscall.Errno {
 	if !attr.IsDir() {
 		out.Size = uint64(attr.Size)
 	}
+	out.Blocks = uint64(attr.AllocationSize) / linuxStatBlockSize
 	accessed, changed := attr.AccessTime, attr.ModTime
 	out.Atime, out.Atimensec = uint64(accessed.Unix()), uint32(accessed.Nanosecond())
 	out.Mtime, out.Mtimensec = uint64(changed.Unix()), uint32(changed.Nanosecond())

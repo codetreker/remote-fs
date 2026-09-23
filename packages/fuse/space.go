@@ -8,9 +8,9 @@ import (
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
 )
 
-// reportedBlockSize is the unit this mount reports space in. Nothing here holds anything
-// in blocks — the volume charges bytes — so it is a denomination rather than a
-// property of any storage, and 4096 is what the filesystems a caller compares against use.
+// reportedBlockSize is the unit this mount reports space in. Space carries authoritative
+// byte totals, including the volume's allocation ledger; Statfs only converts those totals
+// into 4096-byte units for the kernel.
 const reportedBlockSize = 4096
 
 // maxNameLength is the longest name this mount will say a directory can hold. It is the

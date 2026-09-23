@@ -58,6 +58,14 @@ func (s *fileSession) CheckAtomicFileOpen() error {
 	return capabilityCheck(s.remote, func(c httprest.AtomicFileOpenerWithBarrier) error { return c.CheckAtomicFileOpen() })
 }
 
+func (s *fileSession) CheckAllocationReporting() error {
+	reporter, ok := s.remote.(storage.AllocationReporting)
+	if !ok {
+		return syscall.EOPNOTSUPP
+	}
+	return reporter.CheckAllocationReporting()
+}
+
 func (s *fileSession) CheckNamespaceAccess() error {
 	return capabilityCheck(s.remote, func(c httprest.NamespaceAccessWithBarrier) error { return c.CheckNamespaceAccess() })
 }

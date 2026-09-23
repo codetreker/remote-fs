@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"math"
 	"syscall"
 	"time"
 
@@ -235,11 +236,16 @@ func (r *Replica) apply(ctx context.Context, tx *sql.Tx, change metastore.Change
 		return r.store.advanceReplicaDirectoryRevision(ctx, tx, change.Parent, int64(change.Position))
 
 	case metastore.Modified:
-		return updateNode(ctx, tx, *change.Node)
+		return updateNode(ctx, tx, r.store.volume, *change.Node)
 
 	case metastore.Removed:
 		id, err := entryNode(ctx, tx, r.store.volume, change.Parent, change.Name)
 		if err != nil {
+			return err
+		}
+		var kind, size int64
+		var allocation sql.NullInt64
+		if err := tx.QueryRowContext(ctx, `SELECT kind,size,allocation_size FROM nodes WHERE id=? AND volume=?`, id, r.store.volume).Scan(&kind, &size, &allocation); err != nil {
 			return err
 		}
 		if err := removeEntry(ctx, tx, r.store.volume, change.Parent, change.Name); err != nil {
@@ -248,8 +254,13 @@ func (r *Replica) apply(ctx context.Context, tx *sql.Tx, change metastore.Change
 		if err := r.store.advanceReplicaDirectoryRevision(ctx, tx, change.Parent, int64(change.Position)); err != nil {
 			return err
 		}
-		_, err = tx.ExecContext(ctx, `DELETE FROM nodes WHERE id = ?`, id)
-		return err
+		if _, err := tx.ExecContext(ctx, `DELETE FROM nodes WHERE id = ?`, id); err != nil {
+			return err
+		}
+		if kind != int64(storage.NodeRegular) {
+			size = 0
+		}
+		return adjustReplicaCounters(ctx, tx, r.store.volume, -size, -allocation.Int64)
 
 	case metastore.Renamed:
 		// The entry is moved rather than rewritten in place, so that a directory arriving here
@@ -271,7 +282,7 @@ func (r *Replica) apply(ctx context.Context, tx *sql.Tx, change metastore.Change
 				return err
 			}
 		}
-		return updateNode(ctx, tx, *change.Node)
+		return updateNode(ctx, tx, r.store.volume, *change.Node)
 	}
 	return fmt.Errorf("%w: the change is of kind %d, which this build has no meaning for",
 		syscall.EIO, change.Kind)
@@ -298,18 +309,26 @@ func insertNode(ctx context.Context, tx *sql.Tx, volume int64, node metastore.No
 		directoryRevision = initialDirectoryRevision()
 	}
 	_, err = tx.ExecContext(ctx, `
-		INSERT INTO nodes (id,volume,kind,size,atime_sec,atime_nsec,mtime_sec,mtime_nsec,content,
+		INSERT INTO nodes (id,volume,kind,size,allocation_size,atime_sec,atime_nsec,mtime_sec,mtime_nsec,content,
 		                   birth_sec,birth_nsec,change_sec,change_nsec,metadata,link_target,directory_revision)
-		VALUES (?,?,?,?,?,?,?,?,NULL,?,?,?,?,?,?,?)`,
-		node.ID, volume, int64(node.Kind), node.Size, accessSec, accessNsec, modifiedSec, modifiedNsec,
+		VALUES (?,?,?,?,?,?,?,?,?,NULL,?,?,?,?,?,?,?)`,
+		node.ID, volume, int64(node.Kind), node.Size, storedReplicaAllocation(node), accessSec, accessNsec, modifiedSec, modifiedNsec,
 		birthSec, birthNsec, changeSec, changeNsec, metadata, append([]byte{}, node.LinkTarget...), directoryRevision)
-	return err
+	if err != nil {
+		return err
+	}
+	return adjustReplicaCounters(ctx, tx, volume, replicaLogicalSize(node), node.AllocationSize)
 }
 
 // updateNode replaces what a copy holds about a node it already has, and refuses to be a
 // statement about a node it does not.
-func updateNode(ctx context.Context, tx *sql.Tx, node metastore.Node) error {
+func updateNode(ctx context.Context, tx *sql.Tx, volume int64, node metastore.Node) error {
 	if err := validateReplicaNode(node); err != nil {
+		return err
+	}
+	var oldKind, oldSize int64
+	var oldAllocation sql.NullInt64
+	if err := tx.QueryRowContext(ctx, `SELECT kind,size,allocation_size FROM nodes WHERE id=? AND volume=?`, node.ID, volume).Scan(&oldKind, &oldSize, &oldAllocation); err != nil {
 		return err
 	}
 	accessSec, accessNsec := sqlvalue.StoredTime(node.AccessTime)
@@ -320,21 +339,27 @@ func updateNode(ctx context.Context, tx *sql.Tx, node metastore.Node) error {
 	if err != nil {
 		return err
 	}
-	query := `UPDATE nodes SET kind=?,size=?,atime_sec=?,atime_nsec=?,mtime_sec=?,mtime_nsec=?,
+	query := `UPDATE nodes SET kind=?,size=?,allocation_size=?,atime_sec=?,atime_nsec=?,mtime_sec=?,mtime_nsec=?,
 		birth_sec=?,birth_nsec=?,change_sec=?,change_nsec=?,metadata=?,link_target=?`
-	args := []any{int64(node.Kind), node.Size, accessSec, accessNsec, modifiedSec, modifiedNsec,
+	args := []any{int64(node.Kind), node.Size, storedReplicaAllocation(node), accessSec, accessNsec, modifiedSec, modifiedNsec,
 		birthSec, birthNsec, changeSec, changeNsec, metadata, append([]byte{}, node.LinkTarget...)}
 	if len(node.DirectoryRevision) != 0 || node.Kind != storage.NodeDirectory {
 		query += `,directory_revision=?`
 		args = append(args, append([]byte{}, node.DirectoryRevision...))
 	}
-	query += ` WHERE id=?`
-	args = append(args, node.ID)
+	query += ` WHERE id=? AND volume=?`
+	args = append(args, node.ID, volume)
 	result, err := tx.ExecContext(ctx, query, args...)
 	if err != nil {
 		return err
 	}
-	return sqlvalue.ExactlyOne(result, fmt.Sprintf("node %d, which this copy does not hold", node.ID))
+	if err := sqlvalue.ExactlyOne(result, fmt.Sprintf("node %d, which this copy does not hold", node.ID)); err != nil {
+		return err
+	}
+	if oldKind != int64(storage.NodeRegular) {
+		oldSize = 0
+	}
+	return adjustReplicaCounters(ctx, tx, volume, replicaLogicalSize(node)-oldSize, node.AllocationSize-oldAllocation.Int64)
 }
 
 func validateReplicaNode(node metastore.Node) error {
@@ -354,7 +379,37 @@ func validateReplicaNode(node metastore.Node) error {
 	} else if len(node.LinkTarget) != 0 {
 		return syscall.EIO
 	}
+	if err := node.Attr().CheckAllocation(); err != nil {
+		return syscall.EIO
+	}
 	return nil
+}
+
+func storedReplicaAllocation(node metastore.Node) any {
+	if node.AllocationKnown {
+		return node.AllocationSize
+	}
+	return nil
+}
+
+func replicaLogicalSize(node metastore.Node) int64 {
+	if node.Kind == storage.NodeRegular {
+		return node.Size
+	}
+	return 0
+}
+
+func adjustReplicaCounters(ctx context.Context, tx *sql.Tx, volume, logicalDelta, allocationDelta int64) error {
+	var used, allocated int64
+	if err := tx.QueryRowContext(ctx, `SELECT used,allocated_used FROM volumes WHERE id=?`, volume).Scan(&used, &allocated); err != nil {
+		return err
+	}
+	if logicalDelta > 0 && logicalDelta > math.MaxInt64-used || logicalDelta < 0 && -logicalDelta > used ||
+		allocationDelta > 0 && allocationDelta > math.MaxInt64-allocated || allocationDelta < 0 && -allocationDelta > allocated {
+		return syscall.EOVERFLOW
+	}
+	_, err := tx.ExecContext(ctx, `UPDATE volumes SET used=used+?,allocated_used=allocated_used+? WHERE id=?`, logicalDelta, allocationDelta, volume)
+	return err
 }
 
 func storedOptionalTime(value *time.Time) (any, any) {
@@ -483,7 +538,8 @@ func (s *Seeding) empty(ctx context.Context) error {
 			return fmt.Errorf("emptying the copy: %w", sqlerr.Failure(err))
 		}
 	}
-	return nil
+	_, err := s.tx.ExecContext(ctx, `UPDATE volumes SET used=0,allocated_used=0 WHERE id=?`, s.replica.store.volume)
+	return err
 }
 
 // Add records one page of the picture.

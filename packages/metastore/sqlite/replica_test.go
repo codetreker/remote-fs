@@ -333,7 +333,7 @@ func seedAdmissionReplica(t *testing.T, checkClose func(error)) *Replica {
 	defer seeding.Close()
 	rows := []metastore.Row{
 		{Node: replicaDirectory(10)},
-		{Parent: 10, Name: []byte("file"), Node: metastore.Node{ID: 11, Kind: storage.NodeRegular, Size: 7}},
+		{Parent: 10, Name: []byte("file"), Node: metastore.Node{ID: 11, Kind: storage.NodeRegular, Size: 7, AllocationSize: 4096, AllocationKnown: true}},
 	}
 	if err := seeding.Add(t.Context(), rows); err != nil {
 		t.Fatal(err)
@@ -583,7 +583,7 @@ func TestReplicaSeedingPublishesTreeAndPositionTogether(t *testing.T) {
 
 			switch outcome {
 			case "complete":
-				rows := []metastore.Row{{Parent: 20, Name: []byte("replacement"), Node: metastore.Node{ID: 21, Kind: storage.NodeRegular, Size: 19}}}
+				rows := []metastore.Row{{Parent: 20, Name: []byte("replacement"), Node: metastore.Node{ID: 21, Kind: storage.NodeRegular, Size: 19, AllocationSize: 4096, AllocationKnown: true}}}
 				if err := seeding.Add(t.Context(), rows); err != nil {
 					t.Fatal(err)
 				}
@@ -653,7 +653,7 @@ func TestReplicaReadBatchProgressesThroughApplyBacklog(t *testing.T) {
 	}
 	const writers = 8
 	written := make(chan error, writers)
-	node := metastore.Node{ID: 11, Kind: storage.NodeRegular, Size: 19}
+	node := metastore.Node{ID: 11, Kind: storage.NodeRegular, Size: 19, AllocationSize: 4096, AllocationKnown: true}
 	for range writers {
 		waiting := observeReplicaWait(t.Context())
 		go func() {
@@ -1007,7 +1007,7 @@ func TestReplicaWriterProgressUnderContinuousListings(t *testing.T) {
 func TestReplicaAppliesEveryChangeWithoutLosingIdentityOrRollback(t *testing.T) {
 	r := seededAdmissionReplica(t)
 	ctx := t.Context()
-	node := metastore.Node{ID: 12, Kind: storage.NodeRegular, Size: 3, AccessTime: time.Unix(100, 0), ModTime: time.Unix(200, 0)}
+	node := metastore.Node{ID: 12, Kind: storage.NodeRegular, Size: 3, AllocationSize: 4096, AllocationKnown: true, AccessTime: time.Unix(100, 0), ModTime: time.Unix(200, 0)}
 	apply := func(change metastore.Change) {
 		t.Helper()
 		changed, err := r.Apply(ctx, change)

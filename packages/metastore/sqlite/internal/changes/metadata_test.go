@@ -38,7 +38,7 @@ func metadataValues() map[string]any {
 	return map[string]any{
 		"position": int64(7), "previous_position": int64(6), "volume": int64(1), "kind": KindCreated,
 		"parent": int64(1), "name": []byte("file"), "from_parent": nil, "from_name": nil,
-		"node": int64(2), "node_kind": int64(storage.NodeRegular), "size": int64(4),
+		"node": int64(2), "node_kind": int64(storage.NodeRegular), "size": int64(4), "allocation_size": int64(4096),
 		"atime_sec": int64(-100), "atime_nsec": int64(123), "mtime_sec": int64(100), "mtime_nsec": int64(456),
 		"content": "body", "recorded_sec": int64(200), "recorded_nsec": int64(0),
 		"birth_sec": nil, "birth_nsec": nil, "change_sec": nil, "change_nsec": nil,
@@ -49,7 +49,7 @@ func metadataValues() map[string]any {
 }
 
 func metadataQuery(db *sql.DB, values map[string]any) *sql.Row {
-	columns := []string{"position", "previous_position", "volume", "kind", "parent", "name", "from_parent", "from_name", "node", "node_kind", "size", "atime_sec", "atime_nsec", "mtime_sec", "mtime_nsec", "content", "recorded_sec", "recorded_nsec", "birth_sec", "birth_nsec", "change_sec", "change_nsec", "metadata", "link_target", "directory_revision"}
+	columns := []string{"position", "previous_position", "volume", "kind", "parent", "name", "from_parent", "from_name", "node", "node_kind", "size", "allocation_size", "atime_sec", "atime_nsec", "mtime_sec", "mtime_nsec", "content", "recorded_sec", "recorded_nsec", "birth_sec", "birth_nsec", "change_sec", "change_nsec", "metadata", "link_target", "directory_revision"}
 	var aliases []string
 	var args []any
 	for _, column := range columns {
@@ -77,7 +77,7 @@ func TestMetadataDecoderPreservesScalarsAndDefersPayloads(t *testing.T) {
 		want.Name = []byte{}
 		lengths := metastore.ChangePayloadLengths{Name: 4, Content: 4, Metadata: 6}
 		if kind == metastore.Removed {
-			for _, column := range []string{"node", "node_kind", "size", "atime_sec", "atime_nsec", "mtime_sec", "mtime_nsec", "content", "birth_sec", "birth_nsec", "change_sec", "change_nsec", "metadata", "link_target", "directory_revision"} {
+			for _, column := range []string{"node", "node_kind", "size", "allocation_size", "atime_sec", "atime_nsec", "mtime_sec", "mtime_nsec", "content", "birth_sec", "birth_nsec", "change_sec", "change_nsec", "metadata", "link_target", "directory_revision"} {
 				values[column] = nil
 			}
 			lengths.Content = 0
@@ -106,6 +106,7 @@ func TestMetadataDecoderPreservesScalarsAndDefersPayloads(t *testing.T) {
 	values["name"] = nil
 	values["node_kind"] = int64(storage.NodeDirectory)
 	values["size"] = int64(0)
+	values["allocation_size"] = int64(0)
 	values["content"] = nil
 	values["directory_revision"] = []byte{0, 0, 0, 0, 0, 0, 0, 1}
 	got, _, _, err := scanChangeMetadata(metadataQuery(db, values), 1)
@@ -120,7 +121,7 @@ func TestMetadataDecoderRejectsStorageClassesAndInconsistentFields(t *testing.T)
 		t.Fatal(err)
 	}
 	defer db.Close()
-	for _, column := range []string{"position", "previous_position", "volume", "kind", "parent", "from_parent", "node", "node_kind", "size", "atime_sec", "atime_nsec", "mtime_sec", "mtime_nsec", "recorded_sec", "recorded_nsec"} {
+	for _, column := range []string{"position", "previous_position", "volume", "kind", "parent", "from_parent", "node", "node_kind", "size", "allocation_size", "atime_sec", "atime_nsec", "mtime_sec", "mtime_nsec", "recorded_sec", "recorded_nsec"} {
 		t.Run(column+" as text", func(t *testing.T) {
 			values := metadataValues()
 			values[column] = "bad"
@@ -149,6 +150,10 @@ func TestMetadataDecoderRejectsStorageClassesAndInconsistentFields(t *testing.T)
 		{"empty content", map[string]any{"content": ""}},
 		{"zero node", map[string]any{"node": int64(0)}},
 		{"negative size", map[string]any{"size": int64(-1)}},
+		{"negative allocation", map[string]any{"allocation_size": int64(-4096)}},
+		{"unaligned allocation", map[string]any{"allocation_size": int64(4)}},
+		{"allocation disagrees with size", map[string]any{"allocation_size": int64(8192)}},
+		{"missing allocation", map[string]any{"allocation_size": nil}},
 		{"zero node kind", map[string]any{"node_kind": int64(0)}},
 		{"unsupported node kind", map[string]any{"node_kind": int64(4)}},
 		{"directory bytes", map[string]any{"node_kind": int64(storage.NodeDirectory)}},
@@ -159,7 +164,7 @@ func TestMetadataDecoderRejectsStorageClassesAndInconsistentFields(t *testing.T)
 		{"missing created name", map[string]any{"name": nil}},
 		{"modified unnamed nonroot", map[string]any{"kind": KindModified, "name": nil}},
 		{"invalid rename source", map[string]any{"kind": KindRenamed, "from_parent": int64(0), "from_name": []byte("old")}},
-		{"removed carries content", map[string]any{"kind": KindRemoved, "node": nil, "node_kind": nil, "size": nil, "atime_sec": nil, "atime_nsec": nil, "mtime_sec": nil, "mtime_nsec": nil, "birth_sec": nil, "birth_nsec": nil, "change_sec": nil, "change_nsec": nil}},
+		{"removed carries content", map[string]any{"kind": KindRemoved, "node": nil, "node_kind": nil, "size": nil, "allocation_size": nil, "atime_sec": nil, "atime_nsec": nil, "mtime_sec": nil, "mtime_nsec": nil, "birth_sec": nil, "birth_nsec": nil, "change_sec": nil, "change_nsec": nil}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			values := metadataValues()

@@ -88,6 +88,14 @@ type fileSession struct {
 var _ storage.FileStorage = (*Storage)(nil)
 var _ storage.FileSession = (*fileSession)(nil)
 
+func (s *fileSession) CheckAllocationReporting() error {
+	reporter, ok := s.storage.meta.(storage.AllocationReporting)
+	if !ok {
+		return syscall.EOPNOTSUPP
+	}
+	return reporter.CheckAllocationReporting()
+}
+
 func (s *Storage) CheckFileStorage() error {
 	native, ok := s.meta.(fileAuthority)
 	if !ok {

@@ -20,6 +20,10 @@ func checkFileCapability(supported bool) error {
 func (s *remoteFileSession) CheckAtomicFileOpen() error {
 	return checkFileCapability(s.capabilities.AtomicOpen)
 }
+
+func (s *remoteFileSession) CheckAllocationReporting() error {
+	return checkFileCapability(s.capabilities.Allocation)
+}
 func (s *remoteFileSession) CheckNamespaceAccess() error {
 	return checkFileCapability(s.capabilities.Namespace)
 }

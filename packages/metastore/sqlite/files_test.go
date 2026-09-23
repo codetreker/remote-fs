@@ -18,7 +18,7 @@ import (
 func openPublicationFile(t *testing.T) (*LockingStore, metastore.File) {
 	t.Helper()
 	config := lockingTestConfig(t)
-	config.Allowance = 100
+	config.Allowance = 8192
 	s, err := OpenLocking(t.Context(), config)
 	if err != nil {
 		t.Fatal(err)

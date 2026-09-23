@@ -107,7 +107,8 @@ type checkOnlySession struct{ storage.FileSession }
 
 func (checkOnlySession) CheckMetadataAccess() error { return nil }
 
-func (s advertisedSession) CheckMetadataAccess() error { return s.err }
+func (s advertisedSession) CheckMetadataAccess() error      { return s.err }
+func (s advertisedSession) CheckAllocationReporting() error { return s.err }
 func (advertisedSession) SetMetadata(context.Context, uint64, string, []byte, []byte) (storage.OpaquePayload, error) {
 	panic("not called")
 }
@@ -147,7 +148,7 @@ func (advertisedFile) SetMetadata(context.Context, string, []byte, []byte) (stor
 
 func TestCapabilityEnvelopeAdvertisesOnlyImplementedFacets(t *testing.T) {
 	session, err := sessionCapabilitiesOf(advertisedSession{})
-	if err != nil || !session.Metadata || !session.Owners || !session.Ranges {
+	if err != nil || !session.Metadata || !session.Owners || !session.Ranges || !session.Allocation {
 		t.Fatalf("session capabilities = %#v, %v", session, err)
 	}
 	file, err := referenceCapabilitiesOf(advertisedFile{})
@@ -164,7 +165,7 @@ func TestCapabilityEnvelopeAdvertisesOnlyImplementedFacets(t *testing.T) {
 		}
 	}
 	unsupported, err := sessionCapabilitiesOf(advertisedSession{err: syscall.EOPNOTSUPP})
-	if err != nil || unsupported.Metadata || unsupported.Owners || unsupported.Ranges {
+	if err != nil || unsupported.Metadata || unsupported.Owners || unsupported.Ranges || unsupported.Allocation {
 		t.Fatalf("unsupported capabilities = %#v, %v", unsupported, err)
 	}
 	if _, err := sessionCapabilitiesOf(advertisedSession{err: syscall.EIO}); !errors.Is(err, syscall.EIO) {
@@ -173,6 +174,31 @@ func TestCapabilityEnvelopeAdvertisesOnlyImplementedFacets(t *testing.T) {
 	checkOnly, err := sessionCapabilitiesOf(checkOnlySession{})
 	if err != nil || checkOnly.Metadata {
 		t.Fatalf("incomplete metadata interface was advertised: %#v, %v", checkOnly, err)
+	}
+}
+
+func TestAllocationCapabilityRequiresKnownResults(t *testing.T) {
+	if err := (&remoteFileSession{capabilities: fileCapabilities{Allocation: true}}).CheckAllocationReporting(); err != nil {
+		t.Fatal(err)
+	}
+	if err := (&remoteFileSession{}).CheckAllocationReporting(); !errors.Is(err, syscall.EOPNOTSUPP) {
+		t.Fatalf("missing allocation capability: %v", err)
+	}
+	known := AttrOf(storage.Attr{ID: 1, Kind: storage.NodeRegular, Size: 1, AllocationSize: 4096, AllocationKnown: true})
+	if err := checkReportedAllocation(fileResponse{Attr: known}); err != nil {
+		t.Fatalf("known result: %v", err)
+	}
+	unknown := *known
+	unknown.AllocationKnown = false
+	unknown.AllocationSize = 0
+	for _, result := range []fileResponse{
+		{Attr: &unknown},
+		{State: &referenceState{Attr: &unknown}},
+		{Directory: &observedDirectory{Entries: []observedEntry{{Attr: &unknown}}}},
+	} {
+		if err := checkReportedAllocation(result); err == nil {
+			t.Fatalf("advertised allocation accepted unknown result: %+v", result)
+		}
 	}
 }
 
@@ -821,6 +847,24 @@ func TestPendingActionReconciliationKeepsFrozenIntentAndScope(t *testing.T) {
 	response, matched, err = session.reconcilePending(t.Context(), incoming, expectedScope, true)
 	if err != nil || !matched || response.Metadata == nil || string(response.Metadata.Data) != "original" || calls.Load() != 1 {
 		t.Fatalf("matching reconciliation result=%+v matched=%v calls=%d error=%v", response, matched, calls.Load(), err)
+	}
+}
+
+func TestPendingAllocationResultHonorsAdvertisedCapability(t *testing.T) {
+	request := fileRequest{Op: storage.OpFileStatNode, Node: 7}
+	unknown := AttrOf(storage.Attr{ID: 7, Kind: storage.NodeRegular, Size: 1})
+	session := &remoteFileSession{capabilities: fileCapabilities{Allocation: true}, pending: map[string]pendingFileAction{
+		"action": {request: request, response: &fileResponse{Attr: unknown}},
+	}}
+	response, matched, err := session.takePendingResult(request, locking.MutationScope{}, false)
+	if !matched || response.Attr == nil || !errors.Is(err, syscall.EIO) {
+		t.Fatalf("unknown recovered allocation = %+v, matched=%v, err=%v", response, matched, err)
+	}
+	known := AttrOf(storage.Attr{ID: 7, Kind: storage.NodeRegular, Size: 1, AllocationSize: 4096, AllocationKnown: true})
+	session.pending["action"] = pendingFileAction{request: request, response: &fileResponse{Attr: known}}
+	response, matched, err = session.takePendingResult(request, locking.MutationScope{}, false)
+	if !matched || err != nil || response.Attr == nil || !response.Attr.AllocationKnown {
+		t.Fatalf("known recovered allocation = %+v, matched=%v, err=%v", response, matched, err)
 	}
 }
 

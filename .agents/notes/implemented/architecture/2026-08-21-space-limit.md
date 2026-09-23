@@ -2,7 +2,7 @@
 
 Status: implemented
 
-本决定取代[第一个可用版本的范围](../process/2026-08-19-mvp-scope.md)里「`statfs` 一律答 `ENOSYS`」那一条，那份 note 的其余部分不受影响；它也部分改写了 [volume 进入契约](../../proposed/architecture/2026-08-19-volume-in-the-contract.md)对配额归属的划法，见「配额的取值仍然不归本系统」。[移除宿主目录后端](../simplification/2026-09-08-remove-the-host-directory-backend.md)保留通用 `limited` package；随附二进制的两种存储形态由 SQLite 维护逻辑账本。[活文件句柄](2026-09-08-live-file-handles.md)将同步修改与脱离目录后的保留字节纳入同一计费边界。[原生发布计费](../bug-fix/2026-09-07-keep-quota-accounting-stable-across-directory-renames.md)部分替代通用路径采样的选择，保留本决定的空间报告、额度与重数规则。
+本决定取代[第一个可用版本的范围](../process/2026-08-19-mvp-scope.md)里「`statfs` 一律答 `ENOSYS`」那一条，那份 note 的其余部分不受影响；它也部分改写了 [volume 进入契约](../../proposed/architecture/2026-08-19-volume-in-the-contract.md)对配额归属的划法，见「配额的取值仍然不归本系统」。[移除宿主目录后端](../simplification/2026-09-08-remove-the-host-directory-backend.md)保留通用 `limited` package；随附二进制的两种存储形态由 SQLite 维护逻辑账本。[虚拟分配账](2026-09-23-virtual-allocation-ledger.md)把内置 volume 的额度计量明确为 4096 字节 cluster，精确 payload 用量仍单独保存。[活文件句柄](2026-09-08-live-file-handles.md)将同步修改与脱离目录后的保留字节纳入同一计费边界。[原生发布计费](../bug-fix/2026-09-07-keep-quota-accounting-stable-across-directory-renames.md)部分替代通用路径采样的选择，保留本决定的空间报告、额度与重数规则。
 
 ## 问题
 
@@ -63,7 +63,7 @@ FUSE 的 `write(2)` 与 `ftruncate(2)` 分别通过绑定同一对象的 `File.W
 
 ### statfs 的算术
 
-挂载点按 4096 字节一块报出容量。volume 按字节计量，块只是报出去时的计价单位，4096 是拿来跟它比较的那些文件系统用的数。
+挂载点按 4096 字节一块报出容量。通用 `limited` 按精确 payload 字节计量；内置 volume 按[虚拟分配账](2026-09-23-virtual-allocation-ledger.md)的 4096 字节 cluster 收费，两者都把容量以字节数交给挂载点换算。
 
 | 内核要的 | 从哪来 |
 |---|---|

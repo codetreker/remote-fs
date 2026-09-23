@@ -33,6 +33,11 @@ func reapDetachedFiles(ctx context.Context, tx *sql.Tx) error {
 		WHERE volumes.id = retained.volume`); err != nil {
 		return err
 	}
+	if _, err := tx.ExecContext(ctx, `UPDATE volumes SET allocated_used = allocated_used - retained.size
+		FROM (SELECT volume, sum(allocation_size) AS size FROM nodes WHERE detached = 1 GROUP BY volume) retained
+		WHERE volumes.id = retained.volume`); err != nil {
+		return err
+	}
 	_, err := tx.ExecContext(ctx, `DELETE FROM nodes WHERE detached = 1`)
 	return err
 }

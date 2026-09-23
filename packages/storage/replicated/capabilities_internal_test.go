@@ -17,6 +17,26 @@ type rangeSessionStub struct {
 	attempt  storage.RangeAttempt
 }
 
+type allocationSessionStub struct {
+	httprest.FileSessionWithBarrier
+	err error
+}
+
+func (s allocationSessionStub) CheckAllocationReporting() error { return s.err }
+
+func TestAllocationReportingFollowsRemoteSession(t *testing.T) {
+	if err := (&fileSession{remote: &rangeSessionStub{}}).CheckAllocationReporting(); !errors.Is(err, syscall.EOPNOTSUPP) {
+		t.Fatalf("missing remote allocation capability = %v", err)
+	}
+	cause := errors.New("authority cannot report allocation")
+	if err := (&fileSession{remote: allocationSessionStub{err: cause}}).CheckAllocationReporting(); !errors.Is(err, cause) {
+		t.Fatalf("remote allocation failure = %v", err)
+	}
+	if err := (&fileSession{remote: allocationSessionStub{}}).CheckAllocationReporting(); err != nil {
+		t.Fatalf("remote allocation capability = %v", err)
+	}
+}
+
 func (s *rangeSessionStub) CheckUseOwners() error { return s.checkErr }
 func (s *rangeSessionStub) NewUseOwner(context.Context, uint64, storage.UseScope, storage.OwnerOptions) (storage.UseOwner, error) {
 	return 7, s.failure

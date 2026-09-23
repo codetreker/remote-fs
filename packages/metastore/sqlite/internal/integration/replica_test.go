@@ -4,8 +4,12 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"maps"
+	"math"
+	"os"
 	"path"
+	"path/filepath"
 	"syscall"
 	"testing"
 	"time"
@@ -40,6 +44,75 @@ func copyOf(t *testing.T) *sqlite.Replica {
 	}
 	t.Cleanup(func() { replica.Close() })
 	return replica
+}
+
+func TestHistoricalReplicaKeepsUnknownLargeAllocation(t *testing.T) {
+	databasePath := writeHistoricalLeaseDatabase(t, false)
+	for version, name := range []string{
+		"lease_recovery", "retained_files", "neutral_metadata", "durable_identity",
+		"directory_revisions", "delete_intent_owners",
+	} {
+		migration, err := os.ReadFile(filepath.Join("..", "schema", "migrations", fmt.Sprintf("%04d_%s.sql", version+4, name)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		damageDatabase(t, databasePath, string(migration))
+		damageDatabase(t, databasePath, `UPDATE schema_version SET version = ?`, version+4)
+	}
+	db := raw(t, databasePath)
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	for _, statement := range []struct {
+		query string
+		args  []any
+	}{
+		{`UPDATE volumes SET name = 'replica', used = ? WHERE id = 1`, []any{int64(math.MaxInt64 - 8190)}},
+		{`UPDATE nodes SET size = ? WHERE id = 2`, []any{int64(math.MaxInt64 - 8192)}},
+		{`UPDATE nodes SET content = NULL WHERE content IS NOT NULL`, nil},
+		{`DELETE FROM objects`, nil},
+		{`DELETE FROM changes`, nil},
+		{`UPDATE logs SET committed_position = 0, trimmed_through = 0`, nil},
+		{`INSERT INTO nodes (volume, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec, content)
+		  VALUES (1, 1, 0, 0, 0, 0, NULL), (1, 1, 0, 0, 0, 0, NULL)`, nil},
+		{`INSERT INTO entries (volume, parent, name, node)
+		  SELECT 1, 1, CAST('small-a' AS BLOB), max(id)-1 FROM nodes`, nil},
+		{`INSERT INTO entries (volume, parent, name, node)
+		  SELECT 1, 1, CAST('small-b' AS BLOB), max(id) FROM nodes`, nil},
+		{`UPDATE database_state SET node_high_water = (SELECT max(id) FROM nodes)`, nil},
+	} {
+		if _, err := tx.Exec(statement.query, statement.args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	copy, err := sqlite.OpenReplica(t.Context(), databasePath)
+	if err != nil {
+		t.Fatalf("migrating a replica with unrepresentable local allocation: %v", err)
+	}
+	t.Cleanup(func() { copy.Close() })
+	for _, test := range []struct {
+		name string
+		size int64
+	}{
+		{"alpha.txt", math.MaxInt64 - 8192},
+		{"small-a", 1},
+		{"small-b", 1},
+	} {
+		node, err := copy.Stat(t.Context(), test.name)
+		if err != nil || node.Size != test.size || node.AllocationKnown {
+			t.Fatalf("migrated replica node %q = %+v, %v; want size %d with unknown allocation", test.name, node, err, test.size)
+		}
+	}
+	assertHistoricalLeaseSchemaVersion(t, databasePath, 10)
 }
 
 // fill puts one picture of the source into the copy, in pages, the way the transport delivers

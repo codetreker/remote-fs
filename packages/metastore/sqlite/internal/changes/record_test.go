@@ -74,7 +74,7 @@ func execLogSQL(t *testing.T, tx *sql.Tx, query string, args ...any) {
 func fileChange(kind metastore.ChangeKind) metastore.Change {
 	change := metastore.Change{Kind: kind, Parent: 1, Name: []byte("file")}
 	if kind != metastore.Removed {
-		change.Node = &metastore.Node{ID: 2, Kind: storage.NodeRegular, Size: 4, Content: "body",
+		change.Node = &metastore.Node{ID: 2, Kind: storage.NodeRegular, Size: 4, AllocationSize: 4096, AllocationKnown: true, Content: "body",
 			AccessTime: time.Unix(-100, 123).UTC(), ModTime: time.Unix(100, 456).UTC()}
 	}
 	if kind == metastore.Renamed {

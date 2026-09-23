@@ -31,7 +31,6 @@ import (
 	"github.com/codetreker/remote-fs/packages/fuse/posix"
 	"github.com/codetreker/remote-fs/packages/locking"
 	"github.com/codetreker/remote-fs/packages/storage"
-	"github.com/codetreker/remote-fs/packages/storage/limited"
 	"github.com/codetreker/remote-fs/packages/storage/lockcontract/memoryfixture"
 )
 
@@ -3183,7 +3182,7 @@ func TestASpaceThatCannotBeTrueIsRefused(t *testing.T) {
 //
 // The write call must report refusal before returning any successful byte count.
 func TestAWriteWithNoRoomForItIsRefusedAtTheWrite(t *testing.T) {
-	const room = 10
+	const room = 4096
 	mountWithRoom := func(t *testing.T, held int) (string, storage.Storage) {
 		t.Helper()
 		const allowance = 1 << 20
@@ -3235,7 +3234,7 @@ func TestAWriteWithNoRoomForItIsRefusedAtTheWrite(t *testing.T) {
 		}
 	})
 
-	// Only the added bytes consume the remaining allowance.
+	// Crossing the file's allocation boundary consumes one remaining block.
 	t.Run("appending to a file the volume already holds", func(t *testing.T) {
 		const held = 1 << 16
 		mountpoint, backing := mountWithRoom(t, held)
@@ -3258,30 +3257,21 @@ func TestAWriteWithNoRoomForItIsRefusedAtTheWrite(t *testing.T) {
 	})
 }
 
-// mountLimited mounts a volume held in backing under an allowance of that many bytes.
-// The allowance is enforced by the storage rather than described by a fixture, because the
-// cases below turn on one operation reaching the volume by two routes and having to be
-// answered the same way on both.
-func mountLimited(t *testing.T, backing storage.Storage, allowance int64) string {
-	t.Helper()
-	held, err := limited.New(t.Context(), backing, allowance)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return mountStorage(t, held, fuse.Options{Logger: testLogger(t)})
-}
-
 // A truncation that would carry the volume past its allowance is refused at the call
-// that asked for it, and is refused there whether or not the caller holds the file open.
+// that asked for it, whether or not the caller holds the file open.
 //
 // Both descriptor and path truncation publish through retained objects and settle
 // native quota before returning to the syscall that requested the change.
 func TestATruncationWithNoRoomForItIsRefusedAtTheTruncation(t *testing.T) {
 	const allowance = 64 << 10
+	newMount := func(t *testing.T) (storage.FileStorage, string) {
+		t.Helper()
+		_, backing := memoryfixture.New(t, "truncate-quota", allowance, locking.DefaultOptions())
+		return backing, mountStorage(t, backing, fuse.Options{Logger: testLogger(t)})
+	}
 
 	t.Run("growing through an open descriptor", func(t *testing.T) {
-		backing := fuseVolume(t)
-		mountpoint := mountLimited(t, backing, allowance)
+		backing, mountpoint := newMount(t)
 
 		f, err := os.Create(filepath.Join(mountpoint, "f"))
 		if err != nil {
@@ -3308,8 +3298,7 @@ func TestATruncationWithNoRoomForItIsRefusedAtTheTruncation(t *testing.T) {
 	})
 
 	t.Run("growing with no descriptor", func(t *testing.T) {
-		backing := fuseVolume(t)
-		mountpoint := mountLimited(t, backing, allowance)
+		backing, mountpoint := newMount(t)
 		path := filepath.Join(mountpoint, "f")
 		if err := os.WriteFile(path, nil, 0o644); err != nil {
 			t.Fatal(err)
@@ -3329,17 +3318,14 @@ func TestATruncationWithNoRoomForItIsRefusedAtTheTruncation(t *testing.T) {
 		}
 	})
 
-	// A volume past its allowance has to have a way back under it, and shortening a file
-	// is that way. There is no room left at all here, and the truncation is carried out
-	// regardless, because what it needs is the room its growth asks for and it grows by
-	// nothing.
-	t.Run("shrinking from over the allowance", func(t *testing.T) {
-		const stands = allowance + (16 << 10)
-		backing := fuseVolume(t)
+	// Shortening a file remains possible when the volume has no available space.
+	t.Run("shrinking with no room left", func(t *testing.T) {
+		const stands = allowance
+		_, backing := memoryfixture.New(t, "truncate-quota-full", allowance, locking.DefaultOptions())
 		if err := backing.Write(t.Context(), "f", pattern(stands)); err != nil {
 			t.Fatal(err)
 		}
-		mountpoint := mountLimited(t, backing, allowance)
+		mountpoint := mountStorage(t, backing, fuse.Options{Logger: testLogger(t)})
 
 		var described unix.Statfs_t
 		if err := unix.Statfs(mountpoint, &described); err != nil || described.Bavail != 0 {
@@ -3353,7 +3339,7 @@ func TestATruncationWithNoRoomForItIsRefusedAtTheTruncation(t *testing.T) {
 		}
 		defer f.Close()
 		if err := f.Truncate(1024); err != nil {
-			t.Fatalf("ftruncate to 1024 bytes of a file of %d returned %v, with the volume over its allowance of %d",
+			t.Fatalf("ftruncate to 1024 bytes of a file of %d returned %v, with the volume at its allowance of %d",
 				stands, err, allowance)
 		}
 		if err := f.Close(); err != nil {
@@ -3426,18 +3412,20 @@ type capableTestSession struct {
 	storage.RangeControl
 	storage.NodeReferences
 	storage.FileActions
+	storage.AllocationReporting
 }
 
 func testSessionCapabilities(session storage.FileSession) capableTestSession {
 	return capableTestSession{
-		FileSession:      session,
-		NamespaceAccess:  session.(storage.NamespaceAccess),
-		DirectoryReader:  session.(storage.DirectoryReader),
-		AtomicFileOpener: session.(storage.AtomicFileOpener),
-		MetadataAccess:   session.(storage.MetadataAccess),
-		UseOwners:        session.(storage.UseOwners),
-		RangeControl:     session.(storage.RangeControl),
-		NodeReferences:   session.(storage.NodeReferences),
-		FileActions:      session.(storage.FileActions),
+		FileSession:         session,
+		NamespaceAccess:     session.(storage.NamespaceAccess),
+		DirectoryReader:     session.(storage.DirectoryReader),
+		AtomicFileOpener:    session.(storage.AtomicFileOpener),
+		MetadataAccess:      session.(storage.MetadataAccess),
+		UseOwners:           session.(storage.UseOwners),
+		RangeControl:        session.(storage.RangeControl),
+		NodeReferences:      session.(storage.NodeReferences),
+		FileActions:         session.(storage.FileActions),
+		AllocationReporting: session.(storage.AllocationReporting),
 	}
 }

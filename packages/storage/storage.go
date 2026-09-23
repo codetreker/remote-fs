@@ -159,10 +159,29 @@ type ListResult struct {
 	maxBytes       int64
 	usedBytes      int64
 	entryBytes     func(index int, nameBytes, metadataBytes int64, attr Attr) (int64, error)
+	projectAttrs   []func(Attr) Attr
 	entries        []Entry
 	pending        int
 	prefixReserved bool
 	failure        error
+}
+
+// ProjectAttrs adds a scalar attribute projection before any entry is reserved.
+// Nested wrappers register from outermost to innermost; projections run in the
+// reverse order so the caller's charge and retained entry see the final value.
+// Metadata is supplied separately by Commit and cannot be changed here.
+func (r *ListResult) ProjectAttrs(project func(Attr) Attr) error {
+	if r == nil {
+		return fmt.Errorf("nil listing cannot project attributes: %w", syscall.EINVAL)
+	}
+	if r.failure != nil {
+		return r.failure
+	}
+	if project == nil || r.pending != 0 || len(r.entries) != 0 {
+		return r.fail(fmt.Errorf("listing attribute projections must precede entries and be non-nil: %w", syscall.EINVAL))
+	}
+	r.projectAttrs = append(r.projectAttrs, project)
+	return nil
 }
 
 // NewListResult constructs an empty bounded listing. Every bound and charge must be
@@ -218,6 +237,14 @@ func (r *ListResult) Reserve(nameBytes, metadataBytes int64, attr Attr) (*ListRe
 	}
 	if metadataBytes < 6 || metadataBytes > MaxMetadataBytes {
 		return nil, r.fail(syscall.EIO)
+	}
+	attr.AccessTime = attr.AccessTime.UTC()
+	attr.ModTime = attr.ModTime.UTC()
+	for i := len(r.projectAttrs) - 1; i >= 0; i-- {
+		attr = r.projectAttrs[i](attr)
+		if attr.Metadata != nil {
+			return nil, r.fail(fmt.Errorf("listing attribute projection cannot supply metadata: %w", syscall.EINVAL))
+		}
 	}
 	attr.AccessTime = attr.AccessTime.UTC()
 	attr.ModTime = attr.ModTime.UTC()
@@ -407,6 +434,12 @@ type Attr struct {
 	// holds. It is unspecified for a directory.
 	Size int64
 
+	// AllocationSize is the storage-authoritative allocation charged to this node.
+	// AllocationKnown distinguishes a measured zero from an implementation that
+	// cannot report allocation. Callers requiring allocation must reject unknown facts.
+	AllocationSize  int64
+	AllocationKnown bool
+
 	// AccessTime is when the contents were last read.
 	AccessTime time.Time
 
@@ -416,6 +449,14 @@ type Attr struct {
 
 // IsDir reports whether the node is a directory.
 func (a Attr) IsDir() bool { return a.Kind == NodeDirectory }
+
+// CheckAllocation rejects contradictory or negative allocation facts.
+func (a Attr) CheckAllocation() error {
+	if a.AllocationSize < 0 || (!a.AllocationKnown && a.AllocationSize != 0) {
+		return fmt.Errorf("invalid node allocation fact: %w", syscall.EIO)
+	}
+	return nil
+}
 
 // AttrChange names caller-settable attributes of a node. ChangeTime is excluded:
 // the authority advances it when a successful operation changes node state.

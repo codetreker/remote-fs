@@ -194,7 +194,7 @@ func TestCheckpointRejectsMalformedWireBarriers(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			client := checkpointClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if r.Method != http.MethodGet || r.URL.RequestURI() != "/v4/checkpoint" {
+				if r.Method != http.MethodGet || r.URL.RequestURI() != "/v5/checkpoint" {
 					t.Errorf("checkpoint request = %s %s", r.Method, r.URL.RequestURI())
 				}
 				w.Header().Set(HeaderProtocol, Version)

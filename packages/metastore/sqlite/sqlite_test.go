@@ -785,14 +785,14 @@ func TestBoundOpenersPreserveIdentityAndEnforceConfiguredBacklog(t *testing.T) {
 			openBound := func(identity string) (*Store, error) {
 				switch api {
 				case "default":
-					return OpenBound(t.Context(), path, "workspace", identity, 100, DefaultWindow())
+					return OpenBound(t.Context(), path, "workspace", identity, 4096, DefaultWindow())
 				case "object limits":
-					return OpenBoundWithObjectLimits(t.Context(), path, "workspace", identity, 100, DefaultWindow(), ObjectLimits{MaxPendingObjects: 1, MaxPendingBytes: 8})
+					return OpenBoundWithObjectLimits(t.Context(), path, "workspace", identity, 4096, DefaultWindow(), ObjectLimits{MaxPendingObjects: 1, MaxPendingBytes: 8})
 				default:
 					options := DefaultOptions()
 					options.ObjectLimits = ObjectLimits{MaxPendingObjects: 1, MaxPendingBytes: 8}
 					options.MaxReaderConnections = 1
-					return OpenBoundWithOptions(t.Context(), path, "workspace", identity, 100, options)
+					return OpenBoundWithOptions(t.Context(), path, "workspace", identity, 4096, options)
 				}
 			}
 			if s, err := openBound(""); s != nil || !errors.Is(err, syscall.EINVAL) {
@@ -834,7 +834,7 @@ func TestBoundOpenersPreserveIdentityAndEnforceConfiguredBacklog(t *testing.T) {
 			if other, err := openBound("objects-two"); other != nil || !errors.Is(err, syscall.EINVAL) {
 				t.Fatalf("different backing store = %v, %v", other, err)
 			}
-			if other, err := Open(t.Context(), path, "workspace", 100, DefaultWindow()); other != nil || !errors.Is(err, syscall.EINVAL) {
+			if other, err := Open(t.Context(), path, "workspace", 4096, DefaultWindow()); other != nil || !errors.Is(err, syscall.EINVAL) {
 				t.Fatalf("unbound bypass = %v, %v", other, err)
 			}
 			s, err = openBound("objects-one")

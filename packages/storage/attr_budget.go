@@ -42,6 +42,25 @@ func WithBoundedAttrResult(ctx context.Context, limit int64, budget AttrResultBu
 	return context.WithValue(ctx, attrResultBudgetKey{}, attrResultBudgetValue{limit: limit, check: budget})
 }
 
+// WithAttrResultProjection changes the attributes seen by the caller's result
+// budget before a producer admits a mutation. The encoded byte ceiling stays
+// intact; wrappers use this when their returned attributes differ from the
+// native producer's attributes.
+func WithAttrResultProjection(ctx context.Context, project func(Attr) Attr) context.Context {
+	if project == nil {
+		panic("storage: nil attribute result projection")
+	}
+	value, _ := ctx.Value(attrResultBudgetKey{}).(attrResultBudgetValue)
+	if value.check == nil {
+		return ctx
+	}
+	prior := value.check
+	value.check = func(scalar Attr, metadataBytes int64) error {
+		return prior(project(scalar), metadataBytes)
+	}
+	return context.WithValue(ctx, attrResultBudgetKey{}, value)
+}
+
 // CheckAttrResultBudget runs before loading returned metadata and before any
 // mutation or retention that will return the proposed attributes. Without a
 // caller callback the native hard metadata bound still applies. Fixed instants
