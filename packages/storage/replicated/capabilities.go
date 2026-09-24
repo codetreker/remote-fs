@@ -80,9 +80,15 @@ func (s *fileSession) QueryFileAction(ctx context.Context, action storage.FileAc
 	})
 }
 
-func (s *fileSession) QueryDeleteIntent(ctx context.Context, intent storage.DeleteIntentID) (storage.DeleteIntentStatus, error) {
+func (s *fileSession) QueryDeleteIntent(ctx context.Context, owner storage.DeleteIntentOwner, intent storage.DeleteIntentID) (storage.DeleteIntentStatus, error) {
 	return sessionCapability(ctx, s, false, func(ctx context.Context, c storage.FileActions) (storage.DeleteIntentStatus, error) {
-		return c.QueryDeleteIntent(ctx, intent)
+		return c.QueryDeleteIntent(ctx, owner, intent)
+	})
+}
+
+func (s *fileSession) ListDeleteIntents(ctx context.Context, owner storage.DeleteIntentOwner, after storage.DeleteIntentCursor, limit int) (storage.DeleteIntentPage, error) {
+	return sessionCapability(ctx, s, false, func(ctx context.Context, c storage.FileActions) (storage.DeleteIntentPage, error) {
+		return c.ListDeleteIntents(ctx, owner, after, limit)
 	})
 }
 
@@ -119,22 +125,65 @@ func nilReference(reference any) bool {
 	}
 }
 
+func (s *fileSession) closeFailedOpenFile(ctx context.Context, native storage.File) (storage.ReferenceCloseResult, bool, error) {
+	if remote, ok := native.(httprest.FileWithBarrier); ok {
+		result, barrier, err := remote.CloseWithBarrier(ctx)
+		if !result.Released {
+			return result, false, errors.Join(err, result.Check(err))
+		}
+		settled, err := s.base.confirmReleasedClose(ctx, "close-failed-open-file", barrier, err)
+		return result, settled, err
+	}
+	result, err := native.CloseWithResult(ctx)
+	return result, result.Released, errors.Join(err, result.Check(err))
+}
+
+func (s *fileSession) closeFailedOpenReference(ctx context.Context, native storage.NodeReference) (storage.ReferenceCloseResult, bool, error) {
+	if remote, ok := native.(httprest.NodeReferenceWithBarrier); ok {
+		result, barrier, err := remote.CloseWithBarrier(ctx)
+		if !result.Released {
+			return result, false, errors.Join(err, result.Check(err))
+		}
+		settled, err := s.base.confirmReleasedClose(ctx, "close-failed-open-reference", barrier, err)
+		return result, settled, err
+	}
+	result, err := native.CloseWithResult(ctx)
+	return result, result.Released, errors.Join(err, result.Check(err))
+}
+
+func (s *fileSession) cleanupFailedOpenFile(native storage.File, failure error) (storage.File, error) {
+	cleanup, done := s.base.fileCleanupContext()
+	defer done()
+	result, settled, closeErr := s.closeFailedOpenFile(cleanup, native)
+	if settled {
+		return nil, errors.Join(failure, closeErr)
+	}
+	return newFailedOpenFile(failure, result, func(ctx context.Context) (storage.ReferenceCloseResult, bool, error) {
+		return s.closeFailedOpenFile(ctx, native)
+	}), errors.Join(failure, closeErr)
+}
+
+func (s *fileSession) cleanupFailedOpenReference(native storage.NodeReference, failure error) (storage.NodeReference, error) {
+	cleanup, done := s.base.fileCleanupContext()
+	defer done()
+	result, settled, closeErr := s.closeFailedOpenReference(cleanup, native)
+	if settled {
+		return nil, errors.Join(failure, closeErr)
+	}
+	return newFailedOpenReference(failure, result, func(ctx context.Context) (storage.ReferenceCloseResult, bool, error) {
+		return s.closeFailedOpenReference(ctx, native)
+	}), errors.Join(failure, closeErr)
+}
+
 func (s *fileSession) wrapOpenResult(result storage.OpenResult, err error) (storage.OpenResult, error) {
 	if nilReference(result.File) {
 		result.File = nil
 	}
 	if err != nil {
 		if result.File != nil {
-			cleanup, done := s.base.fileCleanupContext()
-			cleanupErr := result.File.Close(cleanup)
-			done()
-			if cleanupErr != nil {
-				if remote, ok := result.File.(httprest.FileWithBarrier); ok {
-					result.File = &retainedFile{session: s, remote: remote}
-				} else {
-					result.File = newFailedOpenFile(result.File, err)
-				}
-				return result, errors.Join(err, cleanupErr)
+			result.File, err = s.cleanupFailedOpenFile(result.File, err)
+			if result.File != nil {
+				return result, err
 			}
 		}
 		return storage.OpenResult{}, err
@@ -143,12 +192,9 @@ func (s *fileSession) wrapOpenResult(result storage.OpenResult, err error) (stor
 	if !ok {
 		failure := fmt.Errorf("atomic open returned no barrier-capable file: %w", syscall.EIO)
 		if result.File != nil {
-			cleanup, done := s.base.fileCleanupContext()
-			cleanupErr := result.File.Close(cleanup)
-			done()
-			if cleanupErr != nil {
-				result.File = newFailedOpenFile(result.File, failure)
-				return result, errors.Join(failure, cleanupErr)
+			result.File, failure = s.cleanupFailedOpenFile(result.File, failure)
+			if result.File != nil {
+				return result, failure
 			}
 		}
 		return storage.OpenResult{}, failure
@@ -243,16 +289,9 @@ func (s *fileSession) openReference(ctx context.Context, open func(context.Conte
 	}
 	if err != nil {
 		if result.Reference != nil {
-			cleanup, done := s.base.fileCleanupContext()
-			cleanupErr := result.Reference.Close(cleanup)
-			done()
-			if cleanupErr != nil {
-				if remote, ok := result.Reference.(httprest.NodeReferenceWithBarrier); ok {
-					result.Reference = &nodeReference{session: s, remote: remote}
-				} else {
-					result.Reference = newFailedOpenReference(result.Reference, err)
-				}
-				return result, errors.Join(err, cleanupErr)
+			result.Reference, err = s.cleanupFailedOpenReference(result.Reference, err)
+			if result.Reference != nil {
+				return result, err
 			}
 		}
 		return storage.NodeOpenResult{}, err
@@ -261,12 +300,9 @@ func (s *fileSession) openReference(ctx context.Context, open func(context.Conte
 	if !ok {
 		failure := fmt.Errorf("node open returned no barrier-capable reference: %w", syscall.EIO)
 		if result.Reference != nil {
-			cleanup, done := s.base.fileCleanupContext()
-			cleanupErr := result.Reference.Close(cleanup)
-			done()
-			if cleanupErr != nil {
-				result.Reference = newFailedOpenReference(result.Reference, failure)
-				return result, errors.Join(failure, cleanupErr)
+			result.Reference, failure = s.cleanupFailedOpenReference(result.Reference, failure)
+			if result.Reference != nil {
+				return result, failure
 			}
 		}
 		return storage.NodeOpenResult{}, failure

@@ -36,11 +36,11 @@ Status: implemented
 
 ### 删除义务具有独立持久身份
 
-`CloseIntent` 带 128-bit 随机、规范小写十六进制 `DeleteIntentID`。它在原子打开中接受并绑定原 NodeID、名字关联、条件与预授权固定效果；相同 ID 不能代表另一个 intent。引用关闭或退役时，authority 在释放 Use claim 和物理 pin 前持久触发或消费该义务。
+`CloseIntent` 带 128-bit 随机、规范小写十六进制 `DeleteIntentID`，当前还带调用方持久保存的 `DeleteIntentOwner`。它在原子打开中接受并绑定原 NodeID、名字关联、条件与预授权固定效果；相同 ID 不能代表另一个 intent。引用关闭或退役时，authority 在释放 Use claim 和物理 pin 前持久触发或消费该义务。owner、发现顺序及关闭释放事实由[可恢复的引用关闭与删除义务归属](2026-09-23-recoverable-close-ownership.md)接续。
 
 节点 pending 状态与每个 armed intent 分开保存。显式 `SetPendingUnlink` 原子核对节点、metadata、Use/share、种类与目录为空条件后推进 generation；`ClearPendingUnlink` 必须给出当前 generation，只清除节点当前 pending 状态，不删除其它引用尚未触发的义务。pending 节点拒绝冲突的新打开与名字修改。
 
-删除 intent 的持久状态区分 armed、pending、completed、明确未执行与 cleanup failed；失败状态保存封闭 errno 分类。`QueryDeleteIntent` 以 durable ID 查询，新的 FileSession 在 authority 重启后仍可取得原义务。终态记录继续占用有界历史，只有带独立 `FileActionID` 的 `AcknowledgeDeleteIntent` 可以幂等删除记录并释放容量；ACK 自己进入普通 action replay/query。成功 ACK 后 authority 不保留 tombstone，也不再承诺拒绝该 ID 的重用，后续查询返回 unknown；调用方必须永久不复用已经 ACK 的 DeleteIntentID。名字已与原对象分离或目录触发时非空会成为明确未执行，绝不删除后来占据同名位置的对象。可重试清理失败继续由 authority 持有。
+删除 intent 的持久状态区分 armed、pending、completed、明确未执行与 cleanup failed；失败状态保存封闭 errno 分类。`QueryDeleteIntent` 以 owner 和 durable ID 查询，新的 FileSession 在 authority 重启后仍可取得原义务；`ListDeleteIntents` 按 owner 和持久序号发现未知 ID。终态记录继续占用有界历史，只有带 owner 与独立 `FileActionID` 的 `AcknowledgeDeleteIntent` 可以幂等删除记录并释放容量；ACK 自己进入普通 action replay/query。成功 ACK 后 authority 不保留 tombstone，也不再承诺拒绝该 ID 的重用，后续查询返回 unknown；调用方必须永久不复用已经 ACK 的 DeleteIntentID。名字已与原对象分离或目录触发时非空会成为明确未执行，绝不删除后来占据同名位置的对象。可重试清理失败继续由 authority 持有。
 
 ### schema v7 与组合边界
 

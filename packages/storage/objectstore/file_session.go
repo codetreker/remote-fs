@@ -37,7 +37,7 @@ type rangeAuthority interface {
 type retainedReference interface {
 	retire() error
 	drainAndRelease() error
-	Close(context.Context) error
+	CloseWithResult(context.Context) (storage.ReferenceCloseResult, error)
 	retryClose(context.Context) (bool, error)
 }
 
@@ -82,6 +82,7 @@ type fileSession struct {
 	closeMu            sync.Mutex
 	closeDone          chan struct{}
 	closeErr           error
+	closeResult        storage.ReferenceCloseResult
 }
 
 var _ storage.FileStorage = (*Storage)(nil)
@@ -432,7 +433,7 @@ func (fs *fileSession) startClose() <-chan struct{} {
 	if fs.closeDone != nil {
 		select {
 		case <-fs.closeDone:
-			if fs.closeErr == nil {
+			if fs.closeResult.Released {
 				return fs.closeDone
 			}
 		default:
@@ -452,37 +453,46 @@ func (fs *fileSession) startClose() <-chan struct{} {
 
 func (fs *fileSession) finishClose() {
 	err := fs.locks.Retire(fs.cleanup)
-	if err == nil {
-		fs.mu.Lock()
-		files := make([]retainedReference, 0, len(fs.files))
-		for f := range fs.files {
-			files = append(files, f)
-		}
-		fs.mu.Unlock()
-		for _, f := range files {
-			err = errors.Join(err, f.Close(fs.cleanup))
-		}
+	released := err == nil
+	fs.mu.Lock()
+	files := make([]retainedReference, 0, len(fs.files))
+	for f := range fs.files {
+		files = append(files, f)
 	}
-	if err == nil {
+	fs.mu.Unlock()
+	for _, f := range files {
+		result, closeErr := f.CloseWithResult(fs.cleanup)
+		released = released && result.Released
+		err = errors.Join(err, closeErr)
+	}
+	if released {
 		fs.storage.fileMu.Lock()
 		delete(fs.storage.fileSessions, fs)
 		fs.storage.fileMu.Unlock()
 	}
+	result := storage.ReferenceCloseResult{Released: released}
+	err = errors.Join(err, result.Check(err))
 	fs.closeMu.Lock()
 	fs.closeErr = err
+	fs.closeResult = result
 	close(fs.closeDone)
 	fs.closeMu.Unlock()
 }
 
 func (fs *fileSession) Close(ctx context.Context) error {
+	_, err := fs.CloseWithResult(ctx)
+	return err
+}
+
+func (fs *fileSession) CloseWithResult(ctx context.Context) (storage.ReferenceCloseResult, error) {
 	done := fs.startClose()
 	select {
 	case <-done:
 		fs.closeMu.Lock()
 		defer fs.closeMu.Unlock()
-		return fs.closeErr
+		return fs.closeResult, fs.closeErr
 	case <-ctx.Done():
-		return ctx.Err()
+		return storage.ReferenceCloseResult{}, ctx.Err()
 	}
 }
 

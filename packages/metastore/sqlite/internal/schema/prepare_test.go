@@ -66,6 +66,50 @@ func testTransaction(t *testing.T, db *sql.DB) *sql.Tx {
 	return tx
 }
 
+func TestDeleteIntentOwnerMigrationPreservesKnownIDsAndCursorOrder(t *testing.T) {
+	db := testDatabase(t, firstDirectoryRevisionSchemaVersion)
+	execute(t, db, `INSERT INTO volumes(id,name,root,used) VALUES(1,'v',1,0)`)
+	execute(t, db, `INSERT INTO nodes(id,volume,kind,size,atime_sec,atime_nsec,mtime_sec,mtime_nsec,link_target)
+		VALUES(1,1,2,0,0,0,0,0,X'')`)
+	for _, id := range []string{"ffffffffffffffffffffffffffffffff", "00000000000000000000000000000000"} {
+		execute(t, db, `INSERT INTO delete_intents
+			(intent,volume,node,parent,name,reference,request_hash,if_empty,outcome,failure,updated_sec,updated_nsec)
+			VALUES(?,1,1,1,X'6e616d65',zeroblob(16),zeroblob(32),1,1,NULL,0,0)`, id)
+	}
+	tx := testTransaction(t, db)
+	if err := schema.Reach(t.Context(), tx); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := db.QueryContext(t.Context(), `SELECT intent,owner,sequence FROM delete_intents ORDER BY sequence`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	for index, want := range []string{"00000000000000000000000000000000", "ffffffffffffffffffffffffffffffff"} {
+		if !rows.Next() {
+			t.Fatalf("missing migrated intent %d", index)
+		}
+		var id, owner string
+		var sequence int64
+		if err := rows.Scan(&id, &owner, &sequence); err != nil {
+			t.Fatal(err)
+		}
+		if id != want || owner != want || sequence != int64(index+1) {
+			t.Fatalf("migrated row %d = %q %q %d", index, id, owner, sequence)
+		}
+	}
+	if rows.Next() || rows.Err() != nil {
+		t.Fatalf("unexpected migration rows: %v", rows.Err())
+	}
+	var highWater int64
+	if err := db.QueryRowContext(t.Context(), `SELECT delete_intent_high_water FROM volumes WHERE id=1`).Scan(&highWater); err != nil || highWater != 2 {
+		t.Fatalf("migrated high-water = %d, %v", highWater, err)
+	}
+}
+
 func execute(t *testing.T, db interface {
 	Exec(string, ...any) (sql.Result, error)
 }, query string, args ...any) {

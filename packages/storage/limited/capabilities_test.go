@@ -104,8 +104,11 @@ func (p *capabilityProbe) CheckFileActions() error { return p.checkErr }
 func (p *capabilityProbe) QueryFileAction(context.Context, storage.FileActionID) (storage.FileActionReceipt, error) {
 	return p.action, p.callErr
 }
-func (p *capabilityProbe) QueryDeleteIntent(context.Context, storage.DeleteIntentID) (storage.DeleteIntentStatus, error) {
+func (p *capabilityProbe) QueryDeleteIntent(context.Context, storage.DeleteIntentOwner, storage.DeleteIntentID) (storage.DeleteIntentStatus, error) {
 	return p.deleteStatus, p.callErr
+}
+func (p *capabilityProbe) ListDeleteIntents(context.Context, storage.DeleteIntentOwner, storage.DeleteIntentCursor, int) (storage.DeleteIntentPage, error) {
+	return storage.DeleteIntentPage{Intents: []storage.DeleteIntentStatus{p.deleteStatus}, Next: 1}, p.callErr
 }
 func (p *capabilityProbe) AcknowledgeDeleteIntent(context.Context, storage.AcknowledgeDeleteIntentCommand) error {
 	return p.callErr
@@ -173,6 +176,9 @@ func (p *referenceProbe) SetAttr(context.Context, storage.AttrChange) (storage.A
 	return p.state.Attr, p.callErr
 }
 func (p *referenceProbe) Close(context.Context) error { return p.callErr }
+func (p *referenceProbe) CloseWithResult(context.Context) (storage.ReferenceCloseResult, error) {
+	return storage.ReferenceCloseResult{Released: p.callErr == nil}, p.callErr
+}
 
 func (p *referenceProbe) CheckScopedReference() error { return p.checkErr }
 func (p *referenceProbe) Scope(context.Context) (storage.UseScope, error) {
@@ -382,10 +388,13 @@ func TestIdentityCapabilityWrappersPreservePartialResultsAndReferences(t *testin
 	if receipt, err := wrapper.QueryFileAction(t.Context(), action); !errors.Is(err, failure) || receipt.Action != action {
 		t.Fatalf("action receipt=%+v error=%v", receipt, err)
 	}
-	if status, err := wrapper.QueryDeleteIntent(t.Context(), intent); !errors.Is(err, failure) || status.ID != intent {
+	if status, err := wrapper.QueryDeleteIntent(t.Context(), "owner", intent); !errors.Is(err, failure) || status.ID != intent {
 		t.Fatalf("delete status=%+v error=%v", status, err)
 	}
-	if err := wrapper.AcknowledgeDeleteIntent(t.Context(), storage.AcknowledgeDeleteIntentCommand{Action: action, Intent: intent}); !errors.Is(err, failure) {
+	if page, err := wrapper.ListDeleteIntents(t.Context(), "owner", 0, 1); !errors.Is(err, failure) || len(page.Intents) != 1 || page.Intents[0].ID != intent {
+		t.Fatalf("delete intents=%+v error=%v", page, err)
+	}
+	if err := wrapper.AcknowledgeDeleteIntent(t.Context(), storage.AcknowledgeDeleteIntentCommand{Action: action, Owner: "owner", Intent: intent}); !errors.Is(err, failure) {
 		t.Fatalf("acknowledge delete intent=%v", err)
 	}
 	state, err := reference.Reference.State(t.Context())

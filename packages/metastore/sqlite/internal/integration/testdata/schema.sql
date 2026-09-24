@@ -27,6 +27,10 @@ CREATE INDEX changes_by_volume ON changes (volume, position);
 
 CREATE INDEX delete_intents_by_node ON delete_intents (volume, node, outcome, intent);
 
+CREATE INDEX delete_intents_by_owner ON delete_intents (volume, owner, sequence);
+
+CREATE UNIQUE INDEX delete_intents_by_sequence ON delete_intents (volume, sequence);
+
 CREATE INDEX entries_by_node ON entries (node);
 
 CREATE INDEX entries_by_node_identity ON entries (
@@ -96,6 +100,11 @@ CREATE TABLE delete_intents (
 	intent TEXT PRIMARY KEY
 	CHECK (length(CAST(intent AS BLOB)) = 32 AND intent NOT GLOB '*[^0-9a-f]*'),
 	volume INTEGER NOT NULL,
+	owner TEXT NOT NULL CHECK (
+	length(CAST(owner AS BLOB)) BETWEEN 1 AND 128 AND
+	instr(CAST(owner AS BLOB), X'00') = 0
+),
+	sequence INTEGER NOT NULL CHECK (sequence > 0),
 	node INTEGER NOT NULL,
 	parent INTEGER,
 	name BLOB,
@@ -174,7 +183,8 @@ CREATE TABLE volumes (
 	root INTEGER NOT NULL,
 	used INTEGER NOT NULL
 	, metadata_used INTEGER NOT NULL DEFAULT 0
-	CHECK (typeof(metadata_used) = 'integer' AND metadata_used >= 0));
+	CHECK (typeof(metadata_used) = 'integer' AND metadata_used >= 0), delete_intent_high_water INTEGER NOT NULL DEFAULT 0
+	CHECK (delete_intent_high_water >= 0));
 
 CREATE TRIGGER changes_metadata_delete AFTER DELETE ON changes BEGIN
 	UPDATE volumes SET metadata_used = metadata_used - coalesce(length(OLD.metadata),0) - coalesce(length(OLD.link_target),0) - coalesce(length(OLD.directory_revision),0)

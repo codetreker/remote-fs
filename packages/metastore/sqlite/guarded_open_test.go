@@ -122,7 +122,7 @@ func TestGuardedResetRejectsCaseEquivalentSiblingWithoutPartialEffects(t *testin
 		Target: storage.ChildCondition{State: storage.SameNode, NodeID: uint64(file.ID)}, Action: fileAction(t),
 		Use:      storage.UseClaim{Uses: storage.ReadData | storage.WriteData | storage.DeleteName, Deny: storage.ReadData},
 		Existing: storage.ResetContent,
-		CloseIntent: &storage.CloseIntent{
+		CloseIntent: &storage.CloseIntent{Owner: testDeleteIntentOwner,
 			ID: intent, Trigger: storage.OnReferenceClose, Condition: storage.UnlinkFile,
 		},
 	})
@@ -132,7 +132,7 @@ func TestGuardedResetRejectsCaseEquivalentSiblingWithoutPartialEffects(t *testin
 	if err != nil || current.ID != file.ID || current.Size != 4 {
 		t.Fatalf("failed guarded reset changed the selected node: %+v, %v", current, err)
 	}
-	if status, err := store.QueryDeleteIntent(t.Context(), intent); err != nil || status.Outcome != storage.DeleteIntentUnknown {
+	if status, err := store.QueryDeleteIntent(t.Context(), testDeleteIntentOwner, intent); err != nil || status.Outcome != storage.DeleteIntentUnknown {
 		t.Fatalf("failed guarded reset armed close intent: %+v, %v", status, err)
 	}
 	probe, err := store.OpenAt(t.Context(), selectChild(selection.Name), storage.OpenAtOptions{
@@ -244,12 +244,12 @@ func TestGuardedChildReferenceRejectsAStaleEdgeWithoutPartialEffects(t *testing.
 		Target: storage.ChildCondition{State: storage.SameNode, NodeID: uint64(directory.ID)}, Action: fileAction(t),
 		Use:            storage.UseClaim{Uses: storage.ReadEntries | storage.DeleteName, Deny: storage.ReadEntries},
 		MetadataAccess: storage.ReadMetadata,
-		CloseIntent: &storage.CloseIntent{
+		CloseIntent: &storage.CloseIntent{Owner: testDeleteIntentOwner,
 			ID: intent, Trigger: storage.OnReferenceClose, Condition: storage.UnlinkIfEmpty,
 		},
 	})
 	requireRejectedGuardedReference(t, result, err)
-	if status, err := store.QueryDeleteIntent(t.Context(), intent); err != nil || status.Outcome != storage.DeleteIntentUnknown {
+	if status, err := store.QueryDeleteIntent(t.Context(), testDeleteIntentOwner, intent); err != nil || status.Outcome != storage.DeleteIntentUnknown {
 		t.Fatalf("failed guarded child reference armed close intent: %+v, %v", status, err)
 	}
 
@@ -481,14 +481,14 @@ func TestKeepWithCloseIntentDoesNotPublishBeforeTheCloseTransition(t *testing.T)
 	result, err := store.OpenAt(openContext, selection, storage.OpenAtOptions{
 		Read: true, Target: storage.ChildCondition{State: storage.SameNode, NodeID: uint64(file.ID)},
 		Action: fileAction(t), Use: storage.UseClaim{Uses: storage.ReadData | storage.DeleteName}, Existing: storage.Keep,
-		CloseIntent: &storage.CloseIntent{
+		CloseIntent: &storage.CloseIntent{Owner: testDeleteIntentOwner,
 			ID: intent, Trigger: storage.OnReferenceClose, Condition: storage.UnlinkFile,
 		},
 	})
 	if err != nil || result.File == nil || result.State.ID != file.ID || result.Outcome != storage.Opened {
 		t.Fatalf("keep with close intent under shared grant = %+v, %v", result, err)
 	}
-	status, err := store.QueryDeleteIntent(t.Context(), intent)
+	status, err := store.QueryDeleteIntent(t.Context(), testDeleteIntentOwner, intent)
 	if err != nil || status.Outcome != storage.DeleteIntentArmed || status.NodeID != uint64(file.ID) {
 		t.Fatalf("armed close intent = %+v, %v", status, err)
 	}

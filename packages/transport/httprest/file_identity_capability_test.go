@@ -201,10 +201,14 @@ func TestIdentityCapabilitiesRoundTripOverHTTP(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	deleteOwner, err := storage.NewDeleteIntentOwner()
+	if err != nil {
+		t.Fatal(err)
+	}
 	deleteOpen, err := session.OpenAt(ctx, storage.ChildSelection{Name: storage.ChildName{Parent: storage.DirectoryTarget{NodeID: parent.ID}, RawLeaf: []byte("delete")}}, storage.OpenAtOptions{
 		Read: true, Target: storage.ChildCondition{State: storage.SameNode, NodeID: deleteAttr.ID}, Action: deleteAction,
 		Use: storage.UseClaim{Uses: storage.ReadData | storage.DeleteName}, Existing: storage.Keep,
-		CloseIntent: &storage.CloseIntent{ID: deleteID, Trigger: storage.OnReferenceClose, Condition: storage.UnlinkFile},
+		CloseIntent: &storage.CloseIntent{ID: deleteID, Owner: deleteOwner, Trigger: storage.OnReferenceClose, Condition: storage.UnlinkFile},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -212,22 +216,39 @@ func TestIdentityCapabilitiesRoundTripOverHTTP(t *testing.T) {
 	if err := deleteOpen.File.Close(ctx); err != nil {
 		t.Fatal(err)
 	}
-	deleteStatus, err := session.QueryDeleteIntent(ctx, deleteID)
+	deleteStatus, err := session.QueryDeleteIntent(ctx, deleteOwner, deleteID)
 	if err != nil || deleteStatus.Outcome != storage.DeleteIntentCompleted || deleteStatus.NodeID != deleteAttr.ID {
 		t.Fatalf("delete intent status=%+v err=%v", deleteStatus, err)
+	}
+	page, err := session.ListDeleteIntents(ctx, deleteOwner, 0, 1)
+	if err != nil || len(page.Intents) != 1 || page.Intents[0] != deleteStatus || page.Next == 0 {
+		t.Fatalf("delete intent page=%+v err=%v", page, err)
+	}
+	end, err := session.ListDeleteIntents(ctx, deleteOwner, page.Next, 1)
+	if err != nil || len(end.Intents) != 0 || end.Next != page.Next {
+		t.Fatalf("delete intent final page=%+v err=%v", end, err)
+	}
+	foreignOwner := storage.DeleteIntentOwner("other-owner")
+	foreign, err := session.QueryDeleteIntent(ctx, foreignOwner, deleteID)
+	if err != nil || foreign.Outcome != storage.DeleteIntentUnknown {
+		t.Fatalf("foreign owner query=%+v err=%v", foreign, err)
+	}
+	foreignPage, err := session.ListDeleteIntents(ctx, foreignOwner, 0, 1)
+	if err != nil || len(foreignPage.Intents) != 0 || foreignPage.Next != 0 {
+		t.Fatalf("foreign owner page=%+v err=%v", foreignPage, err)
 	}
 	ackAction, err := storage.NewFileActionID(status.ActionEpoch)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := session.AcknowledgeDeleteIntent(ctx, storage.AcknowledgeDeleteIntentCommand{Action: ackAction, Intent: deleteID}); err != nil {
+	if err := session.AcknowledgeDeleteIntent(ctx, storage.AcknowledgeDeleteIntentCommand{Action: ackAction, Owner: deleteOwner, Intent: deleteID}); err != nil {
 		t.Fatal(err)
 	}
 	ackReceipt, err := session.QueryFileAction(ctx, ackAction)
 	if err != nil || ackReceipt.Operation != storage.OpFileAcknowledgeDeleteIntent || ackReceipt.Outcome != storage.FileActionCompleted {
 		t.Fatalf("delete acknowledgement receipt=%+v err=%v", ackReceipt, err)
 	}
-	deleteStatus, err = session.QueryDeleteIntent(ctx, deleteID)
+	deleteStatus, err = session.QueryDeleteIntent(ctx, deleteOwner, deleteID)
 	if err != nil || deleteStatus.Outcome != storage.DeleteIntentUnknown || deleteStatus.NodeID != 0 {
 		t.Fatalf("acknowledged delete status=%+v err=%v", deleteStatus, err)
 	}
@@ -970,8 +991,11 @@ func TestNodeReferenceCapabilityMethodsRoundTrip(t *testing.T) {
 	if _, err := reference.State(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := reference.CloseWithBarrier(t.Context()); err != nil {
+	if _, _, err := reference.CloseWithBarrier(t.Context()); err != nil {
 		t.Fatal(err)
+	}
+	if result, err := reference.CloseWithResult(t.Context()); err != nil || !result.Released {
+		t.Fatalf("repeated node reference close=%+v err=%v", result, err)
 	}
 }
 
@@ -1228,6 +1252,7 @@ func TestSemanticFileActionMustMatchTheTransportAction(t *testing.T) {
 		Action:  storage.LockRequestID(action),
 		Acknowledge: acknowledgeDeleteIntentCommandOf(storage.AcknowledgeDeleteIntentCommand{
 			Action: action,
+			Owner:  "owner",
 			Intent: storage.DeleteIntentID(strings.Repeat("d", storage.DeleteIntentIDBytes)),
 		}),
 		Path: []byte{},

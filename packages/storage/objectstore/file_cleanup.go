@@ -32,7 +32,7 @@ func (f *openFile) retryClose(ctx context.Context) (bool, error) {
 
 func (r *nodeReference) retryClose(ctx context.Context) (bool, error) {
 	r.closeMu.Lock()
-	retry := !r.closeFinal && failedClose(r.closeDone, r.closeErr)
+	retry := !r.closeResult.Released && failedClose(r.closeDone, r.closeErr)
 	r.closeMu.Unlock()
 	if !retry {
 		return false, nil

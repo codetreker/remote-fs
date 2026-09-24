@@ -1,6 +1,6 @@
 # 保留文件、metadata 与访问控制
 
-本文描述 `storage.FileStorage`、保留的节点身份、原子子项操作、名字与目录观察、中立 metadata、删除义务、使用声明与范围控制。按路径的基础 volume API 见[顶层设计](../architecture.md)，显式 S/X 扩展见[文件占有](file-locks.md)，Linux 的平台解释见[client 设计](../client/architecture.md)。既有引用与内容语义由[活跃文件句柄](../../../.agents/notes/implemented/architecture/2026-09-08-live-file-handles.md)拥有；能力的取舍见[中立元数据与访问控制](../../../.agents/notes/implemented/architecture/2026-09-16-neutral-metadata-and-access-controls.md)、[持久节点身份与原子文件操作](../../../.agents/notes/implemented/architecture/2026-09-20-durable-identity-and-atomic-file-operations.md)及[有界权威名字观察](../../../.agents/notes/implemented/architecture/2026-09-20-bounded-authoritative-name-observations.md)。
+本文描述 `storage.FileStorage`、保留的节点身份、原子子项操作、名字与目录观察、中立 metadata、删除义务、使用声明与范围控制。按路径的基础 volume API 见[顶层设计](../architecture.md)，显式 S/X 扩展见[文件占有](file-locks.md)，Linux 的平台解释见[client 设计](../client/architecture.md)。既有引用与内容语义由[活跃文件句柄](../../../.agents/notes/implemented/architecture/2026-09-08-live-file-handles.md)拥有；能力的取舍见[中立元数据与访问控制](../../../.agents/notes/implemented/architecture/2026-09-16-neutral-metadata-and-access-controls.md)、[持久节点身份与原子文件操作](../../../.agents/notes/implemented/architecture/2026-09-20-durable-identity-and-atomic-file-operations.md)、[有界权威名字观察](../../../.agents/notes/implemented/architecture/2026-09-20-bounded-authoritative-name-observations.md)及[可恢复的关闭与删除义务归属](../../../.agents/notes/implemented/architecture/2026-09-23-recoverable-close-ownership.md)记录。
 
 ## 一、身份与会话
 
@@ -23,7 +23,9 @@
 
 打开自动把 Read/Write 转为 `ReadData` / `WriteData`，再与显式 Use 合并。`UseClaim{Uses,Deny}` 与同一节点上的其它 claim 双向比较；任一 Deny 与对方 Uses 相交时，新打开在取得引用前以冲突失败。Use 不授予 File 方法、业务权限或 Strong proof。
 
-`NodeReference` 只提供属性、Scope、State 与 Close；它不提供 ReadAt、WriteAt 或 Truncate。`NodeRefOptions.MetadataAccess` 控制属性与 metadata 权限，Use 可声明 ReadData／WriteData 以参与其它入口的兼容性检查，但不会据此增加字节方法。NodeReference 编译期包含 `ScopedReference` 与 `ReferenceStateAccess`，因此通过 `NodeReferences` preflight 后不会在取得目录引用后才以 `EOPNOTSUPP` 拒绝 Scope 或 State。
+`NodeReference` 只提供属性、Scope、State 与关闭；它不提供 ReadAt、WriteAt 或 Truncate。`NodeRefOptions.MetadataAccess` 控制属性与 metadata 权限，Use 可声明 ReadData／WriteData 以参与其它入口的兼容性检查，但不会据此增加字节方法。NodeReference 编译期包含 `ScopedReference` 与 `ReferenceStateAccess`，因此通过 `NodeReferences` preflight 后不会在取得目录引用后才以 `EOPNOTSUPP` 拒绝 Scope 或 State。
+
+`FileSession`、`File` 和 `NodeReference` 的 `CloseWithResult` 返回 `ReferenceCloseResult{Released}` 与错误。`Released` 是该次关闭之后调用方是否仍拥有引用的依据：成功必须为 true；删除义务执行失败但引用已释放时可同时返回 true 与错误；释放或清理尚未确认时返回 false 与错误，调用方保留重试责任。`Close` 仍是只返回错误的入口，遵守同一关闭顺序。包装层与 HTTP 逐层传递结果，不能以错误类别、连接断开或 context 取消猜测释放状态。HTTP 的 `file.close` 和 `file.session-close` 携带 `FileActionID`；有界关闭回执在能力退役后仍可查询动作状态。同一 ID 与输入重投不再次清理，只继续尚未确认的 mutation barrier；确认后返回保存的 Released 与语义错误。`QueryFileAction` 不携带关闭结果，响应丢失须安全重投原动作才能取回它。
 
 `FileSessionOptions` 要显式选择有效值，调用方可从 `DefaultFileSessionOptions` 开始。默认 lease 为 30 秒、动作历史为 1 分钟、单文件大小为 1 GiB，每会话最多 4096 个引用、64 个活跃操作、256 个操作等待者、4096 个 use owner、65536 个范围、1024 个 pending range action 与 16384 个范围动作。会话上限还受 volume 与 HTTP registry 的共享上限约束。
 
@@ -42,7 +44,7 @@
 | `ScopedReference` / `ReferenceStateAccess` | 返回确切活引用的 Scope，以及同次捕获的 Attr、link target、detached/pending 状态 |
 | `DirectoryMetadataObserver` | 在独立授权下返回完整 entries、directory revision 与可选目录当前名字 |
 | `ReferenceIdentity` / `ReferenceNameObserver` | 核对保留引用的固定 NodeID，并观察 Root、Linked 或 Detached 当前绑定 |
-| `FileActions` | 核对 session 内有限 action receipt，查询并显式 ACK durable 删除终态 |
+| `FileActions` | 核对 session 内有限 action receipt，按持久 owner 查询、分页发现并显式 ACK durable 删除终态 |
 | `MetadataAccess` | 按 NodeID 对一个 metadata namespace 作 CAS |
 | `ReferenceMetadataAccess` | 通过保留 File 对一个 metadata namespace 作 CAS |
 | `UseOwners` | 以有效 File scope 注册和退役 range owner |
@@ -54,7 +56,7 @@ Go 的 NamespaceAccess、DirectoryReader 与 DirectoryMetadataObserver 可以独
 
 ## 二、保留节点、名字与回收
 
-SQLite schema v8 在 v7 的符号链接目标、节点 pending generation 和 durable delete intents 之外，为每个目录保存持久、非零的名字集合 revision。`Remove` 或覆盖目标的 `Rename` 移除节点名字时，有引用的对象成为 detached 并保留原 NodeID 与状态；detached 目录必须为空，任何 detached 节点都不能继续出现在 entry 关系中。volume 日志、快照与普通目录遍历只包含仍有名字的节点，detached 对象的后续修改不制造虚构路径事件。
+SQLite schema v9 在 v7 的符号链接目标、节点 pending generation 和 durable delete intents，以及 v8 的目录 revision 之外，为每条义务保存 owner 与单调序号，并为 volume 保存序号高水位。`Remove` 或覆盖目标的 `Rename` 移除节点名字时，有引用的对象成为 detached 并保留原 NodeID 与状态；detached 目录必须为空，任何 detached 节点都不能继续出现在 entry 关系中。volume 日志、快照与普通目录遍历只包含仍有名字的节点，detached 对象的后续修改不制造虚构路径事件。
 
 保留节点的内容仍属于 volume 的实际用量。最后一个引用先退役，在最终发布门处禁止新的修改授权；已经接纳的 I/O 排空之后才物理释放。最后释放在事务内处理用量、当前对象与待回收对象。已知未生效的容量拒绝保留引用供清理重试；结果不明时保留所有权并封锁后续使用，不能提前归还配额。
 
@@ -94,11 +96,13 @@ File 与 NodeReference 的 `ReferenceNameObserver` 复用既有 session、引用
 
 ### pending deletion 与 durable intent
 
-`CloseIntent` 在打开事务中接受，携带由 `NewDeleteIntentID` 生成的 128-bit 小写十六进制 durable ID，并绑定原 NodeID、名字关联、metadata 条件、Use 与文件／空目录条件。它仍处于 armed 时不等于节点已经 pending；引用显式关闭、session 清理或 authority 接管旧责任时才触发。触发时名字已经 unlink/replacement 分离，或目录非空，则该 intent 进入明确未执行终态，不能作用于同名替代物。
+`CloseIntent` 在打开事务中接受，携带由 `NewDeleteIntentID` 生成的 128-bit 小写十六进制 durable ID 与调用方持久保存的 `DeleteIntentOwner`，并绑定原 NodeID、名字关联、metadata 条件、Use 与文件／空目录条件。owner 是 1 至 128 字节、有效 UTF-8 且不含 NUL 的发现命名空间，不是授权凭据。它仍处于 armed 时不等于节点已经 pending；引用显式关闭、session 清理或 authority 接管旧责任时才触发。触发时名字已经 unlink/replacement 分离，或目录非空，则该 intent 进入明确未执行终态，不能作用于同名替代物。
 
 `SetPendingUnlink` 立即在同一事务中核对引用、metadata、Use/share、节点种类与目录为空条件，再推进非零 pending generation。`ClearPendingUnlink` 必须给出当前 generation；竞争或旧 generation 返回 `ErrConditionConflict`，且清除一个节点状态不会删除其它 armed intent。pending 节点拒绝冲突的新打开和名字操作，已有相容引用继续按其权限访问。
 
-delete intent 持久记录 armed、pending、completed、not-executed 或 cleanup-failed；失败记录携带封闭 errno 分类。终态记录继续占用有界历史，直到 `AcknowledgeDeleteIntent` 以自己的 FileActionID 幂等删除记录并释放容量；ACK 也可通过 QueryFileAction 核对。成功 ACK 后不保留 tombstone，后续 QueryDeleteIntent 返回 unknown，authority 不再承担该 ID 的非复用保证；调用方必须永久不复用已经 ACK 的 ID。新 session 可在 authority 重启后查询尚未 ACK 的原义务；普通 File、NodeReference、Scope、Use owner 与 range 不随这份持久记录恢复。
+delete intent 持久记录 armed、pending、completed、not-executed 或 cleanup-failed；失败记录携带封闭 errno 分类。每条记录在同一 volume 内取得持久、单调递增的序号。`FileActions.ListDeleteIntents(ctx, owner, after, limit)` 只返回该 owner 在排他游标之后的记录，最多 256 条，按序号排列；`DeleteIntentCursor` 不超过 `MaxInt64`，页面的 `Next` 是最后返回的序号，空页则保持输入游标。ACK 删除记录后序号不复用，分页不会因删除早先记录而跳过后续义务。`QueryDeleteIntent(ctx, owner, id)` 和 `AcknowledgeDeleteIntent` 都核对 owner；错误 owner 的查询返回 Unknown，ACK 是幂等零效果。
+
+终态记录继续占用有界历史，直到 `AcknowledgeDeleteIntent` 携带 owner 和独立 FileActionID 幂等删除记录并释放容量；ACK 也可通过 QueryFileAction 核对。成功 ACK 后不保留 tombstone，后续 QueryDeleteIntent 返回 unknown，authority 不再承担该 ID 的非复用保证；调用方必须永久不复用已经 ACK 的 ID。新 session 可在 authority 重启后按 owner 发现、按 ID 查询尚未 ACK 的原义务；普通 File、NodeReference、Scope、Use owner 与 range 不随这份持久记录恢复。
 
 `SQLiteOptions.MaxDeleteIntents` 默认每 volume 65536 条，计入 armed、pending、失败及尚未 ACK 的终态。达到上限时，新 CloseIntent 在产生打开或名字效果前以 `EAGAIN` 拒绝；清理、查询和 ACK 保持可用，使已接受责任能够终结并释放名额。
 
@@ -158,21 +162,23 @@ FUSE 将 `flock` 映射到 whole-file domain，将传统 POSIX `fcntl` 映射到
 
 ## 五、HTTP、复制与资源
 
-HTTP 文件请求先执行[业务授权](authorization.md)，再读取或触碰 Session、File、NodeReference、动作历史或 durable intent。OpenAt/OpenNodeRef/OpenChildRef 先授权自身 Operation 和导出的 OpenAccess，再按固定顺序授权实际包含的 remove、set-attr、set-metadata 或 set-pending 效果；全部允许后 native action 才执行。LookupAt、ReadDirNode、ObserveDirectoryMetadata、ObserveName、MutateName、条件 mutation、pending set/clear、action/intent query 与 intent ACK 分别使用自己的规范 Operation。已有 bearer 引用、action ID 或 durable intent ID 都不能绕过当前请求授权；authority 自主完成已经接受的固定删除效果时不重新解释成外部请求。
+HTTP 文件请求先执行[业务授权](authorization.md)，再读取或触碰 Session、File、NodeReference、动作历史或 durable intent。OpenAt/OpenNodeRef/OpenChildRef 先授权自身 Operation 和导出的 OpenAccess，再按固定顺序授权实际包含的 remove、set-attr、set-metadata 或 set-pending 效果；全部允许后 native action 才执行。LookupAt、ReadDirNode、ObserveDirectoryMetadata、ObserveName、MutateName、条件 mutation、pending set/clear、action query、intent list/query/ACK 分别使用自己的规范 Operation。已有 bearer 引用、owner、action ID 或 durable intent ID 都不能绕过当前请求授权；authority 自主完成已经接受的固定删除效果时不重新解释成外部请求。
 
 HTTP v4 统一转发基础 volume、中立 Attr、metadata、文件引用、目录／名字观察、range 和强 S/X。请求的 `op` 直接使用 `storage.Operation` 的规范值；二进制内容、原始叶名、revision、metadata version 和 payload 使用 canonical base64。`file.open-at` 与 `file.open-child-ref` 保留既有顶层 `child` 并接受可选顶层 `guards`，server 把二者组装为 `ChildSelection`。协议拒绝未知、重复、缺席、null 或无关字段，所有结果都携带 v4 marker 与封闭 errno 词汇；v3 路由不提供兼容旁路。
 
+delete-intent query 使用顶层 `deleteOwner` 与 `deleteIntent`，list 使用 `deleteOwner`、`deleteAfter` 与 `deleteLimit`，ACK 命令携带 `owner`、`intent` 与 `action`。CloseIntent 的嵌套值也携带 `owner`。这些字段在访问持久账本前验证，HTTP 的 list、query 和 ACK 分别授权；同一个 owner 的页游标可跨 authority 重启继续使用。
+
 server 的 session 能力宣告 AtomicOpen、Namespace、References、FileActions、Metadata、Owners、Ranges 与 DirectoryMetadata；DirectoryMetadata 只在 DirectoryReader 和 DirectoryMetadataObserver 的完整 backing chain 都可用时为 true。remote client 用这个 bit 同时 gate ReadDirNode 与 ObserveDirectoryMetadata，Namespace bit 只覆盖 LookupAt 与 MutateName。File 与 NodeReference 按实际方法宣告 Metadata、Scope、State、Delete、Conditional 与 ReferenceName。v4 client 只在对应 bool 为 true 时暴露可选接口，任意未知 capability 字段仍是协议错误。
 
-OpenAt、OpenNodeRef 与 OpenChildRef response 携带 storage action 捕获的 node 与 outcome；旧 Open/OpenNode 保留原有 transport journal 与 ACK 形状，不因此取得 storage `FileActionID`。File/NodeReference.Close 和 FileSession.Close 可携带清理产生的 barrier。client 必须验证新原子打开的引用身份与原 action 一致，不能用一次新的 Stat 填补缺失字段。
+OpenAt、OpenNodeRef 与 OpenChildRef response 携带 storage action 捕获的 node 与 outcome；旧 Open/OpenNode 保留原有 transport journal 与 ACK 形状，不因此取得 storage `FileActionID`。`file.close` 与 `file.session-close` 的响应携带 `closeResult.released`、`closeResult.barrierPending` 与可选清理 barrier。`released=true` 且 `barrierPending=true` 只出现在无 barrier 的错误响应中：引用已经释放，但已发生的名字效果尚未取得 mutation barrier；client 以 `CloseBarrierPendingError` 保留原错误链和同一 ActionID，后续 CloseWithResult 或 CloseWithBarrier 重投并等待确认，不能把引用重新交给调用方或报告确认成功。再次传输失败仍保留已确认的释放事实和待核对动作。`barrierPending=false` 是最终结果，无 Log 时可以没有 barrier；原生关闭的语义错误仍如实返回。client 不能从 errno 或 `QueryFileAction` 的 Completed 推导 barrier 状态。client 必须验证新原子打开的引用身份与原 action 一致，不能用一次新的 Stat 填补缺失字段。
 
-随机能力标识会话与文件／节点引用。Open 结果在有限 PendingAck 时间内保留，client 收到能力后单独确认；无确认的引用被回收。OpenAt、OpenNodeRef、OpenChildRef 与新 mutation 在 dispatch 前取得 `FileActionID`，server 以完整输入摘要保留原结果；OpenAt 与 OpenChildRef 的摘要包括 `ChildSelection`。`QueryFileAction` 不接受调用方补填 Operation 来猜测缺失记录。响应丢失后不能单凭请求 context 取消推断动作未发生；原动作已完成时，重投返回保存的引用与结果，不因后来 namespace 变化重新执行 guard 检查。delete intent 使用另一个 durable ID，其状态不随普通 action history 淘汰。
+随机能力标识会话与文件／节点引用。Open 结果在有限 PendingAck 时间内保留，client 收到能力后单独确认；无确认的引用被回收。OpenAt、OpenNodeRef、OpenChildRef、`file.close`、`file.session-close` 与新 mutation 在 dispatch 前取得 `FileActionID`，server 以完整输入摘要保留动作；OpenAt 与 OpenChildRef 的摘要包括 `ChildSelection`。关闭回执在引用或会话能力退役后仍保留于有界历史；查询只返回动作状态，重投返回保存的关闭事实，并在 `barrierPending` 时继续取得原动作的 mutation barrier。`QueryFileAction` 不接受调用方补填 Operation 来猜测缺失记录。响应丢失后不能单凭请求 context 取消推断动作未发生；原动作已完成时，重投不因后来 namespace 变化重新执行 guard 检查，也不重新触发关闭效果。delete intent 使用另一个 durable ID，其状态不随普通 action history 淘汰。
 
-普通已有文件的 Open 已返回能力、但 ACK 失败时，client 先用返回的同一 Session／File 能力执行 Close 清理。只有 Create 与 Truncate 均为 false、原 ACK 错误同时满足 `errors.Is(err, context.Canceled)` 与 `storage.ErrnoOf(err) == EINTR`，且该次清理的原始 error 为 nil，才不返回 File 并保留 EINTR。清理的 ESTALE 不能当作成功，判定发生在既有 ESTALE 抑制之前。带创建／截断意图、deadline、未知 ACK 或会话故障，以及清理 EIO／ESTALE 或独立错误，仍返回无 File 的 EIO；原有创建或截断效果不被解释成未发生。已终止的 native 引用不会由迟到 ACK 或原打开动作的重放重新创建。这项分类不增加重试。
+普通已有文件的 Open 已返回能力、但 ACK 失败时，client 先用返回的同一 Session／File 能力执行 Close 清理。只有 Create 与 Truncate 均为 false、原 ACK 错误同时满足 `errors.Is(err, context.Canceled)` 与 `storage.ErrnoOf(err) == EINTR`，且该次清理报告 `Released=true`、error 为 nil，才不返回 File 并保留 EINTR。清理的 ESTALE 不能当作成功，判定发生在既有 ESTALE 抑制之前。带创建／截断意图、deadline、未知 ACK 或会话故障，以及清理 EIO／ESTALE 或独立错误，仍返回无 File 的 EIO；原有创建或截断效果不被解释成未发生。已终止的 native 引用不会由迟到 ACK 或原打开动作的重放重新创建。这项分类不增加重试。
 
 文件控制通道使用独立的 256 KiB envelope 上限和 admission；Strong 控制继续使用自己的 16 KiB 上限。阻塞 range 通过短的 Apply/Query/Cancel 交换维持，不长期占用 HTTP worker。数据 JSON 在编码前核对 envelope 与 base64 后的总长度；区间读取、Attr/metadata、目录 entries 与当前名字在调用 backend 或载入变长 payload 前扣除返回预算。`file.read-dir-node`、`file.observe-directory-metadata`、`file.observe-name` 与 child selection 的顶层 guards 使用严格 DTO；guards 在授权和 backend 访问前受通用数量、revision、叶名与驻留上限约束。ResultBytes、server body、client body 与 native retention 任一更紧时整次失败。
 
-`HandlerOptions.Files` 默认在整个 registry 内允许 64 个会话，每个会话分别最多保留 16384 个数据动作与 16384 个清理动作，PendingAck 为 5 秒；可接纳的会话 options 受 handler 上限约束。`Handler.Close(ctx)` 停止 admission，退役并排空它创建的 registry；backend 仍归调用方。独立 server 先排空 HTTP 请求，再完成 handler 清理，最后关闭自己拥有的 backend；清理失败不释放 backend 所有权。
+`HandlerOptions.Files` 默认在整个 registry 内允许 64 个活跃会话，每个会话分别最多保留 16384 个数据动作与 16384 个清理动作，PendingAck 为 5 秒；可接纳的会话 options 受 handler 上限约束。已释放的会话保留一份终态记录，其中包含仍在历史期限内的每个 `file.session-close` 动作及其原结果；记录最多容纳 `MaxCleanupActions + 1` 个关闭动作，满额时拒绝新的关闭 ID。活跃会话与终态记录的合计上限为 `2 × MaxSessions`；终态记录占满额外容量时，新会话以 `EAGAIN` 拒绝，到期清理后可重新接纳。`Handler.Close(ctx)` 停止 admission，退役并排空它创建的 registry；backend 仍归调用方。已释放引用的历史清理失败在回执到期后继续计数，关闭返回的错误保留首个和有限数量的近期错误样本，因此报告规模有固定上限；已到期动作的原结果不能从汇总中恢复。独立 server 先排空 HTTP 请求，再完成 handler 清理，最后关闭自己拥有的 backend；清理失败不释放 backend 所有权。
 
 replicated storage 转发原子打开、身份 namespace、identity-bound directory enumeration、DirectoryMetadataObserver、ReferenceNameObserver、NodeReference、FileActions、metadata、scope、pending deletion、条件 mutation、owner 和 range 能力。路径节点事实与 opaque metadata 进入 SQLite 副本；HTTP v4 Node wire 不携带 authority directory revision，副本只为自身树维护不可导出的本地 token。公开 Stat 可由副本回答，公开 List/ListBounded 及三项名字观察在确认副本健康后回源 authority；带 guards 的 ChildSelection 也逐字转发到 authority，因此 guards 永远不与本地 token 比较。引用、Use claim、owner、range 与普通 action history 属于远端 authority/session；durable delete intent 属于远端持久 volume，二者都不写入客户端副本。产生名字或属性日志的成功修改返回权威 barrier，replica 等待同一 incarnation 的位置达到该值；detached 修改没有路径事件，barrier 仍可证明现有 volume 进度。
 

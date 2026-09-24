@@ -179,6 +179,10 @@ func (s *endpointFileSession) Close(ctx context.Context) error {
 	}
 	return err
 }
+func (s *endpointFileSession) CloseWithResult(ctx context.Context) (storage.ReferenceCloseResult, error) {
+	err := s.Close(ctx)
+	return storage.ReferenceCloseResult{Released: err == nil}, err
+}
 
 func endpointConfig() Config {
 	return Config{

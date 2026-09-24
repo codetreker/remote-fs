@@ -3,21 +3,125 @@ package replicated
 import (
 	"context"
 	"errors"
+	"path/filepath"
 	"reflect"
 	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
 
+	"github.com/codetreker/remote-fs/packages/metastore/sqlite"
 	"github.com/codetreker/remote-fs/packages/storage"
 	"github.com/codetreker/remote-fs/packages/transport/httprest"
 )
 
 type fileAuthorityStub struct {
 	storage.File
-	write func(context.Context) (storage.Attr, *httprest.MutationBarrier, error)
-	read  func(context.Context) (storage.FileRead, error)
-	close func(context.Context) error
+	write            func(context.Context) (storage.Attr, *httprest.MutationBarrier, error)
+	read             func(context.Context) (storage.FileRead, error)
+	close            func(context.Context) error
+	releasedOnError  bool
+	closeBarrier     *httprest.MutationBarrier
+	omitCloseBarrier bool
+}
+
+type terminalCloseFileStub struct {
+	*fileAuthorityStub
+	closes int
+}
+
+func (f *terminalCloseFileStub) CloseWithBarrier(context.Context) (storage.ReferenceCloseResult, *httprest.MutationBarrier, error) {
+	f.closes++
+	return storage.ReferenceCloseResult{Released: true}, &httprest.MutationBarrier{Incarnation: "log"}, syscall.ENOTEMPTY
+}
+
+func TestRetainedFileTerminalCloseKeepsReleasedResult(t *testing.T) {
+	session := retainedTestSession(t, &fileSessionStub{close: func(context.Context) error { return nil }})
+	remote := &terminalCloseFileStub{fileAuthorityStub: &fileAuthorityStub{}}
+	file := &retainedFile{session: session, remote: remote}
+	for range 2 {
+		result, err := file.CloseWithResult(t.Context())
+		if !result.Released || !errors.Is(err, syscall.ENOTEMPTY) {
+			t.Fatalf("terminal close=%+v %v", result, err)
+		}
+	}
+	if remote.closes != 1 {
+		t.Fatalf("terminal close repeated remote operation %d times", remote.closes)
+	}
+}
+
+func TestReleasedFileCloseRetriesLocalBarrierConfirmation(t *testing.T) {
+	session := retainedTestSession(t, &fileSessionStub{close: func(context.Context) error { return nil }})
+	closes := 0
+	remote := &fileAuthorityStub{
+		close:        func(context.Context) error { closes++; return nil },
+		closeBarrier: &httprest.MutationBarrier{Incarnation: "log", Position: 1},
+	}
+	file := &retainedFile{session: session, remote: remote}
+	cut, cancel := context.WithCancel(t.Context())
+	cancel()
+	if result, err := file.CloseWithResult(cut); !result.Released || !errors.Is(err, syscall.EIO) || file.closed {
+		t.Fatalf("unconfirmed released close=%+v %v closed=%t", result, err, file.closed)
+	}
+	session.base.mu.Lock()
+	session.base.at = 1
+	session.base.wake()
+	session.base.mu.Unlock()
+	if result, err := file.CloseWithResult(t.Context()); !result.Released || err != nil || !file.closed || closes != 1 {
+		t.Fatalf("reconciled close=%+v %v closed=%t remote calls=%d", result, err, file.closed, closes)
+	}
+}
+
+type pendingBarrierFileStub struct {
+	*fileAuthorityStub
+	closes int
+}
+
+func (f *pendingBarrierFileStub) CloseWithBarrier(context.Context) (storage.ReferenceCloseResult, *httprest.MutationBarrier, error) {
+	f.closes++
+	if f.closes == 1 {
+		return storage.ReferenceCloseResult{Released: true}, nil, &httprest.CloseBarrierPendingError{Cause: syscall.EIO}
+	}
+	if f.closes == 2 {
+		return storage.ReferenceCloseResult{}, nil, syscall.EIO
+	}
+	return storage.ReferenceCloseResult{Released: true}, &httprest.MutationBarrier{Incarnation: "log"}, nil
+}
+
+func TestReleasedFileCloseReplaysMissingBarrier(t *testing.T) {
+	session := retainedTestSession(t, &fileSessionStub{close: func(context.Context) error { return nil }})
+	remote := &pendingBarrierFileStub{fileAuthorityStub: &fileAuthorityStub{}}
+	file := &retainedFile{session: session, remote: remote}
+	if result, err := file.CloseWithResult(t.Context()); !result.Released || !errors.Is(err, syscall.EIO) || file.closed {
+		t.Fatalf("pending close=%+v %v closed=%t", result, err, file.closed)
+	}
+	if result, err := file.CloseWithResult(t.Context()); !result.Released || !errors.Is(err, syscall.EIO) || file.closed || remote.closes != 2 {
+		t.Fatalf("transient replay=%+v %v closed=%t remote calls=%d", result, err, file.closed, remote.closes)
+	}
+	if result, err := file.CloseWithResult(t.Context()); !result.Released || err != nil || !file.closed || remote.closes != 3 {
+		t.Fatalf("replayed close=%+v %v closed=%t remote calls=%d", result, err, file.closed, remote.closes)
+	}
+}
+
+func TestReleasedCloseWithoutBarrierNeverReportsConfirmedSuccess(t *testing.T) {
+	fileSession := retainedTestSession(t, nil)
+	file := &retainedFile{session: fileSession, remote: &fileAuthorityStub{
+		close: func(context.Context) error { return nil }, omitCloseBarrier: true,
+	}}
+	if result, err := file.CloseWithResult(t.Context()); !result.Released || !errors.Is(err, syscall.EIO) || file.closed {
+		t.Fatalf("file close without barrier=%+v %v closed=%t", result, err, file.closed)
+	}
+	referenceSession := retainedTestSession(t, nil)
+	reference := &nodeReference{session: referenceSession, remote: &barrierReferenceStub{omitCloseBarrier: true}}
+	if result, err := reference.CloseWithResult(t.Context()); !result.Released || !errors.Is(err, syscall.EIO) || reference.closed {
+		t.Fatalf("node close without barrier=%+v %v closed=%t", result, err, reference.closed)
+	}
+	session := retainedTestSession(t, &fileSessionStub{
+		close: func(context.Context) error { return nil }, omitCloseBarrier: true,
+	})
+	if result, err := session.CloseWithResult(t.Context()); !result.Released || !errors.Is(err, syscall.EIO) || session.closed || len(session.base.fileSessions) != 1 {
+		t.Fatalf("session close without barrier=%+v %v closed=%t owned=%d", result, err, session.closed, len(session.base.fileSessions))
+	}
 }
 
 func (f *fileAuthorityStub) WriteAtWithBarrier(ctx context.Context, _ int64, _ []byte) (storage.Attr, *httprest.MutationBarrier, error) {
@@ -33,21 +137,36 @@ func (f *fileAuthorityStub) ReadAt(ctx context.Context, _ int64, _ int) (storage
 	return f.read(ctx)
 }
 func (f *fileAuthorityStub) Close(ctx context.Context) error { return f.close(ctx) }
-func (f *fileAuthorityStub) CloseWithBarrier(ctx context.Context) (*httprest.MutationBarrier, error) {
+func (f *fileAuthorityStub) CloseWithBarrier(ctx context.Context) (storage.ReferenceCloseResult, *httprest.MutationBarrier, error) {
 	err := f.close(ctx)
-	return &httprest.MutationBarrier{Incarnation: "log"}, err
+	barrier := f.closeBarrier
+	if barrier == nil && !f.omitCloseBarrier {
+		barrier = &httprest.MutationBarrier{Incarnation: "log"}
+	}
+	return storage.ReferenceCloseResult{Released: err == nil || f.releasedOnError}, barrier, err
 }
 
 type fileSessionStub struct {
 	httprest.FileSessionWithBarrier
-	close func(context.Context) error
-	open  func(context.Context) (storage.File, *httprest.MutationBarrier, error)
+	close            func(context.Context) error
+	open             func(context.Context) (storage.File, *httprest.MutationBarrier, error)
+	releasedOnError  bool
+	closeBarrier     *httprest.MutationBarrier
+	omitCloseBarrier bool
 }
 
 func (s *fileSessionStub) Close(ctx context.Context) error { return s.close(ctx) }
-func (s *fileSessionStub) CloseWithBarrier(ctx context.Context) (*httprest.MutationBarrier, error) {
+func (s *fileSessionStub) CloseWithBarrier(ctx context.Context) (storage.ReferenceCloseResult, *httprest.MutationBarrier, error) {
 	err := s.close(ctx)
-	return &httprest.MutationBarrier{Incarnation: "log"}, err
+	barrier := s.closeBarrier
+	if barrier == nil && !s.omitCloseBarrier {
+		barrier = &httprest.MutationBarrier{Incarnation: "log"}
+	}
+	return storage.ReferenceCloseResult{Released: err == nil || s.releasedOnError}, barrier, err
+}
+func (s *fileSessionStub) CloseWithResult(ctx context.Context) (storage.ReferenceCloseResult, error) {
+	err := s.close(ctx)
+	return storage.ReferenceCloseResult{Released: err == nil || s.releasedOnError}, err
 }
 func (s *fileSessionStub) OpenFileWithBarrier(ctx context.Context, _ string, _ storage.FileOpenOptions) (storage.File, *httprest.MutationBarrier, error) {
 	return s.open(ctx)
@@ -188,19 +307,175 @@ func TestRetainedSessionKeepsOwnershipWhenCleanupIsUnknown(t *testing.T) {
 	}
 }
 
+func TestReleasedSessionCloseRetriesLocalBarrierConfirmation(t *testing.T) {
+	closes := 0
+	remote := &fileSessionStub{
+		close:        func(context.Context) error { closes++; return nil },
+		closeBarrier: &httprest.MutationBarrier{Incarnation: "log", Position: 1},
+	}
+	session := retainedTestSession(t, remote)
+	cut, cancel := context.WithCancel(t.Context())
+	cancel()
+	if result, err := session.CloseWithResult(cut); !result.Released || !errors.Is(err, syscall.EIO) || session.closed || len(session.base.fileSessions) != 1 {
+		t.Fatalf("unconfirmed released session=%+v %v closed=%t owned=%d", result, err, session.closed, len(session.base.fileSessions))
+	}
+	session.base.mu.Lock()
+	session.base.at = 1
+	session.base.wake()
+	session.base.mu.Unlock()
+	if result, err := session.CloseWithResult(t.Context()); !result.Released || err != nil || !session.closed || len(session.base.fileSessions) != 0 || closes != 1 {
+		t.Fatalf("reconciled session=%+v %v closed=%t owned=%d remote calls=%d", result, err, session.closed, len(session.base.fileSessions), closes)
+	}
+}
+
 func TestRetainedOpenClosesTheReferenceWhenConfirmationFails(t *testing.T) {
 	closeCause := errors.New("file close outcome is unknown")
 	closes := 0
-	remoteFile := &fileAuthorityStub{close: func(context.Context) error { closes++; return closeCause }}
+	remoteFile := &fileAuthorityStub{close: func(context.Context) error {
+		closes++
+		if closes == 1 {
+			return closeCause
+		}
+		return nil
+	}}
 	session := retainedTestSession(t, &fileSessionStub{open: func(context.Context) (storage.File, *httprest.MutationBarrier, error) {
 		return remoteFile, nil, nil
 	}})
 	file, err := session.OpenFile(t.Context(), "file", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true}})
-	if file != nil || !errors.Is(err, syscall.EIO) || !errors.Is(err, closeCause) || closes != 1 {
+	if file == nil || !errors.Is(err, syscall.EIO) || !errors.Is(err, closeCause) || closes != 1 {
 		t.Fatalf("unconfirmed open lost reference cleanup: %v, %v, closes %d", file, err, closes)
 	}
 	if len(session.base.fileSessions) != 1 {
 		t.Fatal("unknown reference cleanup lost its owning session")
+	}
+	if result, err := file.CloseWithResult(t.Context()); !result.Released || err != nil || closes != 2 {
+		t.Fatalf("reconciled cleanup=%+v %v, closes %d", result, err, closes)
+	}
+}
+
+func TestFailedOpenCleanupRunsWhileSessionIsClosing(t *testing.T) {
+	session := retainedTestSession(t, nil)
+	session.mu.Lock()
+	session.closing = true
+	session.mu.Unlock()
+	closes := 0
+	remote := &fileAuthorityStub{
+		close:           func(context.Context) error { closes++; return syscall.ENOTEMPTY },
+		releasedOnError: true,
+	}
+	file, err := session.cleanupFailedOpenFile(remote, syscall.EIO)
+	if file != nil || !errors.Is(err, syscall.ENOTEMPTY) || closes != 1 {
+		t.Fatalf("closing session cleanup=%T %v, closes %d", file, err, closes)
+	}
+}
+
+func TestFailedSessionOpenPreservesUnconfirmedCleanupOwnership(t *testing.T) {
+	base := confirmationTestStorage(DefaultOptions())
+	t.Cleanup(base.stop)
+	calls := 0
+	remote := &fileSessionStub{close: func(context.Context) error {
+		calls++
+		if calls == 1 {
+			return syscall.EIO
+		}
+		return nil
+	}}
+	session, err := base.cleanupFailedOpenSession(remote, syscall.EOPNOTSUPP)
+	if session == nil || !errors.Is(err, syscall.EOPNOTSUPP) || !errors.Is(err, syscall.EIO) || calls != 1 {
+		t.Fatalf("unconfirmed session cleanup=%T %v, calls %d", session, err, calls)
+	}
+	for _, check := range []struct {
+		name string
+		call func() error
+	}{
+		{name: "open file", call: func() error {
+			_, err := session.OpenFile(t.Context(), "file", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true}})
+			return err
+		}},
+		{name: "open node", call: func() error {
+			_, err := session.OpenNode(t.Context(), 1, storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true}})
+			return err
+		}},
+		{name: "stat node", call: func() error {
+			_, err := session.StatNode(t.Context(), 1)
+			return err
+		}},
+		{name: "set node attr", call: func() error {
+			_, err := session.SetNodeAttr(t.Context(), 1, storage.AttrChange{})
+			return err
+		}},
+		{name: "renew", call: func() error {
+			_, err := session.Renew(t.Context())
+			return err
+		}},
+		{name: "status", call: func() error {
+			_, err := session.Status(t.Context())
+			return err
+		}},
+	} {
+		if err := check.call(); !errors.Is(err, syscall.EOPNOTSUPP) || !errors.Is(err, syscall.EIO) || calls != 1 || len(base.fileCleanupSessions) != 1 {
+			t.Fatalf("failed session %s=%v, native calls %d, owned %d", check.name, err, calls, len(base.fileCleanupSessions))
+		}
+	}
+	if result, err := session.CloseWithResult(t.Context()); !result.Released || err != nil || calls != 2 {
+		t.Fatalf("reconciled session cleanup=%+v %v, calls %d", result, err, calls)
+	}
+	terminal := &fileSessionStub{close: func(context.Context) error { return syscall.ENOTEMPTY }, releasedOnError: true}
+	session, err = base.cleanupFailedOpenSession(terminal, syscall.EOPNOTSUPP)
+	if session != nil || !errors.Is(err, syscall.EOPNOTSUPP) || !errors.Is(err, syscall.ENOTEMPTY) {
+		t.Fatalf("terminal session cleanup=%T %v", session, err)
+	}
+}
+
+func TestStorageCloseRetriesPartialSessionOpenCleanup(t *testing.T) {
+	base := confirmationTestStorage(DefaultOptions())
+	replica, err := sqlite.OpenReplica(t.Context(), filepath.Join(t.TempDir(), "replica.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	base.local = replica
+	base.stopped = make(chan struct{})
+	close(base.stopped)
+	calls := 0
+	remote := &fileSessionStub{close: func(context.Context) error {
+		calls++
+		if calls == 1 {
+			return syscall.EIO
+		}
+		return nil
+	}}
+	session, err := base.cleanupFailedOpenSession(remote, syscall.EOPNOTSUPP)
+	if session == nil || !errors.Is(err, syscall.EIO) || len(base.fileCleanupSessions) != 1 {
+		t.Fatalf("partial session=%T %v, owned %d", session, err, len(base.fileCleanupSessions))
+	}
+	if err := base.Close(); err != nil || calls != 2 || len(base.fileCleanupSessions) != 0 {
+		t.Fatalf("storage close=%v, calls %d, owned %d", err, calls, len(base.fileCleanupSessions))
+	}
+}
+
+type pendingFailedOpenSessionStub struct {
+	*fileSessionStub
+	closes int
+}
+
+func (s *pendingFailedOpenSessionStub) CloseWithBarrier(context.Context) (storage.ReferenceCloseResult, *httprest.MutationBarrier, error) {
+	s.closes++
+	if s.closes == 1 {
+		return storage.ReferenceCloseResult{Released: true}, nil, &httprest.CloseBarrierPendingError{Cause: syscall.EIO}
+	}
+	return storage.ReferenceCloseResult{Released: true}, &httprest.MutationBarrier{Incarnation: "log"}, nil
+}
+
+func TestPartialSessionOpenRetainsPendingBarrierReconciliation(t *testing.T) {
+	base := confirmationTestStorage(DefaultOptions())
+	t.Cleanup(base.stop)
+	remote := &pendingFailedOpenSessionStub{fileSessionStub: &fileSessionStub{}}
+	session, err := base.cleanupFailedOpenSession(remote, syscall.EOPNOTSUPP)
+	if session == nil || !errors.Is(err, syscall.EIO) || len(base.fileCleanupSessions) != 1 || remote.closes != 1 {
+		t.Fatalf("pending session=%T %v owned=%d remote calls=%d", session, err, len(base.fileCleanupSessions), remote.closes)
+	}
+	if err := base.closeFileSessions(); err != nil || len(base.fileCleanupSessions) != 0 || remote.closes != 2 {
+		t.Fatalf("session barrier replay=%v owned=%d remote calls=%d", err, len(base.fileCleanupSessions), remote.closes)
 	}
 }
 

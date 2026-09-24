@@ -2,6 +2,7 @@ package httprest
 
 import (
 	"github.com/codetreker/remote-fs/packages/storage"
+	"math"
 	"syscall"
 	"unicode/utf8"
 )
@@ -15,7 +16,18 @@ func validateCapabilityArguments(req fileRequest) error {
 	case storage.OpFileQueryAction:
 		return req.FileAction.Check()
 	case storage.OpFileQueryDeleteIntent:
+		if err := req.DeleteOwner.Check(); err != nil {
+			return err
+		}
 		return req.DeleteIntent.Check()
+	case storage.OpFileListDeleteIntents:
+		if err := req.DeleteOwner.Check(); err != nil {
+			return err
+		}
+		if req.DeleteAfter > storage.DeleteIntentCursor(math.MaxInt64) || req.DeleteLimit < 1 || req.DeleteLimit > storage.MaxDeleteIntentPageEntries {
+			return syscall.EINVAL
+		}
+		return nil
 	case storage.OpFileAcknowledgeDeleteIntent:
 		if req.Acknowledge == nil {
 			return syscall.EINVAL
