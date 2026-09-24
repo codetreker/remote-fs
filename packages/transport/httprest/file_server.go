@@ -35,8 +35,50 @@ type fileRegistry struct {
 	wake           chan struct{}
 	done           chan struct{}
 	err            error
-	terminalErr    error
+	terminalErr    closeErrorSummary
 }
+
+const maxRetainedCloseErrors = 16
+
+// Close errors can precede Handler.Close by arbitrarily many retired sessions.
+// Keep the first failure and a bounded sample of later failures while counting
+// every released reference whose cleanup failed.
+type closeErrorSummary struct {
+	count   uint64
+	samples []error
+}
+
+func (s *closeErrorSummary) add(err error) {
+	if err == nil {
+		return
+	}
+	s.count++
+	retained := retainFileError(err)
+	if len(s.samples) < maxRetainedCloseErrors {
+		s.samples = append(s.samples, retained)
+		return
+	}
+	copy(s.samples[1:], s.samples[2:])
+	s.samples[len(s.samples)-1] = retained
+}
+
+func (s closeErrorSummary) result() error {
+	if s.count == 0 {
+		return nil
+	}
+	return &closeErrors{count: s.count, samples: append([]error(nil), s.samples...)}
+}
+
+type closeErrors struct {
+	count   uint64
+	samples []error
+}
+
+func (e *closeErrors) Error() string {
+	return fmt.Sprintf("%d file reference cleanup failures: %v", e.count, errors.Join(e.samples...))
+}
+
+func (e *closeErrors) Unwrap() []error { return e.samples }
 
 type servedFileSession struct {
 	dataActions    int
@@ -124,7 +166,7 @@ func (r *fileRegistry) startLocked() {
 	if !r.running {
 		r.done = make(chan struct{})
 		if r.closed {
-			r.err = r.terminalErr
+			r.err = r.terminalErr.result()
 		}
 		r.running = true
 		go r.run()
@@ -248,7 +290,7 @@ func (r *fileRegistry) run() {
 						r.mu.Unlock()
 					} else if result.Released {
 						r.mu.Lock()
-						r.terminalErr = errors.Join(r.terminalErr, err)
+						r.terminalErr.add(err)
 						r.mu.Unlock()
 					}
 				}
@@ -292,14 +334,15 @@ func (r *fileRegistry) closeRetiringSession(id string, session *servedFileSessio
 	r.mu.Lock()
 	if result.Released && r.sessions[id] == session {
 		delete(r.sessions, id)
+		now := time.Now()
 		terminal := &terminalFileClose{
-			epoch: session.epoch(time.Now()), history: session.options.History,
-			expires: time.Now().Add(2 * session.options.History), releaseErr: retainFileError(err),
+			epoch: session.epoch(now), history: session.options.History,
+			expires: now.Add(2 * session.options.History), releaseErr: retainFileError(err),
 			actions: make(map[storage.LockRequestID]*servedFileAction),
 		}
 		session.mu.Lock()
 		for id, action := range session.actions {
-			if action.op == storage.OpFileSessionClose {
+			if action.op == storage.OpFileSessionClose && now.Before(action.expires) {
 				terminal.actions[id] = action
 			}
 		}
@@ -309,7 +352,7 @@ func (r *fileRegistry) closeRetiringSession(id string, session *servedFileSessio
 	if err != nil && closing {
 		r.recordCloseErrorLocked(err, result.Released)
 	} else if err != nil && result.Released {
-		r.terminalErr = errors.Join(r.terminalErr, err)
+		r.terminalErr.add(err)
 	}
 	r.mu.Unlock()
 	session.mu.Lock()
@@ -322,7 +365,7 @@ func (r *fileRegistry) closeRetiringSession(id string, session *servedFileSessio
 func (r *fileRegistry) recordCloseErrorLocked(err error, released bool) {
 	r.err = errors.Join(r.err, err)
 	if released {
-		r.terminalErr = errors.Join(r.terminalErr, err)
+		r.terminalErr.add(err)
 	}
 }
 
@@ -728,10 +771,18 @@ func (h *Handler) fileCall(ctx context.Context, req fileRequest, digest [32]byte
 			registry.mu.Lock()
 			if registry.sessions[req.Session] == session {
 				delete(registry.sessions, req.Session)
-				registry.terminalCloses[req.Session] = &terminalFileClose{
+				terminal := &terminalFileClose{
 					epoch: epoch, history: session.options.History, expires: action.expires,
-					releaseErr: releaseErr, actions: map[storage.LockRequestID]*servedFileAction{req.Action: action},
+					releaseErr: releaseErr, actions: make(map[storage.LockRequestID]*servedFileAction),
 				}
+				session.mu.Lock()
+				for id, recorded := range session.actions {
+					if recorded.op == storage.OpFileSessionClose && now.Before(recorded.expires) {
+						terminal.actions[id] = recorded
+					}
+				}
+				session.mu.Unlock()
+				registry.terminalCloses[req.Session] = terminal
 			}
 			registry.mu.Unlock()
 		}

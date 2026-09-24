@@ -336,7 +336,7 @@ func (s *remoteFileSession) call(ctx context.Context, req fileRequest) (fileResp
 		cancel()
 		if recoveryErr == nil && !recovered.Retry {
 			response, err = recovered, nil
-		} else if recordedFileOutcome(recoveryErr) {
+		} else if recordedFileOutcome(recoveryErr) || releasedCloseBarrierPending(req, recovered) {
 			response, err = recovered, recoveryErr
 		} else if recoveryAction != "" {
 			s.mu.Lock()
@@ -367,6 +367,11 @@ func (s *remoteFileSession) call(ctx context.Context, req fileRequest) (fileResp
 func recordedFileOutcome(err error) bool {
 	var operation *operationError
 	return errors.As(err, &operation) && operation.recorded
+}
+
+func releasedCloseBarrierPending(req fileRequest, response fileResponse) bool {
+	return (req.Op == storage.OpFileClose || req.Op == storage.OpFileSessionClose) &&
+		response.CloseResult != nil && response.CloseResult.Released && response.CloseResult.BarrierPending
 }
 
 func freezeFileRequest(req fileRequest) (fileRequest, error) {
@@ -437,7 +442,7 @@ func (s *remoteFileSession) resolvePending(ctx context.Context) error {
 		response, err := s.storage.fileCall(recovery, pending.request)
 		cancel()
 		if err != nil {
-			if recordedFileOutcome(err) {
+			if recordedFileOutcome(err) || releasedCloseBarrierPending(pending.request, response) {
 				s.mu.Lock()
 				copy := response
 				pending.response = &copy

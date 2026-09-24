@@ -14,7 +14,7 @@ Status: implemented
 
 `FileSession`、`File` 与 `NodeReference` 提供 `CloseWithResult(ctx) (ReferenceCloseResult, error)`；`ReferenceCloseResult.Released=true` 表示该次调用结束后，调用方已经释放这项引用。成功关闭必须报告 true。删除义务的语义错误可以与已释放引用同时返回；清理尚未确认时，错误和未释放结果共同保留重试责任。原有 `Close` 保留为只返回错误的便利入口，内部遵守同一生命周期。HTTP 和所有第一方包装层传递原结果，不用错误种类或取消推断释放事实。
 
-HTTP 的 `file.close` 与 `file.session-close` 携带 `FileActionID`。服务端在能力退役后仍保留有界关闭回执，同一 ID 与输入重投不再次执行原生关闭，`QueryFileAction` 报告原生动作状态；已释放关闭可报告 Completed，这不证明 mutation barrier 已知。查询不携带 `Released` 或原错误，丢失响应须重投原关闭动作取得它们。`closeResult.barrierPending=true` 只出现在 `released=true`、无 barrier 的错误响应中：重投只继续核对同一已完成效果的 barrier，不能恢复引用或重复触发删除义务。`barrierPending=false` 是最终结果，即使没有 Log 而不携带 barrier；它仍保留原生关闭的语义错误。
+HTTP 的 `file.close` 与 `file.session-close` 携带 `FileActionID`。服务端在能力退役后仍保留有界关闭回执；一次会话关闭先失败、后由另一个 ID 完成时，终态记录保留每个仍在历史期限内的动作及原结果。同一 ID 与输入重投不再次执行原生关闭，`QueryFileAction` 报告该动作状态；已释放关闭可报告 Completed，这不证明 mutation barrier 已知。查询不携带 `Released` 或原错误，丢失响应须重投原关闭动作取得它们。`closeResult.barrierPending=true` 只出现在 `released=true`、无 barrier 的错误响应中：重投只继续核对同一已完成效果的 barrier，不能恢复引用或重复触发删除义务。`barrierPending=false` 是最终结果，即使没有 Log 而不携带 barrier；它仍保留原生关闭的语义错误。
 
 ### 持久 owner 与单调发现顺序
 
@@ -38,6 +38,6 @@ SQLite 在原有删除义务事务与见证提交中保存 owner、序号和不�
 
 ## 后果
 
-调用方可以把关闭后的引用责任与删除义务的业务结果分开处置，并在丢失单个 intent ID 后通过持久 owner 找回未 ACK 的义务。代价是每条义务增加 owner 和持久序号，迁移与持久高水位需要和原有见证、容量及完整性检查一起维护；持久 owner 由调用方保存，遗失 owner 仍不能从未知身份枚举全 volume 的义务。ACK 后没有 tombstone，调用方仍须避免复用已经确认的 ID；序号高水位不会因 ACK 回退。HTTP 会话关闭另保留有限的终态回执，终态记录与活跃会话共同占用 admission 容量，直到历史期限届满。
+调用方可以把关闭后的引用责任与删除义务的业务结果分开处置，并在丢失单个 intent ID 后通过持久 owner 找回未 ACK 的义务。代价是每条义务增加 owner 和持久序号，迁移与持久高水位需要和原有见证、容量及完整性检查一起维护；持久 owner 由调用方保存，遗失 owner 仍不能从未知身份枚举全 volume 的义务。ACK 后没有 tombstone，调用方仍须避免复用已经确认的 ID；序号高水位不会因 ACK 回退。HTTP 会话关闭保留历史期限内的有限动作回执，终态记录与活跃会话共同占用 admission 容量。回执过期后，已释放引用的清理失败继续进入有界汇总：累计次数和首个、近期错误样本供 `Handler.Close` 报告，不能由汇总重建已到期动作的原结果。
 
 本决定接续[持久节点身份与原子文件操作](2026-09-20-durable-identity-and-atomic-file-operations.md)的 durable delete intent、[活跃文件句柄](2026-09-08-live-file-handles.md)的关闭所有权，以及[业务授权](../feature/2026-09-10-host-provided-authorization.md)的逐请求准入；它扩展查询和关闭结果，不改变那些决定的对象绑定、原子打开与已接受效果语义。当前契约见[文件句柄设计](../../../../docs/design/server/file-handles.md)，验证边界见[测试策略](../../../../docs/testing.md)。
