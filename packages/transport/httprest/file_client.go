@@ -355,6 +355,11 @@ func (s *remoteFileSession) call(ctx context.Context, req fileRequest) (fileResp
 		}
 	}
 	if err == nil {
+		if s.capabilities.Allocation {
+			if validationErr := checkReportedAllocation(response); validationErr != nil {
+				return response, unreachable(Request{Op: OpFile}, validationErr)
+			}
+		}
 		s.mu.Lock()
 		if response.Epoch > s.epoch {
 			s.epoch = response.Epoch
@@ -362,6 +367,34 @@ func (s *remoteFileSession) call(ctx context.Context, req fileRequest) (fileResp
 		s.mu.Unlock()
 	}
 	return response, err
+}
+
+func checkReportedAllocation(response fileResponse) error {
+	check := func(attr *Attr) error {
+		if attr == nil {
+			return nil
+		}
+		if !attr.AllocationKnown {
+			return errors.New("allocation-reporting authority returned unknown allocation")
+		}
+		return (storage.Attr{AllocationSize: attr.AllocationSize, AllocationKnown: attr.AllocationKnown}).CheckAllocation()
+	}
+	if err := check(response.Attr); err != nil {
+		return err
+	}
+	if response.State != nil {
+		if err := check(response.State.Attr); err != nil {
+			return err
+		}
+	}
+	if response.Directory != nil {
+		for _, entry := range response.Directory.Entries {
+			if err := check(entry.Attr); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 func recordedFileOutcome(err error) bool {
@@ -485,6 +518,11 @@ func (s *remoteFileSession) takePendingResult(incoming fileRequest, incomingScop
 		}
 		if pending.response != nil {
 			delete(s.pending, key)
+			if s.capabilities.Allocation && pending.resultErr == nil {
+				if err := checkReportedAllocation(*pending.response); err != nil {
+					return *pending.response, true, unreachable(Request{Op: OpFile}, err)
+				}
+			}
 			return *pending.response, true, pending.resultErr
 		}
 		if pending.resultErr != nil {

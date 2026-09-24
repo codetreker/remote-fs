@@ -67,6 +67,14 @@ func capabilitiesOf(value any) (*fileCapabilities, error) {
 
 func sessionCapabilitiesOf(value storage.FileSession) (*fileCapabilities, error) {
 	caps, err := capabilitiesOf(value)
+	if reporter, ok := value.(storage.AllocationReporting); ok {
+		checkErr := reporter.CheckAllocationReporting()
+		if checkErr == nil {
+			caps.Allocation = true
+		} else if storage.ErrnoOf(checkErr) != syscall.EOPNOTSUPP {
+			err = errors.Join(err, checkErr)
+		}
+	}
 	reader, hasReader := value.(storage.DirectoryReader)
 	observer, hasObserver := value.(storage.DirectoryMetadataObserver)
 	if hasReader && hasObserver {

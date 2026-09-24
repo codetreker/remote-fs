@@ -999,29 +999,28 @@ var objectCases = []testCase{
 	{name: "a reservation the volume has room for is committed", allowance: allowance, run: func(t *testing.T, s metastore.Store) {
 		key, err := s.Reserve(ctx(t), "f", 500)
 		mustSucceed(t, err)
-		// The reservation itself takes no room; the bytes are the volume's only once they
-		// are committed.
+		// The reservation itself takes no room; the allocation is charged at commit.
 		mustUsed(t, s, 0)
 		mustSucceed(t, s.Commit(ctx(t), "f", metastore.Object{Key: key, Size: 500, ModTime: time.Now()}))
-		mustUsed(t, s, 500)
+		mustUsed(t, s, 4096)
 		mustHoldExactly(t, s, "f")
 	}},
 
 	{name: "a reservation past the allowance is EDQUOT and records nothing", allowance: allowance, run: func(t *testing.T, s metastore.Store) {
-		put(t, s, "f", allowance-100)
+		put(t, s, "f", allowance-4096)
 
-		_, err := s.Reserve(ctx(t), "g", 101)
+		_, err := s.Reserve(ctx(t), "g", 4097)
 		mustFail(t, err, syscall.EDQUOT)
 		if got := mustGarbage(t, s); len(got) != 0 {
 			t.Fatalf("a refused reservation left %v behind, want nothing", got)
 		}
-		mustUsed(t, s, allowance-100)
+		mustUsed(t, s, allowance-4096)
 
 		// Replacing a file is charged the difference, so a reservation that would overwrite
 		// the large file is taken even though the whole size would not fit twice.
-		_, err = s.Reserve(ctx(t), "f", allowance-100)
+		_, err = s.Reserve(ctx(t), "f", allowance-4096)
 		mustSucceed(t, err)
-		_, err = s.Reserve(ctx(t), "g", 100)
+		_, err = s.Reserve(ctx(t), "g", 4096)
 		mustSucceed(t, err)
 	}},
 
@@ -1070,33 +1069,33 @@ var spaceCases = []testCase{
 		}
 	}},
 
-	// Used is exact and is maintained by the same changes that move bytes in and out, so it
-	// is a census of what the volume's files hold rather than a sample of anything.
-	{name: "used bytes follow what the volume holds", allowance: allowance, run: func(t *testing.T, s metastore.Store) {
+	// Space.Used counts whole allocation units held by live files.
+	{name: "allocated bytes follow what the volume holds", allowance: allowance, run: func(t *testing.T, s metastore.Store) {
 		mustSucceed(t, s.Create(ctx(t), "empty"))
 		mustSucceed(t, s.Mkdir(ctx(t), "d"))
 		mustUsed(t, s, 0)
 
 		put(t, s, "f", 1000)
-		mustUsed(t, s, 1000)
+		mustUsed(t, s, 4096)
 
 		put(t, s, "d/g", 500)
-		mustUsed(t, s, 1500)
+		mustUsed(t, s, 8192)
 
-		// Replacing contents charges the difference in each direction.
-		put(t, s, "f", 3000)
-		mustUsed(t, s, 3500)
+		// Growing across an allocation boundary charges one more unit; shrinking
+		// across it releases that unit.
+		put(t, s, "f", 5000)
+		mustUsed(t, s, 12288)
 		put(t, s, "f", 100)
-		mustUsed(t, s, 600)
+		mustUsed(t, s, 8192)
 
 		mustSucceed(t, s.Remove(ctx(t), "f"))
-		mustUsed(t, s, 500)
+		mustUsed(t, s, 4096)
 
 		// A rename moves bytes that are charged already and credits back what it destroys.
 		put(t, s, "h", 250)
-		mustUsed(t, s, 750)
+		mustUsed(t, s, 8192)
 		mustSucceed(t, s.Rename(ctx(t), "h", "d/g"))
-		mustUsed(t, s, 250)
+		mustUsed(t, s, 4096)
 
 		mustSucceed(t, s.Remove(ctx(t), "d/g"))
 		mustSucceed(t, s.RemoveDir(ctx(t), "d"))
@@ -1112,27 +1111,27 @@ var spaceCases = []testCase{
 	// The refusal happens in the same change that records the size, so no window exists
 	// between deciding there is room and taking it.
 	{name: "a commit past the allowance is EDQUOT and changes nothing", allowance: allowance, run: func(t *testing.T, s metastore.Store) {
-		put(t, s, "f", allowance-100)
-		mustUsed(t, s, allowance-100)
+		put(t, s, "f", allowance-4096)
+		mustUsed(t, s, allowance-4096)
 
 		// The reservation is for what fits; the commit then asks for more than the volume
 		// has left. That is the arrangement a volume which filled up between the two calls
 		// produces, and it is what makes the commit rather than the reservation the authority.
-		key, err := s.Reserve(ctx(t), "g", 100)
+		key, err := s.Reserve(ctx(t), "g", 4096)
 		mustSucceed(t, err)
-		mustFail(t, s.Commit(ctx(t), "g", metastore.Object{Key: key, Size: 101, ModTime: time.Now()}), syscall.EDQUOT)
+		mustFail(t, s.Commit(ctx(t), "g", metastore.Object{Key: key, Size: 4097, ModTime: time.Now()}), syscall.EDQUOT)
 
 		// Neither the file nor the bytes were recorded.
 		if _, err := s.Stat(ctx(t), "g"); !errors.Is(err, syscall.ENOENT) {
 			t.Fatalf("stat g after the refused commit: %v, want ENOENT", err)
 		}
-		mustUsed(t, s, allowance-100)
+		mustUsed(t, s, allowance-4096)
 		mustHoldExactly(t, s, "f")
 
 		// What fits is taken.
-		fits, err := s.Reserve(ctx(t), "g", 100)
+		fits, err := s.Reserve(ctx(t), "g", 4096)
 		mustSucceed(t, err)
-		mustSucceed(t, s.Commit(ctx(t), "g", metastore.Object{Key: fits, Size: 100, ModTime: time.Now()}))
+		mustSucceed(t, s.Commit(ctx(t), "g", metastore.Object{Key: fits, Size: 4096, ModTime: time.Now()}))
 		mustUsed(t, s, allowance)
 
 		space, err := s.Space(ctx(t))
@@ -1164,7 +1163,7 @@ var spaceCases = []testCase{
 		// A full volume still takes a write that shrinks it, which is the only way back
 		// under the allowance.
 		put(t, s, "f", 10)
-		mustUsed(t, s, 10)
+		mustUsed(t, s, 4096)
 	}},
 
 	{name: "a commit of a negative length is EINVAL", allowance: allowance, run: func(t *testing.T, s metastore.Store) {

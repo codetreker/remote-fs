@@ -13,6 +13,9 @@ import (
 type namespaceIdentity struct {
 	ID                int64
 	Kind              storage.NodeKind
+	Size              int64
+	AllocationSize    int64
+	AllocationKnown   bool
 	DirectoryRevision []byte
 	Detached          bool
 }
@@ -27,14 +30,16 @@ func scanNamespaceIdentity(row scanner) (namespaceIdentity, error) {
 	if err := row.Scan(append(header.fields(), &contentRevision, &detached)...); err != nil {
 		return namespaceIdentity{}, err
 	}
-	if _, err := header.node(); err != nil {
+	node, err := header.node()
+	if err != nil {
 		return namespaceIdentity{}, err
 	}
 	if contentRevision < 1 || detached < 0 || detached > 1 {
 		return namespaceIdentity{}, syscall.EIO
 	}
 	return namespaceIdentity{
-		ID: header.id, Kind: storage.NodeKind(header.kind),
+		ID: header.id, Kind: storage.NodeKind(header.kind), Size: node.Size,
+		AllocationSize: node.AllocationSize, AllocationKnown: node.AllocationKnown,
 		DirectoryRevision: append([]byte{}, header.directoryRevision...), Detached: detached == 1,
 	}, nil
 }
@@ -44,6 +49,12 @@ func (s *Store) namespaceIdentity(ctx context.Context, tx *sql.Tx, id int64) (na
 		`SELECT `+namespaceIdentityColumns+` FROM nodes n WHERE n.volume=? AND n.id=?`, s.volume, id))
 	if errors.Is(err, sql.ErrNoRows) {
 		return namespaceIdentity{}, syscall.ESTALE
+	}
+	if err == nil && !s.replicaMetadata {
+		want, allocationErr := allocatedSize(identity.Kind, identity.Size)
+		if allocationErr != nil || !identity.AllocationKnown || identity.AllocationSize != want {
+			return namespaceIdentity{}, syscall.EIO
+		}
 	}
 	if err == nil && !s.replicaMetadata && identity.Kind == storage.NodeDirectory && !validDirectoryRevision(identity.DirectoryRevision) {
 		return namespaceIdentity{}, syscall.EIO

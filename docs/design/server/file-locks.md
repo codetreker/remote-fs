@@ -48,7 +48,7 @@ Session、Owner 与 Grant 是不可伪造的 bearer capability，使用至少 12
 
 Acquire 的结果为 `Pending`、`Granted`、`Cancelled`、`TimedOut` 或带分类的 `Rejected`；Renew 成功为 `Renewed`。Pending 尚未决定最终结果，只能前进到一个终态。立即冲突、AlreadyHeld、排队目标消失及已接纳的 Renew 失败都保留为原动作结果，条件后来改变也不会重新执行。授予当前状态可从 `Active` 前进到 `Released`、`Expired`、`TargetGone` 或 `OwnerRetired`；Query 可以同时报告原 Acquire 已获准与该 grant 现已到期。
 
-响应以授权方单调时钟表达期限与当前状态。SDK 的本地有效期只是保守提示，不能代替服务端最终权限判定；编码与取整规则见下文「HTTP v4 编码」。
+响应以授权方单调时钟表达期限与当前状态。SDK 的本地有效期只是保守提示，不能代替服务端最终权限判定；编码与取整规则见下文「HTTP v5 编码」。
 
 控制错误区分 `Invalid`、`UnsupportedTarget`、`Conflict`、`AlreadyHeld`、`RequestMismatch`、`Capacity`、`Retired`、`OutcomeUnknown`、`StaleResource`、`StaleGrant`、`UnrelatedProof`、`Recovering` 与 `Unavailable`。输入错误映射 `EINVAL`，不支持的目标为 `EOPNOTSUPP`，占有冲突为 `EBUSY`，容量或恢复中为 `EAGAIN`，退役、失效与 proof 相关性失败为 `ESTALE`，未知或不可用为 `EIO`。管理响应仍保留 typed code 与是否已记录的区别，不能从 errno 反推生命周期。响应丢失后核对原授权方、持有者与 Request，不能在新的授权方里悄悄创建另一份意图。
 
@@ -132,15 +132,15 @@ raw SQLite opener 也先取得同一个原生数据库文件的共享 flock，�
 
 服务前验证本地 xattr、flock、同 mount 改名、文件与目录 fsync 能力，不支持的配置明确失败。缺失、损坏、替换或归属不匹配的绑定与 READY 状态不触发自动初始化。证据和对象的暂存属于各自私有存储格式，不能出现在 volume 中。
 
-## HTTP v4 编码
+## HTTP v5 编码
 
-所有端点使用 `/v4/`，每个响应都有 `Remote-Fs-Protocol: 4` 与 `Cache-Control: no-store`。基础 volume 操作名、octet write body、mutation barrier 与 Strong DTO 保留既有含义；v3 及更早版本不被当前 client 接受。
+所有端点使用 `/v5/`，每个响应都有 `Remote-Fs-Protocol: 5` 与 `Cache-Control: no-store`。基础 volume 操作名、octet write body、mutation barrier 与 Strong DTO 保留既有含义；v4 及更早版本不被当前 client 接受。
 
 ### 控制端点
 
 控制请求都是有界的 JSON POST。能力不放入 URL；表中对象使用公共 locking 类型的 JSON 字段，未知或重复成员无效，所有列出的字段均须存在。
 
-| `/v4/` 下的端点 | 请求体 | 成功响应 |
+| `/v5/` 下的端点 | 请求体 | 成功响应 |
 |---|---|---|
 | `session-enrollment` | `{}` | `{"ticket": EnrollmentTicket}` |
 | `session-open` | `{"ticket": EnrollmentTicket}` | `{"session": Session}` |
@@ -196,7 +196,7 @@ SDK 以产生这份 GrantStatus 的请求首次发送时刻加 `remainingMillis`
 
 普通 `flock` 与传统 POSIX `fcntl` 由[保留文件接口](file-handles.md)的中立 advisory range 表达，不创建 Strong Owner 或 grant。它们允许未参与该 advisory domain 的调用方执行普通修改，阻塞等待按 FileSession 的健康续期维持，不采用这里 Acquire 的有限 Wait。`DomainEnforced` 也仍是独立的 Use/range 检查，不等同于 Strong 的持久期限与恢复屏障。普通 Open 不自动选择 Strong 策略。
 
-独立 server 的 Azure Blob 与本地持久对象存储两种形态都建立配对的 enforcing volume 与锁服务，向 HTTP v4 同时发布数据操作、锁管理操作和显式 mutation scope。协议不通过忽略未知 proof、旧授权方身份或非法 scope 保持兼容；无法识别的结果保持错误。
+独立 server 的 Azure Blob 与本地持久对象存储两种形态都建立配对的 enforcing volume 与锁服务，向 HTTP v5 同时发布数据操作、锁管理操作和显式 mutation scope。协议不通过忽略未知 proof、旧授权方身份或非法 scope 保持兼容；无法识别的结果保持错误。
 
 控制 admission、Session、Owner、grant、等待申请、动作历史及本地资源映射分别有界。授权方动作历史满额时，Release、已知 Acquire 的 Cancel 与 Owner / Session 终止仍有执行路径；控制请求本身继续服从独立的 HTTP admission。TCP 断开不解除已经确认的占有，显式生命周期结束与有限 lease / idle 到期负责释放。
 

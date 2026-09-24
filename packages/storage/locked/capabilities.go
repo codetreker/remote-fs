@@ -21,6 +21,11 @@ func (s *fileSession) CheckAtomicFileOpen() error {
 	return err
 }
 
+func (s *fileSession) CheckAllocationReporting() error {
+	_, err := capability(s.FileSession, storage.AllocationReporting.CheckAllocationReporting)
+	return err
+}
+
 func (s *fileSession) OpenAt(ctx context.Context, selection storage.ChildSelection, options storage.OpenAtOptions) (storage.OpenResult, error) {
 	backend, err := capability(s.FileSession, storage.AtomicFileOpener.CheckAtomicFileOpen)
 	if err != nil {

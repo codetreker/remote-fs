@@ -16,7 +16,7 @@ import (
 
 func TestBoundedReadRefusesFromMetadataBeforeFetchingTheObject(t *testing.T) {
 	objects := &observedBoundedObjects{Objects: memory.New()}
-	meta, err := sqlite.Open(t.Context(), filepath.Join(t.TempDir(), "meta.db"), "workspace", 1024, sqlite.DefaultWindow())
+	meta, err := sqlite.Open(t.Context(), filepath.Join(t.TempDir(), "meta.db"), "workspace", 4096, sqlite.DefaultWindow())
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -148,9 +148,12 @@ func TestHangingUpReportsLocalStoreState(t *testing.T) {
 		t.Fatalf("write before SIGHUP: %v", err)
 	}
 	before := spaceOf(t, client)
+	if before.Used != 2*mountBlockSize {
+		t.Fatalf("5000-byte file reserved %d volume bytes, want %d", before.Used, 2*mountBlockSize)
+	}
 	srv.hangup(t)
 	line := srv.awaitLine(t, "local-store status", startup)
-	if !strings.Contains(line, fmt.Sprintf("%d of %d volume bytes used", held, before.Total)) {
+	if !strings.Contains(line, fmt.Sprintf("%d of %d volume bytes used", before.Used, before.Total)) {
 		t.Fatalf("status omitted the current volume usage: %s", line)
 	}
 	if after := spaceOf(t, client); after != before {

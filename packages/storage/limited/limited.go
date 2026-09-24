@@ -556,7 +556,8 @@ func (s *Storage) Rename(ctx context.Context, from, to string) error {
 func (s *Storage) Stat(ctx context.Context, name string) (storage.Attr, error) {
 	s.gate.RLock()
 	defer s.gate.RUnlock()
-	return s.backing.Stat(ctx, name)
+	attr, err := s.backing.Stat(allocationContext(ctx), name)
+	return maskAllocation(attr), err
 }
 
 func (s *Storage) SetAttr(ctx context.Context, name string, change storage.AttrChange) error {
@@ -577,7 +578,8 @@ func (s *Storage) CheckBounded() error {
 func (s *Storage) List(ctx context.Context, name string) ([]storage.Entry, error) {
 	s.gate.RLock()
 	defer s.gate.RUnlock()
-	return s.backing.List(ctx, name)
+	entries, err := s.backing.List(ctx, name)
+	return maskEntries(entries), err
 }
 
 func (s *Storage) ListBounded(ctx context.Context, name string, result *storage.ListResult) (returned error) {
@@ -590,6 +592,9 @@ func (s *Storage) ListBounded(ctx context.Context, name string, result *storage.
 	}
 	s.gate.RLock()
 	defer s.gate.RUnlock()
+	if err := result.ProjectAttrs(maskAllocation); err != nil {
+		return err
+	}
 	return s.backing.ListBounded(ctx, name, result)
 }
 

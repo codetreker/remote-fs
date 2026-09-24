@@ -99,7 +99,7 @@ func TestMetadataContract(t *testing.T) {
 
 func TestClientListHonorsAnOuterTransportLimit(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		body := []byte(`{"entries":[{"name":"Zg==","attr":{"id":1,"kind":1,"size":0,"access_time":{"unix_sec":0,"nanos":0},"mod_time":{"unix_sec":0,"nanos":0}}}]}`)
+		body := []byte(`{"entries":[{"name":"Zg==","attr":{"id":1,"kind":1,"size":0,"allocation_size":0,"allocation_known":false,"access_time":{"unix_sec":0,"nanos":0},"mod_time":{"unix_sec":0,"nanos":0}}}]}`)
 		w.Header().Set(httprest.HeaderProtocol, httprest.Version)
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Content-Length", strconv.Itoa(len(body)))

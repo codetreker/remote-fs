@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"math"
 	"syscall"
 	"time"
 
@@ -66,7 +67,10 @@ func (s *Store) Reserve(ctx context.Context, path string, size int64) (metastore
 		if err != nil {
 			return err
 		}
-		if found && node.IsDir() {
+		if found && node.Kind != storage.NodeRegular {
+			if node.Kind == storage.NodeSymlink {
+				return syscall.ELOOP
+			}
 			return syscall.EISDIR
 		}
 		// What the commit would charge: the difference against whatever the name holds now,
@@ -74,9 +78,13 @@ func (s *Store) Reserve(ctx context.Context, path string, size int64) (metastore
 		// refused by a volume that has room for the difference.
 		var held int64
 		if found {
-			held = node.Size
+			held = node.AllocationSize
 		}
-		if err := s.roomFor(ctx, tx, size-held); err != nil {
+		reserved, err := allocatedSize(storage.NodeRegular, size)
+		if err != nil {
+			return err
+		}
+		if err := s.roomFor(ctx, tx, reserved-held); err != nil {
 			return err
 		}
 		return s.reserveObject(ctx, tx, key, size, sec, nsec)
@@ -245,7 +253,10 @@ func (s *Store) commit(ctx context.Context, tx *sql.Tx, cleaned string, object m
 	if err != nil {
 		return err
 	}
-	if found && node.IsDir() {
+	if found && node.Kind != storage.NodeRegular {
+		if node.Kind == storage.NodeSymlink {
+			return syscall.ELOOP
+		}
 		return syscall.EISDIR
 	}
 
@@ -256,7 +267,11 @@ func (s *Store) commit(ctx context.Context, tx *sql.Tx, cleaned string, object m
 	if found {
 		held, displaced = node.Size, node.Content
 	}
-	if err := s.account(ctx, tx, object.Size-held); err != nil {
+	if err := s.accountFileChange(ctx, tx, held, object.Size); err != nil {
+		return err
+	}
+	allocation, err := allocatedSize(storage.NodeRegular, object.Size)
+	if err != nil {
 		return err
 	}
 
@@ -267,8 +282,8 @@ func (s *Store) commit(ctx context.Context, tx *sql.Tx, cleaned string, object m
 		}
 		changeSec, changeNsec := sqlvalue.StoredTime(time.Now())
 		if _, err := tx.ExecContext(ctx,
-			`UPDATE nodes SET size=?,mtime_sec=?,mtime_nsec=?,content=?,change_sec=?,change_nsec=? WHERE id=?`,
-			object.Size, sec, nsec, sqlvalue.StoredKey(object.Key), changeSec, changeNsec, node.ID); err != nil {
+			`UPDATE nodes SET size=?,allocation_size=?,mtime_sec=?,mtime_nsec=?,content=?,change_sec=?,change_nsec=? WHERE id=?`,
+			object.Size, allocation, sec, nsec, sqlvalue.StoredKey(object.Key), changeSec, changeNsec, node.ID); err != nil {
 			return err
 		}
 		// Modified rather than Created, because the name held this node before the commit. The
@@ -299,12 +314,16 @@ func (s *Store) commit(ctx context.Context, tx *sql.Tx, cleaned string, object m
 
 // createCommitted makes the file a commit is pointing at when nothing is at the name yet.
 func (s *Store) createCommitted(ctx context.Context, tx *sql.Tx, parent metastore.Node, name []byte, object metastore.Object) error {
+	allocation, err := allocatedSize(storage.NodeRegular, object.Size)
+	if err != nil {
+		return err
+	}
 	now := time.Now()
 	node, err := s.insertNode(ctx, tx, storage.NodeRegular, storage.InitialFields{Attr: storage.AttrChange{ModTime: &object.ModTime}}, now)
 	if err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE nodes SET size=?,content=? WHERE id=?`, object.Size, sqlvalue.StoredKey(object.Key), node.ID); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE nodes SET size=?,allocation_size=?,content=? WHERE id=?`, object.Size, allocation, sqlvalue.StoredKey(object.Key), node.ID); err != nil {
 		return err
 	}
 	if err := s.link(ctx, tx, parent.ID, name, node.ID); err != nil {
@@ -316,16 +335,27 @@ func (s *Store) createCommitted(ctx context.Context, tx *sql.Tx, parent metastor
 	return s.touch(ctx, tx, parent.ID, now)
 }
 
-// account moves the volume's byte counter by delta, refusing what the allowance cannot
-// pay for.
+// accountFileChange moves the logical and allocation counters together, admitting growth
+// against the allocated counter before either charge is committed.
 //
 // The refusal and the charge are one step inside the caller's transaction, which is what
 // leaves no window between deciding there is room and taking it.
-func (s *Store) account(ctx context.Context, tx *sql.Tx, delta int64) error {
-	if err := s.roomFor(ctx, tx, delta); err != nil {
+func (s *Store) accountFileChange(ctx context.Context, tx *sql.Tx, oldSize, newSize int64) error {
+	oldAllocation, err := allocatedSize(storage.NodeRegular, oldSize)
+	if err != nil {
 		return err
 	}
-	return s.charge(ctx, tx, delta)
+	newAllocation, err := allocatedSize(storage.NodeRegular, newSize)
+	if err != nil {
+		return err
+	}
+	if err := s.roomFor(ctx, tx, newAllocation-oldAllocation); err != nil {
+		return err
+	}
+	if err := s.charge(ctx, tx, newSize-oldSize); err != nil {
+		return err
+	}
+	return s.chargeAllocation(ctx, tx, newAllocation-oldAllocation)
 }
 
 // roomFor refuses a change of delta bytes the allowance cannot pay for, without moving the
@@ -342,7 +372,7 @@ func (s *Store) roomFor(ctx context.Context, tx *sql.Tx, delta int64) error {
 	if s.allowance == 0 || delta <= 0 {
 		return nil
 	}
-	used, err := s.used(ctx, tx)
+	used, err := s.allocatedUsed(ctx, tx)
 	if err != nil {
 		return err
 	}
@@ -361,8 +391,36 @@ func (s *Store) charge(ctx context.Context, tx *sql.Tx, delta int64) error {
 	if delta == 0 {
 		return nil
 	}
-	_, err := tx.ExecContext(ctx, `UPDATE volumes SET used = used + ? WHERE id = ?`, delta, s.volume)
+	used, err := s.used(ctx, tx)
+	if err != nil {
+		return err
+	}
+	if delta > 0 && delta > math.MaxInt64-used || delta < 0 && -delta > used {
+		return syscall.EOVERFLOW
+	}
+	_, err = tx.ExecContext(ctx, `UPDATE volumes SET used = used + ? WHERE id = ?`, delta, s.volume)
 	return err
+}
+
+func (s *Store) chargeAllocation(ctx context.Context, tx *sql.Tx, delta int64) error {
+	if delta == 0 {
+		return nil
+	}
+	used, err := s.allocatedUsed(ctx, tx)
+	if err != nil {
+		return err
+	}
+	if delta > 0 && delta > math.MaxInt64-used || delta < 0 && -delta > used {
+		return syscall.EOVERFLOW
+	}
+	_, err = tx.ExecContext(ctx, `UPDATE volumes SET allocated_used = allocated_used + ? WHERE id = ?`, delta, s.volume)
+	return err
+}
+
+func (s *Store) allocatedUsed(ctx context.Context, tx *sql.Tx) (int64, error) {
+	var used int64
+	err := tx.QueryRowContext(ctx, `SELECT allocated_used FROM volumes WHERE id = ?`, s.volume).Scan(&used)
+	return used, err
 }
 
 func (s *Store) used(ctx context.Context, tx *sql.Tx) (int64, error) {

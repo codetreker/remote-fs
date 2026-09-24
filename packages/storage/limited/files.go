@@ -61,6 +61,11 @@ func (s *fileSession) SetNodeAttr(ctx context.Context, id uint64, change storage
 	})
 }
 
+func (s *fileSession) StatNode(ctx context.Context, id uint64) (storage.Attr, error) {
+	attr, err := s.FileSession.StatNode(allocationContext(ctx), id)
+	return maskAllocation(attr), err
+}
+
 func (s *fileSession) Close(ctx context.Context) error {
 	_, err := s.CloseWithResult(ctx)
 	return err
@@ -81,6 +86,17 @@ func wrapFile(s *Storage, inner storage.File) storage.File {
 		return nil
 	}
 	return &file{File: inner, referenceCapabilities: referenceCapabilities{backing: inner, storage: s}}
+}
+
+func (f *file) Stat(ctx context.Context) (storage.Attr, error) {
+	attr, err := f.File.Stat(allocationContext(ctx))
+	return maskAllocation(attr), err
+}
+
+func (f *file) ReadAt(ctx context.Context, offset int64, length int) (storage.FileRead, error) {
+	result, err := f.File.ReadAt(allocationContext(ctx), offset, length)
+	result.Attr = maskAllocation(result.Attr)
+	return result, err
 }
 
 func (f *file) WriteAt(ctx context.Context, offset int64, data []byte) (storage.Attr, error) {
@@ -118,6 +134,7 @@ func fileMutation[T any](s *Storage, ctx context.Context, name string, operation
 		var zero T
 		return zero, err
 	}
+	ctx = allocationContext(ctx)
 	result, err := operation(s.accountingContext(ctx, name))
-	return result, s.publicationError(err)
+	return maskResult(result), s.publicationError(err)
 }

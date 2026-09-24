@@ -178,7 +178,7 @@ func TestAnswersThatAreNotThisProtocol(t *testing.T) {
 		// An intermediary that answers on the server's behalf cannot know this header.
 		{"a success from something that is not the server", func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusOK)
-			w.Write([]byte(`{"attr":{"id":9,"kind":1,"size":0,"access_time":{"unix_sec":0,"nanos":0},"mod_time":{"unix_sec":0,"nanos":0}}}`))
+			w.Write([]byte(`{"attr":{"id":9,"kind":1,"size":0,"allocation_size":0,"allocation_known":false,"access_time":{"unix_sec":0,"nanos":0},"mod_time":{"unix_sec":0,"nanos":0}}}`))
 		}},
 		{"a storage error from something that is not the server", func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(httprest.StatusStorageError)
@@ -598,8 +598,8 @@ func TestAStatThatCarriesNoAttributes(t *testing.T) {
 		{`{"attr":{"id":0,"kind":1,"size":7}}`, 0, true},
 
 		// Every required field remains present when size and timestamps are zero.
-		{`{"attr":{"id":9,"kind":1,"size":7,"access_time":{"unix_sec":0,"nanos":0},"mod_time":{"unix_sec":0,"nanos":0}}}`, storage.NodeRegular, false},
-		{`{"attr":{"id":9,"kind":2,"size":0,"access_time":{"unix_sec":0,"nanos":0},"mod_time":{"unix_sec":0,"nanos":0}}}`, storage.NodeDirectory, false},
+		{`{"attr":{"id":9,"kind":1,"size":7,"allocation_size":0,"allocation_known":false,"access_time":{"unix_sec":0,"nanos":0},"mod_time":{"unix_sec":0,"nanos":0}}}`, storage.NodeRegular, false},
+		{`{"attr":{"id":9,"kind":2,"size":0,"allocation_size":0,"allocation_known":false,"access_time":{"unix_sec":0,"nanos":0},"mod_time":{"unix_sec":0,"nanos":0}}}`, storage.NodeDirectory, false},
 	}
 	for _, c := range cases {
 		t.Run(c.body, func(t *testing.T) {
@@ -635,10 +635,10 @@ func TestAListingEntryThatCarriesNoAttributes(t *testing.T) {
 	}{
 		{`{"entries":[{"name":"Zg=="}]}`, true},
 		{`{"entries":[{"name":"Zg==","attr":null}]}`, true},
-		{`{"entries":[{"name":"Zg==","attr":{"id":9,"kind":1,"size":0,"access_time":{"unix_sec":0,"nanos":0},"mod_time":{"unix_sec":0,"nanos":0}}},{"name":"Zw=="}]}`, true},
+		{`{"entries":[{"name":"Zg==","attr":{"id":9,"kind":1,"size":0,"allocation_size":0,"allocation_known":false,"access_time":{"unix_sec":0,"nanos":0},"mod_time":{"unix_sec":0,"nanos":0}}},{"name":"Zw=="}]}`, true},
 		// An entry whose attributes carry no identity is refused with the rest of them.
 		{`{"entries":[{"name":"Zg==","attr":{"kind":1}}]}`, true},
-		{`{"entries":[{"name":"Zg==","attr":{"id":9,"kind":1,"size":0,"access_time":{"unix_sec":0,"nanos":0},"mod_time":{"unix_sec":0,"nanos":0}}}]}`, false},
+		{`{"entries":[{"name":"Zg==","attr":{"id":9,"kind":1,"size":0,"allocation_size":0,"allocation_known":false,"access_time":{"unix_sec":0,"nanos":0},"mod_time":{"unix_sec":0,"nanos":0}}}]}`, false},
 	}
 	for _, c := range cases {
 		t.Run(c.body, func(t *testing.T) {

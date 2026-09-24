@@ -293,6 +293,9 @@ func validateStorageClassesVersion(ctx context.Context, db sqlvalue.Queryer, vol
 	if version >= firstDeleteIntentOwnerSchemaVersion {
 		query += ` OR typeof(delete_intent_high_water) != 'integer' OR delete_intent_high_water < 0`
 	}
+	if version >= firstVirtualAllocationSchemaVersion {
+		query += ` OR typeof(allocated_used) != 'integer' OR allocated_used < 0`
+	}
 	query += `)`
 	if err := db.QueryRowContext(ctx, query, scopeArgs...).Scan(&invalidVolumes); err != nil {
 		return err
@@ -327,6 +330,10 @@ func validateStorageClassesVersion(ctx context.Context, db sqlvalue.Queryer, vol
 	if version >= firstDirectoryRevisionSchemaVersion {
 		neutralNodeClasses += ` OR typeof(directory_revision)!='blob'`
 		neutralChangeClasses += ` OR typeof(directory_revision) NOT IN ('blob','null')`
+	}
+	if version >= firstVirtualAllocationSchemaVersion {
+		neutralNodeClasses += ` OR typeof(allocation_size) NOT IN ('integer','null')`
+		neutralChangeClasses += ` OR typeof(allocation_size) NOT IN ('integer','null')`
 	}
 	queries := []struct {
 		name  string
@@ -524,8 +531,14 @@ func validateIntegrityWithMetadataPolicy(
 		return fmt.Errorf("the database holds %d objects in an unknown state and %d objects with an invalid size: %w",
 			invalidStates, invalidSizes, syscall.EIO)
 	}
-	if err := validateObjectRelationshipsVersion(ctx, db, volume, version); err != nil {
-		return err
+	if opaqueMetadataVersions {
+		if err := validateReplicaObjectAbsence(ctx, db, volume); err != nil {
+			return err
+		}
+	} else {
+		if err := validateObjectRelationshipsVersion(ctx, db, volume, version); err != nil {
+			return err
+		}
 	}
 	if err := validateNodeRelationshipsVersion(ctx, db, volume, version); err != nil {
 		return err
@@ -537,6 +550,11 @@ func validateIntegrityWithMetadataPolicy(
 	}
 	if err := validateUsedAccountingVersion(ctx, db, volume, version); err != nil {
 		return err
+	}
+	if version >= firstVirtualAllocationSchemaVersion {
+		if err := validateAllocation(ctx, db, volume, opaqueMetadataVersions); err != nil {
+			return err
+		}
 	}
 	return validateLogIntegrityVersion(ctx, db, volume, version, true, opaqueMetadataVersions)
 }

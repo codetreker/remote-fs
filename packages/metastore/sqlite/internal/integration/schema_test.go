@@ -114,7 +114,7 @@ func TestWitnessedRetainedMigrationPreservesNodesAndAcceptedState(t *testing.T) 
 				}
 			})
 			assertHistoricalLeaseVolume(t, store, "A")
-			assertHistoricalLeaseSchemaVersion(t, path, 9)
+			assertHistoricalLeaseSchemaVersion(t, path, 10)
 			db := raw(t, path)
 			defer db.Close()
 			var total, initialized int
@@ -234,7 +234,7 @@ func TestNeutralMetadataMigrationWitnessFailurePreservesRecoveryState(t *testing
 	if !errors.Is(err, failure) || !errors.Is(err, syscall.EIO) {
 		t.Fatalf("unaccepted migration = %v; want original witness failure and EIO", err)
 	}
-	assertHistoricalLeaseSchemaVersion(t, path, 9)
+	assertHistoricalLeaseSchemaVersion(t, path, 10)
 	want := historicalLeaseDurableState
 	want.Generation++
 	accepted, visible := witness.accepts()
@@ -906,6 +906,62 @@ func TestLegacyUsedAccountingMustBeExactBeforeMigrating(t *testing.T) {
 	}
 }
 
+func TestLegacyMigrationRefusesUnrepresentableAllocation(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		firstSize  int64
+		secondSize int64
+	}{
+		{"single file rounding", math.MaxInt64, 0},
+		{"volume allocation sum", math.MaxInt64 - 4095, 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			path := database(t)
+			writeVersionOne(t, path)
+			db := raw(t, path)
+			tx, err := db.Begin()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer tx.Rollback()
+			for _, statement := range []struct {
+				query string
+				args  []any
+			}{
+				{`UPDATE objects SET size = ? WHERE key = 'carried'`, []any{test.firstSize}},
+				{`UPDATE nodes SET size = ? WHERE content = 'carried'`, []any{test.firstSize}},
+				{`UPDATE volumes SET used = ? WHERE id = 1`, []any{test.firstSize + test.secondSize}},
+			} {
+				if _, err := tx.Exec(statement.query, statement.args...); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if test.secondSize != 0 {
+				for _, statement := range []string{
+					`INSERT INTO objects (key, volume, state, size, digest, created_sec, created_nsec)
+					 VALUES ('second', 1, 1, 1, NULL, 0, 0)`,
+					`INSERT INTO nodes (volume, mode, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec, content)
+					 SELECT volume, mode, 1, 0, 0, 0, 0, 'second' FROM nodes WHERE id = 3`,
+					`INSERT INTO entries (parent, name, node)
+					 VALUES (2, CAST('second' AS BLOB), (SELECT max(id) FROM nodes))`,
+				} {
+					if _, err := tx.Exec(statement); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			if err := tx.Commit(); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+			before := schemaOf(t, path)
+			assertLegacyMigrationRefusedWithError(t, path, 1, before, syscall.EOVERFLOW)
+		})
+	}
+}
+
 func TestLegacyMigrationValidatesEveryVolumeUsedCounter(t *testing.T) {
 	versions := []struct {
 		name    string
@@ -979,14 +1035,18 @@ func TestLegacyMigrationValidatesEveryVolumeUsedCounter(t *testing.T) {
 }
 
 func assertLegacyMigrationRefused(t *testing.T, path string, version int, before string) {
+	assertLegacyMigrationRefusedWithError(t, path, version, before, syscall.EIO)
+}
+
+func assertLegacyMigrationRefusedWithError(t *testing.T, path string, version int, before string, want error) {
 	t.Helper()
 	store, err := sqlite.Open(t.Context(), path, "workspace", 0, sqlite.DefaultWindow())
 	if err == nil {
 		store.Close()
-		t.Fatalf("opening inconsistent schema version %d succeeded, want EIO", version)
+		t.Fatalf("opening inconsistent schema version %d succeeded, want %v", version, want)
 	}
-	if !errors.Is(err, syscall.EIO) {
-		t.Fatalf("opening inconsistent schema version %d: %v, want EIO", version, err)
+	if !errors.Is(err, want) {
+		t.Fatalf("opening inconsistent schema version %d: %v, want %v", version, err, want)
 	}
 	if after := schemaOf(t, path); after != before {
 		t.Fatalf("refusing schema version %d changed its schema\nbefore:\n%s\nafter:\n%s", version, before, after)
@@ -1286,8 +1346,11 @@ func TestAVersionOneDatabaseIsCarriedForwardIntact(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if space.Used != 700 {
-		t.Fatalf("the migrated volume reports %d bytes used, want the 700 it held", space.Used)
+	if space.Used != 4096 {
+		t.Fatalf("the migrated volume reports %d allocated bytes, want 4096", space.Used)
+	}
+	if logical, err := store.Usage(t.Context()); err != nil || logical != 700 {
+		t.Fatalf("the migrated volume holds %d logical bytes, %v; want 700", logical, err)
 	}
 
 	// The log is there, and it is empty. That is the truthful state: nothing recorded the

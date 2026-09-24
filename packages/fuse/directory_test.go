@@ -125,7 +125,7 @@ func (s *directorySessionFixture) AcknowledgeDeleteIntent(context.Context, stora
 func TestReadOnlyDirectoryHandleRetainsIdentityWithoutRequestingWriteAccess(t *testing.T) {
 	namespace := &namespaceFixture{}
 	reference := &nodeReferenceFixture{
-		attr:  storage.Attr{ID: 7, Kind: storage.NodeDirectory},
+		attr:  storage.Attr{ID: 7, Kind: storage.NodeDirectory, AllocationKnown: true},
 		scope: storage.UseScope{Token: "opened-directory"},
 	}
 	session := &directorySessionFixture{namespaceFixture: namespace, reference: reference}
@@ -134,7 +134,7 @@ func TestReadOnlyDirectoryHandleRetainsIdentityWithoutRequestingWriteAccess(t *t
 		if name.Parent.NodeID != 7 || name.Parent.Scope == nil || *name.Parent.Scope != reference.scope {
 			t.Fatalf("scoped lookup = %+v", name)
 		}
-		return storage.Attr{ID: 8, Kind: storage.NodeRegular}, nil
+		return storage.Attr{ID: 8, Kind: storage.NodeRegular, AllocationKnown: true}, nil
 	}
 
 	opened, _, errno := root.OpendirHandle(t.Context(), syscall.O_RDONLY|syscall.O_DIRECTORY)
@@ -177,7 +177,7 @@ func TestReadOnlyDirectoryHandleRetainsIdentityWithoutRequestingWriteAccess(t *t
 
 func TestInterruptedNodeReferenceOpenReplaysTheSameCompletedAction(t *testing.T) {
 	reference := &nodeReferenceFixture{
-		attr: storage.Attr{ID: 7, Kind: storage.NodeDirectory},
+		attr: storage.Attr{ID: 7, Kind: storage.NodeDirectory, AllocationKnown: true},
 	}
 	session := &directorySessionFixture{
 		namespaceFixture: &namespaceFixture{},
@@ -278,7 +278,7 @@ func TestFileActionReconciliationClassifiesAuthorityReceipts(t *testing.T) {
 func TestDirectoryOpenRejectsInvalidReferencesAndCleansReturnedOwnership(t *testing.T) {
 	if handle, _, errno := namespaceRoot(&directorySessionFixture{
 		namespaceFixture: &namespaceFixture{},
-		reference:        &nodeReferenceFixture{attr: storage.Attr{ID: 7, Kind: storage.NodeDirectory}},
+		reference:        &nodeReferenceFixture{attr: storage.Attr{ID: 7, Kind: storage.NodeDirectory, AllocationKnown: true}},
 	}).OpendirHandle(t.Context(), syscall.O_WRONLY); errno != syscall.EISDIR || handle != nil {
 		t.Fatalf("writable directory open = %v, %v", handle, errno)
 	}
@@ -292,36 +292,36 @@ func TestDirectoryOpenRejectsInvalidReferencesAndCleansReturnedOwnership(t *test
 	}{
 		{
 			name:      "reference returned with interrupted result",
-			reference: &nodeReferenceFixture{attr: storage.Attr{ID: 7, Kind: storage.NodeDirectory}, scope: storage.UseScope{Token: "scope"}},
+			reference: &nodeReferenceFixture{attr: storage.Attr{ID: 7, Kind: storage.NodeDirectory, AllocationKnown: true}, scope: storage.UseScope{Token: "scope"}},
 			outcome:   storage.Opened,
 			openErr:   context.Canceled,
 			wantErrno: syscall.EINTR,
 		},
 		{
 			name:      "invalid attributes",
-			reference: &nodeReferenceFixture{attr: storage.Attr{Kind: storage.NodeDirectory}, scope: storage.UseScope{Token: "scope"}},
+			reference: &nodeReferenceFixture{attr: storage.Attr{Kind: storage.NodeDirectory, AllocationKnown: true}, scope: storage.UseScope{Token: "scope"}},
 			outcome:   storage.Opened,
 		},
 		{
 			name: "invalid scoped reference",
-			reference: &nodeReferenceFixture{attr: storage.Attr{ID: 7, Kind: storage.NodeDirectory}, scope: storage.UseScope{Token: "scope"},
+			reference: &nodeReferenceFixture{attr: storage.Attr{ID: 7, Kind: storage.NodeDirectory, AllocationKnown: true}, scope: storage.UseScope{Token: "scope"},
 				checkErr: storage.ErrInvalidScope},
 			outcome: storage.Opened,
 		},
 		{
 			name: "scope query failure",
-			reference: &nodeReferenceFixture{attr: storage.Attr{ID: 7, Kind: storage.NodeDirectory}, scope: storage.UseScope{Token: "scope"},
+			reference: &nodeReferenceFixture{attr: storage.Attr{ID: 7, Kind: storage.NodeDirectory, AllocationKnown: true}, scope: storage.UseScope{Token: "scope"},
 				scopeErr: syscall.ESTALE},
 			outcome: storage.Opened,
 		},
 		{
 			name:      "malformed scope",
-			reference: &nodeReferenceFixture{attr: storage.Attr{ID: 7, Kind: storage.NodeDirectory}},
+			reference: &nodeReferenceFixture{attr: storage.Attr{ID: 7, Kind: storage.NodeDirectory, AllocationKnown: true}},
 			outcome:   storage.Opened,
 		},
 		{
 			name:      "impossible outcome",
-			reference: &nodeReferenceFixture{attr: storage.Attr{ID: 7, Kind: storage.NodeDirectory}, scope: storage.UseScope{Token: "scope"}},
+			reference: &nodeReferenceFixture{attr: storage.Attr{ID: 7, Kind: storage.NodeDirectory, AllocationKnown: true}, scope: storage.UseScope{Token: "scope"}},
 			outcome:   storage.Created,
 		},
 	} {
@@ -351,7 +351,7 @@ func TestDirectoryOpenRejectsInvalidReferencesAndCleansReturnedOwnership(t *test
 
 func TestDirectoryHandleAttributeMutationRevalidatesReferenceScope(t *testing.T) {
 	reference := &nodeReferenceFixture{
-		attr:  storage.Attr{ID: 7, Kind: storage.NodeDirectory},
+		attr:  storage.Attr{ID: 7, Kind: storage.NodeDirectory, AllocationKnown: true},
 		scope: storage.UseScope{Token: "directory"},
 	}
 	session := &directorySessionFixture{namespaceFixture: &namespaceFixture{}, reference: reference}
@@ -404,7 +404,7 @@ func (s *seekableDirectoryStream) Seekdir(_ context.Context, off uint64) syscall
 }
 
 func TestDirectoryHandleSeekUsesTheOpenedStream(t *testing.T) {
-	reference := &nodeReferenceFixture{attr: storage.Attr{ID: 7, Kind: storage.NodeDirectory}, scope: storage.UseScope{Token: "directory"}}
+	reference := &nodeReferenceFixture{attr: storage.Attr{ID: 7, Kind: storage.NodeDirectory, AllocationKnown: true}, scope: storage.UseScope{Token: "directory"}}
 	session := &directorySessionFixture{namespaceFixture: &namespaceFixture{}, reference: reference}
 	root := namespaceRoot(session)
 	stream := &seekableDirectoryStream{fixedDirectoryStream: &fixedDirectoryStream{entries: []gofuse.DirEntry{{Name: "first"}, {Name: "second"}}}}
@@ -437,7 +437,7 @@ func addObservedEntry(t *testing.T, result *storage.ListResult, name string, att
 
 func TestDirectoryHandleEnumerationUsesOneBoundedExactScopeCapture(t *testing.T) {
 	reference := &nodeReferenceFixture{
-		attr:  storage.Attr{ID: 7, Kind: storage.NodeDirectory},
+		attr:  storage.Attr{ID: 7, Kind: storage.NodeDirectory, AllocationKnown: true},
 		scope: storage.UseScope{Token: "opened-directory"},
 	}
 	session := &directorySessionFixture{namespaceFixture: &namespaceFixture{}, reference: reference}
@@ -447,8 +447,8 @@ func TestDirectoryHandleEnumerationUsesOneBoundedExactScopeCapture(t *testing.T)
 		if target.NodeID != reference.attr.ID || target.Scope == nil || *target.Scope != reference.scope {
 			t.Fatalf("directory target = %+v", target)
 		}
-		addObservedEntry(t, result, "first", storage.Attr{ID: 8, Kind: storage.NodeRegular})
-		addObservedEntry(t, result, "second", storage.Attr{ID: 9, Kind: storage.NodeDirectory})
+		addObservedEntry(t, result, "first", storage.Attr{ID: 8, Kind: storage.NodeRegular, AllocationKnown: true})
+		addObservedEntry(t, result, "second", storage.Attr{ID: 9, Kind: storage.NodeDirectory, AllocationKnown: true})
 		return storage.DirectoryObservation{ParentID: 7, Revision: []byte("capture-1")}, nil
 	}
 	root := namespaceRoot(session)
@@ -513,7 +513,7 @@ func TestDirectoryHandleRejectsFailedPartialAndMalformedCapturesBeforeChangingId
 		{
 			name: "failed partial result",
 			capture: func(result *storage.ListResult) (storage.DirectoryObservation, error) {
-				addObservedEntry(t, result, "uncommitted", storage.Attr{ID: 9, Kind: storage.NodeRegular})
+				addObservedEntry(t, result, "uncommitted", storage.Attr{ID: 9, Kind: storage.NodeRegular, AllocationKnown: true})
 				return storage.DirectoryObservation{}, syscall.ESTALE
 			},
 			wantErrno: syscall.ESTALE,
@@ -521,7 +521,7 @@ func TestDirectoryHandleRejectsFailedPartialAndMalformedCapturesBeforeChangingId
 		{
 			name: "unfinished reservation",
 			capture: func(result *storage.ListResult) (storage.DirectoryObservation, error) {
-				if _, err := result.Reserve(9, 6, storage.Attr{ID: 9, Kind: storage.NodeRegular}); err != nil {
+				if _, err := result.Reserve(9, 6, storage.Attr{ID: 9, Kind: storage.NodeRegular, AllocationKnown: true}); err != nil {
 					t.Fatal(err)
 				}
 				return storage.DirectoryObservation{ParentID: 7, Revision: []byte("capture")}, nil
@@ -531,7 +531,7 @@ func TestDirectoryHandleRejectsFailedPartialAndMalformedCapturesBeforeChangingId
 		{
 			name: "wrong parent",
 			capture: func(result *storage.ListResult) (storage.DirectoryObservation, error) {
-				addObservedEntry(t, result, "replacement", storage.Attr{ID: 9, Kind: storage.NodeRegular})
+				addObservedEntry(t, result, "replacement", storage.Attr{ID: 9, Kind: storage.NodeRegular, AllocationKnown: true})
 				return storage.DirectoryObservation{ParentID: 70, Revision: []byte("capture")}, nil
 			},
 			wantErrno: syscall.EIO,
@@ -539,7 +539,7 @@ func TestDirectoryHandleRejectsFailedPartialAndMalformedCapturesBeforeChangingId
 		{
 			name: "malformed entry",
 			capture: func(result *storage.ListResult) (storage.DirectoryObservation, error) {
-				addObservedEntry(t, result, "replacement", storage.Attr{Kind: storage.NodeRegular})
+				addObservedEntry(t, result, "replacement", storage.Attr{Kind: storage.NodeRegular, AllocationKnown: true})
 				return storage.DirectoryObservation{ParentID: 7, Revision: []byte("capture")}, nil
 			},
 			wantErrno: syscall.EIO,
@@ -547,7 +547,7 @@ func TestDirectoryHandleRejectsFailedPartialAndMalformedCapturesBeforeChangingId
 		{
 			name: "malformed projected metadata after a valid entry",
 			capture: func(result *storage.ListResult) (storage.DirectoryObservation, error) {
-				addObservedEntry(t, result, "first-new", storage.Attr{ID: 9, Kind: storage.NodeRegular})
+				addObservedEntry(t, result, "first-new", storage.Attr{ID: 9, Kind: storage.NodeRegular, AllocationKnown: true})
 				addObservedEntry(t, result, "bad-mode", storage.Attr{
 					ID: 10, Kind: storage.NodeRegular,
 					Metadata: map[string]storage.OpaquePayload{
@@ -561,7 +561,7 @@ func TestDirectoryHandleRejectsFailedPartialAndMalformedCapturesBeforeChangingId
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			reference := &nodeReferenceFixture{
-				attr: storage.Attr{ID: 7, Kind: storage.NodeDirectory}, scope: storage.UseScope{Token: "directory"},
+				attr: storage.Attr{ID: 7, Kind: storage.NodeDirectory, AllocationKnown: true}, scope: storage.UseScope{Token: "directory"},
 			}
 			session := &directorySessionFixture{namespaceFixture: &namespaceFixture{}, reference: reference}
 			session.readDirBounded = func(target storage.DirectoryTarget, result *storage.ListResult) (storage.DirectoryObservation, error) {
@@ -587,7 +587,7 @@ func TestDirectoryHandleRejectsFailedPartialAndMalformedCapturesBeforeChangingId
 
 func TestReleasedDirectoryHandleDoesNotStartAnObservation(t *testing.T) {
 	reference := &nodeReferenceFixture{
-		attr: storage.Attr{ID: 7, Kind: storage.NodeDirectory}, scope: storage.UseScope{Token: "directory"},
+		attr: storage.Attr{ID: 7, Kind: storage.NodeDirectory, AllocationKnown: true}, scope: storage.UseScope{Token: "directory"},
 	}
 	session := &directorySessionFixture{namespaceFixture: &namespaceFixture{}, reference: reference}
 	captures := 0
@@ -604,7 +604,7 @@ func TestReleasedDirectoryHandleDoesNotStartAnObservation(t *testing.T) {
 
 func TestDirectoryReleaseDiscardsAnInFlightObservationBeforeIdentityChanges(t *testing.T) {
 	reference := &nodeReferenceFixture{
-		attr: storage.Attr{ID: 7, Kind: storage.NodeDirectory}, scope: storage.UseScope{Token: "directory"},
+		attr: storage.Attr{ID: 7, Kind: storage.NodeDirectory, AllocationKnown: true}, scope: storage.UseScope{Token: "directory"},
 	}
 	session := &directorySessionFixture{namespaceFixture: &namespaceFixture{}, reference: reference}
 	started := make(chan struct{})
@@ -641,7 +641,7 @@ func TestDirectoryReleaseDiscardsAnInFlightObservationBeforeIdentityChanges(t *t
 func TestDirectoryReleaseClosesEveryResourceOnceAndFencesUnknownCleanup(t *testing.T) {
 	closeErr := errors.New("reference cleanup result unavailable")
 	reference := &nodeReferenceFixture{
-		attr: storage.Attr{ID: 7, Kind: storage.NodeDirectory}, scope: storage.UseScope{Token: "directory"}, closeErr: closeErr,
+		attr: storage.Attr{ID: 7, Kind: storage.NodeDirectory, AllocationKnown: true}, scope: storage.UseScope{Token: "directory"}, closeErr: closeErr,
 	}
 	session := &directorySessionFixture{namespaceFixture: &namespaceFixture{}, reference: reference}
 	root := namespaceRoot(session)
@@ -663,7 +663,7 @@ func TestDirectoryReleaseClosesEveryResourceOnceAndFencesUnknownCleanup(t *testi
 func TestReadlinkUsesRetainedSymlinkIdentityAndClosesIt(t *testing.T) {
 	namespace := &namespaceFixture{}
 	reference := &nodeReferenceFixture{
-		attr: storage.Attr{ID: 9, Kind: storage.NodeSymlink, Size: 9},
+		attr: storage.Attr{ID: 9, Kind: storage.NodeSymlink, AllocationKnown: true, Size: 9},
 		link: []byte("../target"), scope: storage.UseScope{Token: "symlink"},
 	}
 	session := &directorySessionFixture{namespaceFixture: namespace, reference: reference}
@@ -685,7 +685,7 @@ func TestReadlinkUsesRetainedSymlinkIdentityAndClosesIt(t *testing.T) {
 func TestReadlinkRejectsEmptyAuthorityTargetAndClosesReference(t *testing.T) {
 	namespace := &namespaceFixture{}
 	reference := &nodeReferenceFixture{
-		attr:  storage.Attr{ID: 9, Kind: storage.NodeSymlink},
+		attr:  storage.Attr{ID: 9, Kind: storage.NodeSymlink, AllocationKnown: true},
 		scope: storage.UseScope{Token: "empty-symlink"},
 	}
 	session := &directorySessionFixture{namespaceFixture: namespace, reference: reference}
@@ -703,7 +703,7 @@ func TestReadlinkRejectsEmptyAuthorityTargetAndClosesReference(t *testing.T) {
 func TestDirectoryHandleLookupKeepsScopeAfterParentRenameAndNameReuse(t *testing.T) {
 	namespace := &namespaceFixture{}
 	reference := &nodeReferenceFixture{
-		attr:  storage.Attr{ID: 8, Kind: storage.NodeDirectory},
+		attr:  storage.Attr{ID: 8, Kind: storage.NodeDirectory, AllocationKnown: true},
 		scope: storage.UseScope{Token: "renamed-directory"},
 	}
 	session := &directorySessionFixture{namespaceFixture: namespace, reference: reference}
@@ -730,7 +730,7 @@ func TestDirectoryHandleLookupKeepsScopeAfterParentRenameAndNameReuse(t *testing
 		if name.Parent.NodeID != 8 || name.Parent.Scope == nil || *name.Parent.Scope != reference.scope {
 			t.Fatalf("lookup rebound to replacement: %+v", name)
 		}
-		return storage.Attr{ID: 11, Kind: storage.NodeRegular}, nil
+		return storage.Attr{ID: 11, Kind: storage.NodeRegular, AllocationKnown: true}, nil
 	}
 	if _, errno := handle.Lookup(t.Context(), "child", &gofuse.EntryOut{}); errno != 0 {
 		t.Fatal(errno)

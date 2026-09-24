@@ -221,6 +221,9 @@ func (s *Store) rootMetadata(ctx context.Context, tx *sql.Tx) (metastore.Node, m
 		return metastore.Node{}, metastore.RowPayloadLengths{}, err
 	}
 	node, err := header.node()
+	if err == nil {
+		err = s.validateLoadedNode(node)
+	}
 	return node, metastore.RowPayloadLengths{Content: header.contentBytes, Metadata: header.metadataBytes, Target: header.targetBytes}, err
 }
 
@@ -248,6 +251,9 @@ func (p *snapshot) nextMetadata(ctx context.Context) (metastore.Row, metastore.R
 	}
 	value, err := node.node()
 	if err != nil {
+		return metastore.Row{}, metastore.RowPayloadLengths{}, false, err
+	}
+	if err := p.store.validateLoadedNode(value); err != nil {
 		return metastore.Row{}, metastore.RowPayloadLengths{}, false, err
 	}
 	return metastore.Row{Parent: parent, Name: []byte{}, Node: value}, metastore.RowPayloadLengths{

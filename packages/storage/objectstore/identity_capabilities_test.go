@@ -277,7 +277,7 @@ func TestNonemptyDirectoryCloseIntentReleasesReferenceWithTerminalResult(t *test
 }
 
 func TestReferenceActionJournalRejectsAnotherReceiver(t *testing.T) {
-	volume, _ := fileVolume(t, memory.New(), 4096, nil)
+	volume, _ := fileVolume(t, memory.New(), 8192, nil)
 	for _, name := range []string{"first", "second"} {
 		if err := volume.Write(t.Context(), name, []byte("body")); err != nil {
 			t.Fatal(err)

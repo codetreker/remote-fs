@@ -79,7 +79,7 @@ func TestHandlerRetirementReclaimsDetachedFilesBeforeStorageClose(t *testing.T) 
 		t.Fatal(err)
 	}
 	before, err := v.volume.Space(t.Context())
-	if err != nil || before.Used != int64(len("retained")) {
+	if err != nil || before.Used != 4096 {
 		t.Fatalf("detached file quota=%d err=%v", before.Used, err)
 	}
 	httpServer.Close()

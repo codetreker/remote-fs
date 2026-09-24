@@ -615,8 +615,8 @@ func TestStatusCombinesLogicalObjectAndPhysicalState(t *testing.T) {
 	if status.Volume != config.Volume {
 		t.Fatalf("Status.Volume = %q, want %q", status.Volume, config.Volume)
 	}
-	if status.Space.Total != config.Quota || status.Space.Used != int64(len(content)) {
-		t.Fatalf("Status.Space = %+v, want total %d and used %d", status.Space, config.Quota, len(content))
+	if status.Space.Total != config.Quota || status.Space.Used != 4096 {
+		t.Fatalf("Status.Space = %+v, want total %d and used 4096", status.Space, config.Quota)
 	}
 	if !status.Space.Coherent() {
 		t.Fatalf("Status.Space is incoherent: %+v", status.Space)

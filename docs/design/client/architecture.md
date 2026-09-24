@@ -10,7 +10,7 @@ volume 的使用者。持有一份 remote storage，把 volume 呈现为 Linux �
 |---|---|---|
 | **remote storage** `packages/transport/httprest` | 基础 storage 操作逐次转换为 HTTP 请求，不缓存内容。复制的订阅与快照使用独立长连接；`DialOptions` 限制 stream silence、body 与 admission，超时由调用方配置。 | R-INT-3、R-INT-5、R-INT-9 |
 | **显式锁控制** | HTTP client 实现锁 Service，调用方保留 Session / Owner 与原动作身份，以 `WithScope` 构造独立、不可变的修改 proof 集合。控制请求具有独立预算。 | R-CC-3、R-CC-6 至 R-CC-11、R-INT-3 |
-| **本地副本** `packages/storage/replicated` | 一个 storage 装饰器：按路径 `Stat` 走本地 SQLite，公开 `List` / `ListBounded` 与身份目录／名字观察在确认副本健康后回源 authority，其余操作也走远端。副本由 v4 变更流喂着，并为自己的目录树维护不可作为 authority 证据的本地 revision。 | R-CON-1~4、R-ERR-1、R-ERR-2、R-INT-3、R-SEC-3 |
+| **本地副本** `packages/storage/replicated` | 一个 storage 装饰器：按路径 `Stat` 走本地 SQLite，公开 `List` / `ListBounded` 与身份目录／名字观察在确认副本健康后回源 authority，其余操作也走远端。副本由 v5 变更流喂着，保留来源节点的已知或未知分配量，并为自己的目录树维护不可作为 authority 证据的本地 revision。 | R-CON-1~4、R-ERR-1、R-ERR-2、R-INT-3、R-SEC-3 |
 | **挂载呈现层** `packages/fuse` | 把一份 storage 呈现为本地目录。持有 FileSession、已打开目录的 NodeReference、普通 File、UseOwner 与内核 owner 的映射；以父 NodeID 执行子项操作，目录 handle 以 Scope 捕获一次完整 Readdir，文件以 direct I/O 逐次读写。仅 Linux。 | R-FS-1、R-FS-5、R-FS-6、R-FS-8、R-CON-1~3、R-ERR-1、R-ERR-2、R-CC-12、R-CC-13、R-WS-5、R-INT-3、R-INT-8 |
 | **本机 SMB 端点** `packages/smb`、`packages/smb/windows` | 接受 loopback 上的 Windows SMB client，执行 SMB 3.1.1 协商、SSPI 身份验证、强制消息签名以及 connection/session/tree/export 生命周期；每个 authenticated session 与 export 共享一份 FileSession。文件与目录命令返回不支持。 | R-INT-1~3、R-SEC-1、R-SEC-4、R-SEC-5、R-WIN-1、R-WIN-9、R-WIN-10 |
 | **生命周期** | Linux mount 与 SMB Server／Export 的建立、停止和清理重试。 | R-WS-2、R-WIN-10 |
@@ -49,7 +49,7 @@ SSE 不把整个 stream 保存在内存里，但每一帧仍有独立的 `DialOp
 
 每个基础数据调用都要先取得 client 自己的 response admission。默认同时保留 64 份响应、允许 64 个等待者，aggregate 上限为 8 GiB；每份都按 `4 * MaxBodyBytes` 预留，覆盖 raw body、decoded listing 与转换过程的同时保留。默认 1 GiB body 使每个 List 预留 4 GiB，因此 aggregate byte bound 会先把并发压到 2 个活跃 List，另有至多 64 个调用等待。Subscribe、Resubscribe 与 Snapshot 在发出 HTTP 前也取得同一名额，用来约束 stream 尚未成功建立时可能返回的普通 error body；确认 `200 text/event-stream` 后立即释放，后续 frame 由 `MaxFrameBytes` 约束。等待者已满时，`Stat`、`Write`、`Create` 或 stream setup 都会在发出 HTTP 请求前以 `EAGAIN` 失败；context cancellation 会移除等待计数。non-stream admission 一直持有到 response 解码、mutation response/barrier 验证完成。`ReadBounded` 取 client 与调用方 byte bound 中较小者；`ListBounded` 把解码后的 entry 逐项交给调用方的 `ListResult`。普通 `Read` 与 `List` 仍返回完整 materialized value，但整个 HTTP body 及其同时表示都在上述单体与 aggregate 边界内。server 侧的 backend 预算与 response admission 见 [`../server/architecture.md`](../server/architecture.md#六请求与响应的内存边界)。
 
-**平台呈现到这一层为止。** FUSE 把 Linux 内核请求翻译为基础 volume、FileStorage 和中立 identity/metadata/range 调用。已有 inode 的 Open 使用 OpenNode，Create 使用 OpenAt，Opendir 与 Readlink 使用 OpenNodeRef，Lookup 与名字修改使用 LookupAt/MutateName。挂载 preflight 分别要求 NamespaceAccess 与 DirectoryReader；普通 node 操作携带稳定父 NodeID，已打开的 directory handle Lookup 与 Readdir 再附带活 Scope，后者使用 ReadDirNodeBounded。远端会话只有在 v4 DirectoryMetadata bundle bit 为 true 时暴露 DirectoryReader；in-process DirectoryReader 不依赖 DirectoryMetadataObserver。OpenChildRef 是编程入口可用的原子子项引用能力。普通 fd 使用 File，无 fd 的身份属性使用 NodeReference 或 StatNode/SetNodeAttr。
+**平台呈现到这一层为止。** FUSE 把 Linux 内核请求翻译为基础 volume、FileStorage 和中立 identity/metadata/range 调用。已有 inode 的 Open 使用 OpenNode，Create 使用 OpenAt，Opendir 与 Readlink 使用 OpenNodeRef，Lookup 与名字修改使用 LookupAt/MutateName。挂载 preflight 分别要求 NamespaceAccess 与 DirectoryReader；普通 node 操作携带稳定父 NodeID，已打开的 directory handle Lookup 与 Readdir 再附带活 Scope，后者使用 ReadDirNodeBounded。远端会话只有在 v5 DirectoryMetadata bundle bit 为 true 时暴露 DirectoryReader；in-process DirectoryReader 不依赖 DirectoryMetadataObserver。OpenChildRef 是编程入口可用的原子子项引用能力。普通 fd 使用 File，无 fd 的身份属性使用 NodeReference 或 StatNode/SetNodeAttr。
 
 Windows 的本机 SMB endpoint 与 FUSE 平行，不经过 Linux 副本或 inode 层。它只把一个受信配置的 share 绑定到 FileStorage，并把 SSPI 验证的本地 SID／登录会话放入授权 context；远端身份与 credential 仍由 backing remote storage 持有。协议、安全、资源和清理契约见[本机 SMB 端点](smb-endpoint.md)。文件命令、名字解析、Windows metadata、共享／范围语义、通知与 cache recovery 不在该 endpoint 的支持面。
 
@@ -63,7 +63,7 @@ HTTP client 的凭据附加和轮换由嵌入方提供；server 使用业务 con
 
 ### 显式占有与修改 proof
 
-remote storage 使用 HTTP v4，同时提供基础数据操作、中立文件能力与 Strong Service。调用方用 enrollment ticket 建立 Strong Session、创建 Owner、Resolve 现有普通文件并显式 Acquire；普通 FUSE Open 没有自动获取 Strong。Strong Session/Owner、FileSession/File/UseOwner、管理 Request、本地描述符、TCP 连接与复制 incarnation 分别拥有生命周期，断开连接不提前解除已确认保护。
+remote storage 使用 HTTP v5，同时提供基础数据操作、中立文件能力与 Strong Service。调用方用 enrollment ticket 建立 Strong Session、创建 Owner、Resolve 现有普通文件并显式 Acquire；普通 FUSE Open 没有自动获取 Strong。Strong Session/Owner、FileSession/File/UseOwner、管理 Request、本地描述符、TCP 连接与复制 incarnation 分别拥有生命周期，断开连接不提前解除已确认保护。
 
 成功 Resolve 返回资源引用的有限期限、当前 tick，以及这次有效控制活动延长后的 `HistoryExpiresMillis`。后者描述 Owner / Session 的动作核对窗口，不延长 grant，也不由资源引用的有效期推导。重复 Acquire 保留原 ResourceRef 全部字段，新的 Resolve 观测不能改写已经提交的意图。
 
@@ -73,7 +73,7 @@ Acquire 返回立即结果或 Pending 登记；Wait 是远端等待意图的期�
 
 GrantStatus 的剩余时间由服务端对未取整的 deadline 与 now 求差再向下取整。SDK 以原请求发送起点加这个间隔建立保守提示，旧 receipt 不开始新 lease，普通读取成功也不刷新提示。最终权限始终由服务端检查。原授权方退役后，旧意图返回退役或结果未知，不能在新授权方中重做；字段与取整规则见[文件锁协议](../server/file-locks.md#结果与期限)。
 
-Strong 控制请求与响应固定至多 16 KiB；文件 metadata/range 控制使用独立的 256 KiB envelope。容量检查不占用数据 response 或复制 stream 的名额。state-changing control 进入 dispatch 后丢失响应时保持结果未知；只读核对遵循自己的取消边界。缺少 v4 marker、非法 scope 或不一致 receipt 都明确失败。服务端 Strong callback／native 生命周期的失败响应保持 native Unavailable／EIO、recorded=false 且无动作回执；该 wire 协议没有 EINTR code。SDK 本地在 HTTP Do 前接受的取消，以及只读控制在 client 侧接受的取消，仍可返回 EINTR，不经过 native wire 编码。业务策略拒绝另走普通 EACCES／EIO envelope。
+Strong 控制请求与响应固定至多 16 KiB；文件 metadata/range 控制使用独立的 256 KiB envelope。容量检查不占用数据 response 或复制 stream 的名额。state-changing control 进入 dispatch 后丢失响应时保持结果未知；只读核对遵循自己的取消边界。缺少 v5 marker、非法 scope 或不一致 receipt 都明确失败。服务端 Strong callback／native 生命周期的失败响应保持 native Unavailable／EIO、recorded=false 且无动作回执；该 wire 协议没有 EINTR code。SDK 本地在 HTTP Do 前接受的取消，以及只读控制在 client 侧接受的取消，仍可返回 EINTR，不经过 native wire 编码。业务策略拒绝另走普通 EACCES／EIO envelope。
 
 ## 二、路径起点来自副本，子项操作到达权威
 
@@ -87,7 +87,7 @@ Strong 控制请求与响应固定至多 16 KiB；文件 metadata/range 控制�
 
 构建先保留原订阅，再逐页写入快照。客户端读到 snapshot 的语义 EOF 后，先关闭该 HTTP 响应释放连接，再调用 Checkpoint 取得新鲜的 `(incarnation, committed position)`。快照位置不得早于原订阅的 opening tail；checkpoint 不得早于快照，且其 incarnation 必须与原订阅一致。snapshot 只报告捕获位置；incarnation 一致性由 checkpoint 与原订阅核对。
 
-SQLite schema v8 为目录增加持久 revision 时，authority 原子清空无法携带该事实的旧 retained changes、切换 log incarnation 并把窗口位置归零。持有旧 incarnation／position 的 replica 不能续读这段已删除 history，沿既有 mismatch 分支重新取得当前树。HTTP v4 snapshot 与 change 不携带 authority DirectoryRevision；SQLite replica 为 revisionless 输入生成本地 opaque token，并在 replay create、remove 或 rename 时替换相应父目录 token。
+SQLite schema v8 为目录增加持久 revision 时，authority 原子清空无法携带该事实的旧 retained changes、切换 log incarnation 并把窗口位置归零。持有旧 incarnation／position 的 replica 不能续读这段已删除 history，沿既有 mismatch 分支重新取得当前树。HTTP v5 snapshot 与 change 不携带 authority DirectoryRevision，但保留分配量与 known 标志；SQLite replica 为 revisionless 输入生成本地 opaque token，并在 replay create、remove 或 rename 时替换相应父目录 token。
 
 本地 Seeding.Complete 成功后记录已安装的快照位置，唯一的 reader 随后沿原订阅丢弃已包含的事件、应用快照之后的事件，直到达到或超过固定 checkpoint。位置允许跳跃，不要求逐整数相邻；零位置且已达到目标时不等待一条不存在的事件。Complete 与每次 Apply 的成功位置都会在内部推进，即使副本仍以 EIO 拒绝查询；中途失败后的续订以已提交树的位置继续，而不是沿用更早的公开状态。最终追平前不清除失败状态。
 
@@ -188,7 +188,7 @@ volume 报出自己的容量，挂载呈现层把它换算成内核要的块数�
 
 | 内核要的 | 从哪来 |
 |---|---|
-| 块大小 | 固定 4096 字节。volume 按字节计量，块只是报出去时的计价单位 |
+| 块大小 | 固定 4096 字节，与内置 volume 的虚拟分配 cluster 一致 |
 | 总块数 | volume 的总量 |
 | 空闲块数 | 总量减已用，不为负 |
 | 可用块数 | volume 报的「还能写入的量」 |
@@ -208,6 +208,8 @@ volume 报出自己的容量，挂载呈现层把它换算成内核要的块数�
 ### 配额在修改调用上裁决
 
 `WriteAt` 与 `Truncate` 同步执行原生发布记账，超出配额以 `EDQUOT` 返回对应的 write 或 truncate。挂载不缓存剩余容量，也不在数据修改之前调用 Space；Statfs 仍独立查询容量。缩短只在发布成功后释放差额，失败保留原内容与收费，避免其它写者提前花掉尚未释放的字节。
+
+FUSE 在挂载 admission 时检查 FileSession 的 `AllocationReporting`，缺失或失败在任何文件效果前拒绝挂载。节点属性的 `AllocationKnown` 为真时，FUSE 用 `AllocationSize / 512` 报告 `st_blocks`；已知零值报告零块。未知分配量以 `EIO` 拒绝属性投影，不从文件长度猜测。内置 SQLite authority 的分配量按 4096 字节单位变化；已有 cluster 内的增长不增加配额，跨越边界的增长消耗完整单位。来自其它 storage 的已知分配量按来源事实投影，不强制改成 4096。
 
 失去名字但仍被 fd 引用的文件继续计入用量。最后引用退役、在途操作排空且物理释放完成后才回收容量；未知结果不能伪造空闲空间。机制与通用包装器的独立边界见[容量上限](../../../.agents/notes/implemented/architecture/2026-08-21-space-limit.md)。
 

@@ -742,8 +742,8 @@ func (s *Store) finishPoolClosure(poolErr, authorityErr error) error {
 
 // Space reports the allowance and what is left of it.
 //
-// Used is read rather than computed: it is one column of one row, kept exact by the
-// transactions that move bytes. Avail is what the allowance leaves and never less than
+// Used is the measured virtual allocation, read from a counter kept exact by file
+// transactions. Avail is what the allowance leaves and never less than
 // zero — an allowance lowered underneath content already written leaves Used above Total,
 // and a negative Avail arrives in a kernel reply's unsigned field as room no disk holds.
 func (s *Store) Space(ctx context.Context) (storage.Space, error) {
@@ -755,7 +755,7 @@ func (s *Store) Space(ctx context.Context) (storage.Space, error) {
 		return storage.Space{}, fmt.Errorf("this volume is held under no allowance: %w", syscall.ENOSYS)
 	}
 	var used int64
-	if err := s.read.QueryRowContext(ctx, `SELECT used FROM volumes WHERE id = ?`, s.volume).Scan(&used); err != nil {
+	if err := s.read.QueryRowContext(ctx, `SELECT allocated_used FROM volumes WHERE id = ?`, s.volume).Scan(&used); err != nil {
 		return storage.Space{}, fmt.Errorf("reading what the volume holds: %w", sqlerr.ReadFailure(ctx, err))
 	}
 	space := storage.Space{Total: s.allowance, Used: used, Avail: max(s.allowance-used, 0)}
@@ -768,6 +768,10 @@ func (s *Store) Space(ctx context.Context) (storage.Space, error) {
 	}
 	return space, nil
 }
+
+var _ storage.AllocationReporting = (*Store)(nil)
+
+func (s *Store) CheckAllocationReporting() error { return nil }
 
 // mutate runs f inside a write transaction, committing it if f succeeds and rolling it back
 // if it does not.

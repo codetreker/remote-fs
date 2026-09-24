@@ -18,6 +18,7 @@ var nodeHeaderColumns = fmt.Sprintf(`
 	CASE WHEN typeof(n.id)='integer' THEN n.id END,
 	CASE WHEN typeof(n.kind)='integer' THEN n.kind END,
 	CASE WHEN typeof(n.size)='integer' THEN n.size END,
+	CASE WHEN typeof(n.allocation_size) IN ('integer','null') THEN n.allocation_size END,
 	CASE WHEN typeof(n.atime_sec)='integer' THEN n.atime_sec END,
 	CASE WHEN typeof(n.atime_nsec)='integer' THEN n.atime_nsec END,
 	CASE WHEN typeof(n.mtime_sec)='integer' THEN n.mtime_sec END,
@@ -35,7 +36,8 @@ var nodeHeaderColumns = fmt.Sprintf(`
 		AND (n.content IS NULL OR (typeof(n.content)='text' AND length(CAST(n.content AS BLOB))>0))
 		AND typeof(n.metadata)='blob' AND length(n.metadata)<=%d
 		AND typeof(n.link_target)='blob' AND length(n.link_target)<=%d
-		AND typeof(n.directory_revision)='blob' AND length(n.directory_revision)<=%d THEN 1 ELSE 0 END`,
+		AND typeof(n.directory_revision)='blob' AND length(n.directory_revision)<=%d
+		AND typeof(n.allocation_size) IN ('integer','null') THEN 1 ELSE 0 END`,
 	storage.MaxObservationTokenBytes, storage.MaxMetadataBytes, storage.MaxLinkTargetBytes, storage.MaxObservationTokenBytes)
 
 var nodeColumns = nodeHeaderColumns + fmt.Sprintf(`,
@@ -47,6 +49,7 @@ var nodeAttrColumns = nodeHeaderColumns
 
 type nodeHeader struct {
 	id, kind, size        int64
+	allocationSize        sql.NullInt64
 	atimeSec, atimeNsec   int64
 	mtimeSec, mtimeNsec   int64
 	birthSec, birthNsec   sql.NullInt64
@@ -61,13 +64,14 @@ type nodeHeader struct {
 type nodeAttrScan = nodeHeader
 
 func (s *nodeHeader) fields() []any {
-	return []any{&s.id, &s.kind, &s.size, &s.atimeSec, &s.atimeNsec, &s.mtimeSec, &s.mtimeNsec,
+	return []any{&s.id, &s.kind, &s.size, &s.allocationSize, &s.atimeSec, &s.atimeNsec, &s.mtimeSec, &s.mtimeNsec,
 		&s.birthSec, &s.birthNsec, &s.changeSec, &s.changeNsec, &s.directoryRevision,
 		&s.contentBytes, &s.metadataBytes, &s.targetBytes, &s.valid}
 }
 
 func (s *nodeHeader) node() (metastore.Node, error) {
 	if s.valid != 1 || s.id < 1 || s.kind < int64(storage.NodeRegular) || s.kind > int64(storage.NodeSymlink) || s.size < 0 ||
+		s.allocationSize.Valid && s.allocationSize.Int64 < 0 ||
 		s.atimeNsec < 0 || s.atimeNsec >= int64(time.Second) || s.mtimeNsec < 0 || s.mtimeNsec >= int64(time.Second) ||
 		s.contentBytes < 0 || s.metadataBytes < 6 || s.targetBytes < 0 {
 		return metastore.Node{}, fmt.Errorf("invalid stored node metadata: %w", syscall.EIO)
@@ -90,7 +94,7 @@ func (s *nodeHeader) node() (metastore.Node, error) {
 	if err != nil {
 		return metastore.Node{}, err
 	}
-	return metastore.Node{ID: s.id, Kind: kind, Size: s.size,
+	return metastore.Node{ID: s.id, Kind: kind, Size: s.size, AllocationSize: s.allocationSize.Int64, AllocationKnown: s.allocationSize.Valid,
 		AccessTime: sqlvalue.LoadedTime(s.atimeSec, int32(s.atimeNsec)), ModTime: sqlvalue.LoadedTime(s.mtimeSec, int32(s.mtimeNsec)),
 		BirthTime: birth, ChangeTime: changed, DirectoryRevision: bytes.Clone(s.directoryRevision)}, nil
 }
@@ -153,6 +157,12 @@ func (s *Store) scanNode(row scanner) (metastore.Node, error) {
 }
 
 func (s *Store) validateLoadedNode(node metastore.Node) error {
+	if !s.replicaMetadata {
+		want, err := allocatedSize(node.Kind, node.Size)
+		if err != nil || !node.AllocationKnown || node.AllocationSize != want {
+			return fmt.Errorf("stored node allocation disagrees with its size: %w", syscall.EIO)
+		}
+	}
 	if !s.replicaMetadata && node.Kind == storage.NodeDirectory && !validDirectoryRevision(node.DirectoryRevision) {
 		return fmt.Errorf("directory %d has an invalid name-set revision: %w", node.ID, syscall.EIO)
 	}

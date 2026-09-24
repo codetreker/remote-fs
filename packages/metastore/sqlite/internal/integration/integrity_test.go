@@ -710,11 +710,11 @@ func makeFileSizesOverflow(t *testing.T, fixture objectIntegrityFixture) {
 		query string
 		args  []any
 	}{
-		{`UPDATE objects SET size = ? WHERE key = ?`, []any{int64(math.MaxInt64), fixture.live}},
-		{`UPDATE nodes SET size = ? WHERE content = ?`, []any{int64(math.MaxInt64), fixture.live}},
+		{`UPDATE objects SET size = ? WHERE key = ?`, []any{int64(math.MaxInt64 - 4095), fixture.live}},
+		{`UPDATE nodes SET size = ? WHERE content = ?`, []any{int64(math.MaxInt64 - 4095), fixture.live}},
 		{`INSERT INTO objects (key, volume, state, size, digest, created_sec, created_nsec)
-		  VALUES ('overflow-byte', ?, 1, 1, NULL, 0, 0)`, []any{fixture.volume}},
-		{`UPDATE nodes SET size = 1, content = 'overflow-byte' WHERE ` + nodeNamed,
+		  VALUES ('overflow-byte', ?, 1, 4096, NULL, 0, 0)`, []any{fixture.volume}},
+		{`UPDATE nodes SET size = 4096, content = 'overflow-byte' WHERE ` + nodeNamed,
 			[]any{fixture.volume, "copy"}},
 		{`UPDATE volumes SET used = ? WHERE id = ?`, []any{int64(math.MaxInt64), fixture.volume}},
 	} {
@@ -994,8 +994,11 @@ func TestSharedOpenPreservesDetachedObjectsAndQuotaOutsideSnapshots(t *testing.T
 		t.Fatalf("valid detached graph: %v", err)
 	}
 	space, err := store.Space(t.Context())
-	if err != nil || space.Used != 10 {
-		t.Fatalf("retained quota = %+v, %v; want 10 used bytes", space, err)
+	if err != nil || space.Used != 4096 {
+		t.Fatalf("retained quota = %+v, %v; want 4096 allocated bytes", space, err)
+	}
+	if logical, err := store.Usage(t.Context()); err != nil || logical != 10 {
+		t.Fatalf("retained logical usage = %d, %v; want 10 bytes", logical, err)
 	}
 	snap, _, err := store.Snapshot(t.Context())
 	if err != nil {

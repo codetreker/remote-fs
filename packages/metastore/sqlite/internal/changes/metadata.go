@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"database/sql"
 	"fmt"
+	"math"
 	"syscall"
 	"time"
 
@@ -27,6 +28,7 @@ const changeMetadataColumns = `
 	CASE WHEN typeof(node) IN ('integer', 'null') THEN node END, typeof(node),
 	CASE WHEN typeof(node_kind) IN ('integer', 'null') THEN node_kind END, typeof(node_kind),
 	CASE WHEN typeof(size) IN ('integer', 'null') THEN size END, typeof(size),
+	CASE WHEN typeof(allocation_size) IN ('integer', 'null') THEN allocation_size END, typeof(allocation_size),
 	CASE WHEN typeof(atime_sec) IN ('integer', 'null') THEN atime_sec END, typeof(atime_sec),
 	CASE WHEN typeof(atime_nsec) IN ('integer', 'null') THEN atime_nsec END, typeof(atime_nsec),
 	CASE WHEN typeof(mtime_sec) IN ('integer', 'null') THEN mtime_sec END, typeof(mtime_sec),
@@ -54,12 +56,12 @@ func scanChangeMetadata(
 	var extra changeExtraMetadata
 	var (
 		positionRaw, previousRaw, volumeRaw, kindRaw, parentRaw      any
-		fromParentRaw, idRaw, nodeKindRaw, sizeRaw                   any
+		fromParentRaw, idRaw, nodeKindRaw, sizeRaw, allocationRaw    any
 		atimeSecRaw, atimeNsecRaw, mtimeSecRaw, mtimeNsecRaw         any
 		recordedSecRaw, recordedNsecRaw                              any
 		positionType, previousType, volumeType, kindType, parentType string
 		nameType, fromParentType, fromNameType                       string
-		idType, nodeKindType, sizeType                               string
+		idType, nodeKindType, sizeType, allocationType               string
 		atimeSecType, atimeNsecType, mtimeSecType, mtimeNsecType     string
 		contentType, recordedSecType, recordedNsecType               string
 		lengths                                                      metastore.ChangePayloadLengths
@@ -70,6 +72,7 @@ func scanChangeMetadata(
 		&parentRaw, &parentType, &lengths.Name, &nameType,
 		&fromParentRaw, &fromParentType, &lengths.FromName, &fromNameType,
 		&idRaw, &idType, &nodeKindRaw, &nodeKindType, &sizeRaw, &sizeType,
+		&allocationRaw, &allocationType,
 		&atimeSecRaw, &atimeSecType, &atimeNsecRaw, &atimeNsecType,
 		&mtimeSecRaw, &mtimeSecType, &mtimeNsecRaw, &mtimeNsecType,
 		&lengths.Content, &contentType,
@@ -117,6 +120,25 @@ func scanChangeMetadata(
 	if !ok {
 		return metastore.Change{}, metastore.ChangePayloadLengths{}, 0, invalidStoredChangeScalar(position, "size", sizeType)
 	}
+	allocation, ok := nullableStoredInteger(allocationRaw, allocationType)
+	if !ok || allocation.Valid != id.Valid {
+		return metastore.Change{}, metastore.ChangePayloadLengths{}, 0, invalidStoredChangeScalar(position, "allocation_size", allocationType)
+	}
+	if id.Valid {
+		if !size.Valid || !nodeKind.Valid || size.Int64 < 0 || allocation.Int64 < 0 || allocation.Int64%4096 != 0 {
+			return metastore.Change{}, metastore.ChangePayloadLengths{}, 0, invalidStoredChangeScalar(position, "allocation_size", allocationType)
+		}
+		want := int64(0)
+		if nodeKind.Int64 == int64(storage.NodeRegular) && size.Int64 > 0 {
+			if size.Int64 > math.MaxInt64-4095 {
+				return metastore.Change{}, metastore.ChangePayloadLengths{}, 0, invalidStoredChangeScalar(position, "allocation_size", allocationType)
+			}
+			want = ((size.Int64 + 4095) / 4096) * 4096
+		}
+		if allocation.Int64 != want {
+			return metastore.Change{}, metastore.ChangePayloadLengths{}, 0, invalidStoredChangeScalar(position, "allocation_size", allocationType)
+		}
+	}
 	atimeSec, ok := nullableStoredInteger(atimeSecRaw, atimeSecType)
 	if !ok {
 		return metastore.Change{}, metastore.ChangePayloadLengths{}, 0, invalidStoredChangeScalar(position, "atime_sec", atimeSecType)
@@ -157,11 +179,13 @@ func scanChangeMetadata(
 	}
 	if id.Valid {
 		change.Node = &metastore.Node{
-			ID:         id.Int64,
-			Kind:       storage.NodeKind(nodeKind.Int64),
-			Size:       size.Int64,
-			AccessTime: sqlvalue.LoadedTime(atimeSec.Int64, int32(atimeNsec.Int64)),
-			ModTime:    sqlvalue.LoadedTime(mtimeSec.Int64, int32(mtimeNsec.Int64)),
+			ID:              id.Int64,
+			Kind:            storage.NodeKind(nodeKind.Int64),
+			Size:            size.Int64,
+			AllocationSize:  allocation.Int64,
+			AllocationKnown: true,
+			AccessTime:      sqlvalue.LoadedTime(atimeSec.Int64, int32(atimeNsec.Int64)),
+			ModTime:         sqlvalue.LoadedTime(mtimeSec.Int64, int32(mtimeNsec.Int64)),
 		}
 	}
 	if err := validateChangeMetadata(change, lengths, volume, expectedVolume,
