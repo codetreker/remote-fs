@@ -16,7 +16,7 @@ SQLite schema v10 为 authority 持久化每节点分配量和每个 volume 的 
 
 authority 的迁移在一个事务内为所有 volume 从存量节点和历史记录计算分配量，并重建每个 volume 的分配总账；旧 replica 行保持 NULL／未知，不从 Size 推断分配量。打开前的完整性检查拒绝负数、溢出、失配及不符合节点种类或 cluster 边界的值，包含 detached 节点。迁移后已经超过当前上限的 volume 保持可读，`Avail` 为零；不增加分配量的修改仍能使它回到额度之内。旧有内容不会因新账本而被删除或遮蔽。
 
-HTTP v5 的每份 Attr 显式传输分配量与 known 标志，含直接查询、打开结果和目录条目；变更与快照的通用 Node 传输分配量及 known 标志；旧协议标记和路径不能把缺失字段解释成零。`AllocationReporting.CheckAllocationReporting()` 验证 FileSession 完整包装链保证已知分配量。SMB 在打开效果前检查能力，并对原子打开返回的属性再次核验；未知时明确失败。副本保留并验证来源的已知或未知事实；它不在本地提供 `Space`。FUSE 的块数投影与 SMB 的文件分配量均来自同一属性。强制完整的跨入口传递使任何一层都不能从 EOF 猜测权威分配状态。
+HTTP v5 的每份 Attr 显式传输分配量与 known 标志，含直接查询、打开结果和目录条目；变更与快照的通用 Node 传输分配量及 known 标志；旧协议标记和路径不能把缺失字段解释成零。`AllocationReporting.CheckAllocationReporting()` 验证 FileSession 完整包装链保证已知分配量。SMB 在打开效果前检查能力，并对原子打开返回的属性再次核验；未知时明确失败。副本保留并验证来源的已知或未知事实；它不在本地提供 `Space`。FUSE 将同一属性中的已知有效分配字节向上取整为 512 字节 `st_blocks`，包括第三方来源的非对齐值；SMB 直接报告该属性中的分配字节。通用存储不承担 512 字节对齐义务，`statfs` 仍独立使用 `Space` 的权威字节数。强制完整的跨入口传递使任何一层都不能从 EOF 猜测权威分配状态。
 
 [容量上限](2026-08-21-space-limit.md)继续拥有通用 `limited` 的精确 payload 计量与 `Space` 三值契约；`limited` 遮蔽所有返回属性中的底层分配事实，将其标为未知，且 `CheckAllocationReporting` 以 `EOPNOTSUPP` 拒绝。FUSE 与 SMB 在产生效果前拒绝这样的包装链。本决定细化内置 SQLite volume 的额度口径。[缩短文件](../bug-fix/2026-09-07-release-shrunk-quota-after-commit.md)和[原生发布计费](../bug-fix/2026-09-07-keep-quota-accounting-stable-across-directory-renames.md)的最终效果顺序同样用于分配量的增长与释放。
 

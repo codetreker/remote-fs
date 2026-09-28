@@ -209,7 +209,7 @@ volume 报出自己的容量，挂载呈现层把它换算成内核要的块数�
 
 `WriteAt` 与 `Truncate` 同步执行原生发布记账，超出配额以 `EDQUOT` 返回对应的 write 或 truncate。挂载不缓存剩余容量，也不在数据修改之前调用 Space；Statfs 仍独立查询容量。缩短只在发布成功后释放差额，失败保留原内容与收费，避免其它写者提前花掉尚未释放的字节。
 
-FUSE 在挂载 admission 时检查 FileSession 的 `AllocationReporting`，缺失或失败在任何文件效果前拒绝挂载。节点属性的 `AllocationKnown` 为真时，FUSE 用 `AllocationSize / 512` 报告 `st_blocks`；已知零值报告零块。未知分配量以 `EIO` 拒绝属性投影，不从文件长度猜测。内置 SQLite authority 的分配量按 4096 字节单位变化；已有 cluster 内的增长不增加配额，跨越边界的增长消耗完整单位。来自其它 storage 的已知分配量按来源事实投影，不强制改成 4096。
+FUSE 在挂载 admission 时检查 FileSession 的 `AllocationReporting`，缺失或失败在任何文件效果前拒绝挂载。节点属性的 `AllocationKnown` 为真且分配量有效时，FUSE 将 `AllocationSize` 字节向上取整为 512 字节块数并报告为 `st_blocks`；已知零值报告零块。换算先除后判断余数，避免加 511 时整数溢出。未知或无效的分配量以 `EIO` 拒绝属性投影，不从文件长度猜测。内置 SQLite authority 的分配量按 4096 字节单位变化；已有 cluster 内的增长不增加配额，跨越边界的增长消耗完整单位。来自其它 storage 的已知分配量按来源事实投影，不强制要求 512 或 4096 字节对齐。`statfs` 继续按 `Space` 的权威字节数独立换算，不使用节点块数的取整结果。
 
 失去名字但仍被 fd 引用的文件继续计入用量。最后引用退役、在途操作排空且物理释放完成后才回收容量；未知结果不能伪造空闲空间。机制与通用包装器的独立边界见[容量上限](../../../.agents/notes/implemented/architecture/2026-08-21-space-limit.md)。
 
