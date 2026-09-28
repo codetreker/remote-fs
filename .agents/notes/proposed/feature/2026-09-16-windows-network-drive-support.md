@@ -51,7 +51,7 @@ Windows 应用／Explorer ── Windows 文件 API ── SMB redirector
 | Delete intent | authority 持久义务 + 宿主 per-volume `DeleteIntentOwner` | 接受时锁定原对象和可随 rename 移动的同一名字关联、授权与 owner；发起句柄关闭／连接、会话或宿主终止使 `armed` 进入 `pending`，立即拦截冲突新打开；最后相关句柄结束才移除名字。终态与失败可恢复并最终 ACK。 |
 | ChangeSource cursor／缓存安全状态 | 宿主绑定到同一 volume／incarnation 的中立变更源；每个 export 的订阅与可报告对象／名字视图 | 缺口、失联或 overflow 立即使相关缓存答案不可信；树及 active detached 引用的完整重取和事件衔接后才恢复成功报告。 |
 
-volume serial 从可信且稳定的 volume 身份导出；Windows 128-bit file ID 从不可复用的 authority 对象身份导出，命名空间分配持久化并检查碰撞。它们与 SMB 每次打开的 FileId 分属不同层次。同一对象改名或重新打开保持标识；同名替换获得新标识。打开结果的 `Attr.ID` 必须和所获引用的稳定身份一致。现有 `ReferenceIdentity` 是可选接口，`AtomicFileOpener`／`NodeReferences` 不保证返回引用实现它；7.3 须增加覆盖整个 FileSession、HTTP 与 wrappers 的预检能力，承诺两种返回引用都提供不可变 `ReferenceNodeID`，在对象效果前验证完整包装链。预检违约后若仍返回无身份引用，不能宣布成功，并须保留已获引用供清理。
+volume serial 从可信且稳定的 volume 身份导出；Windows 128-bit file ID 从不可复用的 authority 对象身份导出，命名空间分配持久化并检查碰撞。它们与 SMB 每次打开的 FileId 分属不同层次。同一对象改名或重新打开保持标识；按名 replace／同名重建获得新标识；`FILE_SUPERSEDE` 在原对象上原子重置，保持该对象标识。打开结果的 `Attr.ID` 必须和所获引用的稳定身份一致。现有 `ReferenceIdentity` 是可选接口，`AtomicFileOpener`／`NodeReferences` 不保证返回引用实现它；7.3 须增加覆盖整个 FileSession、HTTP 与 wrappers 的预检能力，承诺两种返回引用都提供不可变 `ReferenceNodeID`，在对象效果前验证完整包装链。预检违约后若仍返回无身份引用，不能宣布成功，并须保留已获引用供清理。
 
 所有操作遵守同一生命期顺序：封住新准入 → 排空已接纳操作 → 确认 authority 的释放／barrier 事实 → 撤销本地 owner 与额度。`ReferenceCloseResult.Released=true` 只证明引用已释放；该中立结果没有 `BarrierPending` 字段。现有 `File.CloseWithResult(ctx)`／`NodeReference.CloseWithResult(ctx)` 不接受动作 ID；7.3 提议中立 `CloseWithAction(ctx, FileActionID)`，由 endpoint 在效果前生成 actionID、连同引用身份与不可变 close 意图写入 cleanup owner，再作为参数传给 native、wrappers、HTTP。返回中立 `CloseSettlement{Released, BarrierState, ActionID}`；`BarrierState` 区分无义务、待结算、已结算和未知，HTTP 特有的 pending error 在 adapter 边界转换。相同引用／意图／actionID 的重投返回原释放和 barrier 结果；同一 ID 改变引用或意图明确拒绝。首次响应丢失时 endpoint 已持有原 ID，只能查询或按原 ID 重投，不能从响应字段倒推动作身份。若释放同时仍有待结算或未知 barrier，保留原动作与 cleanup owner，直到 barrier 明确结算；不能只凭 Released 回收整份责任。释放未知或为 false 时保留引用 owner。tree disconnect、LOGOFF、TCP 断开、unpublish 和 server shutdown 均复用这条退休路径。普通句柄与 advisory 锁不跨 authority incarnation 透明恢复；一旦连续性丧失，旧 FileId 持续失败，不能重新绑定同名对象。
 
@@ -63,78 +63,43 @@ volume serial 从可信且稳定的 volume 身份导出；Windows 128-bit file I
 
 概念性的请求上下文包含 `connectionIncarnation, SessionId, TreeId, MessageId, command, principalRef, trustedVolume, deadline, actionID`。其中 `principalRef` 指向受保护的认证对象，不将 SID、token、密钥放入普通日志。每次新 mutation 在准入前分配稳定 actionID；同一逻辑动作的传输重试和结果核对保留该 ID，SessionId 或 TCP 重连不充当幂等键。身份与授权检查对每次请求重新执行；已经被 authority 接纳的固定后续效果按其原授权和持久责任结算。
 
-### 原生发布、映射和 tree 建立
+### 发布、映射与 tree 的责任交接
 
-1. 宿主为每个 drive 构造 `PublishedDrive(exportID, trustedVolumeID, backendRef, SID+LUID owner, WNet target, mappingState)`，预检 loopback listener、目标平台和容量；`Serve` 后由宿主显式发布 share。发布不会自行创建系统映射。
-2. 当前登录会话使用 WNet 建立系统连接。WNet 目标须指向同一 loopback endpoint 与唯一 share；连接和移除结果连同映射身份可查询。`TREE_CONNECT` 在签名 session 下选择 export，核对可信 volume／远端绑定和权限，创建或复用该 SMB session 对该 export 的一份 FileSession，成功后才安装 tree。
-3. 非强制 unmap 是原子准入门：先以不持有 WNet callback 所需锁的原子状态转换，对指定映射设临时 admission fence，**在同一时点快照**该映射已打开句柄、锁与 active／in-flight 操作数（不计正在执行的 unmap 控制请求本身）；fence 只拒绝新打开／tree 准入，仍接受 TREE_DISCONNECT、LOGOFF、既有 I/O 排空和已接纳清理。快照中任何句柄、锁或在途操作非零就立即报告 busy 并撤回临时 fence，即使该操作随后完成且未留下句柄；原映射与 owner 完整可用。只有快照为空才进入 WNet 移除；无 busy 时在 fence 持有期间调用非强制 WNet 移除，防止检查后新打开；返回码本身不总能证明映射是否已变，未确认结果前不退休原句柄。随后核对原映射的 WNet 身份与 endpoint owner，结果分三类：(a) 明确无效果且原映射身份未变，撤回临时 fence，保留句柄／owner，返回移除失败；(b) 映射已确认移除，进入永久 `stopping`，移除操作如实报告 `MappingRemoved=true`，后续资源退休由独立 `Stop`／`Status` 报告 `CleanupPending` 和 owner；(c) 映射身份仍无法确认，保留 fence、映射 owner 与 `Unknown` 状态，不报告普通失败或成功，按同一移除意图继续查询。未知状态后若确认原映射仍在，才允许回滚 fence；确认已移除则走 (b)。`Stop` 仅在映射与所有清理责任均完成时报告完全成功，清理失败保留 `stopping` 与可查询 owner。停止永久封住新连接与操作，排空已接纳动作，退休 tree／session、锁和 delete owner，确认 WNet 映射及 listener 清理。每个失败点注入验证 busy 回滚、不可逆阶段重试及 owner 计费；同一 cleanup 可重试。外部提供的 backend 和 HTTP client 不由 SMB 关闭。
+宿主显式构造 `PublishedDrive{exportID, trustedVolumeID, backendRef, SID/LUID owner, WNet target}`；`packages/smb` 只在签名会话的 `TREE_CONNECT` 中创建或复用该 session/export 的一份 authority FileSession，完成 `BackendIdentity` 绑定、能力与权限核对后才公布 tree。WNet 映射是宿主的独立系统资源，端点不替宿主连接、移除或关闭 backend。[原生映射与夹具提案](2026-09-28-smb-native-wnet-fixture.md)拥有控制器的 `Prepared/Connecting/Connected/Fenced/RemovalUnknown/RemovedCleanupPending/Stopped` 状态机、持久映射 owner 和故障注入接口。
 
-原生可行性门先在 Windows 11 24H2+ Home、Pro 各用普通用户探测 IPv4／IPv6 loopback、可用 host alias、445 端口占用、WNet 目标、SSPI、签名、`TREE_CONNECT` 和 teardown；记录本端点接纳的 TCP 445 socket、SSPI context 中的 SID 与 `AuthenticationId` LUID、宿主交互式登录 LUID 以及签名 TREE_CONNECT，不能把内置 LanmanServer 的响应误认成本端点。若 redirector 使用 network logon 造成 LUID 不同，须设计并原生证明安全的同一登录会话关联，不能简单拒绝真实用户或放宽到仅 SID。现有 endpoint 尚不支持 root 文件命令，映射因后续 root 请求失败时应根据端点 trace 区分已验证的连接／认证／tree 与未实现文件命令。不得用管理员权限、驱动或整机 SMB／防火墙／缓存／安全策略变化使其通过。[Microsoft 的替代 SMB 端口配置](https://learn.microsoft.com/en-us/windows-server/storage/file-server/smb-ports)要求提升权限，而 [`WNetAddConnection2W`](https://learn.microsoft.com/en-us/windows/win32/api/winnetwk/nf-winnetwk-wnetaddconnection2w)无端口参数；普通用户可达性须在目标版本证明。完整映射在 root 命令具备后复验。TCP 445、本机身份关联和每类缓存的原生可行性均是发布阻塞门；任一失败，先确定满足 R-WIN-1／R-WIN-8／R-WIN-9 的机制再继续相应交付。
+非强制移除的跨边界保证是：设置临时 admission fence 的同一时点快照原映射的句柄、锁及 active/in-flight 操作；任一非零即 busy 并撤回 fence，哪怕在途操作随后完成。fence 不持有 WNet callback 所需锁，仍允许已接纳 I/O、CLOSE、TREE_DISCONNECT、LOGOFF 与清理。空闲时的 WNet 返回须按原映射身份判断“确认无效果／确认移除／未知”；只有确认无效果才能撤回 fence。确认移除如实返回映射已移除，`Stop/Status` 单独报告未结清 owner；未知保持 fence 和同一意图。完整停止排空 FileId、authority session、锁、delete intent 与 listener 后才报告成功。
 
-### Windows 名字解码与权威选择
+Windows 11 24H2+ Home/Pro × x64/ARM64 的普通用户可行性必须在本端点真实接纳的 loopback TCP 445 socket、签名 `TREE_CONNECT`、SSPI SID 与 `AuthenticationId` LUID 上证明。若 redirector 采用不同 network logon LUID，须用不可伪造的同一登录会话关联；仅凭 SID 或 loopback 不准入。[替代端口配置](https://learn.microsoft.com/en-us/windows-server/storage/file-server/smb-ports)涉及提升权限，[`WNetAddConnection2W`](https://learn.microsoft.com/en-us/windows/win32/api/winnetwk/nf-winnetwk-wnetaddconnection2w)没有端口参数。不能以高端口协议客户端、管理员权限或改全局设置代替 445/WNet 实证。端口、身份与每类 Windows 缓存的原生可行性均是发布阻塞门。
 
-SMB codec 在 frame 长度和偶数字节检查后按 UTF-16 精确解码；NUL、孤立 surrogate、超过 255 个 UTF-16 code unit 的组件，以及空名、`.`、`..`、路径分隔符、`< > : " / \ | ? *`、U+0000–001F、末尾空格／点和 Windows 设备名都在任何 authority 效果前拒绝。设备名含 `CON`、`PRN`、`AUX`、`NUL`、`COM1–9`、`LPT1–9` 及数字上标 ¹²³ 形式，即使后接扩展名仍拒绝；ADS、设备路径与 NT 前缀不转成普通 volume 名字。有效 supplementary pair 往返转换为 UTF-8；不进行 NFC 或其它 Unicode normalization，原始 authority 名字拼写保持不变。规则与边界须以 [Windows 命名规则](https://learn.microsoft.com/en-us/windows/win32/fileio/naming-a-file)和原生 redirector 测试核对。
+在 7.3 实施前先运行**一次性调研门**：用现有 `smb.New/Publish/Serve` 与 `CurrentIdentity/Authenticator` 接口写仓库 `.tmp` 内的临时 Windows harness，让普通用户在 Home/Pro 发起原生 WNet 连接尝试，保留确由本端点接纳的 445 socket、SSPI SID／LUID、签名 `TREE_CONNECT`、同 SID 另一登录会话／其它用户／anonymous／guest 的拒绝和失败后的清理 trace。现有文件命令返回 `STATUS_NOT_SUPPORTED`，WNet 可能在随后 root CREATE／QUERY_INFO 阶段拒绝持久映射；该门只证明 445、身份关联和签名 tree 可达，不要求成功挂载 drive，不是 9 的发布控制器，也不宣称 WN-01 通过。净化证据及未解决平台差异附在当前设计审查记录中，临时 harness 用完删除；任一门未证明就先修订发布机制，不开始依赖该前提的 7.3。
 
-大小写等价使用 [Windows `CompareStringOrdinal`](https://learn.microsoft.com/en-us/windows/win32/api/stringapiset/nf-stringapiset-comparestringordinal) 的显式长度、`ignoreCase=TRUE`，不使用 Go `EqualFold`、当前 locale 或自选 normalization。对父目录的一次完整有界观察，先验证所有 raw leaf 都是合法 UTF-8 且可表示，再用该 comparer 检查所有 sibling；0 个匹配为不存在，1 个选择其精确 raw leaf，多个匹配或任何无法表示 sibling 使受影响的父目录按名观察整体失败。结果携带根到父每一级 revision／raw edge guard，在最终 authority 动作重验；并发插入 `Foo`／`foo` 必须导致 guard 冲突或被正确排序，不能选错对象。原生向量覆盖 `A/a`、`CON.txt`、尾点／尾空格、`a:b`、emoji surrogate、非法 UTF-8 authority leaf、组合与预组 `é`、255／256 UTF-16 单元、sigma／Turkish I，并把 comparator 结果与 redirector 实际行为交叉验证。[Unicode normalization](https://learn.microsoft.com/en-us/windows/win32/intl/using-unicode-normalization-to-represent-strings)只作为不擅自规范化的边界参考。
+### Windows 名字到权威对象
 
-完整 `DirectoryMetadataObserver` 捕获后才能判断 sibling 歧义，使 7.3 的冷路径按所经目录的 child 数付出有界排序／比较成本；单点 lookup 不能证明不存在大小写冲突。7.3 以正确性优先，记录不同目录规模与深度的冷打开时延及资源消耗。后续若需要优化，只允许 revision 绑定的权威 Windows 名字索引，或由完整观察建立且随变更失效的验证缓存；任一优化必须证明冲突名字不会被漏掉，R-WS-4 的速度不能靠不完整查找取得。
+SMB codec 精确解析 UTF-16，拒绝 NUL、孤立 surrogate、保留设备名、非法组件及 Windows 不可表示名字；不改写 authority 原始名字，也不对 volume 做 Unicode normalization。Windows 等价性使用 [`CompareStringOrdinal`](https://learn.microsoft.com/en-us/windows/win32/api/stringapiset/nf-stringapiset-comparestringordinal) 的显式长度、不区分大小写比较。每一级按名选择都需完整、有界的父目录观察：一个精确匹配可以选择，零个可形成缺席条件，多于一个或任一影响该父目录的不可表示 sibling 使相关按名操作整体失败。选择保存 trusted root、每级目录 revision 和精确 raw edge，最终 authority 效果点重验；客户端早先的 lookup 不构成授权。完整 codec 规则、向量和冷路径成本归[有界 CREATE/CLOSE 提案](2026-09-28-smb-bounded-create-close.md)。这种完整观察可能使大目录打开昂贵；R-WS-4 资格要测冷路径，优化只能使用 revision 耦合的权威索引或已验证且可失效的观察缓存。
 
-### 权威打开、FileId 与结果恢复
+CREATE 与 CLOSE 建立后续操作依赖的 FileId：五种非 supersede disposition 对非空路径在一次 guarded `OpenAt`／`OpenChildRef` 动作内决定存在性、创建／截断、双向共享、引用和初始属性；空名字的 share root 则由同一 FileSession 的 `OpenNodeRef` 按 root 身份条件取得目录引用；supersede 留给 8.1 的 guarded 原子**原位**重置并打开动作，保持既有对象 ID，返回该对象的一份新引用与新的 SMB FileId。每个 FileId 只拥有一份 `File` 或 `NodeReference`，固定 tree、authority epoch、对象 ID、用途／share 与清理 owner。容量和身份能力在效果前预检；端点获得非 nil 引用后即使后续结果错误，也继续拥有清理责任。`ReferenceIdentity` 目前可选，7.3 要保证两种引用经 native、HTTP、wrapper 都能稳定报告 ID。相关 compound 的占位 FileId 只指向同一已签名 frame 中前一个成功 CREATE，不能借其它 session/tree 的旧句柄；编码细节由[7.3 提案](2026-09-28-smb-bounded-create-close.md)拥有。
 
-SMB 名字逐组件解码，按 R-FS-9 在完整父目录观察上检查不可表示名字与大小写歧义。路径选择生成 `NamespaceGuards{RootID, 每级目录 revision, 精确 raw-name edge}`；末级带目标存在／身份条件。现有中立 guard 上限为 256 条、64 KiB；超限在效果前明确失败。打开向最终 authority 动作传入父引用、原始叶名字、完整 guards、disposition、用途／share、初始 metadata 与 actionID。authority 在同一个排序点重新核对整条祖先链和末级条件，并决定存在性、创建或截断、双向共享准入、引用授予及初始属性。不能把早先的客户端查找当作最终 guard，也不能先 open 再另行 truncate 或补共享 claim。
+每项修改在进入 authority 前生成稳定 actionID 并保存不可变输入；SMB endpoint 是 R-FS-8 的调用方，只在有效 receipt 窗口内查询或同 ID、同输入重投。`Unknown`／`Retired` 不能证明未执行，不能根据后来占据路径的对象补做；Windows 应用只得到明确 I/O 错误，不收到内部 actionID。宿主的有界 per-operation ledger 供诊断和验收核对。关闭还需中立 `CloseWithAction(ctx, FileActionID)`：ID 在效果前写入 owner，结果分别报告引用 `Released` 与剩余 barrier；释放引用、结算 barrier、delete intent 与退还额度是不同事实。CLOSE、断线、tree/session 退出和 stop 都推进同一 owner，不能因传输失败伪造释放。
 
-| SMB 打开意图 | 最终权威动作 |
-|---|---|
-| create | 目标不存在才创建；已存在明确冲突。 |
-| open | 目标存在且类型匹配才保留引用。 |
-| open-if | 已存在则打开；不存在则创建；并发创建者结果由最终事务决定。 |
-| overwrite | 已存在文件在同一动作内截断；不存在失败。 |
-| overwrite-if | 已存在则截断，不存在则创建；两种结果均返回准确的 create action。 |
-| supersede | 8.1 通过受完整 guards 约束的 `OpenAtOptions.Existing=ReplaceNode`（或同等原子替换并打开动作）直接返回 `OpenResult{File, Attr, Outcome}`；旧对象由旧引用持有，不能先 `NameCommand` 替换后另开。 |
+### FileId 数据、目录与名字效果
 
-metadata-only 与目录打开取得 `NodeReference`，普通数据文件取得 `File`；一个 FileId 只拥有其中一种。所有实际对象效果之前预留 FileId slot、frame／结果预算和待清理 owner；容量耗尽时 authority 看不到创建或截断。FileId 由 session incarnation 与单调计数构成，计数溢出时拒绝新打开，不能复用仍可能出现在请求中的标识。`OpenAt`／`OpenChildRef` 即使伴随错误返回非 nil 引用，也须交给预留的 owner 清理，不能因错误分支而丢弃。动作接受后无论响应编码、网络或本地注册是否失败，该 session/tree 都保留引用及原 actionID，核对原动作并清理；不能通过新路径打开猜测原结果。SMB endpoint 作为 FileStorage 调用方生成随机 actionID，保存不可变的原请求负载；只在 FileSession 的有限 history 和有效 action epoch 内由 endpoint 内部查询／同 ID、同负载重投。session 退休、history 过期或 authority incarnation 改变后的 `Unknown`／`Retired` 不证明未执行，不能承诺 `QueryFileAction` 一定给出终态，也不能用新 action 或路径重试；本次 SMB 调用返回未知结果对应的 I/O 错误。需要新增按 opaque actionID／ownerID 查询的宿主诊断接口或事件，保留有界的 unresolved owner 状态与清理进度；现有 `Server.Status` 的聚合计数不能回答单个动作。owner 已退休后该状态只表明无法确认结果，不承诺跨进程的普通动作回放或精确完成事实。R-FS-8 的动作查询调用方在此架构中是 SMB endpoint：它在有效回执窗口内内部查询或安全重投同一个逻辑动作。未经修改的 Windows 应用不持有 FileActionID，也不提供逐动作查询 API；不能确认时本次调用返回明确的未知结果／I/O 错误。宿主的有界 per-operation ledger 仅供诊断和验收核对，不冒充应用查询能力。应用遇到 I/O 错误须重新观察当前权威对象，但观察结果不能冒充原动作回执；只有持久 delete intent 有跨重启查询契约。权威结果中的对象身份与引用身份、allocation-known／allocation bytes、属性预算必须在对 SMB 宣告成功前核对。异常结果不把已产生效果说成未执行。
+文件 READ 使用身份稳定的 `File.ReadAt`，成功字节与属性来自同一 revision；WRITE、EOF 和属性／时间修改经过 authority 的条件动作，同次提交内容／长度与 Windows `ARCHIVE`，最终效果点核对 `READONLY` metadata token。目录或 metadata-only FileId 的属性／时间组合更新使用现有 `NodeReference.(ConditionalFileMutation).MutateFile(MutateAttributes)`；字节写入／截断仍不属于此引用，不能调用两次 setter 拼出部分效果。FLUSH 确认后端 durability barrier；CLOSE 不延后写回。Windows 属性解释只在本地 codec；其它入口不解释这些位。allocation 在 CREATE/CLOSE 中按权威字节数报告；文件／volume 信息类只有在权威 Attr、Space 与经中立 `VolumePresentation` 证明的身份／几何足够时才能成功，不能强加内置 volume 的 4096 粒度。配额下调导致 `Used > Total` 或容量结构无法准确表示时，仅受影响的容量 `QUERY_INFO` 明确失败；tree 继续允许读取、释放引用与回收空间，不对整个 share 设置故障 fence。信息类 allowlist、`MinimumCount`、输出预算、时间零值及 `NodeReference` 的条件属性动作归[文件 I/O 与信息提案](2026-09-28-smb-file-data-information.md)。
 
-SMB CREATE 和 CLOSE 的 `AllocationSize` 报告权威分配**字节数**，不要求 4096 对齐；[MS-SMB2 CREATE response](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-smb2/d166aa9e-0b53-410e-b35e-3933d8131927)使用字节语义。分配量能力要在效果前预检；若 adapter 违约返回未知或非法值，结果为错误且保留已获引用。可选且未授予的 `AlSi` preallocation context 可被忽略，但响应不得声称预分配；改变基础打开语义却未支持的 context／flag 在对象效果前明确失败。Windows 信息类中依赖 cluster 几何的转换在 7.4 确定接口和报告规则，并以有效 allocation byte 及可证明的 volume geometry 验证；不能把内置 volume 的 4096 粒度强加给第三方 backend。
+应用可见 QUERY_DIRECTORY 通过目录 FileId 的活 scope 取得一次完整有界 `DirectoryReader.ReadDirNodeBounded` 捕获，先验证**所有**名字与属性，再从冻结的同一 revision 分页；坏条目不能被 pattern 过滤掉。普通续页不冒充实时观察；restart/reopen 重取，FileIndex 只在本句柄当前捕获有效。捕获、cursor、flags、buffer 与预算由[目录枚举提案](2026-09-28-smb-directory-enumeration.md)拥有。目录路径遍历的 `DirectoryMetadataObserver` 与应用目录捕获是不同能力；后者不能替代前者的最终 mutation guards。
 
-### FileId 绑定的 I/O、信息与关闭
+rename、move、replace、unlink 与普通 disposition 在最终 authority 事务核对源／目标**两侧**完整 ancestry guards、对象／关联、共享、pending、`READONLY` 和授权；目前 `NameCommand` 只有末级条件，8.1 须扩展中立命令及 HTTP/wrappers/metastore 的传递。supersede 必须在单个 guarded authority 效果中重置原对象并取得新引用，保持原对象 ID；不能先重置后另开。按名 replace 才是新对象占据旧名字。旧 FileId 在原对象无名或同名被替换后仍指向原对象；Windows file ID 从不可复用 authority ID 导出，不等于每次打开的 SMB FileId。普通可清除的 disposition 与不可撤销的已接受关闭删除义务分账；详见[受 guard 的名字修改提案](2026-09-28-smb-guarded-name-mutation.md)。
 
-READ、WRITE、FLUSH、EOF、文件／volume 信息与属性操作从已签名 header 定位 FileId，依次核对 tree、引用类型、访问权、session incarnation、当前授权及 authority 能力／状态，再由其对象身份调用中立 FileStorage；捕获结果必须先通过完整 response budget 才可编码。READ 使用身份稳定的 `ReadAt`，数据与 Attr 来自同一内容 revision；按请求的 `MinimumCount`、捕获 EOF 与短读规则响应。未支持的 RDMA channel 在后端访问前明确拒绝；分块请求不宣称整个应用调用的一次全局快照。WRITE、EOF 截断和可设置属性通过 `FileMutation` 条件动作提交：把已观察 Windows 属性版本放入 `ExpectedMetadata`，把同一版本的 `ARCHIVE` 更新放入 `Metadata`，在最终 authority 效果点核对 `READONLY` 并同时提交内容／长度与属性。若元数据 CAS 冲突，只有确认原动作 `NotExecuted` 后才能重读并使用新 action；`Unknown` 只查询／重投原 action。overwrite／overwrite-if 的 `ResetContent` 路径同样用 `OpenAtOptions.Target.ExpectedMetadata` 在最终打开动作检查 `READONLY`，并用 `Initial.OnReset.Metadata` 与截断同次设置 `ARCHIVE`，即使原长度已经为零；若创建新对象则使用 `OnCreate` 的 Windows 初始属性。远端确认前不向 Windows 返回成功，失败不能推迟到 CLOSE。FLUSH 以 `Sync` 确认引用健康与后端 durability barrier；CLOSE 不承担延后写回。改名、unlink、同名替换后已有 FileId 仍访问原身份，当前名字查询从身份观察得到最新关联或准确的无名状态。
+关闭时删除在打开时接受，并由宿主为每个 volume 持久保存 `DeleteIntentOwner`；没有已同步、可跨进程恢复的 owner 就在打开效果前拒绝。发起句柄关闭或连接、会话、宿主终止使义务立即进入 `pending`，阻止冲突新打开；原本兼容的旧句柄继续使用，最后相关句柄离开才移除名字。rename 让义务跟随原对象的同一关联；unlink／replacement 分离原关联后义务明确未执行，新同名对象不受影响。查询、分页恢复与 ACK 分别按当前授权处理，已接受的固定删除效果不因随后权限撤销而取消。状态、持久 owner 格式与崩溃恢复由[关闭删除提案](2026-09-28-smb-close-delete-obligation.md)拥有。
 
-Windows codec 只解释 `READONLY`、`HIDDEN`、`SYSTEM`、`ARCHIVE` 四个可设置位；目录、reparse、normal 从节点种类及位状态推导。`READONLY` 阻止该入口发起的不相容写与删除，但其它入口不解释 Windows 专有位。缺失的历史 creation／change 时间稳定显示零，查询不推测、不写回；显式零时间表示保持原值。空间的总量／已用／可用取自权威 `Space` 与分配账，不能用本地缓存或零占位。所有响应按 SMB credits、frame 和信息类长度做有界编码；结果超预算明确失败，不截断完整语义。
+共享 claim 和强制字节范围保护都在同一 authority 对象排序，Windows、Linux 与 SDK 不能换入口绕过。共享范围锁以 `DenySelf=WriteData, DenyOthers=WriteData` 拒绝持有者自身与其它 owner 的写入；排他范围锁拒绝其它 owner 的读取与写入；解除必须按原 ClaimID。LOCK 的异步等待与 CANCEL 使用同一 pending owner；取消不证明授予未发生，批次中已成功解除的效果即使后项失败也保留。完整 `RangeControl`、批次回执、async credit/签名和资源责任归[范围锁与取消提案](2026-09-28-smb-range-lock-cancel.md)。
 
-CLOSE 对 FileId 封住新操作，等待已接纳 I/O，再以已预存于 owner 的 actionID 调 `CloseWithAction`；网络与编码失败只查询／重投同一引用、同一意图的原动作。已确认释放但仍有同步／删除 barrier 错误时去掉文件引用、保留中立剩余义务 owner；释放事实未知时 FileId 进入 cleanup-only，不把其额度回收。CLOSE 的 postquery 属性获取若失败而引用释放已确认，可按协议清除 postquery 标志并报告真实关闭结果，不能为了属性查询失败倒退已确认的释放事实。重复 CLOSE、tree 退出、LOGOFF、断线、unpublish 和 stop 对同一清理责任只推进状态，不重复创建动作。range lock 和共享 claim 在其引用完成排空并得到 authority 释放事实后才离开权威排序。旧句柄在 authority epoch 更换或 lease 失效后返回失效错误；不重开同名目标，也不在未知 close 结果时偷偷释放保护。
+### 变更源与 Windows 可见性
 
-### 目录、名字修改与删除义务
+`FileStorage` 当前没有通用订阅能力；8.3 提议与 backend `BackendIdentity` 绑定同 volume/incarnation 的中立 `ChangeSource`，让所有入口提交的名字事件和**按对象 ID**的内容／长度／属性事件有序可观察，包括已 detached 但仍打开的对象。endpoint 保留“曾向 redirector 成功报告、它可能仍缓存”的有界保守事实集合；本地驱逐不能证明客户端也已驱逐。断流、缺口或 overflow 进入 Fenced，不能从旧内容、目录或负查找生成成功。
 
-目录路径遍历使用 `DirectoryMetadataObserver` 的完整权威 metadata 观察来建立 guards；应用可见 QUERY_DIRECTORY 使用 `DirectoryReader.ReadDirNodeBounded` 的 `DirectoryObservation` 与结果 collector 获取一次完整、有界的目录捕获，两者职责不同。对捕获的**全部**条目验证 UTF-8、Windows 名字表示、case-fold 后唯一性、对象 ID 和编码预算，任何条目失败则整次枚举失败，不能漏掉坏条目后返回其余内容。一个目录 FileId 的枚举 cursor 分页同一次冻结捕获；`RESTART_SCANS` 与 `REOPEN` 丢弃旧 cursor、重新捕获并从头返回，完整新捕获验证失败则不输出条目；`RETURN_SINGLE_ENTRY` 最多返回一个完整条目并只推进已返回条目。`INDEX_SPECIFIED` 只接受该 FileId 当前冻结捕获已发出的 FileIndex，并定位该捕获内相应 cursor；旧捕获或其它句柄的 index 明确失败，绝不把它当路径或跨捕获续游标。输出 buffer 太小而装不下下一完整条目时保持 cursor，返回协议规定的 buffer 错误；达到 cap 时以完整条目边界分页，不截断名字或 metadata。无法完成的快照、超额目录、revision 冲突或不可确认状态均为 I/O／资源错误，不返回空目录。按名操作在其它入口制造的歧义存在时整体拒绝；已经打开的身份 I/O 不受其原名字是否可表示影响。
+恢复须先订阅，再取与 checkpoint 原子绑定、分页且范围有界的 scoped snapshot，回放固定目标位置以前的事件并追 live 流；scope 含已报告事实、active FileId 与所有 watch（包括 `WATCH_TREE` 子树）。不能原子绑定 checkpoint 时，只能从 snapshot **之前**的 cursor 重放，并证明早扫描目录的并发改动不会丢失。无法恢复的 pending watch 收到 `STATUS_NOTIFY_ENUM_DIR`，必须重新权威观察。同目录 rename 在一个 watch 内为 OLD_NAME→NEW_NAME，跨目录分别为源 REMOVED／目标 ADDED；内部事件仍保留同一动作关系。精确 event、watch 与 bounded recovery 由[变更通知及缓存提案](2026-09-28-smb-change-notify-cache-coherence.md)拥有。
 
-rename、move、replace、unlink、supersede 和普通 disposition 必须在最终 authority 事务中验证源与目标各自的完整祖先 guards、原始名字、对象／名字关联和共享／readonly 约束。`ChildCondition.ExpectedMetadata` 与 `PendingUnlinkCommand.ExpectedMetadata` 带入 Windows 属性版本，在最终名字效果点阻止并发设置的 `READONLY` 被旧客户端观察绕过。目前中立 `NameCommand` 有源／目标条件但没有 `NamespaceGuards`；8.1 对普通 rename／replace／unlink 扩展中立受 guard 的名字动作或提供等价的最终事务核对，supersede 则扩展 guarded `OpenAt(ReplaceNode)`；不能以客户端先查再调用 `MutateName` 或替换后另开填补。名字动作含稳定 actionID 和有限期可查询 receipt；响应丢失后不以后来复用源名或目标名的对象推断或重放新动作。rename 事件保留一对旧／新名字关联；同名 replacement 仍为两个对象身份。
-
-关闭时删除与普通 disposition 是两种状态。delete-on-close 打开在任何创建／截断效果前要求宿主提供按 volume 隔离、跨进程重启可恢复的 `DeleteIntentOwner`。authority 在接受打开时以 `CloseIntent.ExpectedMetadata` 检查当时的 `READONLY` 属性版本与删除授权，并持久绑定原对象、当时的名字关联和义务 owner；后续触发是该已接纳动作的固定效果，无须在执行时重新取得已撤销的授权。普通 disposition 在设置时立刻核对当前身份、共享、readonly 和目录为空，并按其自身动作 receipt 恢复；清除它不撤销其它句柄已经接受的关闭删除义务。
-
-发起句柄显式关闭，或其连接、会话、宿主进程终止时，义务从 `armed` 进入 `pending`，立即拒绝冲突新打开／名字动作；已经允许删除共享的旧句柄继续按其权限访问。实际移除等待最后相关句柄结束，只尝试移除与原对象保持同一绑定、可随 rename 移动的关联。关联在触发前已由 unlink／replacement 分离，或目录触发时非空，结果为明确未执行／相应失败；后来占据同名的对象绝不能被删。启动、停止和异常恢复用宿主 owner 分页 `ListDeleteIntents`，按 ID 查询并完成原清理，达成完成或明确未执行终态且本地责任处理完才 ACK。查询、补充清理和 ACK 作为新请求仍受当前授权约束；授权失败或远端不可达时保留 owner、资源占用和状态，不静默遗忘。authority 崩溃重启后已接受义务仍可由同一 owner 找到。
-
-### 共享、范围锁、取消与请求排序
-
-打开声明的 `Uses`、`Deny` 在 authority 最终打开点双向比较；其它入口的打开及名字 mutation 必须经过同一排序边界，不能以协议入口不同绕过。已有持有者禁止新请求，新持有者也禁止已有用途时，冲突在创建、截断、replace、rename、delete 等效果前被拒绝。已接纳 I/O 在关闭或新保护请求到达时可按既定顺序完成；不能先释放 claim 再等待它。Windows 不应将本地 READONLY 或 SID 规则伪装成跨入口业务授权。
-
-字节范围 LOCK／UNLOCK 翻译为中立 `RangeControl` 的 `DomainEnforced` 请求，绑定原文件引用、区间和 lock request ID。共享锁的 `DenyOthers=WriteData`，排他锁的 `DenyOthers=ReadData|WriteData`；UNLOCK 按原 `ClaimID` 做 `RemoveExact`，不从坐标猜测或释放别人的 claim。等待锁、立即失败、批次部分成功、取消、释放与响应丢失均按 authority 的 `RangeAttempt`、`FailedAt`、`Effects` 与 surviving release 语义报告；失败不能把已确认成功的解除重新加锁，也不能保留一个未授予的锁。SMB CANCEL 要能找到已登记的 pending request 并取消其等待，而不能因为当前连接先处理 CANCEL 就跳过原请求的权威状态核对。取消与授予交错时查询原动作确定是否已授予；未知结果保持 owner 直至确定或过期回收。普通 advisory range protection 不跨 authority incarnation 恢复，旧持有者持续失败。独立的强 S/X 保护沿用 R-CC-6 至 R-CC-11 的期限与恢复契约。
-
-### 变更源、Windows 缓存与故障恢复
-
-`storage.FileStorage` 当前没有变更订阅；[HTTP `Storage.Subscribe`](../../../../packages/transport/httprest/subscribe.go) 是具体 adapter 的方法，[metastore `Log`](../../../../packages/metastore/metastore.go) 是远端名字变更日志，不能假设任意 `Share.Backend` 都有同一流。8.3 提出平台中立的 `ChangeSource` 可选能力，或由宿主显式提供的等价依赖：与 `Share.Backend` 的 `BackendIdentity` 绑定同一可信 volume、authority incarnation 和授权身份，暴露订阅、可验证 checkpoint、按页读取的原子 scoped snapshot、按 incarnation+position 恢复及缺口／overflow 错误。HTTP adapter 可把现有订阅包装进该能力；直接 adapter 要独立满足同样契约。缺少变更源的 share 在 8.3 的可见性能力预检时拒绝，不退化为 TTL、固定周期目录扫描或看似健康的无通知模式。
-
-协调器状态为 `Seeding → Ready → Fenced → Recovering`。建基线先订阅同一 incarnation 并记住游标 P；再取得**同一权威时刻**的只读 snapshot 与它原子绑定的 checkpoint S，分页读取保守的“已向 redirector 成功报告、因此它可能仍持有”的内容、文件信息、正／负查找、目录事实所涉及的目录／对象 ID（即使 endpoint 本地无缓存或 SMB lease），以及授予 lease、仍有未完成 `CHANGE_NOTIFY` watch 的作用域和 active detached 引用。`WATCH_TREE` 的作用域含被监视目录的整棵子树，变更事件须以对象父链判定当前属于该子树，并在跨子树 rename 后更新归属；watch 即使从未建立目录 listing 或 lease，也占独立 scope 与队列预算。已报告事实的集合是客户端潜在缓存的有界保守上界；服务端无法直接检查 redirector 私有缓存，不能因为本地条目被驱逐就从恢复 scope 删除。容量满时在新的可缓存成功答复前拒绝或 fence，只有经原生证明已使对应 redirector 事实失效才回收条目；正常大树若因此无法继续服务，8.3 机制不通过资格门。每页有字节／条目预算，整个 snapshot 由短期一致性 token 或等价快照机制固定，不把全 volume 装入内存；没有缓存／lease 的冷查找直接回源 authority。选择固定 tail T，回放 S 之后至 T 的全部变更，再追上 live stream，确认同一 incarnation、无缺口且每个受保护对象的 revision 不回退后进入 Ready。订阅先于 snapshot，保证 S 之后变更在订阅 retention 中；若 backend 不能原子取得 snapshot+checkpoint，就改用 snapshot **之前**的游标 P 回放 P 之后的全部变更，并证明分页基线与重放合成不会漏掉早扫描目录的并发修改，不能在扫描结束后才取 checkpoint 并跳过期间事件。
-
-Fenced 时所有可能由 endpoint 回答的旧视图失败；对断流前已挂起的普通 watch 或 `WATCH_TREE`，若不能完整重建其目录／子树事件范围，回应 `STATUS_NOTIFY_ENUM_DIR` 并要求下一次订阅前重新权威观察；子树过大或变更队列溢出也走此路径，不能悄悄从新尾部续订。Recovering 在有界队列和页预算内重建。snapshot token 过期、retention 已 trim、队列 overflow、scope 增长超额、active watch 队列超额、incarnation 改变或任一组件不可达时丢弃该次基线并重试；持续不能完成时保持 Fenced，状态暴露失败原因。active detached 引用也纳入对象状态捕获与事件回放，不能树基线完成就宣称这些 FileId 已恢复。8.3 的负载门须以远大于内存预算的真实大树、深目录、含仅由 redirector 缓存但 endpoint 本地已驱逐的正／负查找，并在首个分页后修改早扫描目录，证明恢复能前进或明确拒绝，不能因普通大 volume 永久误判为损坏。
-
-现有 [`metastore.Change`](../../../../packages/metastore/metastore.go) 以 `Parent/Name/From/Node` 描述名字，[客户端架构](../../../../docs/design/client/architecture.md)记录无名对象写入可能没有命名事件。仅靠该日志会漏掉已打开、失去最后名字的对象内容修改，违背 R-FS-6 与 R-CON-1。此提案选择扩展中立变更语义，增加按不可复用对象 ID 表达内容、长度、属性 revision 的 mutation 事件，包括 detached 对象；名字事件仍携带原始关联。生产端在确认修改的同一权威发布顺序中产生该事件，订阅端按对象 ID 找到所有 active FileId、仅对实际授予且匹配的 lease key 发 break，并使相应本机对象视图失效。恢复基线从 active 引用直接读取 detached 对象的状态，回放其后对象事件。若底层 adapter 无法产生完整对象事件，只有经真实 Windows 客户端证明 detached FileId 的内容缓存从未拦截权威读取时，才可为该 adapter 选择禁用对应缓存；否则该 adapter 不取得 R-WIN-8 资格。
-
-authority 的 rename 事件保持旧／新关联，但 SMB 对目录 watch 的投影遵循 [FILE_NOTIFY_INFORMATION](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-fscc/634043d7-7b39-47e9-9e26-bda64685e4c9)：同目录改名向同一 watch 依次发 `OLD_NAME`、`NEW_NAME`；跨目录移动分别向源 watch 发 `REMOVED`、目标 watch 发 `ADDED`，不伪造跨 watch 的一个成对 SMB payload。普通 watch 只投影所监视目录的事件，`WATCH_TREE` 按权威父链投影整棵子树内的名字、内容、大小和属性事件；跨子树移动分别按移出与移入计算。内部事件与日志保留同一动作的关联，供 cache invalidation 和诊断。该投影与 R-WIN-3 约定一致：同目录通知成对，跨目录分别通知移除与新增；内部变更仍保留同一动作的旧／新关系。
-
-Windows redirector 的文件内容、文件信息、目录与负查找有不同缓存路径；[lease break](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-smb2/4f35576a-6f3b-40f0-a832-1c30b0afccb3)只作用于匹配 lease key，[CHANGE_NOTIFY](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-smb2/05869c32-39f0-4726-afc9-671b76ae5ca7)只回应已挂起的请求。服务端有序事件、break 和通知都不能单独证明应用首次读取会发 SMB 请求；返回 EIO 也只覆盖实际到达 endpoint 的请求。因此每一类缓存都须在真实 Home／Pro redirector 上分别预热、由另一入口修改或只切断 authority／变更源，再观察首次应用调用是否在一秒内取得权威结果或明确失败。不得通过修改[系统级 SMB 客户端缓存配置](https://learn.microsoft.com/en-us/powershell/module/smbshare/set-smbclientconfiguration)取得通过。
-
-流静默失联尤其危险：现有 HTTP stream [keepalive](../../../../packages/transport/httprest/limits.go) 和客户端[静默超时](../../../../packages/transport/httprest/client.go)分别为 10 秒、30 秒，不能满足一秒故障与失效窗口。8.3 须定义并测得最坏情况的 `变更提交/失联 → 检测 → fence/lease break → redirector 处理 → 首次应用调用` 总时延；先不授予 lease，在真实客户端测量六类缓存路径；仍有本地命中时再逐类试验服务器主动 break 或等效机制。对内容、信息、目录、正负查找分别测量。健康路径的可见性由事件驱动，失联检测可以有有界健康机制，但不能用固定周期权威数据轮询或缓存到期代替事件。只断开普通 authority 路径或只断开变更流时，未知旧视图均不能作为成功答案。若任一缓存类没有无需全局设置、普通用户可用的失效／拒绝机制，或静默失联窗口无法达标，应先修改架构与相应规范，不得宣告 Windows 支持。
+这套服务端结构**尚未证明** Windows redirector 的内容、文件信息、目录、正负查找和标识缓存都会失效；服务端 EIO 只覆盖实际到达它的请求。lease break 只作用于匹配的已授予 key，CHANGE_NOTIFY 只回应待处理的 watch；静默失联前的本机缓存命中尤其需要实证。8.3 用已交付的 9 号 WNet／故障夹具在四个 OS cell 做聚焦 WN-09／WN-10 原生证明：各类预热后的一次调用须在一秒界限内看到权威值或明确错误，故障时还须在健康检测**之前**立即调用一次。不能靠系统级缓存设置、TTL 或周期性数据轮询通过。若某类没有普通用户可用的充分失效机制，SMB 方案不能宣称满足 R-WIN-8；具体原生门与故障证据归[资格提案](2026-09-28-smb-native-qualification.md)。
 
 ### 故障结果、预算与可观测性
 
@@ -166,21 +131,21 @@ Windows redirector 的文件内容、文件信息、目录与负查找有不同�
 
 ### 分段交付与证明门
 
-以下编号沿用 [Issue #30](https://github.com/codetreker/remote-fs/issues/30)。每个聚焦 PR 同时交付相应实现、`docs/design/`、implemented Agent Note、正常／错误／资源边界测试；后段不能用自己的补丁掩盖前段错误。分段只是依赖顺序，最终 Windows 支持仍须满足完整 R-WIN-2 与 WN 矩阵。
+[Issue #30](https://github.com/codetreker/remote-fs/issues/30)的剩余工作分成九个**各有独立提案文件**的实现 PR；表中顺序按技术依赖排列，因此 9 号映射／夹具在 8.3 缓存工作前交付；这份总提案持有整体拓扑、跨任务不变量、最终 WN 矩阵和放弃的架构路线，不替代分项提案的具体接口、文件布局、算法及段内测试。每段实际落地时同 PR 更新 `docs/design/`、implemented Agent Note、代码和覆盖该段错误路径的测试；后段不能把前段未确认结果掩盖为成功。
 
-| 段 | 交付结构 | 该段必须证明 |
+| 段与拥有提案 | 依赖与本段结果 | 下一段取得的保证 |
 |---|---|---|
-| 7.3 有界 CREATE/CLOSE | 原生发布可行性门；名字 codec 与最终 guarded `OpenAt`／`OpenChildRef`；五种非 supersede 打开；共享准入；FileId 与 close owner；related compound CREATE→CLOSE 的 FileId 传递。 | 最终选择无 check-then-act；容量耗尽无对象效果；响应丢失保留原动作／引用；CLOSE 与断线沿同一预提交 actionID 结算，不会过早释放 claim；compound 只沿成功的同帧 CREATE 传递 all-ones FileId，不改签名覆盖的原始帧。 |
-| 7.4 身份 I/O 与信息 | READ、WRITE、FLUSH、EOF、条件 metadata／ARCHIVE，文件与 volume 查询；有界 response/credits。 | 返回内容与属性同 revision；写入远端确认；metadata CAS 冲突在明确未执行后才能新建动作，未知结果只查／重投原动作；allocation 与 cluster geometry 经过信息类门。 |
-| 7.5 目录观察 | 完整 `ReadDirNodeBounded` 捕获、全量名字验证、per-FileId 冻结 cursor、restart 重取。 | 无部分枚举、无歧义漏项；目录 revision 和身份一致；预算耗尽明确失败。 |
-| 7.6 删除义务 | 打开时接受关闭删除、宿主持久 per-volume owner、CloseIntent、分页恢复和 ACK。 | 接受前 owner 可恢复；原对象／关联不变；崩溃重启后义务可查询并抵达终态。 |
-| 8.1 名字修改 | supersede 用 guarded `OpenAt(ReplaceNode)` 原子返回引用；普通 disposition、rename／move／replace／unlink 扩展中立 `NameCommand`，把源／目标完整 ancestry guards 穿过 HTTP、wrappers、metastore 到最终事务。 | 不能只验证末级 raw slot；同名替换不改变旧句柄身份；结果丢失可按原 action 恢复。 |
-| 8.2 共享与范围 | 跨入口名字效果的共享保护、LOCK／UNLOCK、等待、批次、异步 pending request 与 CANCEL。 | 权威授予与已接纳 I/O 有序；取消竞态以 `RangeControl.Query/Cancel` 结算，不把 context 取消当作未授予。 |
-| 8.3 通知与缓存 | 中立 `ChangeSource` 与对象 ID mutation feed、同目录 rename 成对投影／跨目录双 watch 投影、redirector lease／oplock 或实证等效失效、缺口重取。 | active detached 句柄的对象变化可见；预热的内容／属性／目录／正负查找首次观察在一秒内得到权威事实；断流与 overflow fail closed；无周期数据轮询依赖。 |
-| 9 原生映射与 fixture | 当前登录会话 WNet 所有权、停止恢复；持久远端 volume 的 Linux authority、Windows x64／ARM64 客户端与可控故障 fixture。 | 无提权／全局策略变化；非强制 busy 原映射完整；可分别切断 authority 与变更流、控制签名后 frame、提交前后响应、delete 状态崩溃和名字复用。 |
-| 10 原生资格 | Home／Pro × x64／ARM64 正式 redirector 矩阵、需求追踪、冷状态性能和资源测量。 | WN-01 至 WN-17 全部 executed/pass、无 skip；R-WS-4 的量化门槛先写入 spec 后再通过，不以单测或模拟客户端替代。 |
+| [7.3 有界 CREATE/CLOSE](2026-09-28-smb-bounded-create-close.md) | 在 445／身份／签名 TREE 可达性调研门后交付五种非 supersede 打开、typed FileId、权威 guarded 选择、共享准入和调用方带 ID 的 close。 | 句柄容量先于效果预留；响应丢失、tree 退休和 barrier 各有 owner；7.4 可按原对象 I/O。 |
+| [7.4 文件 I/O 与信息](2026-09-28-smb-file-data-information.md) | 使用 7.3 FileId；READ/WRITE/FLUSH/EOF、条件内容／属性动作、目录引用已有 `ConditionalFileMutation.MutateFile(MutateAttributes)` 的条件属性动作和可证明的文件／volume 信息。 | 写入与 `ARCHIVE` 同步提交；身份与 allocation/geometry 信息不伪造；7.5 可投影完整目录条目。 |
+| [7.5 目录枚举](2026-09-28-smb-directory-enumeration.md) | 使用目录引用和信息 codec；完整有界捕获、全量 Windows 名字验证、冻结 cursor 分页。 | 单次枚举不混 revision、不漏坏名字；后续名字修改仍须独立 guards。 |
+| [7.6 关闭删除义务](2026-09-28-smb-close-delete-obligation.md) | 使用原子打开／close owner；宿主持久 per-volume owner、`CloseIntent`、armed→pending→终态、分页恢复与 ACK。 | 义务在发起句柄消失后仍可由 authority 完成，8.1 的普通 disposition 不会撤销它。 |
+| [8.1 受 guard 的名字修改](2026-09-28-smb-guarded-name-mutation.md) | 使用完整目录观察和 7.6 pending；双侧 ancestry guard 的 rename／replace／unlink、普通 disposition、原对象身份稳定的原位 supersede。 | 旧引用与新路径不混，名字效果可按原 action 结算；8.2/8.3 获得身份与关联事件。 |
+| [8.2 范围锁与取消](2026-09-28-smb-range-lock-cancel.md) | 在同一对象保护排序上接入 `RangeControl`、async LOCK/CANCEL、批次 surviving effects。 | 读写和名字效果跨 Windows/Linux/SDK 服从同一保护，pending request 有可结算 owner。 |
+| [9 原生 WNet 与夹具](2026-09-28-smb-native-wnet-fixture.md) | 在 7.3–8.2 的文件／名字／锁基础上交付正式 WNet 控制器、持久远端 authority 与三条独立故障路径。 | 四 OS cell 有可复验的 socket/session/authority 绑定与可控注入，8.3 可据此做聚焦缓存证明。 |
+| [8.3 变更通知及缓存](2026-09-28-smb-change-notify-cache-coherence.md) | 开始时用 9 的原生夹具对无 lease、候选 break／通知机制逐缓存类做限范围 spike；再基于实证与前段对象／名字事件、async owner 交付 `ChangeSource`、WATCH_TREE、scoped replay、保守客户端事实账与分类失效。 | 四 OS cell 的聚焦 WN-09／10 缓存首次观察与故障门通过，最终完整矩阵仍由 10 判定。 |
+| [10 原生资格](2026-09-28-smb-native-qualification.md) | 在完成 7.3–9 后执行 Home/Pro × x64/ARM64、两台 Windows host、WN-01–17、冷状态测量。 | 全部必需 case executed/pass，无 skip；R-WS-4 量化门槛先写入 spec 后通过，发布证据可按 hash 与源事件复核。 |
 
-SMB related compound 中 CREATE 成功后的 all-ones FileId 是同一签名 frame 内后续命令的占位引用。解析层必须在该 frame 的已验证上下文里把它绑定到前一成功 CREATE 的 FileId；前置 CREATE 失败则相关后继失败，不能从另一 frame 或另一个 tree 取旧 FileId。此状态不改动原始已签名字节，也不替代每个后继操作自己的准入和授权核对。[MS-SMB2](https://winprotocoldocs-bhdugrdyduf5h2e4.b02.azurefd.net/MS-SMB2/%5bMS-SMB2%5d.pdf)的 CREATE、CLOSE 与 related operation 章节拥有协议编码细节。
+7.3–8.2 作为中间交付审查；9 在 8.3 前提供正式 WNet 控制器与故障夹具。8.3 开始时用该夹具测候选缓存失效机制；候选实现后再跑聚焦 WN-09／10，不把 spike 当作最终通过。7.3 前的一次性门只证明现有 endpoint 的 445／登录会话／签名 TREE 可达，文件命令仍 unsupported，不能替代 9 对完整 WNet 映射和生命周期的证明，也不能替代 10 的完整资格。“Windows 网络驱动器支持完成”只在 10 的所有发布门通过后成立。
 
 ### 范围切分与开放决策
 
@@ -197,9 +162,9 @@ SMB related compound 中 CREATE 成功后的 all-ones FileId 是同一签名 fra
 | 跨底层请求的大 I/O 全局快照／回滚 | 保证；需跨请求事务 | 只承诺每个已报告片段的当前契约，不宣称应用调用级原子性。 |
 | Windows 本地 metadata replica | 功能；需初始化、恢复、磁盘与缺口模型 | 正确性只依赖权威观察；将来副本不能成为 Windows 专用远端 schema。 |
 
-仍须经实证或接口审查确定的点：普通用户可靠到达 loopback WNet 目标的方式；Windows redirector 对内容、文件信息、目录和正负查找缓存各自接受何种无全局策略的失效动作；第三方 FileStorage 有效分配字节与 Windows cluster 信息类之间的可报告 geometry；`NameCommand` 两侧 ancestry guard 的中立 wire／存储形状；可用资源默认额度及 R-WS-4 冷状态门槛。前两项必须在大规模文件命令和缓存实现之前分别通过原生门；geometry 在 7.4 信息类宣布支持前确定；guard 在 8.1 任何名字 mutation 前落地；额度与性能门槛在 10 宣告支持前经测量写入规范。未证明时只对应能力保持明确不支持，不能以假定的成功状态跨门。
+仍须经实证或接口审查确定的点：普通用户对本机 445、SSPI 登录会话关联与签名 TREE 的可达性；所需文件／信息命令具备后的完整 WNet 映射；Windows redirector 对内容、文件信息、目录、正负查找与标识缓存各自接受何种无全局策略的失效动作；第三方 FileStorage 分配字节与 Windows geometry 的可报告关系；`NameCommand` 两侧 ancestry guard 的中立 wire／存储形状；资源默认额度及 R-WS-4 冷状态门槛。第一项由 7.3 前的一次性原生调研给出窄证据，第二项由 PR9 正式控制器和夹具证明；缓存候选机制在 8.3 开始时用 PR9 夹具试验，不能要求在实现候选前完全证明，也不能在未通过聚焦 WN-09／10 时宣称一致性。geometry 在 7.4 信息类宣布支持前确定；guard 在 8.1 名字效果前落地；额度与性能门槛在 10 宣告支持前经测量写入规范。未证明的能力保持明确失败，不能以假定的成功状态跨门。
 
-交付 PR 以单一目的为界：7.3–7.6 分开；8 按名字修改、范围控制、通知缓存的依赖顺序切分；9 的生命周期与 fixture 根据审查负担分开或合并；10 只承载资格与证据。Issue checklist 与设计文档随已交付状态同步；此 proposed note 在全部决定落地时按 Agent Note 生命周期规则改写为 implemented。
+九份分项提案分别对应九个聚焦实现 PR；7.3–7.6、8.1–8.2、9、8.3、10 按表中依赖顺序交付，不以历史提交机械拆分，也不因预计 merge conflict 扩大单个 PR。每个 PR 的 diff 只包含其提案仍需交付的概念；Issue checklist 与设计文档随实际落地同步。全部架构决定落地后，本总提案按 Agent Note 生命周期规则改写为 implemented。
 
 ## 备选方案
 
@@ -222,7 +187,7 @@ SMB related compound 中 CREATE 成功后的 all-ones FileId 是同一签名 fra
 | Case | 外部动作与故障时点 | 必须观察到 |
 |---|---|---|
 | WN-01 发布与身份 | 在 Windows 11 24H2+ Home／Pro × x64／ARM64 上，普通用户分别在创建者会话、同用户第二登录会话、另一用户、anonymous 和 guest 下连接两个 volume；在已连接后的下一请求前篡改或撤销完整性 | 每个 drive 只呈现自己的 volume；记录本端点接纳的 TCP 445 socket 和 SSPI SID／AuthenticationId LUID 与宿主交互式登录会话的安全关联；仅创建者会话成功且每个请求绑定该会话；错误身份、篡改与降级在 authority 收到文件操作前失败；不安装驱动、不提权 |
-| WN-02 打开矩阵 | 对不存在和已存在目标执行 create、open、open-if、overwrite、overwrite-if 与 supersede，并覆盖 metadata-only 和目录打开；在存在性判断与最终生效之间替换目标 | 每种存在性、截断、替换与返回句柄结果唯一；目标竞争时明确失败或作用于已验证对象；失败无部分效果，不用 open 后补 truncate／replace |
+| WN-02 打开矩阵 | 对不存在和已存在目标执行 create、open、open-if、overwrite、overwrite-if 与 supersede，并覆盖 metadata-only 和目录打开；在存在性判断与最终生效之间替换目标 | 每种存在性、截断、替换与返回句柄结果唯一；supersede 对已存在文件在原对象上提交，旧／新打开报告同一稳定对象 ID 但各有自己的 SMB FileId；目标不存在时在同一原子打开中创建新对象；按名 replace 才替换为新对象 ID；目标竞争时明确失败或作用于已验证对象；失败无部分效果，不用 open 后补 truncate／replace |
 | WN-03 读写与提交 | `WriteFile`、改变 EOF、flush；分别在提交前、提交后响应前丢失连接，并在并发读取中暂停发布；触发 quota 拒绝 | 成功只在远端确认后返回；完成、明确未执行、未知可区分并可按同一动作核对；提交前其它入口看不到新状态，成功读取不混合前后版本；未触及范围保持，失败不延迟到 close |
 | WN-04 身份与替换 | Windows B、Linux、SDK 分别对 Windows A 预热并已打开的文件和目录执行 rename、same-name replacement、unlink 与同名重建；记录两个 authority 对象、volume serial、128-bit Windows file ID、当前名字、属性与内容；旧对象无名后继续读、写、截断、查属性，并跨正常重连重复打开 | rename 与正常重连保持同一对象身份；replacement／重建产生新身份；旧句柄全部操作仍落在旧对象，新路径落在新对象，双方修改互不污染；authority restart 后旧句柄失败而新打开取得当前对象 |
 | WN-05 名字与目录 | 从 Linux／SDK 创建大小写等价、非法 UTF-8、保留或 Windows 不可表示名字；Windows 执行查找、枚举、同目录 rename、跨目录 move、通知和已有句柄 I/O | 同目录 OLD_NAME 后接 NEW_NAME、跨目录源 watch REMOVED／目标 watch ADDED，内部事件保留同一动作关系；每个相关按名操作整体失败且不漏项、不猜测、不改数据；其它入口名字不变；已有身份 I/O 继续；一次成功枚举来自完整有界观察 |
@@ -236,7 +201,7 @@ SMB related compound 中 CREATE 成功后的 all-ones FileId 是同一签名 fra
 | WN-13 部分存储与持久损坏 | 分别使名字、对象字节、状态组成部分不可达，篡改或移除持久结构与对象内容，再通过 Windows 读取、列目录和打开 | 每类故障均为 I/O 错误；不拼出部分成功，不初始化空 volume，不返回无法验证的字节；状态报告指出受影响组成部分 |
 | WN-14 平台中立合规 | 检查公开 API、wire schema、持久 schema 与 storage interface，只允许对象身份、metadata namespace、用途、范围、固定状态与中立错误；用不理解 Windows 语义的替代 adapter 运行打开、属性、共享、锁与删除组合 | 无 Windows comparer、disposition、flag、状态码或本地主体类型进入远端契约；Windows metadata 更新保留其它 namespace；Linux／SDK 名字、授权和非 Windows metadata 不变 |
 | WN-15 排除项 | 以版本化有限请求 corpus 覆盖 ADS、ACL 编辑、hard link、reparse 创建／遍历、稀疏／压缩／加密、multichannel、failover 与离线写入：原生 API 可到达的请求用 redirector，其余 wire 形态由独立协议客户端补证并标注来源。用原生 redirector 执行普通打开、断开重连和旧句柄访问；另用实际 SMB 协议客户端精确发送 durable／persistent CREATE context，核对响应后尝试恢复与重放，该协议证据不冒充原生证据；同时比较快照驱动安装、LAN 监听与全局缓存／安全设置前后状态 | 独立的不支持操作返回明确 unsupported，authority 无部分效果。协议客户端请求可选 durable 或 persistent context 时，普通打开可以成功，但响应不得授予该能力；原生 redirector 的旧句柄在断线重连后不能恢复，对它的操作失败。服务端不保留可恢复句柄状态或重放记录。旧平台拒绝发布；没有驱动、LAN 暴露或全局策略变化 |
-| WN-16 支持面完整性 | 查询文件种类、大小、标识、当前名字、四类时间、受支持属性、volume 容量／已用／可用空间；分别订阅名字、内容、大小、属性变化；对版本化有限 corpus 中每个未支持信息类、控制操作和标志发起可达的原生请求，未暴露给 Windows API 的 wire 形态由实际协议客户端补证；在固定真实数据集与冷状态下测量连接、首次枚举、最初读取和小文件操作 | 支持项返回权威事实且变化分类正确；空间数字满足 R-WS-5；冷挂载结果通过已写入 spec 的 R-WS-4 门槛；未支持项返回明确 unsupported，authority 无请求或无部分效果，不返回占位零值 |
+| WN-16 支持面完整性 | 查询文件种类、大小、标识、当前名字、四类时间和受支持属性；在可精确表示的 volume 查询容量／已用／可用空间，再分别构造 `Used > Total`、字节值不能被容量单位整除和缺少可信 geometry 的 volume 发起相同容量 `QUERY_INFO`，随后读取文件并执行有助于释放空间的修改；分别订阅名字、内容、大小、属性变化；对版本化有限 corpus 中每个未支持信息类、控制操作和标志发起可达的原生请求，未暴露给 Windows API 的 wire 形态由实际协议客户端补证；在固定真实数据集与冷状态下测量连接、首次枚举、最初读取和小文件操作 | 可表示时容量三值与 authority 实测值及 R-WS-5 完全一致；不可表示时受影响的容量 `QUERY_INFO` 明确返回 I/O 错误、不截断或伪造数字，原 tree 的读取、引用释放与空间回收仍按身份／授权／共享／配额规则工作；其它支持项返回权威事实且变化分类正确；冷挂载结果通过已写入 spec 的 R-WS-4 门槛；未支持项返回明确 unsupported，authority 无请求或无部分效果，不返回占位零值 |
 | WN-17 修改结果丢失 | 对 rename、replace、delete、属性与时间修改分别在明确未提交和已提交但响应丢失处断开；在重投前让其它入口复用源名或目标名；原生应用记录返回值，已授权宿主按 per-operation ledger 的 actionID／ownerID 查询 endpoint 的结算 | 应用收到无法确认的 I/O 错误；宿主证据显示 endpoint 在有效回执窗口内只查询／重投原动作，不重复效果、不把另一调用方的状态认作原结果，也不作用于后来占据名字的对象；回执退休后保持 Unknown |
 
 需求与 case 双向追踪如下；一项需求可以由多个 case 共同证明，但不能没有 case。
