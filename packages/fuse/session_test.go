@@ -111,15 +111,25 @@ func TestFileSessionRenewalKeepsReferencesLiveAndRetiresThem(t *testing.T) {
 }
 
 func TestFileSessionContinuityLossFencesAndRetiresTheAuthority(t *testing.T) {
+	armed := make(chan struct{})
+	injected := make(chan struct{})
 	v, _ := lifecycleVolume(t, func(native storage.FileSession) storage.FileSession {
-		return &sessionLifecycleProbe{FileSession: native, renew: func(context.Context) (storage.FileSessionStatus, error) {
-			return storage.FileSessionStatus{}, syscall.ESTALE
+		return &sessionLifecycleProbe{FileSession: native, renew: func(ctx context.Context) (storage.FileSessionStatus, error) {
+			select {
+			case <-armed:
+				close(injected)
+				return storage.FileSessionStatus{}, syscall.ESTALE
+			default:
+				return native.Renew(ctx)
+			}
 		}}
 	})
 	file, err := v.files.OpenFile(t.Context(), "file", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true}})
 	if err != nil {
 		t.Fatal(err)
 	}
+	close(armed)
+	waitLifecycle(t, injected)
 	waitLifecycle(t, v.done)
 	if errnoOf(v.check()) != syscall.EIO || errnoOf(v.stopSession()) != syscall.EIO {
 		t.Fatalf("lost continuity did not persist failure: check=%v close=%v", v.check(), v.stopSession())
