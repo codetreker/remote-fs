@@ -38,7 +38,7 @@ import (
 const (
 	// Prefix begins the URL path of every request, relative to wherever the handler is
 	// mounted. The version segment is the place a future incompatible change lands.
-	Prefix = "/v4/"
+	Prefix = "/v5/"
 
 	// HeaderProtocol names the response header that identifies an answer as having come
 	// from a handler speaking this protocol, and Version is its only accepted value.
@@ -49,7 +49,7 @@ const (
 	// it never reached the handler. Requiring a header the intermediary does not know
 	// about closes that.
 	HeaderProtocol = "Remote-Fs-Protocol"
-	Version        = "4"
+	Version        = "5"
 
 	// StatusStorageError marks the one response that carries an operation outcome in the
 	// storage contract's errno vocabulary. Most come from the storage. A handler-owned

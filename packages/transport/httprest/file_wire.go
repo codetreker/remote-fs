@@ -189,6 +189,7 @@ type FileSessionWithBarrier interface {
 }
 
 type fileCapabilities struct {
+	Allocation        bool `json:"allocation"`
 	DirectoryMetadata bool `json:"directoryMetadata"`
 	ReferenceName     bool `json:"referenceName"`
 	AtomicOpen        bool `json:"atomicOpen"`

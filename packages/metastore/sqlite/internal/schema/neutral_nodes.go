@@ -36,6 +36,10 @@ func validateNeutralNodeValues(ctx context.Context, db sqlvalue.Queryer, volume 
 	if version >= firstDurableIdentitySchemaVersion {
 		detachedKind = ""
 	}
+	missingContent := " OR (kind=1 AND content IS NULL AND size!=0)"
+	if opaqueDirectoryRevisions {
+		missingContent = ""
+	}
 	var invalid int64
 	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM nodes WHERE `+where+`(
 		kind NOT IN (1,2,3) OR size<0 OR detached NOT IN (0,1)`+detachedKind+` OR content_revision<1 OR
@@ -43,8 +47,8 @@ func validateNeutralNodeValues(ctx context.Context, db sqlvalue.Queryer, volume 
 		(birth_sec IS NULL)!=(birth_nsec IS NULL) OR (change_sec IS NULL)!=(change_nsec IS NULL) OR
 		birth_nsec NOT BETWEEN 0 AND 999999999 OR change_nsec NOT BETWEEN 0 AND 999999999 OR
 		(kind=2 AND (size!=0 OR content IS NOT NULL)) OR
-		(kind=1 AND content IS NULL AND size!=0) OR (kind=3 AND content IS NOT NULL) OR
-		(content IS NOT NULL AND content='')`+durable+directoryRevision+`
+		(kind=3 AND content IS NOT NULL) OR
+		(content IS NOT NULL AND content='')`+missingContent+durable+directoryRevision+`
 	)`, args...).Scan(&invalid); err != nil {
 		return err
 	}

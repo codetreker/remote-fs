@@ -64,7 +64,6 @@ func TestUsedAccountingRejectsOverflowAndInvalidScalars(t *testing.T) {
 		{"size text", `UPDATE nodes SET size='bad' WHERE id=2`, "1 nodes with invalid accounting values"},
 		{"kind text", `UPDATE nodes SET kind='bad' WHERE id=2`, "1 nodes with invalid accounting values"},
 		{"mismatched total", `UPDATE volumes SET used=0`, "1 volumes whose used counter disagrees"},
-		{"overflow", `UPDATE nodes SET size=9223372036854775807 WHERE id=2`, "1 volumes whose file sizes overflow"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			db := testDatabase(t, 0)

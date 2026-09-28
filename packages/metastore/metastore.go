@@ -154,10 +154,9 @@ type Store interface {
 	// Space reports the room the volume has, or syscall.ENOSYS if it has no allowance.
 	// A volume's answer does not change over its life: one that answers answers always.
 	//
-	// Used is exact and costs no traversal, because it is maintained by the same changes
-	// that move bytes in and out. Nothing here samples a filesystem: an object store has no
-	// capacity to report, so a volume held in one has no figures at all beyond the
-	// allowance it was given and the bytes it is known to hold.
+	// Used is the exact virtual allocation charged to live and detached nodes, and costs
+	// no traversal because file changes update its counter in the same transaction.
+	// Usage separately reports exact logical content bytes.
 	Space(ctx context.Context) (storage.Space, error)
 
 	// Garbage returns at most limit objects that nothing references and whose ownership is
@@ -224,6 +223,10 @@ type Node struct {
 	// Size is the length of a file's contents. It is zero for a directory, which the storage
 	// contract leaves unspecified.
 	Size int64
+	// AllocationSize is the volume reservation attributed to this node. A zero
+	// value is meaningful only when AllocationKnown is true.
+	AllocationSize  int64
+	AllocationKnown bool
 
 	AccessTime time.Time
 	ModTime    time.Time
@@ -239,7 +242,8 @@ func (n Node) IsDir() bool { return n.Kind == storage.NodeDirectory }
 // Attr renders the node as the storage contract describes it.
 func (n Node) Attr() storage.Attr {
 	return (storage.Attr{
-		ID: uint64(n.ID), Kind: n.Kind, Size: n.Size, AccessTime: n.AccessTime, ModTime: n.ModTime,
+		ID: uint64(n.ID), Kind: n.Kind, Size: n.Size, AllocationSize: n.AllocationSize,
+		AllocationKnown: n.AllocationKnown, AccessTime: n.AccessTime, ModTime: n.ModTime,
 		BirthTime: n.BirthTime, ChangeTime: n.ChangeTime, Metadata: n.Metadata,
 	}).Clone()
 }

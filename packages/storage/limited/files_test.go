@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -11,6 +12,7 @@ import (
 	"testing/synctest"
 	"time"
 
+	"github.com/codetreker/remote-fs/packages/fuse"
 	"github.com/codetreker/remote-fs/packages/locking"
 	"github.com/codetreker/remote-fs/packages/storage"
 	"github.com/codetreker/remote-fs/packages/storage/limited"
@@ -43,6 +45,134 @@ func retainedFile(t *testing.T, session storage.FileSession, name string, create
 		t.Fatal(err)
 	}
 	return file
+}
+
+func TestLogicalAllowanceMasksBackingAllocation(t *testing.T) {
+	volume := newStorage(t, 8192)
+	if err := volume.Write(t.Context(), "first", []byte("a")); err != nil {
+		t.Fatal(err)
+	}
+	if err := volume.Write(t.Context(), "second", []byte("b")); err != nil {
+		t.Fatal(err)
+	}
+	space, err := volume.Space(t.Context())
+	if err != nil || space.Used != 2 {
+		t.Fatalf("logical allowance = %+v, %v", space, err)
+	}
+	assertUnknown := func(where string, attr storage.Attr) {
+		t.Helper()
+		if attr.AllocationKnown || attr.AllocationSize != 0 {
+			t.Fatalf("%s exposed backing allocation: %+v", where, attr)
+		}
+	}
+	attr, err := volume.Stat(t.Context(), "first")
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertUnknown("stat", attr)
+	entries, err := volume.List(t.Context(), "")
+	if err != nil || len(entries) != 2 {
+		t.Fatalf("list = %+v, %v", entries, err)
+	}
+	for _, entry := range entries {
+		assertUnknown("list", entry.Attr)
+	}
+	result, err := storage.NewListResult(4096, 0, func(_ int, _, _ int64, attr storage.Attr) (int64, error) {
+		assertUnknown("bounded admission", attr)
+		return 1, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := volume.ListBounded(t.Context(), "", result); err != nil {
+		t.Fatal(err)
+	}
+	bounded, err := result.Entries()
+	if err != nil || len(bounded) != 2 {
+		t.Fatalf("bounded list = %+v, %v", bounded, err)
+	}
+	for _, entry := range bounded {
+		assertUnknown("bounded list", entry.Attr)
+	}
+	outer, err := limited.New(t.Context(), volume, 8192)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nested, err := storage.NewListResult(4096, 0, func(_ int, _, _ int64, attr storage.Attr) (int64, error) {
+		assertUnknown("nested bounded admission", attr)
+		return 1, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := outer.ListBounded(t.Context(), "", nested); err != nil {
+		t.Fatal(err)
+	}
+	if nestedEntries, err := nested.Entries(); err != nil || len(nestedEntries) != 2 {
+		t.Fatalf("nested bounded list = %+v, %v", nestedEntries, err)
+	}
+	session := retainedSession(t, volume, t.Context(), storage.DefaultFileSessionOptions())
+	reporter := session.(storage.AllocationReporting)
+	if err := reporter.CheckAllocationReporting(); !errors.Is(err, syscall.EOPNOTSUPP) {
+		t.Fatalf("logical allowance advertised allocation: %v", err)
+	}
+	byID, err := session.StatNode(t.Context(), attr.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertUnknown("stat node", byID)
+	file := retainedFile(t, session, "first", false)
+	retained, err := file.Stat(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertUnknown("file stat", retained)
+	read, err := file.ReadAt(t.Context(), 0, 1)
+	if err != nil || string(read.Data) != "a" {
+		t.Fatalf("file read = %+v, %v", read, err)
+	}
+	assertUnknown("file read", read.Attr)
+	root, err := volume.Stat(t.Context(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	namespace := session.(storage.NamespaceAccess)
+	lookup, err := namespace.LookupAt(t.Context(), storage.ChildName{Parent: storage.DirectoryTarget{NodeID: root.ID}, RawLeaf: []byte("first")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertUnknown("identity lookup", lookup)
+	directory := session.(storage.DirectoryReader)
+	observed, err := directory.ReadDirNode(t.Context(), storage.DirectoryTarget{NodeID: root.ID})
+	if err != nil || len(observed.Entries) != 2 {
+		t.Fatalf("identity directory = %+v, %v", observed, err)
+	}
+	for _, entry := range observed.Entries {
+		assertUnknown("identity directory", entry.Attr)
+	}
+	if mount, err := fuse.New(t.TempDir(), volume, fuse.Options{}); mount != nil || !errors.Is(err, syscall.EOPNOTSUPP) {
+		t.Fatalf("FUSE accepted unsupported allocation: mount=%v err=%v", mount, err)
+	}
+}
+
+func TestMaskedAllocationIsBudgetedBeforeMutation(t *testing.T) {
+	volume := newStorage(t, 8192)
+	session := retainedSession(t, volume, t.Context(), storage.DefaultFileSessionOptions())
+	file := retainedFile(t, session, "file", true)
+	const exactKnownBooleanBytes = len("true")
+	ctx := storage.WithAttrResultBudget(t.Context(), func(attr storage.Attr, _ int64) error {
+		if len(strconv.FormatBool(attr.AllocationKnown)) > exactKnownBooleanBytes {
+			return syscall.EFBIG
+		}
+		return nil
+	})
+	if _, err := file.WriteAt(ctx, 0, []byte("x")); !errors.Is(err, syscall.EFBIG) {
+		t.Fatalf("masked result exceeded exact pre-effect budget: %v", err)
+	}
+	attr, err := file.Stat(t.Context())
+	if err != nil || attr.Size != 0 {
+		t.Fatalf("rejected mutation changed file: %+v, %v", attr, err)
+	}
 }
 
 func TestRetainedQuotaSurvivesUnlinkAndSettlesFinalCloseOnce(t *testing.T) {

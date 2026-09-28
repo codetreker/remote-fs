@@ -410,14 +410,14 @@ func decodeObservedEntryBytes(data []byte, parent uint64, collector *directoryRe
 
 func decodeDeferredObservedAttrBytes(data []byte) (deferredObservedAttr, error) {
 	allowed := map[string]struct{}{
-		"id": {}, "kind": {}, "size": {}, "access_time": {}, "mod_time": {},
+		"id": {}, "kind": {}, "size": {}, "allocation_size": {}, "allocation_known": {}, "access_time": {}, "mod_time": {},
 		"birth_time": {}, "change_time": {}, "metadata": {},
 	}
-	members, err := splitJSONObject(data, 8, 64, allowed)
+	members, err := splitJSONObject(data, 10, 64, allowed)
 	if err != nil {
 		return deferredObservedAttr{}, err
 	}
-	for _, required := range []string{"id", "kind", "size", "access_time", "mod_time"} {
+	for _, required := range []string{"id", "kind", "size", "allocation_size", "allocation_known", "access_time", "mod_time"} {
 		if _, ok := members[required]; !ok {
 			return deferredObservedAttr{}, fmt.Errorf("observed directory attributes carry no %s", required)
 		}
@@ -435,6 +435,17 @@ func decodeDeferredObservedAttrBytes(data []byte) (deferredObservedAttr, error) 
 	result.wire.Size, err = parseJSONInt64(members["size"])
 	if err != nil {
 		return deferredObservedAttr{}, errors.New("observed directory size is invalid")
+	}
+	result.wire.AllocationSize, err = parseJSONInt64(members["allocation_size"])
+	if err != nil {
+		return deferredObservedAttr{}, errors.New("observed directory allocation size is invalid")
+	}
+	switch {
+	case bytes.Equal(members["allocation_known"], []byte("true")):
+		result.wire.AllocationKnown = true
+	case bytes.Equal(members["allocation_known"], []byte("false")):
+	default:
+		return deferredObservedAttr{}, errors.New("observed directory allocation knowledge is invalid")
 	}
 	if err := decodeFileJSON(members["access_time"], &result.wire.AccessTime); err != nil {
 		return deferredObservedAttr{}, err

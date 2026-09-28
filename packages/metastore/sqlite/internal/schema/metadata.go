@@ -156,10 +156,13 @@ func validateMetadataAccounting(ctx context.Context, db sqlvalue.Queryer, versio
 		return err
 	}
 	var unexpected int64
-	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM sqlite_schema WHERE type='trigger' AND name NOT IN (
+	allowed := `
 		'nodes_metadata_insert','nodes_metadata_update','nodes_metadata_delete',
-		'changes_metadata_insert','changes_metadata_update','changes_metadata_delete'
-	)`).Scan(&unexpected); err != nil {
+		'changes_metadata_insert','changes_metadata_update','changes_metadata_delete'`
+	if version >= firstVirtualAllocationSchemaVersion {
+		allowed += `,'changes_allocation_insert'`
+	}
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM sqlite_schema WHERE type='trigger' AND name NOT IN (`+allowed+`)`).Scan(&unexpected); err != nil {
 		return err
 	}
 	if unexpected != 0 {
@@ -189,6 +192,35 @@ func validateMetadataAccounting(ctx context.Context, db sqlvalue.Queryer, versio
 			}
 			if !actual.Valid || sqliteschema.Structure(actual.String) != sqliteschema.Structure(definition) {
 				return fmt.Errorf("metadata accounting trigger %s does not match its schema: %w", name, syscall.EIO)
+			}
+		}
+	}
+	if version >= firstVirtualAllocationSchemaVersion {
+		allocationBody, err := migrationFiles.ReadFile("migrations/0010_virtual_allocation.sql")
+		if err != nil {
+			return err
+		}
+		for _, name := range []string{"changes_allocation_insert"} {
+			start := strings.Index(string(allocationBody), "CREATE TRIGGER "+name+" ")
+			if start < 0 {
+				return fmt.Errorf("allocation definition %s is missing: %w", name, syscall.EIO)
+			}
+			definition := string(allocationBody[start:])
+			end := strings.Index(definition, "\nEND;")
+			if end < 0 {
+				return fmt.Errorf("allocation definition %s is incomplete: %w", name, syscall.EIO)
+			}
+			definition = definition[:end+4]
+			var actual sql.NullString
+			err := db.QueryRowContext(ctx, `SELECT CASE WHEN length(CAST(sql AS BLOB))<=8192 THEN sql END FROM sqlite_schema WHERE type='trigger' AND name=?`, name).Scan(&actual)
+			if errors.Is(err, sql.ErrNoRows) {
+				return fmt.Errorf("allocation trigger %s is missing: %w", name, syscall.EIO)
+			}
+			if err != nil {
+				return err
+			}
+			if !actual.Valid || sqliteschema.Structure(actual.String) != sqliteschema.Structure(definition) {
+				return fmt.Errorf("allocation trigger %s does not match its schema: %w", name, syscall.EIO)
 			}
 		}
 	}

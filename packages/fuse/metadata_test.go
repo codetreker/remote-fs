@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io/fs"
+	"math"
 	"syscall"
 	"testing"
 	"time"
@@ -88,6 +89,15 @@ func (f *metadataFileProbe) Truncate(context.Context, int64) (storage.Attr, erro
 	return f.attr, nil
 }
 
+type byteAllocationFileProbe struct{ metadataFileProbe }
+
+func (f *byteAllocationFileProbe) Truncate(_ context.Context, size int64) (storage.Attr, error) {
+	f.truncates++
+	f.attr.Size = size
+	f.attr.AllocationSize = size
+	return f.attr, nil
+}
+
 func TestPermissionPresentationDefaultsDoNotCreateMetadata(t *testing.T) {
 	for kind, want := range map[storage.NodeKind]fs.FileMode{storage.NodeRegular: 0644, storage.NodeDirectory: fs.ModeDir | 0755, storage.NodeSymlink: fs.ModeSymlink | 0777} {
 		attr := storage.Attr{ID: 1, Kind: kind}
@@ -137,7 +147,7 @@ func TestActualChangeTimeWinsOverLinuxHistoricalPresentation(t *testing.T) {
 	changed := time.Unix(200, 456)
 	v := &volume{}
 	for _, actual := range []*time.Time{nil, &changed} {
-		attr := storage.Attr{ID: 1, Kind: storage.NodeRegular, ModTime: modified, AccessTime: modified, ChangeTime: actual}
+		attr := storage.Attr{ID: 1, Kind: storage.NodeRegular, AllocationKnown: true, ModTime: modified, AccessTime: modified, ChangeTime: actual}
 		var out gofuse.Attr
 		if errno := v.fillAttr(&out, attr); errno != 0 {
 			t.Fatal(errno)
@@ -152,6 +162,52 @@ func TestActualChangeTimeWinsOverLinuxHistoricalPresentation(t *testing.T) {
 		if out.Mtime != 100 || out.Mtimensec != 123 || attr.ChangeTime != actual {
 			t.Fatal("presentation changed authoritative times")
 		}
+	}
+}
+
+func TestAllocatedBytesBecomeLinuxBlocks(t *testing.T) {
+	v := &volume{}
+	for _, test := range []struct {
+		attr   storage.Attr
+		blocks uint64
+		errno  syscall.Errno
+	}{
+		{attr: storage.Attr{ID: 1, Kind: storage.NodeRegular, Size: 1, AllocationSize: 4096, AllocationKnown: true}, blocks: 8},
+		{attr: storage.Attr{ID: 2, Kind: storage.NodeRegular, Size: 4097, AllocationSize: 8192, AllocationKnown: true}, blocks: 16},
+		{attr: storage.Attr{ID: 3, Kind: storage.NodeRegular, AllocationKnown: true}, blocks: 0},
+		{attr: storage.Attr{ID: 7, Kind: storage.NodeRegular, Size: 1, AllocationSize: 1, AllocationKnown: true}, blocks: 1},
+		{attr: storage.Attr{ID: 8, Kind: storage.NodeRegular, Size: 1, AllocationSize: 513, AllocationKnown: true}, blocks: 2},
+		{attr: storage.Attr{ID: 9, Kind: storage.NodeRegular, Size: 1, AllocationSize: math.MaxInt64, AllocationKnown: true}, blocks: 1 << 54},
+		{attr: storage.Attr{ID: 10, Kind: storage.NodeDirectory, AllocationSize: 1, AllocationKnown: true}, blocks: 1},
+		{attr: storage.Attr{ID: 4, Kind: storage.NodeRegular, AllocationSize: -1, AllocationKnown: true}, errno: syscall.EIO},
+		{attr: storage.Attr{ID: 5, Kind: storage.NodeRegular, AllocationSize: 4096}, errno: syscall.EIO},
+		{attr: storage.Attr{ID: 6, Kind: storage.NodeRegular}, errno: syscall.EIO},
+	} {
+		var out gofuse.Attr
+		if got := v.fillAttr(&out, test.attr); got != test.errno || got == 0 && out.Blocks != test.blocks {
+			t.Fatalf("allocation %+v projected as %d blocks with %v, want %d blocks with %v", test.attr, out.Blocks, got, test.blocks, test.errno)
+		}
+	}
+}
+
+func TestExactByteAllocationSurvivesSetattrAndGetattr(t *testing.T) {
+	attr := storage.Attr{ID: 7, Kind: storage.NodeRegular, AllocationKnown: true}
+	file := &byteAllocationFileProbe{metadataFileProbe: metadataFileProbe{attr: attr}}
+	v := &volume{files: &metadataSessionProbe{attr: attr}, maxFileSize: 1024, deadline: time.Now().Add(time.Minute)}
+	n := &node{volume: v, id: &identity{node: attr.ID, kind: syscall.S_IFREG}}
+	h := newHandle(n, file, true, true)
+	var changed gofuse.AttrOut
+	if errno := n.Setattr(t.Context(), h, &gofuse.SetAttrIn{SetAttrInCommon: gofuse.SetAttrInCommon{
+		Valid: gofuse.FATTR_SIZE, Size: 1,
+	}}, &changed); errno != 0 {
+		t.Fatalf("setattr after exact-byte allocation: %v", errno)
+	}
+	if file.truncates != 1 || file.attr.AllocationSize != 1 || changed.Size != 1 || changed.Blocks != 1 {
+		t.Fatalf("setattr returned %+v after %d truncates and %d allocated bytes", changed.Attr, file.truncates, file.attr.AllocationSize)
+	}
+	var read gofuse.AttrOut
+	if errno := n.Getattr(t.Context(), h, &read); errno != 0 || read.Size != 1 || read.Blocks != 1 {
+		t.Fatalf("getattr after exact-byte allocation: %+v, %v", read.Attr, errno)
 	}
 }
 

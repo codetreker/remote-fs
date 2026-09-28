@@ -30,75 +30,75 @@ storage.Operation 是覆盖路径、文件会话、复制和锁控制的 transpo
 
 | Operation | HTTP wire 入口／动作 | 被授权的语义 |
 |---|---|---|
-| `volume.stat` | `/v4/stat` | 读取路径属性 |
-| `volume.list` | `/v4/list` | 列出目录，含 bounded listing |
-| `volume.read` | `/v4/read` | 读取完整文件，含 bounded read |
-| `volume.space` | `/v4/space` | 查询容量 |
-| `volume.set-attr` | `/v4/setattr` | 修改路径属性 |
-| `volume.write` | `/v4/write` | 创建缺失的文件或替换已有路径内容 |
-| `volume.create` | `/v4/create` | 创建文件 |
-| `volume.mkdir` | `/v4/mkdir` | 创建目录 |
-| `volume.remove` | `/v4/remove` | 删除文件名字 |
-| `volume.remove-dir` | `/v4/removedir` | 删除目录 |
-| `volume.rename` | `/v4/rename` | 在同一 volume 内改名或覆盖目标 |
-| `replication.subscribe` | `/v4/subscribe` | 开始订阅及该订阅后续输出 |
-| `replication.resubscribe` | `/v4/resubscribe` | 按游标续订及其后续输出 |
-| `replication.snapshot` | `/v4/snapshot` | 捕获快照及发送整份快照 |
-| `replication.checkpoint` | `/v4/checkpoint` | 读取日志化身与已提交位置 |
-| `file.session-open` | `/v4/file`，`file.session-open` | 建立 FileSession |
-| `file.status` | `/v4/file-control`，`file.status` | 查询 FileSession 状态与历史边界 |
-| `file.renew` | `/v4/file-control`，`file.renew` | 续期 FileSession |
-| `file.session-close` | `/v4/file-control`，`file.session-close` | 关闭 FileSession |
-| `file.stat-node` | `/v4/file`，`file.stat-node` | 按节点身份读取属性 |
-| `file.set-node-attr` | `/v4/file`，`file.set-node-attr` | 按节点身份修改属性 |
-| `file.open` | `/v4/file`，`file.open` | 按路径打开，携带 OpenAccess |
-| `file.open-node` | `/v4/file`，`file.open-node` | 按节点身份打开，携带 OpenAccess |
-| `file.open-at` | `/v4/file`，`file.open-at` | 按父身份原子打开／创建／清空／替换普通文件 |
-| `file.lookup-at` | `/v4/file`，`file.lookup-at` | 按父身份查询一个原始叶名 |
-| `file.read-dir-node` | `/v4/file`，`file.read-dir-node` | 按目录身份执行应用枚举并检查 `ReadEntries` |
-| `file.observe-directory-metadata` | `/v4/file`，同名动作 | 取得完整目录 entries、revision 与可选目录当前名字 |
-| `file.observe-name` | `/v4/file`，`file.observe-name` | 取得一个保留引用的 Root／Linked／Detached 当前绑定 |
-| `file.mutate-name` | `/v4/file`，`file.mutate-name` | 按父身份创建、删除或改名子项 |
-| `file.open-node-ref` | `/v4/file`，`file.open-node-ref` | 按 NodeID 打开 metadata-only 引用 |
-| `file.open-child-ref` | `/v4/file`，`file.open-child-ref` | 按父身份打开或创建节点引用 |
-| `file.query-action` | `/v4/file-control`，`file.query-action` | 核对 FileSession 内的有限动作回执 |
-| `file.query-delete-intent` | `/v4/file-control`，`file.query-delete-intent` | 查询 durable 删除义务状态 |
-| `file.list-delete-intents` | `/v4/file-control`，`file.list-delete-intents` | 按持久 owner 分页发现 durable 删除义务 |
-| `file.acknowledge-delete-intent` | `/v4/file-control`，同名动作 | 幂等确认并释放 durable 删除终态记录 |
-| `file.ack` | `/v4/file-control`，`file.ack` | 确认已交付的打开引用 |
-| `file.stat` | `/v4/file`，`file.stat` | 查询保留引用的属性 |
-| `file.state` | `/v4/file-control`，`file.state` | 原子读取引用属性、link target 与 pending 状态 |
-| `file.read` | `/v4/file`，`file.read` | 按保留引用读取范围 |
-| `file.write` | `/v4/file`，`file.write` | 按保留引用修改范围 |
-| `file.truncate` | `/v4/file`，`file.truncate` | 改变保留文件长度 |
-| `file.set-attr` | `/v4/file`，`file.set-attr` | 修改保留文件的共同时间 |
-| `file.sync` | `/v4/file`，`file.sync` | 同步检查已发布文件状态 |
-| `file.scope` | `/v4/file-control`，`file.scope` | 取得该确切 File 的中立 scope |
-| `file.set-node-metadata` | `/v4/file`，`file.set-node-metadata` | 按 NodeID 对一个 namespace 作 CAS |
-| `file.set-metadata` | `/v4/file`，`file.set-metadata` | 通过保留 File 对一个 namespace 作 CAS |
-| `file.new-use-owner` | `/v4/file-control`，`file.new-use-owner` | 以有效 scope 注册 range owner |
-| `file.retire-use-owner` | `/v4/file-control`，`file.retire-use-owner` | 退役 range owner |
-| `file.range-get-conflict` | `/v4/file-control`，`file.range-get-conflict` | 查询一个实际 range 冲突 |
-| `file.range-apply` | `/v4/file-control`，`file.range-apply` | 接纳一批中立 range 编辑 |
-| `file.range-query`、`file.range-cancel` | `/v4/file-control`，同名动作 | 核对或取消原 range 动作 |
-| `file.range-drop` | `/v4/file-control`，`file.range-drop` | 清理 owner 在指定 domain 的状态 |
-| `file.set-pending-unlink` | `/v4/file-control`，同名动作 | 原子建立节点 pending deletion |
-| `file.clear-pending-unlink` | `/v4/file-control`，同名动作 | 按 generation 清除当前 pending 状态 |
-| `file.mutate` | `/v4/file`，`file.mutate` | 按 size/metadata 条件修改引用 |
-| `file.close` | `/v4/file-control`，`file.close` | 关闭一个保留文件引用 |
-| `lock.session-enrollment` | `/v4/session-enrollment` | 申请强占有会话 enrollment ticket |
-| `lock.session-open` | `/v4/session-open` | 使用 ticket 建立强占有会话 |
-| `lock.session-close` | `/v4/session-close` | 关闭强占有会话 |
-| `lock.owner-create` | `/v4/owner-create` | 建立强占有 owner |
-| `lock.owner-retire` | `/v4/owner-retire` | 退役强占有 owner |
-| `lock.resolve` | `/v4/lock-resolve` | 取得逻辑资源引用 |
-| `lock.acquire` | `/v4/lock-acquire` | 申请强 S／X 占有 |
-| `lock.renew` | `/v4/lock-renew` | 续期强占有 |
-| `lock.release` | `/v4/lock-release` | 释放强占有 |
-| `lock.cancel` | `/v4/lock-cancel` | 取消／核对强占有动作 |
-| `lock.query-action` | `/v4/lock-query-action` | 查询动作历史 |
-| `lock.query-grant` | `/v4/lock-query-grant` | 查询 grant 当前状态 |
-| `lock.status` | `/v4/lock-status` | 查询授权方状态 |
+| `volume.stat` | `/v5/stat` | 读取路径属性 |
+| `volume.list` | `/v5/list` | 列出目录，含 bounded listing |
+| `volume.read` | `/v5/read` | 读取完整文件，含 bounded read |
+| `volume.space` | `/v5/space` | 查询容量 |
+| `volume.set-attr` | `/v5/setattr` | 修改路径属性 |
+| `volume.write` | `/v5/write` | 创建缺失的文件或替换已有路径内容 |
+| `volume.create` | `/v5/create` | 创建文件 |
+| `volume.mkdir` | `/v5/mkdir` | 创建目录 |
+| `volume.remove` | `/v5/remove` | 删除文件名字 |
+| `volume.remove-dir` | `/v5/removedir` | 删除目录 |
+| `volume.rename` | `/v5/rename` | 在同一 volume 内改名或覆盖目标 |
+| `replication.subscribe` | `/v5/subscribe` | 开始订阅及该订阅后续输出 |
+| `replication.resubscribe` | `/v5/resubscribe` | 按游标续订及其后续输出 |
+| `replication.snapshot` | `/v5/snapshot` | 捕获快照及发送整份快照 |
+| `replication.checkpoint` | `/v5/checkpoint` | 读取日志化身与已提交位置 |
+| `file.session-open` | `/v5/file`，`file.session-open` | 建立 FileSession |
+| `file.status` | `/v5/file-control`，`file.status` | 查询 FileSession 状态与历史边界 |
+| `file.renew` | `/v5/file-control`，`file.renew` | 续期 FileSession |
+| `file.session-close` | `/v5/file-control`，`file.session-close` | 关闭 FileSession |
+| `file.stat-node` | `/v5/file`，`file.stat-node` | 按节点身份读取属性 |
+| `file.set-node-attr` | `/v5/file`，`file.set-node-attr` | 按节点身份修改属性 |
+| `file.open` | `/v5/file`，`file.open` | 按路径打开，携带 OpenAccess |
+| `file.open-node` | `/v5/file`，`file.open-node` | 按节点身份打开，携带 OpenAccess |
+| `file.open-at` | `/v5/file`，`file.open-at` | 按父身份原子打开／创建／清空／替换普通文件 |
+| `file.lookup-at` | `/v5/file`，`file.lookup-at` | 按父身份查询一个原始叶名 |
+| `file.read-dir-node` | `/v5/file`，`file.read-dir-node` | 按目录身份执行应用枚举并检查 `ReadEntries` |
+| `file.observe-directory-metadata` | `/v5/file`，同名动作 | 取得完整目录 entries、revision 与可选目录当前名字 |
+| `file.observe-name` | `/v5/file`，`file.observe-name` | 取得一个保留引用的 Root／Linked／Detached 当前绑定 |
+| `file.mutate-name` | `/v5/file`，`file.mutate-name` | 按父身份创建、删除或改名子项 |
+| `file.open-node-ref` | `/v5/file`，`file.open-node-ref` | 按 NodeID 打开 metadata-only 引用 |
+| `file.open-child-ref` | `/v5/file`，`file.open-child-ref` | 按父身份打开或创建节点引用 |
+| `file.query-action` | `/v5/file-control`，`file.query-action` | 核对 FileSession 内的有限动作回执 |
+| `file.query-delete-intent` | `/v5/file-control`，`file.query-delete-intent` | 查询 durable 删除义务状态 |
+| `file.list-delete-intents` | `/v5/file-control`，`file.list-delete-intents` | 按持久 owner 分页发现 durable 删除义务 |
+| `file.acknowledge-delete-intent` | `/v5/file-control`，同名动作 | 幂等确认并释放 durable 删除终态记录 |
+| `file.ack` | `/v5/file-control`，`file.ack` | 确认已交付的打开引用 |
+| `file.stat` | `/v5/file`，`file.stat` | 查询保留引用的属性 |
+| `file.state` | `/v5/file-control`，`file.state` | 原子读取引用属性、link target 与 pending 状态 |
+| `file.read` | `/v5/file`，`file.read` | 按保留引用读取范围 |
+| `file.write` | `/v5/file`，`file.write` | 按保留引用修改范围 |
+| `file.truncate` | `/v5/file`，`file.truncate` | 改变保留文件长度 |
+| `file.set-attr` | `/v5/file`，`file.set-attr` | 修改保留文件的共同时间 |
+| `file.sync` | `/v5/file`，`file.sync` | 同步检查已发布文件状态 |
+| `file.scope` | `/v5/file-control`，`file.scope` | 取得该确切 File 的中立 scope |
+| `file.set-node-metadata` | `/v5/file`，`file.set-node-metadata` | 按 NodeID 对一个 namespace 作 CAS |
+| `file.set-metadata` | `/v5/file`，`file.set-metadata` | 通过保留 File 对一个 namespace 作 CAS |
+| `file.new-use-owner` | `/v5/file-control`，`file.new-use-owner` | 以有效 scope 注册 range owner |
+| `file.retire-use-owner` | `/v5/file-control`，`file.retire-use-owner` | 退役 range owner |
+| `file.range-get-conflict` | `/v5/file-control`，`file.range-get-conflict` | 查询一个实际 range 冲突 |
+| `file.range-apply` | `/v5/file-control`，`file.range-apply` | 接纳一批中立 range 编辑 |
+| `file.range-query`、`file.range-cancel` | `/v5/file-control`，同名动作 | 核对或取消原 range 动作 |
+| `file.range-drop` | `/v5/file-control`，`file.range-drop` | 清理 owner 在指定 domain 的状态 |
+| `file.set-pending-unlink` | `/v5/file-control`，同名动作 | 原子建立节点 pending deletion |
+| `file.clear-pending-unlink` | `/v5/file-control`，同名动作 | 按 generation 清除当前 pending 状态 |
+| `file.mutate` | `/v5/file`，`file.mutate` | 按 size/metadata 条件修改引用 |
+| `file.close` | `/v5/file-control`，`file.close` | 关闭一个保留文件引用 |
+| `lock.session-enrollment` | `/v5/session-enrollment` | 申请强占有会话 enrollment ticket |
+| `lock.session-open` | `/v5/session-open` | 使用 ticket 建立强占有会话 |
+| `lock.session-close` | `/v5/session-close` | 关闭强占有会话 |
+| `lock.owner-create` | `/v5/owner-create` | 建立强占有 owner |
+| `lock.owner-retire` | `/v5/owner-retire` | 退役强占有 owner |
+| `lock.resolve` | `/v5/lock-resolve` | 取得逻辑资源引用 |
+| `lock.acquire` | `/v5/lock-acquire` | 申请强 S／X 占有 |
+| `lock.renew` | `/v5/lock-renew` | 续期强占有 |
+| `lock.release` | `/v5/lock-release` | 释放强占有 |
+| `lock.cancel` | `/v5/lock-cancel` | 取消／核对强占有动作 |
+| `lock.query-action` | `/v5/lock-query-action` | 查询动作历史 |
+| `lock.query-grant` | `/v5/lock-query-grant` | 查询 grant 当前状态 |
+| `lock.status` | `/v5/lock-status` | 查询授权方状态 |
 
 
 副本构建还需要 replication.checkpoint 的明确许可；允许订阅或快照不隐含这项权限。Checkpoint 是一次普通读取，遵循入口授权、通用传输预算和安全错误规则，不建立持续输出。
@@ -146,9 +146,9 @@ Stop 非阻塞地发出取消／停止通知。嵌入方使用 `Stop → HTTP Sh
 
 [内部授权错误](../../../packages/transport/httprest/authorization.go)的 Error() 返回固定文本，Classification() 拥有可信 errno，Unwrap() 保留原 cause。原错误不直接进入普通、file、lock 或 stream writer；writer 不沿策略错误链重新分类或发送其文本。原请求／handler 取消优先于 callback 分类；这一适配不改写普通存储错误或未知动作结果。
 
-未开始 stream 时，授权错误使用 v4 协议标记、422 和普通 `{errno,message}`。强锁 decoder 遇到 lockCode 或 recorded 任一字段，都必须校验完整 native envelope；字段缺失、损坏不转入普通分支。只有精确的普通 errno/message 结构及 EACCES／EIO 才是 dispatch 前的授权失败，header、标记和大小限制仍须满足。授权错误不携带伪造的 native code、recorded 或动作回执。
+未开始 stream 时，授权错误使用 v5 协议标记、422 和普通 `{errno,message}`。强锁 decoder 遇到 lockCode 或 recorded 任一字段，都必须校验完整 native envelope；字段缺失、损坏不转入普通分支。只有精确的普通 errno/message 结构及 EACCES／EIO 才是 dispatch 前的授权失败，header、标记和大小限制仍须满足。授权错误不携带伪造的 native code、recorded 或动作回执。
 
-stream fault 保留 message 并增加可选 errno，只接受 EACCES／EIO；缺省 errno 的 generic fault 仍为 EIO，null、空值、畸形或未知 errno，以及重复的 errno／message 字段，都是协议 EIO。该字段属于 v4。直接 HTTP SDK 在所有初始 frame 与 Next 包装处保留有效 typed EACCES／EIO；replica 观察 follower 失败后仍统一以 EIO 使本地视图不可用。经失效副本回答的 FUSE 元数据错误因此可为 EIO，不能伪造空目录或不存在。
+stream fault 保留 message 并增加可选 errno，只接受 EACCES／EIO；缺省 errno 的 generic fault 仍为 EIO，null、空值、畸形或未知 errno，以及重复的 errno／message 字段，都是协议 EIO。该字段属于 v5。直接 HTTP SDK 在所有初始 frame 与 Next 包装处保留有效 typed EACCES／EIO；replica 观察 follower 失败后仍统一以 EIO 使本地视图不可用。经失效副本回答的 FUSE 元数据错误因此可为 EIO，不能伪造空目录或不存在。
 
 ## 六、嵌入示例与观测
 
