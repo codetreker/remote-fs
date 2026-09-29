@@ -68,9 +68,19 @@ func validateFileRequest(r fileRequest) error {
 	switch r.Op {
 	case storage.OpFileSessionOpen:
 		expected.Options = r.Options
-	case storage.OpFileStatus, storage.OpFileRenew, storage.OpFileSessionClose:
+	case storage.OpFileStatus, storage.OpFileRenew:
+	case storage.OpFileSessionClose:
+		expected.CloseGeneration = r.CloseGeneration
 	case storage.OpFileQueryAction:
 		expected.FileAction = r.FileAction
+		expected.File = r.File
+		expected.CloseGeneration = r.CloseGeneration
+		if r.File != "" && (!validFileCapability(r.File) || r.CloseGeneration == 0) {
+			return errors.New("bound close query has invalid reference or generation")
+		}
+		if r.File == "" && r.CloseGeneration != 0 {
+			return errors.New("unbound action query has a close generation")
+		}
 	case storage.OpFileQueryDeleteIntent:
 		expected.DeleteOwner = r.DeleteOwner
 		expected.DeleteIntent = r.DeleteIntent
@@ -91,8 +101,12 @@ func validateFileRequest(r fileRequest) error {
 	case storage.OpFileSetNodeAttr:
 		expected.Node = r.Node
 		expected.Change = r.Change
-	case storage.OpFileStat, storage.OpFileSync, storage.OpFileClose, storage.OpFileAck, storage.OpFileState, storage.OpFileScope:
+	case storage.OpFileStat, storage.OpFileSync, storage.OpFileAck, storage.OpFileState, storage.OpFileScope, storage.OpFileCloseOwnerStatus:
 		reference = true
+	case storage.OpFileClose:
+		reference = true
+		expected.CloseGeneration = r.CloseGeneration
+		expected.CloseImplicit = r.CloseImplicit
 	case storage.OpFileRead:
 		reference = true
 		expected.Offset = r.Offset
@@ -182,6 +196,11 @@ func validateFileRequest(r fileRequest) error {
 	}
 	if !reflect.DeepEqual(r, expected) {
 		return errors.New("file operation carries unrelated operands")
+	}
+	if r.Op == storage.OpFileClose || r.Op == storage.OpFileSessionClose {
+		if r.CloseGeneration == 0 {
+			return errors.New("close operation has no generation")
+		}
 	}
 	if action := semanticFileAction(r); action != "" && r.Action != action {
 		return errors.New("file operation action identity differs from its semantic action")
@@ -302,6 +321,8 @@ func validateFileResponse(req fileRequest, r fileResponse) error {
 			expected.Scope = r.Scope
 		case storage.OpFileState:
 			expected.State = r.State
+		case storage.OpFileCloseOwnerStatus:
+			expected.CloseOwnerStatus = r.CloseOwnerStatus
 		case storage.OpFileNewUseOwner:
 			expected.Owner = r.Owner
 		case storage.OpFileSetNodeMetadata, storage.OpFileSetMetadata:
@@ -357,7 +378,7 @@ func validateFileResponse(req fileRequest, r fileResponse) error {
 			return err
 		}
 	case storage.OpFileClose, storage.OpFileSessionClose:
-		if r.CloseResult == nil || !r.CloseResult.Released || r.CloseResult.BarrierPending {
+		if r.CloseResult == nil || !r.CloseResult.Released || !r.CloseResult.Determined || r.CloseResult.BarrierPending {
 			return errors.New("close response does not prove release")
 		}
 	case storage.OpFileOpen, storage.OpFileOpenNode:
@@ -434,6 +455,13 @@ func validateFileResponse(req fileRequest, r fileResponse) error {
 	case storage.OpFileState, storage.OpFileSetPendingUnlink, storage.OpFileClearPendingUnlink:
 		if r.State == nil {
 			return errors.New("reference state is incomplete")
+		}
+	case storage.OpFileCloseOwnerStatus:
+		if r.CloseOwnerStatus == nil {
+			return errors.New("close owner status is absent")
+		}
+		if _, err := r.CloseOwnerStatus.storage(); err != nil {
+			return err
 		}
 	case storage.OpFileScope:
 		if r.Scope == nil {
@@ -539,11 +567,15 @@ func validatePartialFileResponse(req fileRequest, response fileResponse) error {
 		if response.CloseResult == nil {
 			return errors.New("partial close result is absent")
 		}
+		if response.CloseResult.Released && !response.CloseResult.Determined {
+			return errors.New("partial close release is undetermined")
+		}
 		if response.CloseResult.BarrierPending && (!response.CloseResult.Released || response.Barrier != nil) {
 			return errors.New("partial close result has inconsistent barrier state")
 		}
-	case storage.OpFileOpenAt, storage.OpFileOpenNodeRef, storage.OpFileOpenChildRef:
+	case storage.OpFileOpen, storage.OpFileOpenNode, storage.OpFileOpenAt, storage.OpFileOpenNodeRef, storage.OpFileOpenChildRef:
 		expected.File = response.File
+		expected.Node = response.Node
 		expected.Attr = response.Attr
 		expected.Outcome = response.Outcome
 		expected.Capabilities = response.Capabilities

@@ -68,6 +68,29 @@ func (c *Coordinator) DropUse(ctx context.Context, node uint64, scope storage.Us
 	return nil
 }
 
+// DropUseExact is the final fallible step of a retained reference close. The
+// complete original claim must still be installed; an absent or changed claim
+// is an authority inconsistency, not an idempotent release.
+func (c *Coordinator) DropUseExact(ctx context.Context, node uint64, scope storage.UseScope, claim storage.UseClaim) error {
+	if err := checkCall(ctx, node); err != nil {
+		return err
+	}
+	if err := scope.Check(); err != nil {
+		return err
+	}
+	if err := claim.Check(); err != nil {
+		return err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	old, ok := c.uses[scope]
+	if !ok || old.node != node || old.claim != claim {
+		return storage.ErrInvalidScope
+	}
+	delete(c.uses, scope)
+	return nil
+}
+
 func (c *Coordinator) checkUseLocked(node uint64, scope storage.UseScope, uses storage.Uses) error {
 	if scope.Token != "" {
 		own, ok := c.uses[scope]

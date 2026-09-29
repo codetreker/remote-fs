@@ -67,6 +67,14 @@ func capabilitiesOf(value any) (*fileCapabilities, error) {
 
 func sessionCapabilitiesOf(value storage.FileSession) (*fileCapabilities, error) {
 	caps, err := capabilitiesOf(value)
+	if recovery, ok := value.(storage.RecoverableReferenceClose); ok {
+		checkErr := recovery.CheckRecoverableReferenceClose()
+		if checkErr == nil {
+			caps.CloseRecovery = true
+		} else if storage.ErrnoOf(checkErr) != syscall.EOPNOTSUPP {
+			err = errors.Join(err, checkErr)
+		}
+	}
 	if reporter, ok := value.(storage.AllocationReporting); ok {
 		checkErr := reporter.CheckAllocationReporting()
 		if checkErr == nil {
@@ -102,6 +110,7 @@ func sessionCapabilitiesOf(value storage.FileSession) (*fileCapabilities, error)
 
 func referenceCapabilitiesOf(value retainedReference) (*fileCapabilities, error) {
 	caps, err := capabilitiesOf(value)
+	_, caps.CloseRecovery = value.(storage.ReferenceCloseActions)
 	if capability, ok := value.(storage.ReferenceMetadataAccess); ok {
 		checkErr := capability.CheckMetadataAccess()
 		if checkErr == nil {
@@ -133,8 +142,19 @@ func (h *Handler) openReference(ctx context.Context, session *servedFileSession,
 		session.mu.Unlock()
 		return response, syscall.EAGAIN
 	}
+	reserveClose := session.recoverable
+	if reserveClose && session.cleanupActions+session.cleanupReserved+2 > h.files.limits.MaxCleanupActions {
+		session.mu.Unlock()
+		return response, syscall.EAGAIN
+	}
+	if reserveClose {
+		session.cleanupReserved += 2
+	}
 	capability := fileCapability()
 	entry := &servedFile{closing: true}
+	if reserveClose {
+		entry.closeReserve = 2
+	}
 	session.files[capability] = entry
 	session.mu.Unlock()
 
@@ -185,6 +205,7 @@ func (h *Handler) openReference(ctx context.Context, session *servedFileSession,
 	if !retainedReferencePresent(reference) {
 		reference = nil
 		delete(session.files, capability)
+		session.cleanupReserved -= entry.closeReserve
 	} else {
 		entry.native = reference
 		entry.closing = false
@@ -204,6 +225,9 @@ func (h *Handler) openReference(ctx context.Context, session *servedFileSession,
 	response.Capabilities, capabilityErr = referenceCapabilitiesOf(reference)
 	if capabilityErr != nil {
 		openErr = errors.Join(openErr, capabilityErr, syscall.EIO)
+	}
+	if session.recoverable && !response.Capabilities.CloseRecovery {
+		openErr = errors.Join(openErr, syscall.EOPNOTSUPP)
 	}
 	if (request.Op == storage.OpFileOpenNodeRef || request.Op == storage.OpFileOpenChildRef) && (!response.Capabilities.Scope || !response.Capabilities.State) {
 		openErr = errors.Join(openErr, errors.New("node reference lacks mandatory scope or state capability"), syscall.EIO)

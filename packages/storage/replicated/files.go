@@ -86,7 +86,7 @@ func (s *Storage) newFileSession(ctx context.Context, options storage.FileSessio
 		return s.cleanupFailedOpenSession(remoteSession, fmt.Errorf("file session has no replication barriers: %w", syscall.EOPNOTSUPP))
 	}
 	lifetime, stopSession := context.WithCancel(context.Background())
-	session := &fileSession{base: s, remote: barriers, lifetime: lifetime, stop: stopSession, changed: make(chan struct{})}
+	session := &fileSession{base: s, remote: barriers, lifetime: lifetime, stop: stopSession, changed: make(chan struct{}), maxCloseActions: options.MaxCloseActions}
 	s.mu.Lock()
 	if s.fileSessions == nil {
 		s.fileSessions = make(map[*fileSession]struct{})
@@ -257,20 +257,54 @@ func (s *Storage) closeFileSessions() error {
 }
 
 type fileSession struct {
-	base              *Storage
-	remote            httprest.FileSessionWithBarrier
-	lifetime          context.Context
-	stop              context.CancelFunc
-	mu                sync.Mutex
-	active            int
-	closing           bool
-	closed            bool
-	closeResult       storage.ReferenceCloseResult
-	closeErr          error
-	closeBarrier      *httprest.MutationBarrier
-	closeAuthorityErr error
-	changed           chan struct{}
-	closeRun          chan struct{}
+	base                   *Storage
+	remote                 httprest.FileSessionWithBarrier
+	maxCloseActions        int
+	closeReservationMu     sync.Mutex
+	closeReservations      int
+	closeTombstones        int
+	closeTombstoneRegistry map[closeTombstoneKey]*closeTombstone
+	closeTombstoneSequence uint64
+	closeTombstonesRetired bool
+	lifetime               context.Context
+	stop                   context.CancelFunc
+	mu                     sync.Mutex
+	active                 int
+	closing                bool
+	closed                 bool
+	closeResult            storage.ReferenceCloseResult
+	closeErr               error
+	closeBarrier           *httprest.MutationBarrier
+	closeAuthorityErr      error
+	closeOriginalErr       error
+	changed                chan struct{}
+	closeRun               chan struct{}
+}
+
+func (s *fileSession) reserveCloseAttempt() error {
+	s.closeReservationMu.Lock()
+	defer s.closeReservationMu.Unlock()
+	if s.maxCloseActions <= 0 || s.closeReservations >= s.maxCloseActions {
+		return syscall.EAGAIN
+	}
+	s.closeReservations++
+	return nil
+}
+
+func (s *fileSession) canReserveCloseAttempt() bool {
+	s.closeReservationMu.Lock()
+	defer s.closeReservationMu.Unlock()
+	return s.maxCloseActions > 0 && s.closeReservations < s.maxCloseActions
+}
+
+func (s *fileSession) releaseCloseAttempt() {
+	s.closeReservationMu.Lock()
+	if s.closeReservations == 0 {
+		s.closeReservationMu.Unlock()
+		panic("replicated close admission underflow")
+	}
+	s.closeReservations--
+	s.closeReservationMu.Unlock()
 }
 
 // The session drains local calls as well as server references. Reconciliation and
@@ -326,6 +360,7 @@ func (s *fileSession) CloseWithResult(ctx context.Context) (storage.ReferenceClo
 	previous := s.closeResult
 	previousBarrier := s.closeBarrier
 	previousAuthorityErr := s.closeAuthorityErr
+	previousOriginalErr := s.closeOriginalErr
 	s.closing = true
 	s.stop()
 	s.closeRun = make(chan struct{})
@@ -355,7 +390,11 @@ func (s *fileSession) CloseWithResult(ctx context.Context) (storage.ReferenceClo
 		result, barrier, authorityErr = s.remote.CloseWithBarrier(ctx)
 	}
 	if previous.Released && !result.Released {
-		return previous, errors.Join(authorityErr, fmt.Errorf("released session close lost barrier replay: %w", syscall.EIO))
+		return previous, errors.Join(previousOriginalErr, authorityErr, fmt.Errorf("released session close lost barrier replay: %w", syscall.EIO))
+	}
+	rawAuthorityErr := authorityErr
+	if previous.Released && previousBarrier == nil {
+		authorityErr = errors.Join(persistentCloseError(previousOriginalErr), authorityErr)
 	}
 	err := errors.Join(authorityErr, result.Check(authorityErr))
 	if !result.Released {
@@ -365,7 +404,10 @@ func (s *fileSession) CloseWithResult(ctx context.Context) (storage.ReferenceClo
 	s.mu.Lock()
 	s.closeResult = result
 	s.closeBarrier = barrier
-	s.closeAuthorityErr = authorityErr
+	s.closeAuthorityErr = rawAuthorityErr
+	if !previous.Released {
+		s.closeOriginalErr = rawAuthorityErr
+	}
 	if !settled {
 		s.mu.Unlock()
 		return result, err
@@ -373,6 +415,7 @@ func (s *fileSession) CloseWithResult(ctx context.Context) (storage.ReferenceClo
 	s.closed = true
 	s.closeErr = err
 	s.mu.Unlock()
+	s.retireCloseTombstones()
 	s.base.mu.Lock()
 	delete(s.base.fileSessions, s)
 	s.base.mu.Unlock()

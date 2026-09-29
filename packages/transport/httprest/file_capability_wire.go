@@ -31,6 +31,7 @@ type NodeReferencesWithBarrier interface {
 type NodeReferenceWithBarrier interface {
 	storage.NodeReference
 	CloseWithBarrier(context.Context) (storage.ReferenceCloseResult, *MutationBarrier, error)
+	CloseWithActionAndBarrier(context.Context, storage.CloseAttempt) (storage.ReferenceCloseResult, *MutationBarrier, error)
 	SetAttrWithBarrier(context.Context, storage.AttrChange) (storage.Attr, *MutationBarrier, error)
 }
 
@@ -426,15 +427,52 @@ type deleteIntentPage struct {
 
 type referenceCloseResult struct {
 	Released       bool `json:"released"`
+	Determined     bool `json:"determined"`
 	BarrierPending bool `json:"barrierPending,omitempty"`
 }
 
+type closeAttemptResult struct {
+	Action     storage.FileActionID `json:"action"`
+	Generation uint64               `json:"generation"`
+}
+
+type closeOwnerStatusResult struct {
+	Released       bool                      `json:"released"`
+	Ready          bool                      `json:"ready"`
+	Current        *closeAttemptResult       `json:"current,omitempty"`
+	CurrentOutcome storage.FileActionOutcome `json:"currentOutcome"`
+	NextGeneration uint64                    `json:"nextGeneration"`
+	CurrentEpoch   uint64                    `json:"currentEpoch"`
+}
+
+func closeOwnerStatusResultOf(value storage.CloseOwnerStatus) *closeOwnerStatusResult {
+	result := &closeOwnerStatusResult{
+		Released: value.Released, Ready: value.Ready, CurrentOutcome: value.CurrentOutcome,
+		NextGeneration: value.NextGeneration, CurrentEpoch: value.CurrentEpoch,
+	}
+	if value.Current != nil {
+		result.Current = &closeAttemptResult{Action: value.Current.Action, Generation: value.Current.Generation}
+	}
+	return result
+}
+
+func (value closeOwnerStatusResult) storage() (storage.CloseOwnerStatus, error) {
+	result := storage.CloseOwnerStatus{
+		Released: value.Released, Ready: value.Ready, CurrentOutcome: value.CurrentOutcome,
+		NextGeneration: value.NextGeneration, CurrentEpoch: value.CurrentEpoch,
+	}
+	if value.Current != nil {
+		result.Current = &storage.CloseAttempt{Action: value.Current.Action, Generation: value.Current.Generation}
+	}
+	return result, result.Check()
+}
+
 func referenceCloseResultOf(value storage.ReferenceCloseResult) *referenceCloseResult {
-	return &referenceCloseResult{Released: value.Released}
+	return &referenceCloseResult{Released: value.Released, Determined: value.Determined || value.Released}
 }
 
 func (value referenceCloseResult) storage() storage.ReferenceCloseResult {
-	return storage.ReferenceCloseResult{Released: value.Released}
+	return storage.ReferenceCloseResult{Released: value.Released, Determined: value.Determined}
 }
 
 func deleteIntentPageOf(value storage.DeleteIntentPage) (*deleteIntentPage, error) {

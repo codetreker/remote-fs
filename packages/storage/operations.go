@@ -61,6 +61,7 @@ const (
 	OpFileSetPendingUnlink        Operation = "file.set-pending-unlink"
 	OpFileClearPendingUnlink      Operation = "file.clear-pending-unlink"
 	OpFileMutate                  Operation = "file.mutate"
+	OpFileCloseOwnerStatus        Operation = "file.close-owner-status"
 	OpFileClose                   Operation = "file.close"
 	OpLockSessionEnrollment       Operation = "lock.session-enrollment"
 	OpLockSessionOpen             Operation = "lock.session-open"

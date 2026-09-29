@@ -36,9 +36,10 @@ type rangeAuthority interface {
 
 type retainedReference interface {
 	retire() error
-	drainAndRelease() error
+	drainAndRetireOwners() error
 	CloseWithResult(context.Context) (storage.ReferenceCloseResult, error)
 	retryClose(context.Context) (bool, error)
+	closeState() *referenceCloseState
 }
 
 // Heartbeats, lock acquisition, and lock reconciliation have independent capacity.
@@ -76,6 +77,8 @@ type fileSession struct {
 	cleanupOperations  int
 	files              map[retainedReference]struct{}
 	actions            map[storage.FileActionID]*fileAction
+	closeActions       map[storage.FileActionID]*referenceCloseReceipt
+	closeRefs          map[*referenceCloseState]struct{}
 	opening            int
 	identityOps        sync.WaitGroup
 	timer              *time.Timer
@@ -160,7 +163,8 @@ func (s *Storage) NewFileSession(ctx context.Context, options storage.FileSessio
 	fs := &fileSession{storage: s, native: native, domain: domain, options: options,
 		cleanup: context.WithoutCancel(ctx), epoch: hex.EncodeToString(nonce[:]),
 		active: true, expires: time.Now().Add(options.Lease), revision: 1,
-		files: make(map[retainedReference]struct{}), actions: make(map[storage.FileActionID]*fileAction)}
+		files: make(map[retainedReference]struct{}), actions: make(map[storage.FileActionID]*fileAction),
+		closeActions: make(map[storage.FileActionID]*referenceCloseReceipt), closeRefs: make(map[*referenceCloseState]struct{})}
 	fs.locks, err = domain.NewSession(options, fs.fence)
 	if err != nil {
 		return nil, err
@@ -270,11 +274,12 @@ func (fs *fileSession) open(ctx context.Context, options storage.FileOpenOptions
 	if native == nil {
 		return nil, fs.finishOpen(nil, err)
 	}
-	f := &openFile{session: fs, native: native, options: options, active: true}
+	f := &openFile{session: fs, native: native, options: options, active: true,
+		closing: referenceCloseState{next: 1}}
 	err = fs.finishOpen(f, err)
 	if err != nil {
 		err = errors.Join(err, f.retire())
-		f.startClose()
+		go f.CloseWithResult(fs.cleanup)
 		return nil, err
 	}
 	return f, nil
@@ -286,7 +291,9 @@ func (fs *fileSession) beginOpen(ctx context.Context) (func(), error) {
 		return nil, err
 	}
 	fs.mu.Lock()
-	if len(fs.files)+fs.opening >= fs.options.MaxFiles {
+	fs.pruneCloseHistoryLocked(time.Now())
+	if len(fs.files)+fs.opening >= fs.options.MaxFiles ||
+		len(fs.closeRefs)+fs.opening >= (fs.options.MaxCloseActions-1)/2 {
 		fs.mu.Unlock()
 		done()
 		return nil, syscall.EMFILE
@@ -301,6 +308,10 @@ func (fs *fileSession) finishOpen(reference retainedReference, err error) error 
 	fs.opening--
 	if reference != nil {
 		fs.files[reference] = struct{}{}
+		if fs.closeRefs == nil {
+			fs.closeRefs = make(map[*referenceCloseState]struct{})
+		}
+		fs.closeRefs[reference.closeState()] = struct{}{}
 	}
 	active := fs.active && time.Now().Before(fs.expires)
 	fs.mu.Unlock()
@@ -430,7 +441,7 @@ func (fs *fileSession) fence() error {
 			errs = append(errs, err)
 			continue
 		}
-		errs = append(errs, f.drainAndRelease())
+		errs = append(errs, f.drainAndRetireOwners())
 	}
 	return errors.Join(errs...)
 }
@@ -478,7 +489,7 @@ func (fs *fileSession) finishClose() {
 		delete(fs.storage.fileSessions, fs)
 		fs.storage.fileMu.Unlock()
 	}
-	result := storage.ReferenceCloseResult{Released: released}
+	result := storage.ReferenceCloseResult{Released: released, Determined: released}
 	err = errors.Join(err, result.Check(err))
 	fs.closeMu.Lock()
 	fs.closeErr = err

@@ -93,6 +93,27 @@ func TestNativeUseAndRangeOwnersShareCapacity(t *testing.T) {
 	}
 }
 
+func TestDropUseExactRequiresOriginalClaim(t *testing.T) {
+	c := fixture(t, DefaultConfig())
+	scope := storage.UseScope{Token: "exact"}
+	claim := storage.UseClaim{Uses: storage.ReadData, Deny: storage.WriteData}
+	if err := c.AddUse(background, 9, scope, claim); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.DropUseExact(background, 9, scope, storage.UseClaim{Uses: storage.ReadData}); !errors.Is(err, storage.ErrInvalidScope) {
+		t.Fatalf("changed claim = %v", err)
+	}
+	if err := c.CheckUse(background, 9, storage.UseScope{}, storage.WriteData); !errors.Is(err, storage.ErrUseConflict) {
+		t.Fatalf("mismatched release removed claim: %v", err)
+	}
+	if err := c.DropUseExact(background, 9, scope, claim); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.DropUseExact(background, 9, scope, claim); !errors.Is(err, storage.ErrInvalidScope) {
+		t.Fatalf("missing claim = %v", err)
+	}
+}
+
 func TestUseAndIOValidationRejectWithoutStateChange(t *testing.T) {
 	c := fixture(t, DefaultConfig())
 	ctx, cancel := context.WithCancel(background)
