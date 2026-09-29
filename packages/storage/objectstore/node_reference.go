@@ -12,17 +12,14 @@ import (
 )
 
 type nodeReference struct {
-	session     *fileSession
-	native      metastore.NodeReference
-	uses        referenceUses
-	active      bool
-	operations  sync.WaitGroup
-	retireMu    sync.Mutex
-	retired     bool
-	closeMu     sync.Mutex
-	closeDone   chan struct{}
-	closeErr    error
-	closeResult storage.ReferenceCloseResult
+	session    *fileSession
+	native     metastore.NodeReference
+	uses       referenceUses
+	active     bool
+	operations sync.WaitGroup
+	retireMu   sync.Mutex
+	retired    bool
+	closing    referenceCloseState
 }
 
 func (r *nodeReference) begin(ctx context.Context) (context.Context, func(), error) {
@@ -89,43 +86,27 @@ func (r *nodeReference) retire() error {
 	return nil
 }
 
-func (r *nodeReference) drainAndRelease() error {
+func (r *nodeReference) drainAndRetireOwners() error {
 	r.operations.Wait()
-	ctx, cancel := r.session.operationContext(r.session.cleanup)
-	defer cancel()
-	dropErr := r.native.DropUse(ctx)
-	ownerErr := r.session.retireReferenceOwners(&r.uses)
-	return errors.Join(dropErr, ownerErr)
+	return r.session.retireReferenceOwners(&r.uses)
 }
 
-func (r *nodeReference) startClose() <-chan struct{} {
-	r.closeMu.Lock()
-	defer r.closeMu.Unlock()
-	if r.closeDone != nil {
-		select {
-		case <-r.closeDone:
-			if r.closeResult.Released {
-				return r.closeDone
-			}
-		default:
-			return r.closeDone
-		}
-	}
-	r.closeDone = make(chan struct{})
-	go r.finishClose()
-	return r.closeDone
-}
+func (r *nodeReference) closeState() *referenceCloseState { return &r.closing }
 
-func (r *nodeReference) finishClose() {
+func (r *nodeReference) performClose() (storage.ReferenceCloseResult, error) {
 	err := r.retire()
 	var result storage.ReferenceCloseResult
 	if err == nil {
-		err = r.drainAndRelease()
+		err = r.drainAndRetireOwners()
+		if err != nil {
+			result.Determined = true
+		}
 	}
 	if err == nil {
 		ctx, cancel := r.session.operationContext(r.session.cleanup)
 		result, err = r.native.CloseWithResult(ctx)
 		cancel()
+		result.Determined = result.Determined || result.Released
 		err = errors.Join(err, result.Check(err))
 	}
 	if result.Released {
@@ -134,11 +115,7 @@ func (r *nodeReference) finishClose() {
 		r.session.mu.Unlock()
 		r.session.storage.sweepAfterMutation()
 	}
-	r.closeMu.Lock()
-	r.closeErr = err
-	r.closeResult = result
-	close(r.closeDone)
-	r.closeMu.Unlock()
+	return result, err
 }
 
 func (r *nodeReference) Close(ctx context.Context) error {
@@ -147,15 +124,19 @@ func (r *nodeReference) Close(ctx context.Context) error {
 }
 
 func (r *nodeReference) CloseWithResult(ctx context.Context) (storage.ReferenceCloseResult, error) {
-	done := r.startClose()
-	select {
-	case <-done:
-		r.closeMu.Lock()
-		defer r.closeMu.Unlock()
-		return r.closeResult, r.closeErr
-	case <-ctx.Done():
-		return storage.ReferenceCloseResult{}, ctx.Err()
-	}
+	return r.closing.runImplicit(ctx, r.session, r.performClose)
+}
+
+func (r *nodeReference) CloseWithAction(ctx context.Context, attempt storage.CloseAttempt) (storage.ReferenceCloseResult, error) {
+	return r.closing.run(ctx, r.session, attempt, r.performClose)
+}
+
+func (r *nodeReference) QueryCloseAttempt(ctx context.Context, attempt storage.CloseAttempt) (storage.FileActionReceipt, error) {
+	return r.closing.query(ctx, r.session, attempt)
+}
+
+func (r *nodeReference) CloseOwnerStatus(ctx context.Context) (storage.CloseOwnerStatus, error) {
+	return r.closing.status(ctx, r.session)
 }
 
 func (r *nodeReference) CheckScopedReference() error {

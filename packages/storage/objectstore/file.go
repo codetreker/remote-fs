@@ -13,18 +13,15 @@ import (
 )
 
 type openFile struct {
-	session     *fileSession
-	native      metastore.File
-	uses        referenceUses
-	options     storage.FileOpenOptions
-	active      bool
-	operations  sync.WaitGroup
-	retireMu    sync.Mutex
-	retired     bool
-	closeMu     sync.Mutex
-	closeDone   chan struct{}
-	closeErr    error
-	closeResult storage.ReferenceCloseResult
+	session    *fileSession
+	native     metastore.File
+	uses       referenceUses
+	options    storage.FileOpenOptions
+	active     bool
+	operations sync.WaitGroup
+	retireMu   sync.Mutex
+	retired    bool
+	closing    referenceCloseState
 }
 
 var _ storage.File = (*openFile)(nil)
@@ -370,38 +367,21 @@ func (f *openFile) retire() error {
 	return nil
 }
 
-func (f *openFile) drainAndRelease() error {
+func (f *openFile) drainAndRetireOwners() error {
 	f.operations.Wait()
-	ctx, cancel := f.session.operationContext(f.session.cleanup)
-	defer cancel()
-	dropErr := f.native.DropUse(ctx)
-	ownerErr := f.session.retireReferenceOwners(&f.uses)
-	return errors.Join(dropErr, ownerErr)
+	return f.session.retireReferenceOwners(&f.uses)
 }
 
-func (f *openFile) startClose() <-chan struct{} {
-	f.closeMu.Lock()
-	defer f.closeMu.Unlock()
-	if f.closeDone != nil {
-		select {
-		case <-f.closeDone:
-			if f.closeResult.Released {
-				return f.closeDone
-			}
-		default:
-			return f.closeDone
-		}
-	}
-	f.closeDone = make(chan struct{})
-	go f.finishClose()
-	return f.closeDone
-}
+func (f *openFile) closeState() *referenceCloseState { return &f.closing }
 
-func (f *openFile) finishClose() {
+func (f *openFile) performClose() (storage.ReferenceCloseResult, error) {
 	err := f.retire()
 	var result storage.ReferenceCloseResult
 	if err == nil {
-		err = f.drainAndRelease()
+		err = f.drainAndRetireOwners()
+		if err != nil {
+			result.Determined = true
+		}
 	}
 	if err == nil {
 		// Cleanup keeps the creation-time accounting hooks. Attaching Close's
@@ -409,6 +389,7 @@ func (f *openFile) finishClose() {
 		ctx, cancel := f.session.operationContext(f.session.cleanup)
 		result, err = f.native.CloseWithResult(ctx)
 		cancel()
+		result.Determined = result.Determined || result.Released
 		err = errors.Join(err, result.Check(err))
 	}
 	if result.Released {
@@ -417,11 +398,7 @@ func (f *openFile) finishClose() {
 		f.session.mu.Unlock()
 		f.session.storage.sweepAfterMutation()
 	}
-	f.closeMu.Lock()
-	f.closeErr = err
-	f.closeResult = result
-	close(f.closeDone)
-	f.closeMu.Unlock()
+	return result, err
 }
 
 func (f *openFile) Close(ctx context.Context) error {
@@ -430,13 +407,17 @@ func (f *openFile) Close(ctx context.Context) error {
 }
 
 func (f *openFile) CloseWithResult(ctx context.Context) (storage.ReferenceCloseResult, error) {
-	done := f.startClose()
-	select {
-	case <-done:
-		f.closeMu.Lock()
-		defer f.closeMu.Unlock()
-		return f.closeResult, f.closeErr
-	case <-ctx.Done():
-		return storage.ReferenceCloseResult{}, ctx.Err()
-	}
+	return f.closing.runImplicit(ctx, f.session, f.performClose)
+}
+
+func (f *openFile) CloseWithAction(ctx context.Context, attempt storage.CloseAttempt) (storage.ReferenceCloseResult, error) {
+	return f.closing.run(ctx, f.session, attempt, f.performClose)
+}
+
+func (f *openFile) QueryCloseAttempt(ctx context.Context, attempt storage.CloseAttempt) (storage.FileActionReceipt, error) {
+	return f.closing.query(ctx, f.session, attempt)
+}
+
+func (f *openFile) CloseOwnerStatus(ctx context.Context) (storage.CloseOwnerStatus, error) {
+	return f.closing.status(ctx, f.session)
 }

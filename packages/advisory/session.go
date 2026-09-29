@@ -85,6 +85,34 @@ func (s *Session) Epoch(ctx context.Context) (uint64, error) {
 	return epoch, err
 }
 
+// WithCloseAdmission keeps only the close-action epoch available after Retire.
+// The caller must already hold an exact retained reference; this does not
+// reactivate advisory owners, data admission, or ordinary session history.
+func (s *Session) WithCloseAdmission(ctx context.Context, admit func(uint64) error) error {
+	if admit == nil {
+		return syscall.EINVAL
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	c := s.coordinator
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if err := s.advanceLocked(c.now()); err != nil {
+		return err
+	}
+	return admit(s.epoch)
+}
+
+func (s *Session) CloseEpoch(ctx context.Context) (uint64, error) {
+	var epoch uint64
+	err := s.WithCloseAdmission(ctx, func(current uint64) error {
+		epoch = current
+		return nil
+	})
+	return epoch, err
+}
+
 // IOHealth validates session continuity only. Ordinary I/O never participates
 // in advisory conflict checks; native reference health is the caller's check.
 func (s *Session) IOHealth(ctx context.Context, node uint64) error {

@@ -513,11 +513,18 @@ func (s *Storage) storageError(req Request, body []byte) error {
 	_, hasCapability := members["capabilityCode"]
 	_, hasFileRecorded := members["fileRecorded"]
 	_, hasFileResult := members["fileResult"]
+	_, hasCloseProof := members["closeNotExecutedEpoch"]
 	if hasCode != hasRecorded || hasCapability && hasCode {
 		return unreachable(req, errors.New("response combines unrelated error families"))
 	}
 	if hasFileResult && (resp.FileResult == nil || req.Op != OpFile && req.Op != OpFileControl) {
 		return unreachable(req, errors.New("invalid partial file result"))
+	}
+	if hasCloseProof {
+		if req.Op != OpFileControl || resp.CloseNotExecutedEpoch == 0 || hasFileResult || hasFileRecorded || hasCapability || hasCode || resp.Errno != "ESTALE" {
+			return unreachable(req, errors.New("invalid close nonexecution proof"))
+		}
+		return &storage.CloseActionNotExecutedError{CurrentEpoch: resp.CloseNotExecutedEpoch}
 	}
 	if hasCode && !hasFileRecorded {
 		failure, err := decodeVolumeLockFailure(body)

@@ -55,9 +55,6 @@ type File interface {
 	// Retire fences publication before an external caller starts draining I/O.
 	// The physical pin and quota survive until Close has a known durable result.
 	Retire(context.Context) error
-	// DropUse releases the reference's native Uses/Deny claim after admitted I/O drains.
-	// It is idempotent and leaves the physical retention pin for Close.
-	DropUse(context.Context) error
 	// Close is idempotent and retires the reference before releasing its pin.
 	// Last-close accounting uses its context and the actual remaining file size.
 	Close(context.Context) error

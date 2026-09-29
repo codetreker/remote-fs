@@ -174,7 +174,8 @@ func (fs *fileSession) openNodeReference(ctx context.Context, open func(context.
 	if result.Reference == nil {
 		return opened, fs.finishOpen(nil, err)
 	}
-	reference := &nodeReference{session: fs, native: result.Reference, uses: referenceUses{nodeID: uint64(result.State.ID)}, active: true}
+	reference := &nodeReference{session: fs, native: result.Reference, uses: referenceUses{nodeID: uint64(result.State.ID)}, active: true,
+		closing: referenceCloseState{next: 1}}
 	opened.Reference = reference
 	err = fs.finishOpen(reference, err)
 	return opened, err

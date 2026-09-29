@@ -199,6 +199,9 @@ type FileSessionOptions struct {
 	MaxLockRanges   int
 	MaxPendingLocks int
 	MaxLockActions  int
+	// MaxCloseActions bounds the separate cleanup receipt lane. Two slots per
+	// live reference and one session-close slot are reserved before open effects.
+	MaxCloseActions int
 }
 
 func DefaultFileSessionOptions() FileSessionOptions {
@@ -207,7 +210,7 @@ func DefaultFileSessionOptions() FileSessionOptions {
 		MaxFileSize: DefaultFileMaxSize,
 		MaxFiles:    4096, MaxOperations: 64, MaxWaiters: 256,
 		MaxLockOwners: 4096, MaxLockRanges: 65536,
-		MaxPendingLocks: 1024, MaxLockActions: 16384,
+		MaxPendingLocks: 1024, MaxLockActions: 16384, MaxCloseActions: 16384,
 	}
 }
 
@@ -218,7 +221,8 @@ func (o FileSessionOptions) Check() error {
 	}
 	if o.MaxFileSize <= 0 || o.MaxFiles <= 0 || o.MaxOperations <= 0 || o.MaxWaiters < 0 ||
 		o.MaxLockOwners <= 0 || o.MaxLockRanges <= 0 ||
-		o.MaxPendingLocks <= 0 || o.MaxLockActions <= 0 {
+		o.MaxPendingLocks <= 0 || o.MaxLockActions <= 0 || o.MaxCloseActions <= 0 ||
+		o.MaxFiles > (o.MaxCloseActions-1)/2 {
 		return fmt.Errorf("file session resource limits must be positive, except zero waiters: %w", syscall.EINVAL)
 	}
 	return nil

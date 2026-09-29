@@ -257,7 +257,7 @@ DirectoryTarget/ChildName 把子项操作绑定到父 NodeID、可选活 Scope �
 
 `WriteAt` 与 `Truncate` 先读取当前完整对象，在有界内存中生成下一份完整内容：范围之外保留当前字节，扩展部分为零。随后按 `Reserve → Put → Commit` 发布，以读取时的 `content_revision` 做原生 CAS；revision 不符表示未提交，成功清理本次新对象后才能重新读取并尝试。真实提交、持久确认或 cleanup 结果未知时立即报错并保留失败隔离，不重放可能已生效的写入。普通重叠写入可依实际顺序各自成功；这项内部重试不是调用方显式内容版本校验的承诺。每次写入和截断成功前完成服务端确认，关闭不补交旧整文件快照。
 
-关闭或会话退役先在最终发布 gate 内撤销引用权限，持久触发或消费该引用已经接受的 CloseIntent，再排空已接纳的 materialization 与上传，最后释放 native pin。最后一个 pin 关闭 detached 节点时，在同一事务中删除节点、按实际剩余分配量释放配额，并把当前对象标为 garbage；真正对象删除由 sweeper 执行。pending 名字删除同样经过正常 Strong gate 与变更日志。`CloseWithResult` 报告 native pin 和引用是否已经释放；语义错误可与已释放结果同时出现，未确认释放仍保留 pin、delete intent 与配额责任。旧 epoch 的引用明确失效，但 durable intent 由新 authority 按 owner 发现、查询和清理，不按原路径重建。
+关闭或会话退役先封住该引用的新操作，在最终发布 gate 内退休引用并触发或消费它已经接受的 CloseIntent，然后排空已接纳的 materialization／上传并清理辅助 owner。原共享 Use claim 保持安装，直到最后一个 pin 的 pending 名字删除或 detached 节点回收在同一权威发布路径中确认完成；节点回收按实际剩余分配量释放配额，并把当前对象标为 garbage，真正对象删除由 sweeper 执行。最终化确认后，SQLite 在同一 commit gate 内严格核对并解除原 Use，再无失败地释放 pin 和引用容量；明确未释放时，原 claim 仍阻止冲突准入。`CloseWithResult` 报告 `Released` 与 `Determined`，语义错误可与已释放结果共存；提交不明或 claim 不符时保持未知和 authority fence，不提前释放责任。旧 epoch 的引用明确失效，但 durable intent 由新 authority 按 owner 发现、查询和清理，不按原路径重建。
 
 原请求消失后的清理使用 `PublicationAccountingChain` 的不可变快照。恢复 context 只保留自己的取消／deadline 和该 accounting chain，丢弃原业务授权、Scope、Strong proof 与其它 request value。`MaintenanceAccounting` 在恢复开始前核对完整包装链和实际 Used，再原子安装当前维护链；活引用继续使用创建时捕获的链，二者不会重复结算。
 

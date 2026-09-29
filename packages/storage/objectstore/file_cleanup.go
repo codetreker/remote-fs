@@ -21,20 +21,14 @@ func failedClose(done <-chan struct{}, err error) bool {
 }
 
 func (f *openFile) retryClose(ctx context.Context) (bool, error) {
-	f.closeMu.Lock()
-	retry := failedClose(f.closeDone, f.closeErr)
-	f.closeMu.Unlock()
-	if !retry {
+	if !f.closing.retryable(f.session) {
 		return false, nil
 	}
 	return true, f.Close(ctx)
 }
 
 func (r *nodeReference) retryClose(ctx context.Context) (bool, error) {
-	r.closeMu.Lock()
-	retry := !r.closeResult.Released && failedClose(r.closeDone, r.closeErr)
-	r.closeMu.Unlock()
-	if !retry {
+	if !r.closing.retryable(r.session) {
 		return false, nil
 	}
 	return true, r.Close(ctx)

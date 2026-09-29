@@ -12,15 +12,9 @@ import (
 )
 
 type nodeReference struct {
-	session           *fileSession
-	remote            httprest.NodeReferenceWithBarrier
-	mu                sync.Mutex
-	closed            bool
-	closeResult       storage.ReferenceCloseResult
-	closeErr          error
-	closeBarrier      *httprest.MutationBarrier
-	closeAuthorityErr error
-	closeRun          chan struct{}
+	session *fileSession
+	remote  httprest.NodeReferenceWithBarrier
+	retainedClose
 }
 
 func referenceCall[C, R any](ctx context.Context, session *fileSession, remote any, call func(context.Context, C) (R, error)) (R, error) {
@@ -52,76 +46,19 @@ func (r *nodeReference) Close(ctx context.Context) error {
 }
 
 func (r *nodeReference) CloseWithResult(ctx context.Context) (storage.ReferenceCloseResult, error) {
-	r.mu.Lock()
-	for r.closeRun != nil {
-		run := r.closeRun
-		r.mu.Unlock()
-		select {
-		case <-run:
-		case <-ctx.Done():
-			return storage.ReferenceCloseResult{}, ctx.Err()
-		}
-		r.mu.Lock()
-	}
-	if r.closed {
-		result, err := r.closeResult, r.closeErr
-		r.mu.Unlock()
-		return result, err
-	}
-	previous := r.closeResult
-	previousBarrier := r.closeBarrier
-	previousAuthorityErr := r.closeAuthorityErr
-	r.closeRun = make(chan struct{})
-	r.mu.Unlock()
-	defer func() {
-		r.mu.Lock()
-		close(r.closeRun)
-		r.closeRun = nil
-		r.mu.Unlock()
-	}()
-	r.session.mu.Lock()
-	sessionClosed := r.session.closed
-	r.session.mu.Unlock()
-	if sessionClosed && !previous.Released {
-		result := storage.ReferenceCloseResult{Released: true}
-		r.mu.Lock()
-		r.closed = true
-		r.closeResult = result
-		r.mu.Unlock()
-		return result, nil
-	}
-	var result storage.ReferenceCloseResult
-	var barrier *httprest.MutationBarrier
-	var authorityErr error
-	if previous.Released && previousBarrier != nil {
-		result, barrier, authorityErr = previous, previousBarrier, previousAuthorityErr
-	} else if previous.Released {
-		result, barrier, authorityErr = r.remote.CloseWithBarrier(ctx)
-	} else {
-		result, authorityErr = fileCall(ctx, r.session, false, func(ctx context.Context) (storage.ReferenceCloseResult, error) {
-			var callErr error
-			result, barrier, callErr = r.remote.CloseWithBarrier(ctx)
-			return result, callErr
-		})
-	}
-	if previous.Released && !result.Released {
-		return previous, errors.Join(authorityErr, fmt.Errorf("released reference close lost barrier replay: %w", syscall.EIO))
-	}
-	err := errors.Join(authorityErr, result.Check(authorityErr))
-	if !result.Released {
-		return result, err
-	}
-	settled, err := r.session.base.confirmReleasedClose(ctx, "close-reference", barrier, authorityErr)
-	r.mu.Lock()
-	r.closeResult = result
-	r.closeBarrier = barrier
-	r.closeAuthorityErr = authorityErr
-	if settled {
-		r.closed = true
-		r.closeErr = err
-	}
-	r.mu.Unlock()
-	return result, err
+	return r.retainedClose.close(ctx, r.session, r.remote, "reference", nil)
+}
+
+func (r *nodeReference) CloseWithAction(ctx context.Context, attempt storage.CloseAttempt) (storage.ReferenceCloseResult, error) {
+	return r.retainedClose.closeWithAction(ctx, r.session, r.remote, "reference", attempt)
+}
+
+func (r *nodeReference) QueryCloseAttempt(ctx context.Context, attempt storage.CloseAttempt) (storage.FileActionReceipt, error) {
+	return queryCloseAttempt(ctx, r.remote, attempt)
+}
+
+func (r *nodeReference) CloseOwnerStatus(ctx context.Context) (storage.CloseOwnerStatus, error) {
+	return r.retainedClose.ownerStatus(ctx, r.session, r.remote)
 }
 
 func (r *nodeReference) CheckScopedReference() error {

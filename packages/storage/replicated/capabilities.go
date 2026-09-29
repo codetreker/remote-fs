@@ -82,6 +82,10 @@ func (s *fileSession) CheckFileActions() error {
 	return capabilityCheck(s.remote, func(c storage.FileActions) error { return c.CheckFileActions() })
 }
 
+func (s *fileSession) CheckRecoverableReferenceClose() error {
+	return capabilityCheck(s.remote, storage.RecoverableReferenceClose.CheckRecoverableReferenceClose)
+}
+
 func (s *fileSession) QueryFileAction(ctx context.Context, action storage.FileActionID) (storage.FileActionReceipt, error) {
 	return sessionCapability(ctx, s, false, func(ctx context.Context, c storage.FileActions) (storage.FileActionReceipt, error) {
 		return c.QueryFileAction(ctx, action)

@@ -406,7 +406,7 @@ func TestRetainedHTTPPureReadCancellationAfterDispatchIsEINTR(t *testing.T) {
 func TestRetainedHTTPCleanupHistoryExhaustionRetiresOwnedLocks(t *testing.T) {
 	ctx := context.Background()
 	limits := DefaultFileLimits()
-	limits.MaxCleanupActions = 1
+	limits.MaxCleanupActions = 5
 	client, _, backend := retainedHTTPFixture(t, limits)
 	if err := backend.Write(ctx, "file", []byte("data")); err != nil {
 		t.Fatal(err)
@@ -428,8 +428,14 @@ func TestRetainedHTTPCleanupHistoryExhaustionRetiresOwnedLocks(t *testing.T) {
 	if result, err := fileRanges.Apply(ctx, fileOwners[1], []storage.RangeCommand{lock}, id); err != nil || result.State != storage.Granted {
 		t.Fatalf("grant = %+v, %v", result, err)
 	}
-	if err := fileRanges.Drop(ctx, fileOwners[1], storage.DomainRecord); !errors.Is(err, syscall.EIO) {
+	if err := fileRanges.Drop(ctx, fileOwners[1], storage.DomainRecord); !errors.Is(err, syscall.EAGAIN) {
 		t.Fatalf("exhausted cleanup history = %v", err)
+	}
+	if result, err := file.CloseWithResult(ctx); err != nil || !result.Released {
+		t.Fatalf("reserved reference close result=%+v err=%v", result, err)
+	}
+	if result, err := session.CloseWithResult(ctx); err != nil || !result.Released {
+		t.Fatalf("reserved session close result=%+v err=%v", result, err)
 	}
 	observerSession, err := backend.NewFileSession(ctx, storage.DefaultFileSessionOptions())
 	if err != nil {
@@ -445,7 +451,7 @@ func TestRetainedHTTPCleanupHistoryExhaustionRetiresOwnedLocks(t *testing.T) {
 		t.Fatalf("failed cleanup retained a lock: %+v, %v", conflict, err)
 	}
 	if _, err := file.ReadAt(ctx, 0, 4); err == nil {
-		t.Fatal("retired holder still allowed ordinary I/O")
+		t.Fatal("closed holder still allowed ordinary I/O")
 	}
 }
 
@@ -1049,7 +1055,7 @@ func TestRetainedHTTPPendingExpiryRetainsCapabilityAndChargeUntilNativeClose(t *
 		t.Fatal(err)
 	}
 	go func() {
-		_, err := client.fileCall(ctx, fileRequest{Op: storage.OpFileClose, Session: remote.id, File: opened.File, Action: closeAction})
+		_, err := client.fileCall(ctx, fileRequest{Op: storage.OpFileClose, Session: remote.id, File: opened.File, Action: closeAction, CloseGeneration: 1, CloseImplicit: true})
 		outcome <- err
 	}()
 	select {

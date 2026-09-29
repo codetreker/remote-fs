@@ -848,12 +848,13 @@ func (r *MutationResponse) UnmarshalJSON(data []byte) error {
 // name neither side has heard of. Message is for whoever reads the logs and carries no
 // meaning for the client.
 type ErrorResponse struct {
-	CapabilityCode string                `json:"capabilityCode,omitempty"`
-	FileRecorded   *bool                 `json:"fileRecorded,omitempty"`
-	FileResult     *fileResponse         `json:"fileResult,omitempty"`
-	Attempt        *storage.RangeAttempt `json:"attempt,omitempty"`
-	Errno          string                `json:"errno,omitempty"`
-	Message        string                `json:"message,omitempty"`
-	LockCode       locking.Code          `json:"lockCode,omitempty"`
-	Recorded       *bool                 `json:"recorded,omitempty"`
+	CapabilityCode        string                `json:"capabilityCode,omitempty"`
+	FileRecorded          *bool                 `json:"fileRecorded,omitempty"`
+	FileResult            *fileResponse         `json:"fileResult,omitempty"`
+	CloseNotExecutedEpoch uint64                `json:"closeNotExecutedEpoch,omitempty"`
+	Attempt               *storage.RangeAttempt `json:"attempt,omitempty"`
+	Errno                 string                `json:"errno,omitempty"`
+	Message               string                `json:"message,omitempty"`
+	LockCode              locking.Code          `json:"lockCode,omitempty"`
+	Recorded              *bool                 `json:"recorded,omitempty"`
 }

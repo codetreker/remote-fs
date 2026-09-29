@@ -375,9 +375,6 @@ func TestNodeReferenceDelegatesMetadataMutationPendingDeleteAndLifecycle(t *test
 	if err := ref.Retire(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	if err := ref.DropUse(t.Context()); err != nil {
-		t.Fatal(err)
-	}
 	if err := ref.Close(t.Context()); err != nil {
 		t.Fatal(err)
 	}
