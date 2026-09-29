@@ -20,11 +20,11 @@
 
 ## CI 工具链与缓存
 
-三个作业使用[共享 setup action](../.github/actions/setup-go/action.yml)固定 Go 1.26.8，并按作业、工具链、依赖和源码 SHA 保存 module／编译缓存；同作业前缀及经校验的旧快照可作为种子。两个 Linux 作业继续分担普通与挂载测试，Windows 作业只运行 native SSPI package 的 race test 与 vet。缓存复用编译工作，`-count=1` 仍使每次调用实际执行测试。包分配、race、覆盖率和严格 verdict 门禁不变。缓存上传也消耗时间与空间，净收益须看完整作业；原因与兼容边界见[缓存决定](../.agents/notes/implemented/process/2026-09-09-refresh-ci-go-build-caches.md)。
+四个作业使用[共享 setup action](../.github/actions/setup-go/action.yml)固定 Go 1.26.8，并按作业、工具链、依赖和源码 SHA 保存 module／编译缓存；同作业前缀及经校验的旧快照可作为种子。三个 Linux 作业分别运行非挂载的普通包、根 SQLite 包、挂载与端到端包；Windows 作业只运行 native SSPI package 的 race test 与 vet。缓存复用编译工作，`-count=1` 仍使每次调用实际执行测试。根 SQLite 包的单独调度不缩小 race、严格 verdict 或 module-wide 覆盖率门禁。缓存上传也消耗时间与空间，净收益须看完整作业；原因与兼容边界见[缓存决定](../.agents/notes/implemented/process/2026-09-09-refresh-ci-go-build-caches.md)。
 
 ## CI 执行预算
 
-checks 作业总上限为三十五分钟，其中 contract / unit 步骤以 `-race -count=1 -timeout 10m` 执行，每个包测试二进制的累计预算为十分钟。串行副本可见性验收以 `-timeout 5m` 执行整个包；这一进程预算与单项的一秒可见性判据分别成立。严格的 skip、无测试与缺失 verdict 检查继续执行，覆盖率门禁与包划分保持原义。预算依据、较晚发现整包挂起的代价及重新调查的条件见[执行预算决定](../.agents/notes/implemented/process/2026-09-23-budget-ci-full-load-execution.md)与[原有整包 race 预算](../.agents/notes/implemented/process/2026-09-08-budget-ci-race-test-execution.md)。
+checks 作业总上限为三十五分钟，`sqlite-race` 与 `mounted` 各有二十分钟作业上限。非挂载 race suite 在 `checks` 排除根 `./packages/metastore/sqlite`，它由 `sqlite-race` 单独通过 `assert-every-test-ran.sh -race -count=1 -timeout 10m ./packages/metastore/sqlite` 执行；SQLite 的内部子包仍随普通包运行。挂载包仍在 `mounted`。两个非挂载 race 调用与挂载 race 调用的每个测试二进制各有十分钟累计预算；独立 runner 不提高该 watchdog，也不允许跳过、无测试或缺失 verdict。受保护分支当前要求原有 `checks` 结果；workflow 让 `checks` 依赖 `sqlite-race`，在依赖失败或跳过时仍执行，并在最后明确核对依赖结果为 success，否则 `checks` 失败。新增作业的状态因此会进入现有必需检查，不依赖 ruleset 自动把新作业列为 required。`mounted` 的 module-wide coverage gate 继续测试整个模块，包含 SQLite。串行副本可见性验收在 `checks` 以 `-timeout 5m` 执行整个包；这一进程预算与单项的一秒可见性判据分别成立。作业隔离的理由见[SQLite race 调度决定](../.agents/notes/implemented/process/2026-09-29-isolate-sqlite-race-ci.md)；预算依据见[执行预算决定](../.agents/notes/implemented/process/2026-09-23-budget-ci-full-load-execution.md)与[原有整包 race 预算](../.agents/notes/implemented/process/2026-09-08-budget-ci-race-test-execution.md)。
 
 ## 覆盖率是必要的，从来不是充分的
 
@@ -378,7 +378,7 @@ session lifecycle 用例专门覆盖四条不能由普通成功 transcript 推�
 
 ### Azure Blob
 
-`packages/storage/objectstore/azblob` 对一个真的 Blob 端点跑，那个端点是 Azurite。它定义在 [`deployments/azurite.yml`](../deployments/azurite.yml)：本地 `make azurite` 起、`make azurite-down` 停；CI 的两个 Linux job 各自在依赖 Blob 的测试之前启动同一模拟器，并等待它能够回答请求。挂载 job 的真实 Azure 二进制锁与重启用例依赖该端点，因此启动步骤位于对拍和端到端测试之前；后面的全 module 覆盖率闸门继续使用这份模拟器。
+`packages/storage/objectstore/azblob` 对一个真的 Blob 端点跑，那个端点是 Azurite。它定义在 [`deployments/azurite.yml`](../deployments/azurite.yml)：本地 `make azurite` 起、`make azurite-down` 停；CI 的 `checks` 与 `mounted` 两个 Linux job 各自在依赖 Blob 的测试之前启动同一模拟器，并等待它能够回答请求。挂载 job 的真实 Azure 二进制锁与重启用例依赖该端点，因此启动步骤位于对拍和端到端测试之前；后面的全 module 覆盖率闸门继续使用这份模拟器。
 
 **够不到模拟器时这一层失败，不跳过。** 依赖缺席是一个必须报出来的事实，不是一个可以让用例自己消失的条件。
 
