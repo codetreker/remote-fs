@@ -114,6 +114,56 @@ func TestDropUseExactRequiresOriginalClaim(t *testing.T) {
 	}
 }
 
+func TestCloseUnlinkExemptsOnlyTheExactClosingClaim(t *testing.T) {
+	c := fixture(t, DefaultConfig())
+	closing := storage.UseScope{Token: "closing"}
+	other := storage.UseScope{Token: "other"}
+	claim := storage.UseClaim{Uses: storage.ReadData, Deny: storage.DeleteName}
+	if err := c.AddUse(background, 9, closing, claim); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.CheckUse(background, 9, closing, storage.DeleteName); !errors.Is(err, syscall.EBADF) {
+		t.Fatalf("closing reference gained ordinary delete access = %v", err)
+	}
+	if err := c.CheckCloseUnlink(background, 9, closing, claim); err != nil {
+		t.Fatalf("accepted obligation blocked by closing claim = %v", err)
+	}
+	for _, attempt := range []struct {
+		node  uint64
+		scope storage.UseScope
+		claim storage.UseClaim
+	}{
+		{10, closing, claim},
+		{9, other, claim},
+		{9, closing, storage.UseClaim{Uses: storage.ReadData}},
+	} {
+		if err := c.CheckCloseUnlink(background, attempt.node, attempt.scope, attempt.claim); !errors.Is(err, storage.ErrInvalidScope) {
+			t.Fatalf("inexact closing claim %+v = %v", attempt, err)
+		}
+	}
+	if err := c.AddUse(background, 9, other, claim); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.CheckCloseUnlink(background, 9, closing, claim); !errors.Is(err, storage.ErrUseConflict) {
+		t.Fatalf("another reference's denial was exempted = %v", err)
+	}
+	if err := c.DropUseExact(background, 9, other, claim); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.CheckCloseUnlink(background, 9, closing, claim); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.CheckUse(background, 9, storage.UseScope{}, storage.DeleteName); !errors.Is(err, storage.ErrUseConflict) {
+		t.Fatalf("cleanup check removed original protection = %v", err)
+	}
+	if err := c.DropUseExact(background, 9, closing, claim); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.CheckCloseUnlink(background, 9, closing, claim); !errors.Is(err, storage.ErrInvalidScope) {
+		t.Fatalf("released closing claim = %v", err)
+	}
+}
+
 func TestUseAndIOValidationRejectWithoutStateChange(t *testing.T) {
 	c := fixture(t, DefaultConfig())
 	ctx, cancel := context.WithCancel(background)
@@ -127,6 +177,9 @@ func TestUseAndIOValidationRejectWithoutStateChange(t *testing.T) {
 		func() error { return c.DropUse(background, 1, storage.UseScope{}) },
 		func() error { return c.CheckUse(background, 0, storage.UseScope{}, 0) },
 		func() error { return c.CheckUse(background, 1, storage.UseScope{}, 128) },
+		func() error { return c.CheckCloseUnlink(background, 0, scope, storage.UseClaim{}) },
+		func() error { return c.CheckCloseUnlink(background, 1, storage.UseScope{}, storage.UseClaim{}) },
+		func() error { return c.CheckCloseUnlink(background, 1, scope, storage.UseClaim{Uses: 128}) },
 		func() error { return c.CheckIO(background, 0, storage.UseScope{}, bytesRange(0, 1), storage.ReadData) },
 		func() error { return c.CheckIO(background, 1, storage.UseScope{}, storage.Range{}, storage.ReadData) },
 		func() error {
@@ -144,6 +197,7 @@ func TestUseAndIOValidationRejectWithoutStateChange(t *testing.T) {
 		func() error { return c.AddUse(ctx, 1, scope, storage.UseClaim{}) },
 		func() error { return c.DropUse(ctx, 1, scope) },
 		func() error { return c.CheckUse(ctx, 1, scope, 0) },
+		func() error { return c.CheckCloseUnlink(ctx, 1, scope, storage.UseClaim{}) },
 		func() error { return c.CheckIO(ctx, 1, scope, bytesRange(0, 1), storage.ReadData) },
 	} {
 		if err := call(); !errors.Is(err, context.Canceled) {

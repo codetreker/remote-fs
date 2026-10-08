@@ -216,7 +216,7 @@ func TestPendingCloseIntentFinalizationSurvivesFailedExactUseDrop(t *testing.T) 
 	opened, err := store.OpenAt(t.Context(), selectChild(storage.ChildName{Parent: directoryTarget(root), RawLeaf: []byte("victim")}), storage.OpenAtOptions{
 		Read: true, Write: true, Create: true, Exclusive: true, Existing: storage.Keep, Action: fileAction(t),
 		Target:      storage.ChildCondition{State: storage.Absent},
-		Use:         storage.UseClaim{Uses: storage.ReadData | storage.WriteData | storage.DeleteName},
+		Use:         storage.UseClaim{Uses: storage.ReadData | storage.WriteData | storage.DeleteName, Deny: storage.DeleteName},
 		CloseIntent: &storage.CloseIntent{Owner: testDeleteIntentOwner, ID: intentID, Trigger: storage.OnReferenceClose, Condition: storage.UnlinkFile},
 	})
 	if err != nil {

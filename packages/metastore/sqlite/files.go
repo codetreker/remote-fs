@@ -548,7 +548,10 @@ func (f *retainedFile) CloseWithResult(ctx context.Context) (storage.ReferenceCl
 	if count == 1 && !f.finalizationDone {
 		finalized, err := f.finalizeForCloseLocked(ctx)
 		if err != nil {
-			if s.coordinator.healthy() != nil || storage.IsPublicationAccountingUncertain(err) {
+			if errors.Is(err, storage.ErrInvalidScope) {
+				err = errors.Join(syscall.EIO, err)
+			}
+			if errors.Is(err, storage.ErrInvalidScope) || s.coordinator.healthy() != nil || storage.IsPublicationAccountingUncertain(err) {
 				result, fenceErr := f.poisonCloseLocked(err)
 				return result, errors.Join(sqlerr.Failure(terminalResult), fenceErr)
 			}
@@ -585,7 +588,7 @@ func (f *retainedFile) finalizeForCloseLocked(ctx context.Context) (bool, error)
 		return false, err
 	}
 	if state.PendingUnlink {
-		return true, s.finalizePendingUnlinkLocked(ctx, f.id)
+		return true, s.finalizePendingUnlinkLocked(ctx, f.id, f)
 	}
 	if state.State.Detached {
 		return true, s.mutateTransactionLocked(ctx, ctx, &volumeIntent{kind: locking.RemoveMutation, node: f.id, cleanup: true}, func(tx *sql.Tx) error {
