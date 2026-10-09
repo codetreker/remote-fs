@@ -96,6 +96,71 @@ type transientCloseQueryReference struct {
 	queries atomic.Int32
 }
 
+type recordedCloseResult struct {
+	result      storage.ReferenceCloseResult
+	err         error
+	lostReplies int32
+	calls       atomic.Int32
+}
+
+type recordedCloseReference struct {
+	*concurrentCloseReference
+	results map[storage.CloseAttempt]*recordedCloseResult
+}
+
+func (f *recordedCloseReference) CloseWithAction(_ context.Context, attempt storage.CloseAttempt) (storage.ReferenceCloseResult, error) {
+	recorded := f.results[attempt]
+	if recorded == nil {
+		return storage.ReferenceCloseResult{}, syscall.EINVAL
+	}
+	calls := recorded.calls.Add(1)
+	if calls == 1 && recorded.result.Released {
+		f.release()
+	}
+	if calls <= recorded.lostReplies {
+		return storage.ReferenceCloseResult{}, syscall.EIO
+	}
+	return recorded.result, recorded.err
+}
+
+func (f *recordedCloseReference) QueryCloseAttempt(_ context.Context, attempt storage.CloseAttempt) (storage.FileActionReceipt, error) {
+	recorded := f.results[attempt]
+	if recorded == nil {
+		return storage.FileActionReceipt{}, syscall.EINVAL
+	}
+	outcome := storage.FileActionNotExecuted
+	if recorded.calls.Load() > 0 {
+		outcome = storage.FileActionCompleted
+	}
+	return storage.FileActionReceipt{Action: attempt.Action, Operation: storage.OpFileClose, Outcome: outcome}, nil
+}
+
+func (f *recordedCloseReference) CloseOwnerStatus(context.Context) (storage.CloseOwnerStatus, error) {
+	status := storage.CloseOwnerStatus{Released: f.released.Load(), NextGeneration: 1, CurrentEpoch: 1}
+	status.Ready = !status.Released
+	for attempt, recorded := range f.results {
+		if recorded.calls.Load() > 0 {
+			status.NextGeneration = max(status.NextGeneration, attempt.Generation+1)
+		}
+	}
+	return status, status.Check()
+}
+
+type recordedCloseSession struct {
+	storage.FileSession
+	file    *recordedCloseReference
+	cleanup storage.CloseAttempt
+	calls   atomic.Int32
+}
+
+func (s *recordedCloseSession) CloseWithResult(ctx context.Context) (storage.ReferenceCloseResult, error) {
+	s.calls.Add(1)
+	if s.file.released.Load() {
+		return storage.ReferenceCloseResult{Released: true, Determined: true}, nil
+	}
+	return s.file.CloseWithAction(ctx, s.cleanup)
+}
+
 func (f *transientCloseQueryReference) QueryCloseAttempt(ctx context.Context, attempt storage.CloseAttempt) (storage.FileActionReceipt, error) {
 	if f.queries.Add(1) == 1 {
 		return storage.FileActionReceipt{}, syscall.EIO
@@ -627,6 +692,94 @@ func TestHTTPTransientCloseQueryFailureRetainsRecoveryOwner(t *testing.T) {
 			assertConcurrentCloseRecovered(t, handler, request, [32]byte{2})
 			if query.queries.Load() != 2 || closeCalls.Load() != 2 || sessionCalls.Load() != 1 || file.effects.Load() != 1 {
 				t.Fatalf("query recovery repeated native cleanup: queries=%d closeCalls=%d sessionCloses=%d effects=%d", query.queries.Load(), closeCalls.Load(), sessionCalls.Load(), file.effects.Load())
+			}
+		})
+	}
+}
+
+func TestHTTPCompletedCloseQueryRequiresExactResult(t *testing.T) {
+	for _, fact := range []struct {
+		name        string
+		result      storage.ReferenceCloseResult
+		err         error
+		lostReplies int32
+	}{
+		{"undetermined-replay", storage.ReferenceCloseResult{Released: true, Determined: true}, syscall.ENOTEMPTY, 2},
+		{"historical-retained", storage.ReferenceCloseResult{Determined: true}, syscall.ENOSPC, 1},
+	} {
+		t.Run(fact.name, func(t *testing.T) {
+			for _, retirement := range []string{"explicit", "background"} {
+				t.Run(retirement, func(t *testing.T) {
+					handler, session, file, _, _, request := concurrentCloseFixture(t)
+					laterID, err := storage.NewFileActionID(1)
+					if err != nil {
+						t.Fatal(err)
+					}
+					first := storage.CloseAttempt{Action: storage.FileActionID(request.Action), Generation: request.CloseGeneration}
+					later := storage.CloseAttempt{Action: laterID, Generation: 2}
+					reference := &recordedCloseReference{concurrentCloseReference: file, results: map[storage.CloseAttempt]*recordedCloseResult{
+						first: {result: fact.result, err: fact.err, lostReplies: fact.lostReplies},
+						later: {result: storage.ReferenceCloseResult{Released: true, Determined: true}},
+					}}
+					native := &recordedCloseSession{file: reference, cleanup: later}
+					session.native = native
+					session.files["file"].native = reference
+					response, err := handler.fileCall(t.Context(), request, [32]byte{2})
+					if response.CloseResult == nil || response.CloseResult.Determined || !errors.Is(err, syscall.EIO) {
+						t.Fatalf("lost initial result=%+v err=%v", response.CloseResult, err)
+					}
+					if retirement == "explicit" {
+						closeID, err := storage.NewLockRequestID(1)
+						if err != nil {
+							t.Fatal(err)
+						}
+						response, err := handler.fileCall(t.Context(), fileRequest{Op: storage.OpFileSessionClose, Session: "session", Action: closeID, CloseGeneration: 1}, [32]byte{3})
+						if response.CloseResult == nil || !response.CloseResult.Released || err != nil {
+							t.Fatalf("session release=%+v err=%v", response.CloseResult, err)
+						}
+					} else {
+						session.mu.Lock()
+						session.retired = true
+						session.mu.Unlock()
+						handler.files.closeRetiringSession("session", session, false)
+					}
+					if fact.lostReplies > 1 {
+						handler.files.mu.Lock()
+						active, terminal := handler.files.sessions["session"], handler.files.terminalCloses["session"]
+						handler.files.mu.Unlock()
+						session.mu.Lock()
+						retained := session.closeReconciling && session.files["file"] != nil
+						session.mu.Unlock()
+						if active != session || terminal != nil || !retained {
+							t.Fatal("Completed query discarded ownership before the exact result was known")
+						}
+						handler.files.closeRetiringSession("session", session, false)
+					}
+					handler.files.mu.Lock()
+					active, terminal := handler.files.sessions["session"], handler.files.terminalCloses["session"]
+					handler.files.mu.Unlock()
+					if active != nil || terminal == nil {
+						t.Fatal("determined exact result did not complete retirement")
+					}
+					response, err = handler.fileCall(t.Context(), request, [32]byte{2})
+					if response.CloseResult == nil || !response.CloseResult.Determined || response.CloseResult.Released != fact.result.Released || response.CloseResult.BarrierPending || !errors.Is(err, fact.err) || errors.Is(err, syscall.EIO) {
+						t.Fatalf("exact action result changed after retirement: result=%+v err=%v", response.CloseResult, err)
+					}
+					if (response.Barrier != nil) != fact.result.Released {
+						t.Fatalf("release barrier does not match original result: result=%+v barrier=%+v", response.CloseResult, response.Barrier)
+					}
+					receipt, err := handler.fileCall(t.Context(), fileRequest{Op: storage.OpFileQueryAction, Session: "session", File: "file", FileAction: first.Action, CloseGeneration: first.Generation}, [32]byte{})
+					if err != nil || receipt.ActionReceipt == nil || receipt.ActionReceipt.Outcome != storage.FileActionCompleted {
+						t.Fatalf("exact action receipt=%+v err=%v", receipt.ActionReceipt, err)
+					}
+					laterCalls := int32(0)
+					if !fact.result.Released {
+						laterCalls = 1
+					}
+					if reference.results[first].calls.Load() != fact.lostReplies+1 || reference.results[later].calls.Load() != laterCalls || native.calls.Load() != 1 || file.effects.Load() != 1 {
+						t.Fatalf("exact result retrieval repeated effects: original=%d later=%d session=%d effects=%d", reference.results[first].calls.Load(), reference.results[later].calls.Load(), native.calls.Load(), file.effects.Load())
+					}
+				})
 			}
 		})
 	}

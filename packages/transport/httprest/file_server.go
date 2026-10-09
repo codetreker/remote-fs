@@ -491,6 +491,7 @@ func (r *fileRegistry) reconcileReleasedClose(ctx context.Context, session *serv
 		attempt := storage.CloseAttempt{Action: actionID, Generation: action.closeGeneration}
 		var result storage.ReferenceCloseResult
 		var closeErr error
+		boundCompleted := false
 		if action.closeImplicit {
 			result, closeErr = file.native.CloseWithResult(ctx)
 		} else {
@@ -498,16 +499,20 @@ func (r *fileRegistry) reconcileReleasedClose(ctx context.Context, session *serv
 			if queryErr != nil {
 				settled = false
 			} else if receipt.Outcome == storage.FileActionCompleted && receipt.Action == actionID {
+				boundCompleted = true
 				result, closeErr = closer.CloseWithAction(ctx, attempt)
+				if !result.Released && !result.Determined {
+					settled = false
+				}
 			}
 		}
-		if result.Released {
+		if result.Released || boundCompleted && result.Determined {
 			action.response.CloseResult = referenceCloseResultOf(result)
-			action.response.CloseResult.BarrierPending = true
+			action.response.CloseResult.BarrierPending = result.Released
 			action.response.Barrier = nil
 			action.closeSemanticErr = retainFileError(closeErr)
 			action.err = action.closeSemanticErr
-			action.barrierPending = true
+			action.barrierPending = result.Released
 			session.mu.Lock()
 			action.uncertain = false
 			action.expires = time.Now().Add(session.options.History)
