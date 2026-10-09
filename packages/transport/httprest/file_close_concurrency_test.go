@@ -91,6 +91,18 @@ type concurrentCloseCall struct {
 	err      error
 }
 
+type transientCloseQueryReference struct {
+	*concurrentCloseReference
+	queries atomic.Int32
+}
+
+func (f *transientCloseQueryReference) QueryCloseAttempt(ctx context.Context, attempt storage.CloseAttempt) (storage.FileActionReceipt, error) {
+	if f.queries.Add(1) == 1 {
+		return storage.FileActionReceipt{}, syscall.EIO
+	}
+	return f.concurrentCloseReference.QueryCloseAttempt(ctx, attempt)
+}
+
 func concurrentCloseFixture(t *testing.T) (*Handler, *servedFileSession, *concurrentCloseReference, *concurrentCloseLog, fileRequest, fileRequest) {
 	t.Helper()
 	implicitID, err := storage.NewLockRequestID(1)
@@ -551,4 +563,71 @@ func TestHTTPDeferredSessionPublicationRetainsOneNativeReleaseError(t *testing.T
 		t.Fatalf("native release error lost at terminal: %v", terminal)
 	}
 	assertConcurrentCloseRecovered(t, handler, implicit, [32]byte{1})
+}
+
+func TestHTTPTransientCloseQueryFailureRetainsRecoveryOwner(t *testing.T) {
+	for _, retirement := range []string{"explicit", "background"} {
+		t.Run(retirement, func(t *testing.T) {
+			handler, session, file, _, _, request := concurrentCloseFixture(t)
+			query := &transientCloseQueryReference{concurrentCloseReference: file}
+			session.files["file"].native = query
+			var closeCalls, sessionCalls atomic.Int32
+			file.explicit = func(context.Context) (storage.ReferenceCloseResult, error) {
+				result, err := file.release()
+				if closeCalls.Add(1) == 1 {
+					return storage.ReferenceCloseResult{}, syscall.EIO
+				}
+				return result, err
+			}
+			native := session.native.(concurrentCloseSession)
+			native.closing = func(context.Context) { sessionCalls.Add(1) }
+			session.native = native
+			response, err := handler.fileCall(t.Context(), request, [32]byte{2})
+			if response.CloseResult == nil || response.CloseResult.Determined || !errors.Is(err, syscall.EIO) || file.effects.Load() != 1 {
+				t.Fatalf("hidden native release=%+v err=%v effects=%d", response.CloseResult, err, file.effects.Load())
+			}
+			if retirement == "explicit" {
+				closeID, err := storage.NewLockRequestID(1)
+				if err != nil {
+					t.Fatal(err)
+				}
+				response, err := handler.fileCall(t.Context(), fileRequest{Op: storage.OpFileSessionClose, Session: "session", Action: closeID, CloseGeneration: 1}, [32]byte{3})
+				if response.CloseResult == nil || !response.CloseResult.Released || err != nil {
+					t.Fatalf("session release=%+v err=%v", response.CloseResult, err)
+				}
+			} else {
+				session.mu.Lock()
+				session.retired = true
+				session.mu.Unlock()
+				handler.files.closeRetiringSession("session", session, false)
+			}
+			if t.Context().Err() != nil || query.queries.Load() != 1 {
+				t.Fatalf("query failure did not use a live context: err=%v queries=%d", t.Context().Err(), query.queries.Load())
+			}
+			handler.files.mu.Lock()
+			active, terminal := handler.files.sessions["session"], handler.files.terminalCloses["session"]
+			handler.files.mu.Unlock()
+			session.mu.Lock()
+			retained := session.files["file"] != nil && session.closeReconciling
+			session.mu.Unlock()
+			if active != session || terminal != nil || !retained {
+				t.Fatal("failed query discarded the exact native recovery owner")
+			}
+			receipt, err := handler.fileCall(t.Context(), fileRequest{Op: storage.OpFileQueryAction, Session: "session", FileAction: storage.FileActionID(request.Action)}, [32]byte{})
+			if err != nil || receipt.ActionReceipt == nil || receipt.ActionReceipt.Outcome != storage.FileActionUnknown {
+				t.Fatalf("failed query changed the unresolved receipt=%+v err=%v", receipt.ActionReceipt, err)
+			}
+			handler.files.closeRetiringSession("session", session, false)
+			handler.files.mu.Lock()
+			active, terminal = handler.files.sessions["session"], handler.files.terminalCloses["session"]
+			handler.files.mu.Unlock()
+			if active != nil || terminal == nil {
+				t.Fatal("successful native query did not complete deferred retirement")
+			}
+			assertConcurrentCloseRecovered(t, handler, request, [32]byte{2})
+			if query.queries.Load() != 2 || closeCalls.Load() != 2 || sessionCalls.Load() != 1 || file.effects.Load() != 1 {
+				t.Fatalf("query recovery repeated native cleanup: queries=%d closeCalls=%d sessionCloses=%d effects=%d", query.queries.Load(), closeCalls.Load(), sessionCalls.Load(), file.effects.Load())
+			}
+		})
+	}
 }

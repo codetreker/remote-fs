@@ -495,7 +495,9 @@ func (r *fileRegistry) reconcileReleasedClose(ctx context.Context, session *serv
 			result, closeErr = file.native.CloseWithResult(ctx)
 		} else {
 			receipt, queryErr := closer.QueryCloseAttempt(ctx, attempt)
-			if queryErr == nil && receipt.Outcome == storage.FileActionCompleted && receipt.Action == actionID {
+			if queryErr != nil {
+				settled = false
+			} else if receipt.Outcome == storage.FileActionCompleted && receipt.Action == actionID {
 				result, closeErr = closer.CloseWithAction(ctx, attempt)
 			}
 		}
