@@ -1564,6 +1564,14 @@ func TestHTTPSessionRetirementReconcilesUnknownFileClose(t *testing.T) {
 	if result.Released || result.Determined || !errors.Is(err, syscall.EIO) {
 		t.Fatalf("suppressed native release=%+v err=%v", result, err)
 	}
+	receipt, err := file.QueryCloseAttempt(t.Context(), attempt)
+	if err != nil || receipt.Action != id || receipt.Operation != storage.OpFileClose || receipt.Outcome != storage.FileActionCompleted {
+		t.Fatalf("bound native close receipt=%+v err=%v", receipt, err)
+	}
+	unbound, err := client.fileCall(t.Context(), fileRequest{Op: storage.OpFileQueryAction, Session: file.session.id, FileAction: id})
+	if err != nil || unbound.ActionReceipt == nil || unbound.ActionReceipt.Outcome != storage.FileActionUnknown {
+		t.Fatalf("bound query changed the HTTP close result: receipt=%+v err=%v", unbound.ActionReceipt, err)
+	}
 	handler.files.mu.Lock()
 	served := handler.files.sessions[file.session.id]
 	handler.files.mu.Unlock()
@@ -1579,7 +1587,7 @@ func TestHTTPSessionRetirementReconcilesUnknownFileClose(t *testing.T) {
 	if !result.Released || !result.Determined || err != nil {
 		t.Fatalf("same-ID terminal reconciliation=%+v err=%v", result, err)
 	}
-	receipt, err := file.QueryCloseAttempt(t.Context(), attempt)
+	receipt, err = file.QueryCloseAttempt(t.Context(), attempt)
 	if err != nil || receipt.Outcome != storage.FileActionCompleted || receipt.Action != id {
 		t.Fatalf("terminal close receipt=%+v err=%v", receipt, err)
 	}

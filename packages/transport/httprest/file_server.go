@@ -864,6 +864,9 @@ func (h *Handler) fileCall(ctx context.Context, req fileRequest, digest [32]byte
 							action.retryMu.Unlock()
 							return fileResponse{}, queryErr
 						}
+						if bound.Action == req.FileAction && bound.Operation == storage.OpFileClose && bound.Outcome == storage.FileActionCompleted {
+							outcome = storage.FileActionCompleted
+						}
 						if bound.Outcome == storage.FileActionNotExecuted {
 							owner, ownerErr := closer.CloseOwnerStatus(ctx)
 							if ownerErr != nil {

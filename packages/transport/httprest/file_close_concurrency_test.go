@@ -108,6 +108,15 @@ type recordedCloseReference struct {
 	results map[storage.CloseAttempt]*recordedCloseResult
 }
 
+type unrelatedCloseQueryReference struct {
+	*recordedCloseReference
+	receipt storage.FileActionReceipt
+}
+
+func (f *unrelatedCloseQueryReference) QueryCloseAttempt(context.Context, storage.CloseAttempt) (storage.FileActionReceipt, error) {
+	return f.receipt, nil
+}
+
 func (f *recordedCloseReference) CloseWithAction(_ context.Context, attempt storage.CloseAttempt) (storage.ReferenceCloseResult, error) {
 	recorded := f.results[attempt]
 	if recorded == nil {
@@ -692,6 +701,105 @@ func TestHTTPTransientCloseQueryFailureRetainsRecoveryOwner(t *testing.T) {
 			assertConcurrentCloseRecovered(t, handler, request, [32]byte{2})
 			if query.queries.Load() != 2 || closeCalls.Load() != 2 || sessionCalls.Load() != 1 || file.effects.Load() != 1 {
 				t.Fatalf("query recovery repeated native cleanup: queries=%d closeCalls=%d sessionCloses=%d effects=%d", query.queries.Load(), closeCalls.Load(), sessionCalls.Load(), file.effects.Load())
+			}
+		})
+	}
+}
+
+func TestHTTPBoundCloseQueryReportsNativeCompletion(t *testing.T) {
+	for _, released := range []bool{false, true} {
+		name := "retained"
+		if released {
+			name = "released"
+		}
+		t.Run(name, func(t *testing.T) {
+			handler, session, file, log, _, request := concurrentCloseFixture(t)
+			attempt := storage.CloseAttempt{Action: storage.FileActionID(request.Action), Generation: request.CloseGeneration}
+			recorded := &recordedCloseResult{
+				result: storage.ReferenceCloseResult{Released: released, Determined: true},
+				err:    syscall.ENOTEMPTY, lostReplies: 1,
+			}
+			reference := &recordedCloseReference{concurrentCloseReference: file, results: map[storage.CloseAttempt]*recordedCloseResult{attempt: recorded}}
+			session.files["file"].native = reference
+			log.fail.Store(true)
+			response, err := handler.fileCall(t.Context(), request, [32]byte{2})
+			if response.CloseResult == nil || response.CloseResult.Determined || !errors.Is(err, syscall.EIO) {
+				t.Fatalf("lost initial result=%+v err=%v", response.CloseResult, err)
+			}
+			query := fileRequest{Op: storage.OpFileQueryAction, Session: "session", File: "file", FileAction: attempt.Action, CloseGeneration: attempt.Generation}
+			receipt, err := handler.fileCall(t.Context(), query, [32]byte{})
+			if err != nil || receipt.ActionReceipt == nil || receipt.ActionReceipt.Action != attempt.Action || receipt.ActionReceipt.Operation != storage.OpFileClose || receipt.ActionReceipt.Outcome != storage.FileActionCompleted {
+				t.Fatalf("bound native completion=%+v err=%v", receipt.ActionReceipt, err)
+			}
+			session.mu.Lock()
+			action, retained := session.actions[request.Action], session.files["file"] != nil
+			session.mu.Unlock()
+			action.retryMu.Lock()
+			unchanged := action.response.CloseResult != nil && !action.response.CloseResult.Determined && !action.response.CloseResult.Released && action.response.Barrier == nil && !action.barrierPending && action.uncertain && errors.Is(action.err, syscall.EIO)
+			action.retryMu.Unlock()
+			if !unchanged || !retained || recorded.calls.Load() != 1 {
+				t.Fatalf("query changed unresolved close: unchanged=%v retained=%v calls=%d", unchanged, retained, recorded.calls.Load())
+			}
+			query.File = ""
+			receipt, err = handler.fileCall(t.Context(), query, [32]byte{})
+			if err != nil || receipt.ActionReceipt == nil || receipt.ActionReceipt.Outcome != storage.FileActionUnknown {
+				t.Fatalf("unbound query inferred completion=%+v err=%v", receipt.ActionReceipt, err)
+			}
+			query.File, query.CloseGeneration = "file", attempt.Generation+1
+			if _, err := handler.fileCall(t.Context(), query, [32]byte{}); !errors.Is(err, syscall.EINVAL) {
+				t.Fatalf("wrong generation query=%v", err)
+			}
+			response, err = handler.fileCall(t.Context(), request, [32]byte{2})
+			if response.CloseResult == nil || !response.CloseResult.Determined || response.CloseResult.Released != released || response.CloseResult.BarrierPending != released || !errors.Is(err, syscall.ENOTEMPTY) || errors.Is(err, syscall.EIO) != released {
+				t.Fatalf("same-ID exact result=%+v err=%v", response.CloseResult, err)
+			}
+			log.fail.Store(false)
+			response, err = handler.fileCall(t.Context(), request, [32]byte{2})
+			if response.CloseResult == nil || !response.CloseResult.Determined || response.CloseResult.Released != released || response.CloseResult.BarrierPending || (response.Barrier != nil) != released || !errors.Is(err, syscall.ENOTEMPTY) || errors.Is(err, syscall.EIO) {
+				t.Fatalf("settled same-ID result=%+v barrier=%+v err=%v", response.CloseResult, response.Barrier, err)
+			}
+			expectedEffects := int32(0)
+			if released {
+				expectedEffects = 1
+			}
+			if recorded.calls.Load() != 2 || file.effects.Load() != expectedEffects {
+				t.Fatalf("query/replay repeated native close: calls=%d effects=%d", recorded.calls.Load(), file.effects.Load())
+			}
+		})
+	}
+}
+
+func TestHTTPBoundCloseQueryRejectsUnrelatedNativeCompletion(t *testing.T) {
+	for _, mismatch := range []string{"action", "operation"} {
+		t.Run(mismatch, func(t *testing.T) {
+			handler, session, file, _, _, request := concurrentCloseFixture(t)
+			attempt := storage.CloseAttempt{Action: storage.FileActionID(request.Action), Generation: request.CloseGeneration}
+			recorded := &recordedCloseResult{result: storage.ReferenceCloseResult{Determined: true}, err: syscall.ENOSPC, lostReplies: 1}
+			reference := &unrelatedCloseQueryReference{
+				recordedCloseReference: &recordedCloseReference{concurrentCloseReference: file, results: map[storage.CloseAttempt]*recordedCloseResult{attempt: recorded}},
+				receipt:                storage.FileActionReceipt{Action: attempt.Action, Operation: storage.OpFileClose, Outcome: storage.FileActionCompleted},
+			}
+			if mismatch == "action" {
+				id, err := storage.NewFileActionID(1)
+				if err != nil {
+					t.Fatal(err)
+				}
+				reference.receipt.Action = id
+			} else {
+				reference.receipt.Operation = storage.OpFileSessionClose
+			}
+			session.files["file"].native = reference
+			response, err := handler.fileCall(t.Context(), request, [32]byte{2})
+			if response.CloseResult == nil || response.CloseResult.Determined || !errors.Is(err, syscall.EIO) {
+				t.Fatalf("lost initial result=%+v err=%v", response.CloseResult, err)
+			}
+			query := fileRequest{Op: storage.OpFileQueryAction, Session: "session", File: "file", FileAction: attempt.Action, CloseGeneration: attempt.Generation}
+			receipt, err := handler.fileCall(t.Context(), query, [32]byte{})
+			if err != nil || receipt.ActionReceipt == nil || receipt.ActionReceipt.Action != attempt.Action || receipt.ActionReceipt.Operation != storage.OpFileClose || receipt.ActionReceipt.Outcome != storage.FileActionUnknown {
+				t.Fatalf("unrelated native completion accepted: receipt=%+v err=%v", receipt.ActionReceipt, err)
+			}
+			if recorded.calls.Load() != 1 || file.effects.Load() != 0 {
+				t.Fatalf("query caused native close: calls=%d effects=%d", recorded.calls.Load(), file.effects.Load())
 			}
 		})
 	}
