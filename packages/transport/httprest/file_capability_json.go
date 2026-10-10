@@ -11,7 +11,7 @@ func validateCapabilityArguments(req fileRequest) error {
 	switch req.Op {
 	case storage.OpFileScope:
 		return nil
-	case storage.OpFileState:
+	case storage.OpFileState, storage.OpFileCloseOwnerStatus:
 		return nil
 	case storage.OpFileQueryAction:
 		return req.FileAction.Check()

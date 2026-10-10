@@ -5,17 +5,20 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"github.com/codetreker/remote-fs/packages/storage"
 	"io"
 	"net"
 	"reflect"
 	"strings"
 	"sync"
+	"syscall"
 	"unicode/utf8"
 )
 
 type Server struct {
-	config Config
-	// Package tests can select a deterministic comparer on non-Windows hosts.
+	handleMu     sync.Mutex
+	handleOwners map[*fileHandle]struct{}
+	config       Config
 	nameComparer nameComparer
 
 	mu              sync.Mutex
@@ -92,7 +95,7 @@ func shareKey(name string) (string, error) {
 // acquires no file session and never takes ownership of the backend.
 func (s *Server) Publish(share Share) (*Export, error) {
 	key, err := shareKey(share.Name)
-	if err != nil || key == "IPC$" || share.Volume == "" || interfaceNil(share.Backend) {
+	if err != nil || key == "IPC$" || share.Volume == "" || share.BackendVolume == "" || share.RootNodeID == 0 || interfaceNil(share.Backend) {
 		return nil, ErrConfig
 	}
 	e := &Export{server: s, share: share, key: key, active: 1}
@@ -109,6 +112,14 @@ func (s *Server) Publish(share Share) (*Export, error) {
 	s.mu.Unlock()
 
 	err = share.Backend.CheckFileStorage()
+	if err == nil {
+		identity, ok := share.Backend.(storage.BackendIdentity)
+		if !ok {
+			err = syscall.EOPNOTSUPP
+		} else {
+			err = identity.CheckBackendIdentity()
+		}
+	}
 	s.mu.Lock()
 	e.active--
 	if err == nil && (s.stopping || e.stopping) {

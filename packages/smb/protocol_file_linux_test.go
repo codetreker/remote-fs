@@ -28,7 +28,11 @@ func startRealFileProtocolServer(t *testing.T) (realSMBFixture, net.Conn) {
 	}
 	server.nameComparer = testNameCompare
 	fixture.server = server
-	if _, err := server.Publish(Share{Name: "data", Volume: "files", Backend: fixture.volume}); err != nil {
+	identity, err := fixture.volume.BackendIdentity(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.Publish(Share{Name: "data", Volume: "files", BackendVolume: identity.Volume, RootNodeID: identity.RootNodeID, Backend: fixture.volume}); err != nil {
 		t.Fatal(err)
 	}
 	listener, err := net.Listen("tcp4", "127.0.0.1:0")
@@ -84,7 +88,7 @@ func TestSignedRelatedCreateCloseReportsAuthoritativeAllocation(t *testing.T) {
 				t.Fatalf("authority allocation for size %d = %+v, %v", test.size, attr, err)
 			}
 
-			create := createRequestForTest(name, 1, accessReadData)
+			create := createRequestForTest(name, 1, accessReadData|accessReadAttr)
 			closeBody := make([]byte, 24)
 			binary.LittleEndian.PutUint16(closeBody, 24)
 			binary.LittleEndian.PutUint16(closeBody[2:], 1)

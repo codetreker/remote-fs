@@ -75,7 +75,7 @@ func startConfiguredProtocolServer(t *testing.T, config Config) (*Server, *endpo
 		t.Fatal(err)
 	}
 	backend := &endpointStorage{session: newEndpointFileSession()}
-	if _, err := server.Publish(Share{Name: "data", Volume: "volume", Backend: backend}); err != nil {
+	if _, err := server.Publish(Share{Name: "data", Volume: "volume", BackendVolume: "test-volume", RootNodeID: 1, Backend: backend}); err != nil {
 		t.Fatal(err)
 	}
 	listener, err := net.Listen("tcp4", "127.0.0.1:0")
@@ -435,22 +435,17 @@ func TestAuthenticatedControlTranscriptAndUnsupportedCommands(t *testing.T) {
 	}
 	treeID := header.TreeID
 
-	for index, command := range []uint16{wire.Flush, wire.Read, wire.Write, wire.Lock, wire.QueryDirectory, wire.ChangeNotify, wire.QueryInfo, wire.SetInfo} {
+	for index, command := range []uint16{wire.Create, wire.Close, wire.Flush, wire.Read, wire.Write, wire.Lock, wire.QueryDirectory, wire.ChangeNotify, wire.QueryInfo, wire.SetInfo} {
 		packet := signedRequest(t, key, wire.Header{Command: command, MessageID: uint64(5 + index), SessionID: sessionID, TreeID: treeID, Credits: 1}, []byte{2, 0})
 		sendFrame(t, connection, packet)
 		response = readFrame(t, connection)
 		header, _ = wire.ParseHeader(response)
-		if header.Status != statusUnsupported || key.Verify(response) != nil {
-			t.Fatalf("command %d = %+v", command, header)
+		expected := statusUnsupported
+		if command == wire.Create || command == wire.Close {
+			expected = statusInvalid
 		}
-	}
-	for index, command := range []uint16{wire.Create, wire.Close} {
-		packet := signedRequest(t, key, wire.Header{Command: command, MessageID: uint64(20 + index), SessionID: sessionID, TreeID: treeID, Credits: 1}, []byte{2, 0})
-		sendFrame(t, connection, packet)
-		response = readFrame(t, connection)
-		header, _ = wire.ParseHeader(response)
-		if header.Status != statusInvalid || key.Verify(response) != nil {
-			t.Fatalf("malformed command %d = %+v", command, header)
+		if header.Status != expected || key.Verify(response) != nil {
+			t.Fatalf("command %d = %+v", command, header)
 		}
 	}
 	if calls := backend.dataCalls.Load(); calls != 0 {

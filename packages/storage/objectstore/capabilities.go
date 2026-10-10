@@ -107,11 +107,12 @@ func (fs *fileSession) openAt(ctx context.Context, selection storage.ChildSelect
 		return opened, fs.finishOpen(nil, err)
 	}
 	file := &openFile{
-		session: fs,
-		native:  result.File,
-		uses:    referenceUses{nodeID: uint64(result.State.ID)},
-		options: storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: options.Read, Write: options.Write}},
-		active:  true,
+		session:  fs,
+		native:   result.File,
+		uses:     referenceUses{nodeID: uint64(result.State.ID)},
+		options:  storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: options.Read, Write: options.Write}},
+		metadata: options.MetadataAccess,
+		active:   true,
 	}
 	opened.File = file
 	err = fs.finishOpen(file, err)
@@ -174,7 +175,8 @@ func (fs *fileSession) openNodeReference(ctx context.Context, open func(context.
 	if result.Reference == nil {
 		return opened, fs.finishOpen(nil, err)
 	}
-	reference := &nodeReference{session: fs, native: result.Reference, uses: referenceUses{nodeID: uint64(result.State.ID)}, active: true}
+	reference := &nodeReference{session: fs, native: result.Reference, uses: referenceUses{nodeID: uint64(result.State.ID)}, active: true,
+		closing: referenceCloseState{next: 1}}
 	opened.Reference = reference
 	err = fs.finishOpen(reference, err)
 	return opened, err
@@ -328,6 +330,9 @@ func (f *openFile) Scope(ctx context.Context) (storage.UseScope, error) {
 func (f *openFile) CheckMetadataAccess() error { return f.native.CheckMetadataAccess() }
 
 func (f *openFile) SetMetadata(ctx context.Context, namespace string, expected, data []byte) (storage.OpaquePayload, error) {
+	if f.metadata&storage.WriteMetadata == 0 {
+		return storage.OpaquePayload{}, syscall.EBADF
+	}
 	if err := f.CheckMetadataAccess(); err != nil {
 		return storage.OpaquePayload{}, err
 	}

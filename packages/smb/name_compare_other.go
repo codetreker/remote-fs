@@ -2,7 +2,6 @@
 
 package smb
 
-import "syscall"
-
-func nameComparisonAvailable() error                    { return syscall.EOPNOTSUPP }
-func nativeNameCompare([]uint16, []uint16) (int, error) { return 0, syscall.EOPNOTSUPP }
+func platformNameComparer() (nameComparer, error) {
+	return portableNameCompare, nil
+}

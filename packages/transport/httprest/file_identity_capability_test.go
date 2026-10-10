@@ -519,7 +519,7 @@ func TestLostSemanticOpenResponsesReplayTheOriginalCapability(t *testing.T) {
 				switch operation {
 				case storage.OpFileOpenAt:
 					result, openErr := session.OpenAt(t.Context(), storage.ChildSelection{Name: storage.ChildName{Parent: storage.DirectoryTarget{NodeID: parent.ID}, RawLeaf: []byte("file")}}, storage.OpenAtOptions{
-						Read: true, Target: storage.ChildCondition{State: storage.SameNode, NodeID: file.ID}, Action: action,
+						Read: true, MetadataAccess: storage.ReadMetadata, Target: storage.ChildCondition{State: storage.SameNode, NodeID: file.ID}, Action: action,
 						Use: storage.UseClaim{Uses: storage.ReadData}, Existing: storage.Keep,
 					})
 					return result.File, openErr

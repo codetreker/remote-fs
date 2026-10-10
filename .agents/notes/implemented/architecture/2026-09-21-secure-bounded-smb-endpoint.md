@@ -2,8 +2,6 @@
 
 Status: implemented
 
-[有界 SMB 文件引用](2026-09-23-bounded-smb-file-handles.md)在本决定的 session/tree 基础上交付 CREATE/CLOSE、FileId 和 tree 文件工作清理。本文的命令支持范围与文件引用延期描述属于端点基础交付时的决定；端点目前的完整支持面见[本机 SMB 端点](../../../../docs/design/client/smb-endpoint.md)。
-
 ## 问题
 
 Windows 系统网络驱动器需要一个由系统 SMB client 能够连接的本机端点。若文件适配先于协议安全与资源所有权落地，后续补签名、认证到期或 session retirement 会改变每个命令的入口和清理顺序；文件 handle、共享限制和删除义务都会建在不可依赖的会话上。
@@ -16,7 +14,7 @@ SMB frame、compound request、authentication token、connection、session、tre
 
 ### 协议安全先于文件命令
 
-本决定交付的 `packages/smb` 本机 endpoint 只成功处理 SMB framing bootstrap、SMB 3.1.1 NEGOTIATE、SESSION_SETUP、ECHO、TREE_CONNECT、TREE_DISCONNECT 与 LOGOFF。当时已识别但未实现的 CREATE、CLOSE、READ、WRITE、FLUSH、LOCK、IOCTL、QUERY_DIRECTORY、CHANGE_NOTIFY、QUERY_INFO、SET_INFO 与 oplock work 不进入 backing，并返回 `STATUS_NOT_SUPPORTED`。CANCEL 的动作语义不在本决定内；CANCEL、未知 command 与畸形 request fail closed，终止连接而不执行受控效果。
+本决定交付的本机协议基础成功处理 SMB framing bootstrap、SMB 3.1.1 NEGOTIATE、SESSION_SETUP、ECHO、TREE_CONNECT、TREE_DISCONNECT 与 LOGOFF；它为文件命令保留逐请求安全与 owner 生命周期。CREATE/CLOSE 及文件名字／访问／share 适配由[有界 CREATE/CLOSE](../feature/2026-09-28-smb-bounded-create-close.md)拥有。READ、WRITE、FLUSH、LOCK、IOCTL、QUERY_DIRECTORY、CHANGE_NOTIFY、QUERY_INFO、SET_INFO 与 oplock work 仍不进入 backing，并返回 `STATUS_NOT_SUPPORTED`。CANCEL 的动作语义不在本决定内；CANCEL、未知 command 与畸形 request fail closed，终止连接而不执行受控效果。
 
 Direct TCP payload 在分配前受 byte bound 限制。SMB2 header、compound offset/alignment、command count、negotiate context、UTF-16 和变长字段使用严格 decoder；解析结果借用一份被请求生命周期持有的 bounded frame。compound request 保留每个 command 的原始 bytes、MessageId、SessionId、TreeId 与 related 关系，协议层不把后续文件命令压成一个无上下文 callback。
 
@@ -34,11 +32,11 @@ SSPI 身份只保护本机入口。Share 仍携带 host-selected volume identity
 
 Server 拥有 loopback listener、export registry、connection 和全局 session capacity。listener 只有在确认本地地址为 loopback 后才转移所有权；accepted peer 另行核对 loopback。Publish 校验 FileStorage 能力但不取得 backend 所有权。非强制 Unpublish 在任何 live tree 或 connect／request 已取得 export 时以 busy 保留原 mapping 和资源；没有使用者时才进入清理并移除 export。export cleanup 逐层跳过未持有目标 export 的 connection 与 session，只为已经退休的目标 session 运行 retirement bookkeeping；必须加入同一 owner 的 authentication 或 cleanup 时，等待服从调用方 context。退休 session 还有其它 authority 时，目标 cleanup 只移除并释放自己，剩余 authority 继续拥有 retirement。最后一个 authority 在 native close 完成后仍保留 map entry 与 export ref，取得 authentication lock 后才把 authority 移除、`resourcesClosed` 记录和 ref 释放作为同一个不可取消的 commit；取消留下同一 owner 供重试。Server shutdown 另行强制 fence 新工作、清理 tree／FileSession，并只移除已经静止且确认释放的 export。
 
-connection 拥有 negotiate transcript、credit、pending request 和本连接的 session table；全局 registry 另外持有 session charge。authenticated session 拥有 SSPI identity、signer、tree 和每个 export 的 authority session。同一 session 连接同一 export 的多个 tree 共享一份 FileSession，tree 只是 SMB alias，不成为第二个远端 owner。
+connection 拥有 negotiate transcript、credit、pending request 和本连接的 session table；全局 registry 另外持有 session charge。authenticated session 拥有 SSPI identity、signer、tree 和每个 export 的 authority session。同一 session 连接同一 export 的多个 tree 共享一份 FileSession，tree 不建立第二份 FileSession，但独立拥有自己的 FileId；文件引用与 tree admission 由[有界 CREATE/CLOSE](../feature/2026-09-28-smb-bounded-create-close.md)定义。
 
 authority session 在 `file.session-open`、`file.status`、`file.renew` 与 `file.session-close` 的当前授权下建立、核对、续期和清理。它只接受同一 epoch 中单调前进的 status revision，以 response receipt time 消耗 Remaining；过期、fenced、retired 或 identity 改变都使它停止。续期失败先 fence 新 tree/work，再以独立 cleanup context 关闭；未知 cleanup 继续占用 export 与 session capacity。
 
-TREE_DISCONNECT 在本决定中取消已经登记到该 tree 的 pending request 并关闭一个 tree；同一 authority 的最后一个 tree 排空并关闭共享 FileSession。[有界 SMB 文件引用](2026-09-23-bounded-smb-file-handles.md)使它先封住并排空该 tree 的文件工作、清理句柄，再释放 authority 引用。LOGOFF 先发布 session retirement，取消其它 request，再关闭 authentication、trees 和 orphan authority。断线走同一 ownership 清理，不能仅删除协议 map。`Server.Shutdown` 永久拒绝新 accept/auth/tree work，关闭 listener 与连接，等待 admitted goroutine，然后重试全部未决 cleanup。已经失败的 cleanup 由原 Server、Export、session 或 tree 保留，可由后续调用重试。
+TREE_DISCONNECT 先 fence 并取消已经登记到该 tree 的 pending request，排空已接纳文件工作和自己持有的 handles，再减少 authority ref；同一 authority 的最后一个 tree 才关闭共享 FileSession。LOGOFF 先发布 session retirement，取消其它 request，再关闭 authentication、trees 和 orphan authority。断线走同一 ownership 清理，不能仅删除协议 map。`Server.Shutdown` 永久拒绝新 accept/auth/tree work，关闭 listener 与连接，等待 admitted goroutine，然后重试全部未决 cleanup。已经失败的 cleanup 由原 Server、Export、session 或 tree 保留，可由后续调用重试。
 
 ### 每种累积资源独立有界
 
@@ -50,11 +48,11 @@ authentication exchange 有独立 expiry watcher。新的 reauthentication gener
 
 ### 范围边界
 
-本决定交付 Windows client 所需的 secure bounded SMB endpoint/session foundation，并只部分满足 R-WIN-1、R-WIN-9 与 R-WIN-10。后续[有界 SMB 文件引用](2026-09-23-bounded-smb-file-handles.md)交付 CREATE/CLOSE；整个入口仍不声明 Windows network-drive support 已完成。
+本决定交付 Windows client 所需的 secure bounded SMB endpoint/session foundation，并只部分满足 R-WIN-1、R-WIN-9 与 R-WIN-10。它不交付可浏览或可读写 share，不声明 Windows network-drive support 已完成。
 
-本决定没有包含 Windows name/metadata projection、authoritative resolver、CREATE/CLOSE/READ/WRITE/FLUSH、QUERY_INFO、directory enumeration、share-mode admission、delete-on-close 与 handle cleanup；其中 CREATE/CLOSE 及其引用清理由[有界 SMB 文件引用](2026-09-23-bounded-smb-file-handles.md)接续。SUPERSEDE、disposition、rename、current-name traversal、CHANGE_NOTIFY、overflow/rescan、cache invalidation 和 byte-range LOCK/CANCEL 属于其它 mutation/concurrency 决定。WNet mapping、Windows VM lifecycle、真实 redirector 的身份／缓存／故障验收也不由本决定完成。
+Windows name/metadata projection、authoritative resolver、CREATE/CLOSE、share-mode admission 与 FileId cleanup 由[有界 CREATE/CLOSE](../feature/2026-09-28-smb-bounded-create-close.md)接续。READ/WRITE/FLUSH、QUERY_INFO、directory enumeration 和 delete-on-close 属于各自文件能力。SUPERSEDE、disposition、rename、current-name traversal、CHANGE_NOTIFY、overflow/rescan、cache invalidation 与 byte-range LOCK/CANCEL 属于独立 mutation/concurrency 工作。WNet mapping、Windows VM lifecycle、真实 redirector 的身份／缓存／故障验收不由本决定完成。
 
-平台中立约束保持不变：SMB status、Windows name comparer、create disposition、本地主体和协议 handle 不进入 storage/HTTP schema；tree 保留 FileStorage 与 FileSession 的扩展位置，未来 FileId 绑定 retained File/NodeReference，不能由路径、connection、SessionId、TreeId 或 NodeID 直接充当。directory revision 仍只可比等，不是 notification cursor；当前端点不建立 watcher 或 TTL cache。
+平台中立约束保持不变：SMB status、Windows name comparer、create disposition、本地主体和协议 handle 不进入 storage/HTTP schema；tree 保留 FileStorage 与 FileSession 的扩展位置，FileId 绑定 retained File/NodeReference，不能由路径、connection、SessionId、TreeId 或 NodeID 直接充当。directory revision 仍只可比等，不是 notification cursor；当前端点不建立 watcher 或 TTL cache。
 
 ## 备选方案
 
@@ -72,6 +70,6 @@ authentication exchange 有独立 expiry watcher。新的 reauthentication gener
 
 文件适配获得一条已经验证身份、消息完整性、share 归属、FileSession lifetime 与资源上限的命令入口。authentication timeout、LOGOFF 与并发 TREE_CONNECT、以及 signer 与 response frame 的竞态在加入文件 handle 之前已经有可执行回归。
 
-本决定交付时的代价是 endpoint 只能建立和拆除安全 session/tree，文件与目录操作明确失败。Windows 上的 listener/WNet 组合、实际系统客户端行为和缓存语义仍需后续原生验收；跨平台 Go 测试与 native SSPI 单测不能替代这些结果。
+代价是当前 endpoint 只能建立和拆除安全 session/tree，所有文件与目录操作仍明确失败。Windows 上的 listener/WNet 组合、实际系统客户端行为和缓存语义仍需后续原生验收；跨平台 Go 测试与 native SSPI 单测不能替代这些结果。
 
 本决定接续[Windows 系统网络驱动器支持](../../proposed/feature/2026-09-16-windows-network-drive-support.md)、[中立元数据与访问控制](2026-09-16-neutral-metadata-and-access-controls.md)、[持久节点身份与原子文件操作](2026-09-20-durable-identity-and-atomic-file-operations.md)与[有界权威名字观察](2026-09-20-bounded-authoritative-name-observations.md)。完整协议和 runtime 契约见[本机 SMB 端点](../../../../docs/design/client/smb-endpoint.md)。

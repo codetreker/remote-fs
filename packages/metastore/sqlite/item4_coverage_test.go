@@ -63,7 +63,7 @@ func TestAtomicOpenResetsReplacesAndRejectsKindMismatch(t *testing.T) {
 	rootTarget := directoryTarget(root)
 	createdAt := time.Unix(123, 0)
 	name := storage.ChildName{Parent: rootTarget, RawLeaf: []byte("file")}
-	created, err := store.OpenAt(t.Context(), selectChild(name), storage.OpenAtOptions{
+	created, err := store.OpenAt(t.Context(), selectChild(name), storage.OpenAtOptions{MetadataAccess: storage.ReadMetadata | storage.WriteMetadata,
 		Read: true, Write: true, Create: true, Exclusive: true,
 		Target: storage.ChildCondition{State: storage.Absent}, Action: fileAction(t),
 		Use: storage.UseClaim{Uses: storage.ReadData | storage.WriteData}, Existing: storage.Keep,
@@ -84,7 +84,7 @@ func TestAtomicOpenResetsReplacesAndRejectsKindMismatch(t *testing.T) {
 	}
 
 	resetAt := time.Unix(456, 0)
-	reset, err := store.OpenAt(t.Context(), selectChild(name), storage.OpenAtOptions{
+	reset, err := store.OpenAt(t.Context(), selectChild(name), storage.OpenAtOptions{MetadataAccess: storage.ReadMetadata | storage.WriteMetadata,
 		Read: true, Write: true,
 		Target: storage.ChildCondition{State: storage.SameNode, NodeID: uint64(createdID)}, Action: fileAction(t),
 		Use: storage.UseClaim{Uses: storage.ReadData | storage.WriteData}, Existing: storage.ResetContent,
@@ -105,7 +105,7 @@ func TestAtomicOpenResetsReplacesAndRejectsKindMismatch(t *testing.T) {
 	}
 
 	replaceAt := time.Unix(789, 0)
-	replaced, err := store.OpenAt(t.Context(), selectChild(name), storage.OpenAtOptions{
+	replaced, err := store.OpenAt(t.Context(), selectChild(name), storage.OpenAtOptions{MetadataAccess: storage.ReadMetadata | storage.WriteMetadata,
 		Read: true, Write: true, Create: true,
 		Target: storage.ChildCondition{State: storage.SameNode, NodeID: uint64(createdID)}, Action: fileAction(t),
 		Use: storage.UseClaim{Uses: storage.ReadData | storage.WriteData | storage.DeleteName}, Existing: storage.ReplaceNode,
@@ -310,7 +310,7 @@ func TestNodeReferenceDelegatesMetadataMutationPendingDeleteAndLifecycle(t *test
 	if err != nil || !bytes.Equal(again.PendingGeneration, pending.PendingGeneration) {
 		t.Fatalf("repeated pending state = %+v, %v; want generation %x", again, err, pending.PendingGeneration)
 	}
-	if result, err := store.OpenAt(t.Context(), selectChild(name), storage.OpenAtOptions{
+	if result, err := store.OpenAt(t.Context(), selectChild(name), storage.OpenAtOptions{MetadataAccess: storage.ReadMetadata | storage.WriteMetadata,
 		Read: true, Target: storage.ChildCondition{State: storage.Any}, Action: fileAction(t),
 		Use: storage.UseClaim{Uses: storage.ReadData}, Existing: storage.Keep,
 	}); result.File != nil || !errors.Is(err, storage.ErrPendingDelete) {
@@ -373,9 +373,6 @@ func TestNodeReferenceDelegatesMetadataMutationPendingDeleteAndLifecycle(t *test
 		t.Fatal(err)
 	}
 	if err := ref.Retire(t.Context()); err != nil {
-		t.Fatal(err)
-	}
-	if err := ref.DropUse(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 	if err := ref.Close(t.Context()); err != nil {

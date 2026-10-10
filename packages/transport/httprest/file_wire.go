@@ -14,7 +14,7 @@ const MaxFileControlBytes int64 = 256 << 10
 
 func fileControl(op storage.Operation) bool {
 	switch op {
-	case storage.OpFileStatus, storage.OpFileRenew, storage.OpFileSessionClose, storage.OpFileQueryAction, storage.OpFileQueryDeleteIntent, storage.OpFileListDeleteIntents, storage.OpFileAcknowledgeDeleteIntent, storage.OpFileClose, storage.OpFileAck, storage.OpFileState, storage.OpFileScope, storage.OpFileNewUseOwner, storage.OpFileRetireUseOwner, storage.OpFileRangeGetConflict, storage.OpFileRangeApply, storage.OpFileRangeQuery, storage.OpFileRangeCancel, storage.OpFileRangeDrop, storage.OpFileSetPendingUnlink, storage.OpFileClearPendingUnlink:
+	case storage.OpFileBackendIdentity, storage.OpFileStatus, storage.OpFileRenew, storage.OpFileSessionClose, storage.OpFileQueryAction, storage.OpFileCloseOwnerStatus, storage.OpFileQueryDeleteIntent, storage.OpFileListDeleteIntents, storage.OpFileAcknowledgeDeleteIntent, storage.OpFileClose, storage.OpFileAck, storage.OpFileState, storage.OpFileScope, storage.OpFileNewUseOwner, storage.OpFileRetireUseOwner, storage.OpFileRangeGetConflict, storage.OpFileRangeApply, storage.OpFileRangeQuery, storage.OpFileRangeCancel, storage.OpFileRangeDrop, storage.OpFileSetPendingUnlink, storage.OpFileClearPendingUnlink:
 		return true
 	}
 	return false
@@ -25,6 +25,8 @@ type fileRequest struct {
 	Session           string                          `json:"session"`
 	File              string                          `json:"file"`
 	Action            storage.LockRequestID           `json:"action"`
+	CloseGeneration   uint64                          `json:"closeGeneration,omitempty"`
+	CloseImplicit     bool                            `json:"closeImplicit,omitempty"`
 	Path              []byte                          `json:"path"`
 	Node              uint64                          `json:"node"`
 	Options           storage.FileSessionOptions      `json:"options"`
@@ -91,29 +93,32 @@ func (r fileRequest) MarshalJSON() ([]byte, error) {
 }
 
 type fileResponse struct {
-	Node            uint64                     `json:"node,omitempty"`
-	Session         string                     `json:"session,omitempty"`
-	File            string                     `json:"file,omitempty"`
-	Retry           bool                       `json:"retry,omitempty"`
-	Epoch           uint64                     `json:"epoch"`
-	Status          *storage.FileSessionStatus `json:"status,omitempty"`
-	Attr            *Attr                      `json:"attr,omitempty"`
-	Data            []byte                     `json:"data"`
-	Conflict        *storage.RangeConflict     `json:"conflict,omitempty"`
-	Attempt         *storage.RangeAttempt      `json:"attempt,omitempty"`
-	Barrier         *MutationBarrier           `json:"barrier,omitempty"`
-	Capabilities    *fileCapabilities          `json:"capabilities,omitempty"`
-	Scope           *storage.UseScope          `json:"scope,omitempty"`
-	Owner           storage.UseOwner           `json:"owner,omitempty"`
-	Metadata        *OpaquePayload             `json:"metadata,omitempty"`
-	Outcome         storage.OpenOutcome        `json:"outcome,omitempty"`
-	State           *referenceState            `json:"state,omitempty"`
-	ActionReceipt   *storage.FileActionReceipt `json:"actionReceipt,omitempty"`
-	DeleteStatus    *deleteIntentStatus        `json:"deleteStatus,omitempty"`
-	DeletePage      *deleteIntentPage          `json:"deletePage,omitempty"`
-	CloseResult     *referenceCloseResult      `json:"closeResult,omitempty"`
-	Directory       *observedDirectory         `json:"directory,omitempty"`
-	NameObservation *nameObservation           `json:"nameObservation,omitempty"`
+	Node             uint64                     `json:"node,omitempty"`
+	Session          string                     `json:"session,omitempty"`
+	File             string                     `json:"file,omitempty"`
+	Retry            bool                       `json:"retry,omitempty"`
+	Epoch            uint64                     `json:"epoch"`
+	Status           *storage.FileSessionStatus `json:"status,omitempty"`
+	Attr             *Attr                      `json:"attr,omitempty"`
+	Data             []byte                     `json:"data"`
+	Conflict         *storage.RangeConflict     `json:"conflict,omitempty"`
+	Attempt          *storage.RangeAttempt      `json:"attempt,omitempty"`
+	Barrier          *MutationBarrier           `json:"barrier,omitempty"`
+	Capabilities     *fileCapabilities          `json:"capabilities,omitempty"`
+	BackendIdentity  *backendIdentity           `json:"backendIdentity,omitempty"`
+	SessionIdentity  *fileSessionIdentity       `json:"sessionIdentity,omitempty"`
+	Scope            *storage.UseScope          `json:"scope,omitempty"`
+	Owner            storage.UseOwner           `json:"owner,omitempty"`
+	Metadata         *OpaquePayload             `json:"metadata,omitempty"`
+	Outcome          storage.OpenOutcome        `json:"outcome,omitempty"`
+	State            *referenceState            `json:"state,omitempty"`
+	ActionReceipt    *storage.FileActionReceipt `json:"actionReceipt,omitempty"`
+	DeleteStatus     *deleteIntentStatus        `json:"deleteStatus,omitempty"`
+	DeletePage       *deleteIntentPage          `json:"deletePage,omitempty"`
+	CloseResult      *referenceCloseResult      `json:"closeResult,omitempty"`
+	CloseOwnerStatus *closeOwnerStatusResult    `json:"closeOwnerStatus,omitempty"`
+	Directory        *observedDirectory         `json:"directory,omitempty"`
+	NameObservation  *nameObservation           `json:"nameObservation,omitempty"`
 }
 
 func fileMutation(op storage.Operation) bool {
@@ -178,6 +183,7 @@ type FileWithBarrier interface {
 	TruncateWithBarrier(context.Context, int64) (storage.Attr, *MutationBarrier, error)
 	SetAttrWithBarrier(context.Context, storage.AttrChange) (storage.Attr, *MutationBarrier, error)
 	CloseWithBarrier(context.Context) (storage.ReferenceCloseResult, *MutationBarrier, error)
+	CloseWithActionAndBarrier(context.Context, storage.CloseAttempt) (storage.ReferenceCloseResult, *MutationBarrier, error)
 }
 
 type FileSessionWithBarrier interface {
@@ -189,6 +195,9 @@ type FileSessionWithBarrier interface {
 }
 
 type fileCapabilities struct {
+	SessionIdentity   bool `json:"sessionIdentity"`
+	StableIdentity    bool `json:"stableIdentity"`
+	OpenMetadata      bool `json:"openMetadata"`
 	Allocation        bool `json:"allocation"`
 	DirectoryMetadata bool `json:"directoryMetadata"`
 	ReferenceName     bool `json:"referenceName"`
@@ -203,4 +212,5 @@ type fileCapabilities struct {
 	Scope             bool `json:"scope"`
 	Delete            bool `json:"delete"`
 	Conditional       bool `json:"conditional"`
+	CloseRecovery     bool `json:"closeRecovery"`
 }

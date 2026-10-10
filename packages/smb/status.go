@@ -34,57 +34,61 @@ func statusError(err error) uint32 {
 }
 
 const (
-	statusInvalidHandle    uint32 = 0xc0000008
+	statusSharingViolation uint32 = 0xc0000043
+	statusRetry            uint32 = 0xc000022d
+	statusDeletePending    uint32 = 0xc0000056
 	statusNameNotFound     uint32 = 0xc0000034
 	statusNameCollision    uint32 = 0xc0000035
-	statusSharingViolation uint32 = 0xc0000043
-	statusDeletePending    uint32 = 0xc0000056
 	statusFileIsDirectory  uint32 = 0xc00000ba
 	statusNotADirectory    uint32 = 0xc0000103
-	statusRetry            uint32 = 0xc000022d
+	statusInvalidHandle    uint32 = 0xc0000008
 )
 
 func createStatusError(err error) uint32 {
-	if errors.Is(err, errNameInvalid) || errors.Is(err, errPathMissing) {
-		return namespaceStatus(err)
-	}
-	if errors.Is(err, authz.ErrDenied) || errors.Is(err, ErrIdentityDenied) {
-		return statusDenied
-	}
-	errno := storage.ErrnoOf(err)
-	switch {
-	case err == nil:
+	if err == nil {
 		return statusOK
-	case errno == syscall.EIO:
+	}
+	if errors.Is(err, syscall.EIO) {
 		return statusIO
-	case errors.Is(err, storage.ErrInvalidScope):
-		return statusRetry
+	}
+	var unknown *unknownNamespaceError
+	if errors.As(err, &unknown) {
+		return statusIO
+	}
+	switch {
 	case errors.Is(err, storage.ErrUseConflict):
 		return statusSharingViolation
+	case errors.Is(err, storage.ErrConditionConflict), errors.Is(err, storage.ErrInvalidScope):
+		return statusRetry
 	case errors.Is(err, storage.ErrPendingDelete):
 		return statusDeletePending
-	case errors.Is(err, storage.ErrConditionConflict), errno == syscall.EAGAIN, errno == syscall.EBUSY:
-		return statusRetry
-	case errno == syscall.ENOENT:
+	case errors.Is(err, errPathMissing), errors.Is(err, errNameInvalid):
+		return namespaceStatus(err)
+	}
+	switch storage.ErrnoOf(err) {
+	case syscall.ENOENT:
 		return statusNameNotFound
-	case errno == syscall.EEXIST:
+	case syscall.EEXIST:
 		return statusNameCollision
-	case errno == syscall.EISDIR:
+	case syscall.EISDIR:
 		return statusFileIsDirectory
-	case errno == syscall.ENOTDIR:
+	case syscall.ENOTDIR:
 		return statusNotADirectory
-	case errno == syscall.EBADF:
+	case syscall.EBADF:
 		return statusInvalidHandle
+	case syscall.EBUSY:
+		return statusRetry
 	default:
 		return statusError(err)
 	}
 }
 
 func closeStatusError(err error) uint32 {
-	switch storage.ErrnoOf(err) {
-	case syscall.EBADF, syscall.ENOENT:
-		return statusInvalidHandle
-	default:
-		return statusError(err)
+	if errors.Is(err, syscall.EIO) {
+		return statusIO
 	}
+	if errors.Is(err, syscall.EBADF) || errors.Is(err, syscall.ENOENT) {
+		return statusInvalidHandle
+	}
+	return statusError(err)
 }

@@ -12,7 +12,7 @@ import (
 	"github.com/codetreker/remote-fs/packages/smb/internal/wire"
 )
 
-func (c *connection) dispatch(ctx context.Context, request, original wire.Request, header *wire.Header, inherited wire.FileID, created *wire.FileID) ([]byte, uint32, *signing.Session) {
+func (c *connection) dispatch(ctx context.Context, request, original wire.Request, header *wire.Header) ([]byte, uint32, *signing.Session) {
 	if request.Header.Command == wire.Negotiate {
 		body, status := c.negotiate(request)
 		return body, status, nil
@@ -102,12 +102,10 @@ func (c *connection) dispatch(ctx context.Context, request, original wire.Reques
 	}
 	switch request.Header.Command {
 	case wire.Create:
-		body, status, id := c.createFile(ctx, s, tree, request)
-		if created != nil {
-			*created = id
-		}
+		body, status, _ := c.createFile(ctx, s, tree, request)
 		return body, status, signer
 	case wire.Close:
+		inherited, _ := ctx.Value(relatedFileKey{}).(wire.FileID)
 		body, status := c.closeFile(ctx, s, tree, request, inherited)
 		return body, status, signer
 	}

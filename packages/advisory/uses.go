@@ -68,6 +68,54 @@ func (c *Coordinator) DropUse(ctx context.Context, node uint64, scope storage.Us
 	return nil
 }
 
+// DropUseExact is the final fallible step of a retained reference close. The
+// complete original claim must still be installed; an absent or changed claim
+// is an authority inconsistency, not an idempotent release.
+func (c *Coordinator) DropUseExact(ctx context.Context, node uint64, scope storage.UseScope, claim storage.UseClaim) error {
+	if err := checkCall(ctx, node); err != nil {
+		return err
+	}
+	if err := scope.Check(); err != nil {
+		return err
+	}
+	if err := claim.Check(); err != nil {
+		return err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.exactUseLocked(node, scope, claim) {
+		return storage.ErrInvalidScope
+	}
+	delete(c.uses, scope)
+	return nil
+}
+
+func (c *Coordinator) exactUseLocked(node uint64, scope storage.UseScope, claim storage.UseClaim) bool {
+	old, ok := c.uses[scope]
+	return ok && old.node == node && old.claim == claim
+}
+
+// CheckCloseUnlink settles an already accepted deletion obligation under native
+// finalization ordering. Its last reference may lack DeleteName access, but only
+// that reference's complete original claim may be exempted from its own denial.
+func (c *Coordinator) CheckCloseUnlink(ctx context.Context, node uint64, scope storage.UseScope, claim storage.UseClaim) error {
+	if err := checkCall(ctx, node); err != nil {
+		return err
+	}
+	if err := scope.Check(); err != nil {
+		return err
+	}
+	if err := claim.Check(); err != nil {
+		return err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.exactUseLocked(node, scope, claim) {
+		return storage.ErrInvalidScope
+	}
+	return c.checkOtherUsesLocked(node, scope, storage.DeleteName)
+}
+
 func (c *Coordinator) checkUseLocked(node uint64, scope storage.UseScope, uses storage.Uses) error {
 	if scope.Token != "" {
 		own, ok := c.uses[scope]
@@ -78,6 +126,10 @@ func (c *Coordinator) checkUseLocked(node uint64, scope storage.UseScope, uses s
 			return syscall.EBADF
 		}
 	}
+	return c.checkOtherUsesLocked(node, scope, uses)
+}
+
+func (c *Coordinator) checkOtherUsesLocked(node uint64, scope storage.UseScope, uses storage.Uses) error {
 	for otherScope, other := range c.uses {
 		if other.node == node && otherScope != scope && uses&other.claim.Deny != 0 {
 			return storage.ErrUseConflict

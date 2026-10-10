@@ -103,7 +103,7 @@ func TestExactLookupAndCreateUseParentIdentityAndCapturedOpenResult(t *testing.T
 		if target.Parent.NodeID != 7 || target.Parent.Scope != nil || string(target.RawLeaf) != name {
 			t.Fatalf("open target = %+v", target)
 		}
-		if !options.Read || !options.Write || !options.Create || options.Exclusive || options.Target.State != storage.Any || options.Existing != storage.Keep || options.Use.Uses != storage.ReadData|storage.WriteData {
+		if !options.Read || !options.Write || !options.Create || options.Exclusive || options.Target.State != storage.Any || options.Existing != storage.Keep || options.Use.Uses != storage.ReadData|storage.WriteData || options.MetadataAccess != storage.ReadMetadata|storage.WriteMetadata {
 			t.Fatalf("open options = %+v", options)
 		}
 		if epoch, err := options.Action.Epoch(); err != nil || epoch != 7 {

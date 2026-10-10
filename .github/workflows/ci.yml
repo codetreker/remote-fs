@@ -16,8 +16,8 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
-  # The layers that mount a filesystem, named once. The two Linux jobs below divide the
-  # suite on exactly this line: the second runs these, the first runs everything else.
+  # The layers that mount a filesystem, named once for the mounted job and the
+  # nonmounting package selection below.
   MOUNTING_PACKAGES: ./packages/fuse/... ./cmd/...
 
 jobs:
@@ -25,6 +25,8 @@ jobs:
     name: build, format, links, contract and unit tests
     runs-on: ubuntu-24.04
     timeout-minutes: 35
+    needs: sqlite-race
+    if: ${{ always() && !cancelled() }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -77,10 +79,33 @@ jobs:
           set -euo pipefail
           # Both expansions are lists of import paths and must split into arguments.
           # shellcheck disable=SC2046,SC2086
-          go list $MOUNTING_PACKAGES >"$RUNNER_TEMP/mounting"
+          go list $MOUNTING_PACKAGES ./packages/metastore/sqlite >"$RUNNER_TEMP/separate-packages"
           # shellcheck disable=SC2046
           .github/scripts/assert-every-test-ran.sh -race -count=1 -timeout 10m \
-            $(go list ./... | grep -vxF -f "$RUNNER_TEMP/mounting")
+            $(go list ./... | grep -vxF -f "$RUNNER_TEMP/separate-packages")
+
+      - name: Require SQLite contract and race tests
+        if: ${{ always() && !cancelled() }}
+        env:
+          SQLITE_RACE_RESULT: ${{ needs.sqlite-race.result }}
+        run: |
+          if [ "$SQLITE_RACE_RESULT" != success ]; then
+            echo "::error::SQLite contract and race tests concluded $SQLITE_RACE_RESULT"
+            exit 1
+          fi
+
+  sqlite-race:
+    name: SQLite contract and race tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-go
+
+      - name: SQLite contract and race tests
+        run: .github/scripts/assert-every-test-ran.sh -race -count=1 -timeout 10m ./packages/metastore/sqlite
 
   mounted:
     name: differential and end-to-end tests
@@ -174,9 +199,10 @@ jobs:
           exit "$leaked"
 
   windows-sspi:
-    name: native Windows SMB tests
-    # This hosted label is Windows Server 2025. It exercises SMB name handling
-    # and the native SSPI API. Windows 11 redirector and WNet acceptance follow later.
+    name: native Windows SSPI tests
+    # This hosted label is Windows Server 2025. It exercises native SSPI and ordinal
+    # name APIs plus portable SMB/wire tests. Windows 11 redirector and WNet
+    # acceptance belongs to later work.
     # https://github.com/actions/runner-images/blob/9d7eec51794bb688d6c7ce00550cda5a134c88a3/README.md#available-images
     runs-on: windows-2025
     timeout-minutes: 10
@@ -186,8 +212,12 @@ jobs:
           persist-credentials: false
       - uses: ./.github/actions/setup-go
 
-      - name: Test the SMB endpoint and native SSPI adapter
-        run: go test -count=1 -race ./packages/smb/...
+      - name: Test the native SSPI adapter
+        run: go test -count=1 -race ./packages/smb/windows
 
-      - name: Vet the SMB endpoint and native SSPI adapter
-        run: go vet ./packages/smb/...
+      - name: Vet the native SSPI adapter
+        run: go vet ./packages/smb/windows
+
+      - name: Test native Windows names and portable SMB protocol
+        shell: bash
+        run: .github/scripts/assert-every-test-ran.sh -race -count=1 -timeout 10m ./packages/smb ./packages/smb/internal/wire

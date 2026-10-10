@@ -77,6 +77,122 @@ type pendingBarrierFileStub struct {
 	closes int
 }
 
+type semanticReplayFileStub struct {
+	*fileAuthorityStub
+	closes           int
+	noBarrierReplays int
+}
+
+func (f *semanticReplayFileStub) CloseWithBarrier(context.Context) (storage.ReferenceCloseResult, *httprest.MutationBarrier, error) {
+	f.closes++
+	if f.closes == 1 {
+		return storage.ReferenceCloseResult{Released: true, Determined: true}, nil, syscall.ENOTEMPTY
+	}
+	if f.closes == 2 {
+		return storage.ReferenceCloseResult{}, nil, syscall.ECONNRESET
+	}
+	if f.closes <= 2+f.noBarrierReplays {
+		return storage.ReferenceCloseResult{Released: true, Determined: true}, nil, syscall.ECONNRESET
+	}
+	return storage.ReferenceCloseResult{Released: true, Determined: true}, &httprest.MutationBarrier{Incarnation: "log"}, nil
+}
+
+type semanticReplayReferenceStub struct {
+	*barrierReferenceStub
+	closes           int
+	noBarrierReplays int
+}
+
+func (r *semanticReplayReferenceStub) CloseWithBarrier(context.Context) (storage.ReferenceCloseResult, *httprest.MutationBarrier, error) {
+	r.closes++
+	if r.closes == 1 {
+		return storage.ReferenceCloseResult{Released: true, Determined: true}, nil, syscall.ENOTEMPTY
+	}
+	if r.closes == 2 {
+		return storage.ReferenceCloseResult{}, nil, syscall.ECONNRESET
+	}
+	if r.closes <= 2+r.noBarrierReplays {
+		return storage.ReferenceCloseResult{Released: true, Determined: true}, nil, syscall.ECONNRESET
+	}
+	return storage.ReferenceCloseResult{Released: true, Determined: true}, &httprest.MutationBarrier{Incarnation: "log"}, nil
+}
+
+type semanticReplaySessionStub struct {
+	*fileSessionStub
+	closes           int
+	noBarrierReplays int
+}
+
+func (s *semanticReplaySessionStub) CloseWithBarrier(context.Context) (storage.ReferenceCloseResult, *httprest.MutationBarrier, error) {
+	s.closes++
+	if s.closes == 1 {
+		return storage.ReferenceCloseResult{Released: true, Determined: true}, nil, syscall.ENOTEMPTY
+	}
+	if s.closes == 2 {
+		return storage.ReferenceCloseResult{}, nil, syscall.ECONNRESET
+	}
+	if s.closes <= 2+s.noBarrierReplays {
+		return storage.ReferenceCloseResult{Released: true, Determined: true}, nil, syscall.ECONNRESET
+	}
+	return storage.ReferenceCloseResult{Released: true, Determined: true}, &httprest.MutationBarrier{Incarnation: "log"}, nil
+}
+
+func TestReleasedCloseReplayPreservesOriginalSemanticError(t *testing.T) {
+	const noBarrierReplays = 32
+	fileSession := retainedTestSession(t, nil)
+	fileRemote := &semanticReplayFileStub{fileAuthorityStub: &fileAuthorityStub{}, noBarrierReplays: noBarrierReplays}
+	file := &retainedFile{session: fileSession, remote: fileRemote}
+	if result, err := file.CloseWithResult(t.Context()); !result.Released || !errors.Is(err, syscall.ENOTEMPTY) || file.closed {
+		t.Fatalf("file initial close = %+v, %v", result, err)
+	}
+	if result, err := file.CloseWithResult(t.Context()); !result.Released || !errors.Is(err, syscall.ENOTEMPTY) || !errors.Is(err, syscall.ECONNRESET) || !errors.Is(err, syscall.EIO) || fileRemote.closes != 2 {
+		t.Fatalf("file replay = %+v, %v, calls=%d", result, err, fileRemote.closes)
+	}
+	for range noBarrierReplays {
+		if result, err := file.CloseWithResult(t.Context()); !result.Released || !errors.Is(err, syscall.ENOTEMPTY) || !errors.Is(err, syscall.ECONNRESET) || file.closeAuthorityErr != syscall.ECONNRESET || file.closeOriginalErr != syscall.ENOTEMPTY {
+			t.Fatalf("file repeated replay = %+v, %v, current=%v, original=%v", result, err, file.closeAuthorityErr, file.closeOriginalErr)
+		}
+	}
+	if result, err := file.CloseWithResult(t.Context()); !result.Released || !errors.Is(err, syscall.ENOTEMPTY) || !file.closed || fileRemote.closes != 3+noBarrierReplays {
+		t.Fatalf("file confirmed replay = %+v, %v, calls=%d", result, err, fileRemote.closes)
+	}
+
+	referenceSession := retainedTestSession(t, nil)
+	referenceRemote := &semanticReplayReferenceStub{barrierReferenceStub: &barrierReferenceStub{}, noBarrierReplays: noBarrierReplays}
+	reference := &nodeReference{session: referenceSession, remote: referenceRemote}
+	if result, err := reference.CloseWithResult(t.Context()); !result.Released || !errors.Is(err, syscall.ENOTEMPTY) || reference.closed {
+		t.Fatalf("reference initial close = %+v, %v", result, err)
+	}
+	if result, err := reference.CloseWithResult(t.Context()); !result.Released || !errors.Is(err, syscall.ENOTEMPTY) || !errors.Is(err, syscall.ECONNRESET) || !errors.Is(err, syscall.EIO) || referenceRemote.closes != 2 {
+		t.Fatalf("reference replay = %+v, %v, calls=%d", result, err, referenceRemote.closes)
+	}
+	for range noBarrierReplays {
+		if result, err := reference.CloseWithResult(t.Context()); !result.Released || !errors.Is(err, syscall.ENOTEMPTY) || !errors.Is(err, syscall.ECONNRESET) || reference.closeAuthorityErr != syscall.ECONNRESET || reference.closeOriginalErr != syscall.ENOTEMPTY {
+			t.Fatalf("reference repeated replay = %+v, %v, current=%v, original=%v", result, err, reference.closeAuthorityErr, reference.closeOriginalErr)
+		}
+	}
+	if result, err := reference.CloseWithResult(t.Context()); !result.Released || !errors.Is(err, syscall.ENOTEMPTY) || !reference.closed || referenceRemote.closes != 3+noBarrierReplays {
+		t.Fatalf("reference confirmed replay = %+v, %v, calls=%d", result, err, referenceRemote.closes)
+	}
+
+	sessionRemote := &semanticReplaySessionStub{fileSessionStub: &fileSessionStub{}, noBarrierReplays: noBarrierReplays}
+	session := retainedTestSession(t, sessionRemote)
+	if result, err := session.CloseWithResult(t.Context()); !result.Released || !errors.Is(err, syscall.ENOTEMPTY) || session.closed {
+		t.Fatalf("session initial close = %+v, %v", result, err)
+	}
+	if result, err := session.CloseWithResult(t.Context()); !result.Released || !errors.Is(err, syscall.ENOTEMPTY) || !errors.Is(err, syscall.ECONNRESET) || !errors.Is(err, syscall.EIO) || sessionRemote.closes != 2 {
+		t.Fatalf("session replay = %+v, %v, calls=%d", result, err, sessionRemote.closes)
+	}
+	for range noBarrierReplays {
+		if result, err := session.CloseWithResult(t.Context()); !result.Released || !errors.Is(err, syscall.ENOTEMPTY) || !errors.Is(err, syscall.ECONNRESET) || session.closeAuthorityErr != syscall.ECONNRESET || session.closeOriginalErr != syscall.ENOTEMPTY {
+			t.Fatalf("session repeated replay = %+v, %v, current=%v, original=%v", result, err, session.closeAuthorityErr, session.closeOriginalErr)
+		}
+	}
+	if result, err := session.CloseWithResult(t.Context()); !result.Released || !errors.Is(err, syscall.ENOTEMPTY) || !session.closed || sessionRemote.closes != 3+noBarrierReplays {
+		t.Fatalf("session confirmed replay = %+v, %v, calls=%d", result, err, sessionRemote.closes)
+	}
+}
+
 func (f *pendingBarrierFileStub) CloseWithBarrier(context.Context) (storage.ReferenceCloseResult, *httprest.MutationBarrier, error) {
 	f.closes++
 	if f.closes == 1 {
@@ -146,6 +262,10 @@ func (f *fileAuthorityStub) CloseWithBarrier(ctx context.Context) (storage.Refer
 	return storage.ReferenceCloseResult{Released: err == nil || f.releasedOnError}, barrier, err
 }
 
+func (f *fileAuthorityStub) CloseWithActionAndBarrier(ctx context.Context, _ storage.CloseAttempt) (storage.ReferenceCloseResult, *httprest.MutationBarrier, error) {
+	return f.CloseWithBarrier(ctx)
+}
+
 type fileSessionStub struct {
 	httprest.FileSessionWithBarrier
 	close            func(context.Context) error
@@ -178,7 +298,7 @@ func retainedTestSession(t *testing.T, remote httprest.FileSessionWithBarrier) *
 	lifetime, stop := context.WithCancel(context.Background())
 	t.Cleanup(stop)
 	t.Cleanup(base.stop)
-	session := &fileSession{base: base, remote: remote, lifetime: lifetime, stop: stop, changed: make(chan struct{})}
+	session := &fileSession{base: base, remote: remote, lifetime: lifetime, stop: stop, changed: make(chan struct{}), maxCloseActions: storage.DefaultFileSessionOptions().MaxCloseActions}
 	base.fileSessions = map[*fileSession]struct{}{session: {}}
 	return session
 }
@@ -245,7 +365,11 @@ func TestRetainedSessionCloseCancelsAndDrainsBeforeRemoteCleanup(t *testing.T) {
 		return nil
 	}})
 	entered, cancelled, resume := make(chan struct{}), make(chan struct{}), make(chan struct{})
-	file := &retainedFile{session: session, remote: &fileAuthorityStub{read: func(ctx context.Context) (storage.FileRead, error) {
+	var fileCloses atomic.Int64
+	file := &retainedFile{session: session, remote: &fileAuthorityStub{close: func(context.Context) error {
+		fileCloses.Add(1)
+		return nil
+	}, read: func(ctx context.Context) (storage.FileRead, error) {
 		close(entered)
 		<-ctx.Done()
 		close(cancelled)
@@ -278,8 +402,8 @@ func TestRetainedSessionCloseCancelsAndDrainsBeforeRemoteCleanup(t *testing.T) {
 	if err := session.Close(t.Context()); err != nil || remoteCloses.Load() != 1 {
 		t.Fatal("repeated close repeated authority cleanup:", err)
 	}
-	if err := file.Close(t.Context()); err != nil {
-		t.Fatal("session cleanup did not close its files:", err)
+	if err := file.Close(t.Context()); err != nil || fileCloses.Load() != 1 {
+		t.Fatalf("file release lacked authority proof: %v after %d calls", err, fileCloses.Load())
 	}
 }
 

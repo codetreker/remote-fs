@@ -72,7 +72,7 @@ func TestAtomicOpenJournalPreservesIdentityAndRejectsChangedIntent(t *testing.T)
 		},
 		RootID: root.ID,
 	}}
-	options := storage.OpenAtOptions{
+	options := storage.OpenAtOptions{MetadataAccess: storage.ReadMetadata | storage.WriteMetadata,
 		Read: true, Target: storage.ChildCondition{State: storage.SameNode, NodeID: want.ID},
 		Action: action, Use: storage.UseClaim{Uses: storage.ReadData}, Existing: storage.Keep,
 	}
@@ -120,7 +120,7 @@ func TestAtomicOpenJournalTreatsEmptyAndAbsentGuardsAsTheSameIntent(t *testing.T
 	}
 	session := fileSessionFor(t, volume, storage.DefaultFileSessionOptions())
 	opener := session.(storage.AtomicFileOpener)
-	options := storage.OpenAtOptions{
+	options := storage.OpenAtOptions{MetadataAccess: storage.ReadMetadata | storage.WriteMetadata,
 		Read: true, Target: storage.ChildCondition{State: storage.SameNode, NodeID: file.ID},
 		Action: fileActionFor(t, session), Use: storage.UseClaim{Uses: storage.ReadData}, Existing: storage.Keep,
 	}
@@ -160,7 +160,7 @@ func TestDurableCloseIntentDeletesOriginalIdentityAndCanBeAcknowledged(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	options := storage.OpenAtOptions{
+	options := storage.OpenAtOptions{MetadataAccess: storage.ReadMetadata | storage.WriteMetadata,
 		Read: true, Target: storage.ChildCondition{State: storage.SameNode, NodeID: want.ID},
 		Action: fileActionFor(t, session), Use: storage.UseClaim{Uses: storage.ReadData | storage.DeleteName}, Existing: storage.Keep,
 		CloseIntent: &storage.CloseIntent{ID: intent, Owner: owner, Trigger: storage.OnReferenceClose, Condition: storage.UnlinkFile},
@@ -240,6 +240,9 @@ func TestNonemptyDirectoryCloseIntentReleasesReferenceWithTerminalResult(t *test
 		t.Fatal(err)
 	}
 	session := fileSessionFor(t, volume, storage.DefaultFileSessionOptions())
+	if err := session.(storage.RecoverableReferenceClose).CheckRecoverableReferenceClose(); err != nil {
+		t.Fatalf("recoverable close preflight: %v", err)
+	}
 	intent, err := storage.NewDeleteIntentID()
 	if err != nil {
 		t.Fatal(err)
@@ -258,11 +261,28 @@ func TestNonemptyDirectoryCloseIntentReleasesReferenceWithTerminalResult(t *test
 	if err != nil || opened.Reference == nil {
 		t.Fatalf("open directory reference=%+v error=%v", opened, err)
 	}
-	if result, err := opened.Reference.CloseWithResult(t.Context()); !result.Released || !errors.Is(err, syscall.ENOTEMPTY) {
+	closer := opened.Reference.(storage.ReferenceCloseActions)
+	closeStatus, err := closer.CloseOwnerStatus(t.Context())
+	if err != nil || !closeStatus.Ready || closeStatus.Released || closeStatus.NextGeneration != 1 {
+		t.Fatalf("directory close owner before close=%+v error=%v", closeStatus, err)
+	}
+	closeID, err := storage.NewFileActionID(closeStatus.CurrentEpoch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	attempt := storage.CloseAttempt{Action: closeID, Generation: closeStatus.NextGeneration}
+	if result, err := closer.CloseWithAction(t.Context(), attempt); !result.Released || !result.Determined || !errors.Is(err, syscall.ENOTEMPTY) {
 		t.Fatalf("close nonempty directory=%+v %v", result, err)
 	}
-	if result, err := opened.Reference.CloseWithResult(t.Context()); !result.Released || !errors.Is(err, syscall.ENOTEMPTY) {
+	receipt, err := closer.QueryCloseAttempt(t.Context(), attempt)
+	if err != nil || receipt.Operation != storage.OpFileClose || receipt.Outcome != storage.FileActionCompleted {
+		t.Fatalf("directory close receipt=%+v error=%v", receipt, err)
+	}
+	if result, err := closer.CloseWithAction(t.Context(), attempt); !result.Released || !errors.Is(err, syscall.ENOTEMPTY) {
 		t.Fatalf("replayed terminal close=%+v %v", result, err)
+	}
+	if result, err := opened.Reference.CloseWithResult(t.Context()); !result.Released || !errors.Is(err, syscall.ENOTEMPTY) {
+		t.Fatalf("legacy close after action=%+v %v", result, err)
 	}
 	if _, err := opened.Reference.Stat(t.Context()); !errors.Is(err, syscall.EBADF) {
 		t.Fatalf("closed reference remained active: %v", err)

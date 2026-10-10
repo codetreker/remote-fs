@@ -2,6 +2,7 @@ package limited
 
 import (
 	"context"
+	"errors"
 	"syscall"
 
 	"github.com/codetreker/remote-fs/packages/storage"
@@ -29,6 +30,11 @@ func (s *fileSession) OpenAt(ctx context.Context, selection storage.ChildSelecti
 	backing, err := capability(s.FileSession, storage.AtomicFileOpener.CheckAtomicFileOpen)
 	if err != nil {
 		return storage.OpenResult{}, err
+	}
+	if options.MetadataAccess != 0 {
+		if err := s.CheckOpenMetadataAccess(); err != nil {
+			return storage.OpenResult{}, err
+		}
 	}
 	result, err := fileMutation(s.storage, ctx, "atomic open", func(ctx context.Context) (storage.OpenResult, error) {
 		return backing.OpenAt(ctx, selection, options)
@@ -118,6 +124,11 @@ func (s *fileSession) CheckNodeReferences() error {
 
 func (s *fileSession) CheckFileActions() error {
 	_, err := capability(s.FileSession, storage.FileActions.CheckFileActions)
+	return err
+}
+
+func (s *fileSession) CheckRecoverableReferenceClose() error {
+	_, err := capability(s.FileSession, storage.RecoverableReferenceClose.CheckRecoverableReferenceClose)
 	return err
 }
 
@@ -264,6 +275,31 @@ func (s *fileSession) Drop(ctx context.Context, owner storage.UseOwner, domain s
 type referenceCapabilities struct {
 	backing any
 	storage *Storage
+}
+
+func (r *referenceCapabilities) CloseWithAction(ctx context.Context, attempt storage.CloseAttempt) (storage.ReferenceCloseResult, error) {
+	backing, err := capability(r.backing, func(c storage.ReferenceCloseActions) error { return nil })
+	if err != nil {
+		return storage.ReferenceCloseResult{}, err
+	}
+	result, err := backing.CloseWithAction(ctx, attempt)
+	return result, r.storage.publicationError(errors.Join(err, result.Check(err)))
+}
+
+func (r *referenceCapabilities) QueryCloseAttempt(ctx context.Context, attempt storage.CloseAttempt) (storage.FileActionReceipt, error) {
+	backing, err := capability(r.backing, func(c storage.ReferenceCloseActions) error { return nil })
+	if err != nil {
+		return storage.FileActionReceipt{}, err
+	}
+	return backing.QueryCloseAttempt(ctx, attempt)
+}
+
+func (r *referenceCapabilities) CloseOwnerStatus(ctx context.Context) (storage.CloseOwnerStatus, error) {
+	backing, err := capability(r.backing, func(c storage.ReferenceCloseActions) error { return nil })
+	if err != nil {
+		return storage.CloseOwnerStatus{}, err
+	}
+	return backing.CloseOwnerStatus(ctx)
 }
 
 func (r *referenceCapabilities) CheckScopedReference() error {

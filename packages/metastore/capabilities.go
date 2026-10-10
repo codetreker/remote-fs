@@ -23,6 +23,9 @@ type AtomicFileOpener interface {
 	OpenAt(context.Context, storage.ChildSelection, storage.OpenAtOptions) (OpenResult, error)
 }
 
+// BackendIdentity is optional; unsupported authorities must fail preflight.
+type BackendIdentity interface{ storage.BackendIdentity }
+
 // NodeReference shares native retention and session lifetime without granting
 // regular-file byte methods.
 type NodeReference interface {
@@ -33,7 +36,6 @@ type NodeReference interface {
 	Node(context.Context) (FileState, error)
 	SetAttr(context.Context, storage.AttrChange) (FileState, error)
 	Retire(context.Context) error
-	DropUse(context.Context) error
 	Close(context.Context) error
 	CloseWithResult(context.Context) (storage.ReferenceCloseResult, error)
 }

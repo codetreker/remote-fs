@@ -105,7 +105,15 @@ func (s *endpointStorage) ReadBounded(context.Context, string, int64) ([]byte, e
 	s.dataCalls.Add(1)
 	return nil, syscall.ENOSYS
 }
-func (s *endpointStorage) CheckFileStorage() error { return s.checkErr }
+func (s *endpointStorage) CheckFileStorage() error     { return s.checkErr }
+func (s *endpointStorage) CheckBackendIdentity() error { return s.checkErr }
+func (*endpointStorage) BackendIdentity(context.Context) (storage.BackendIdentityResult, error) {
+	return endpointBackendIdentity(), nil
+}
+
+func endpointBackendIdentity() storage.BackendIdentityResult {
+	return storage.BackendIdentityResult{Volume: "test-volume", Authority: "test-authority", RootNodeID: 1}
+}
 func (s *endpointStorage) NewFileSession(context.Context, storage.FileSessionOptions) (storage.FileSession, error) {
 	s.sessionOpens.Add(1)
 	if s.session == nil {
@@ -115,6 +123,7 @@ func (s *endpointStorage) NewFileSession(context.Context, storage.FileSessionOpt
 }
 
 type endpointFileSession struct {
+	endpointCreateCapabilities
 	mu           sync.Mutex
 	status       storage.FileSessionStatus
 	renewFn      func(context.Context, int) (storage.FileSessionStatus, error)
@@ -131,6 +140,13 @@ func newEndpointFileSession() *endpointFileSession {
 		HistoryRemaining: time.Minute,
 	}}
 }
+func (*endpointFileSession) CheckFileSessionIdentity() error { return nil }
+func (s *endpointFileSession) FileSessionIdentity(context.Context) (storage.FileSessionIdentityResult, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return storage.FileSessionIdentityResult{Backend: endpointBackendIdentity(), SessionEpoch: s.status.Epoch}, nil
+}
+
 func (*endpointFileSession) OpenFile(context.Context, string, storage.FileOpenOptions) (storage.File, error) {
 	return nil, syscall.ENOSYS
 }
@@ -183,35 +199,41 @@ func (s *endpointFileSession) CloseWithResult(ctx context.Context) (storage.Refe
 	err := s.Close(ctx)
 	return storage.ReferenceCloseResult{Released: err == nil}, err
 }
-func (*endpointFileSession) CheckAtomicFileOpen() error      { return nil }
-func (*endpointFileSession) CheckAllocationReporting() error { return nil }
-func (*endpointFileSession) OpenAt(context.Context, storage.ChildSelection, storage.OpenAtOptions) (storage.OpenResult, error) {
-	return storage.OpenResult{}, syscall.ENOSYS
-}
-func (*endpointFileSession) CheckNodeReferences() error { return nil }
-func (*endpointFileSession) OpenNodeRef(context.Context, uint64, storage.NodeRefOptions) (storage.NodeOpenResult, error) {
-	return storage.NodeOpenResult{}, syscall.ENOSYS
-}
-func (*endpointFileSession) OpenChildRef(context.Context, storage.ChildSelection, storage.NodeRefOptions) (storage.NodeOpenResult, error) {
-	return storage.NodeOpenResult{}, syscall.ENOSYS
-}
-func (*endpointFileSession) CheckDirectoryMetadataObservation() error { return nil }
-func (*endpointFileSession) ObserveDirectoryMetadata(context.Context, storage.DirectoryTarget, storage.DirectoryMetadataOptions, *storage.ListResult) (storage.DirectoryMetadataObservation, error) {
+
+type endpointCreateCapabilities struct{}
+
+func (endpointCreateCapabilities) CheckAllocationReporting() error          { return nil }
+func (endpointCreateCapabilities) CheckDirectoryMetadataObservation() error { return nil }
+func (endpointCreateCapabilities) ObserveDirectoryMetadata(context.Context, storage.DirectoryTarget, storage.DirectoryMetadataOptions, *storage.ListResult) (storage.DirectoryMetadataObservation, error) {
 	return storage.DirectoryMetadataObservation{}, syscall.ENOSYS
 }
-func (*endpointFileSession) CheckFileActions() error { return nil }
-func (*endpointFileSession) QueryFileAction(context.Context, storage.FileActionID) (storage.FileActionReceipt, error) {
+func (endpointCreateCapabilities) CheckAtomicFileOpen() error { return nil }
+func (endpointCreateCapabilities) OpenAt(context.Context, storage.ChildSelection, storage.OpenAtOptions) (storage.OpenResult, error) {
+	return storage.OpenResult{}, syscall.ENOSYS
+}
+func (endpointCreateCapabilities) CheckNodeReferences() error { return nil }
+func (endpointCreateCapabilities) OpenNodeRef(context.Context, uint64, storage.NodeRefOptions) (storage.NodeOpenResult, error) {
+	return storage.NodeOpenResult{}, syscall.ENOSYS
+}
+func (endpointCreateCapabilities) OpenChildRef(context.Context, storage.ChildSelection, storage.NodeRefOptions) (storage.NodeOpenResult, error) {
+	return storage.NodeOpenResult{}, syscall.ENOSYS
+}
+func (endpointCreateCapabilities) CheckFileActions() error { return nil }
+func (endpointCreateCapabilities) QueryFileAction(context.Context, storage.FileActionID) (storage.FileActionReceipt, error) {
 	return storage.FileActionReceipt{}, syscall.ENOSYS
 }
-func (*endpointFileSession) QueryDeleteIntent(context.Context, storage.DeleteIntentOwner, storage.DeleteIntentID) (storage.DeleteIntentStatus, error) {
+func (endpointCreateCapabilities) QueryDeleteIntent(context.Context, storage.DeleteIntentOwner, storage.DeleteIntentID) (storage.DeleteIntentStatus, error) {
 	return storage.DeleteIntentStatus{}, syscall.ENOSYS
 }
-func (*endpointFileSession) ListDeleteIntents(context.Context, storage.DeleteIntentOwner, storage.DeleteIntentCursor, int) (storage.DeleteIntentPage, error) {
+func (endpointCreateCapabilities) ListDeleteIntents(context.Context, storage.DeleteIntentOwner, storage.DeleteIntentCursor, int) (storage.DeleteIntentPage, error) {
 	return storage.DeleteIntentPage{}, syscall.ENOSYS
 }
-func (*endpointFileSession) AcknowledgeDeleteIntent(context.Context, storage.AcknowledgeDeleteIntentCommand) error {
+func (endpointCreateCapabilities) AcknowledgeDeleteIntent(context.Context, storage.AcknowledgeDeleteIntentCommand) error {
 	return syscall.ENOSYS
 }
+func (endpointCreateCapabilities) CheckStableReferenceIdentity() error   { return nil }
+func (endpointCreateCapabilities) CheckOpenMetadataAccess() error        { return nil }
+func (endpointCreateCapabilities) CheckRecoverableReferenceClose() error { return nil }
 
 func endpointConfig() Config {
 	return Config{
@@ -233,8 +255,6 @@ func TestEndpointConfigurationAndExportReservation(t *testing.T) {
 		"authorizer":          func(c *Config) { c.Authorize = nil },
 		"frame":               func(c *Config) { c.Limits.MaxFrameBytes = c.Limits.MaxIOBytes },
 		"sessions":            func(c *Config) { c.Limits.MaxSessions = 0 },
-		"handles":             func(c *Config) { c.Limits.MaxHandles = 0 },
-		"directory budget":    func(c *Config) { c.Limits.MaxDirectoryBytes = 0 },
 		"timeout":             func(c *Config) { c.Limits.CleanupTimeout = 0 },
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -252,14 +272,14 @@ func TestEndpointConfigurationAndExportReservation(t *testing.T) {
 		t.Fatal(err)
 	}
 	backend := &endpointStorage{}
-	export, err := server.Publish(Share{Name: "Volume", Volume: "volume-a", Backend: backend})
+	export, err := server.Publish(Share{Name: "Volume", Volume: "volume-a", BackendVolume: "test-volume", RootNodeID: 1, Backend: backend})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := server.Publish(Share{Name: "Other", Volume: "volume-b", Backend: &endpointStorage{}}); !errors.Is(err, ErrBusy) {
+	if _, err := server.Publish(Share{Name: "Other", Volume: "volume-b", BackendVolume: "test-volume", RootNodeID: 1, Backend: &endpointStorage{}}); !errors.Is(err, ErrBusy) {
 		t.Fatalf("second export = %v", err)
 	}
-	if _, err := server.Publish(Share{Name: "volume", Volume: "volume-c", Backend: &endpointStorage{}}); !errors.Is(err, ErrBusy) {
+	if _, err := server.Publish(Share{Name: "volume", Volume: "volume-c", BackendVolume: "test-volume", RootNodeID: 1, Backend: &endpointStorage{}}); !errors.Is(err, ErrBusy) {
 		t.Fatalf("case-equivalent export = %v", err)
 	}
 	if err := export.Unpublish(t.Context()); err != nil {
@@ -281,10 +301,10 @@ func TestPublishFailureDoesNotConsumeCapacity(t *testing.T) {
 		t.Fatal(err)
 	}
 	cause := errors.New("capability chain")
-	if _, err := server.Publish(Share{Name: "bad", Volume: "bad", Backend: &endpointStorage{checkErr: cause}}); !errors.Is(err, cause) {
+	if _, err := server.Publish(Share{Name: "bad", Volume: "bad", BackendVolume: "test-volume", RootNodeID: 1, Backend: &endpointStorage{checkErr: cause}}); !errors.Is(err, cause) {
 		t.Fatalf("failed publish = %v", err)
 	}
-	if _, err := server.Publish(Share{Name: "good", Volume: "good", Backend: &endpointStorage{}}); err != nil {
+	if _, err := server.Publish(Share{Name: "good", Volume: "good", BackendVolume: "test-volume", RootNodeID: 1, Backend: &endpointStorage{}}); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -295,7 +315,7 @@ func TestShutdownRemovesQuiescentExportsWithoutTakingBackendOwnership(t *testing
 		t.Fatal(err)
 	}
 	backend := &endpointStorage{}
-	if _, err := server.Publish(Share{Name: "data", Volume: "volume", Backend: backend}); err != nil {
+	if _, err := server.Publish(Share{Name: "data", Volume: "volume", BackendVolume: "test-volume", RootNodeID: 1, Backend: backend}); err != nil {
 		t.Fatal(err)
 	}
 	if err := server.Shutdown(t.Context()); err != nil {

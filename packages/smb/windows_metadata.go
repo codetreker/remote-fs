@@ -132,8 +132,8 @@ func checkCreateAllocation(attr storage.Attr) error {
 	if err := attr.CheckAllocation(); err != nil {
 		return err
 	}
-	if !attr.AllocationKnown || attr.AllocationSize%4096 != 0 {
-		return fmt.Errorf("CREATE requires known 4096-byte allocation: %w", syscall.EIO)
+	if !attr.AllocationKnown {
+		return fmt.Errorf("CREATE requires known allocation: %w", syscall.EIO)
 	}
 	return nil
 }

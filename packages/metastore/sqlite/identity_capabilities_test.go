@@ -107,7 +107,7 @@ func TestIdentityAddressedNamespaceAndAtomicOpenPreserveTheSelectedNode(t *testi
 		t.Fatal(err)
 	}
 	name := storage.ChildName{Parent: storage.DirectoryTarget{NodeID: directory.Attr().ID}, RawLeaf: []byte("file")}
-	opened, err := store.OpenAt(t.Context(), selectChild(name), storage.OpenAtOptions{
+	opened, err := store.OpenAt(t.Context(), selectChild(name), storage.OpenAtOptions{MetadataAccess: storage.ReadMetadata | storage.WriteMetadata,
 		Read: true, Write: true, Create: true, Exclusive: true,
 		Target: storage.ChildCondition{State: storage.Absent}, Action: fileAction(t),
 		Use: storage.UseClaim{Uses: storage.ReadData | storage.WriteData}, Existing: storage.Keep,
@@ -179,7 +179,7 @@ func TestAtomicIdentityOpensCheckAuthoritativeMetadataPredicates(t *testing.T) {
 		open func(storage.ChildCondition) (func() error, error)
 	}{
 		{"OpenAt", func(condition storage.ChildCondition) (func() error, error) {
-			result, err := store.OpenAt(t.Context(), selectChild(name), storage.OpenAtOptions{
+			result, err := store.OpenAt(t.Context(), selectChild(name), storage.OpenAtOptions{MetadataAccess: storage.ReadMetadata | storage.WriteMetadata,
 				Read: true, Target: condition, Action: fileAction(t), Existing: storage.Keep,
 				Use: storage.UseClaim{Uses: storage.ReadData},
 			})
@@ -234,7 +234,7 @@ func TestUncertainIdentityMutationsPreserveTheirCapturedResults(t *testing.T) {
 		}
 		acceptErr := errors.New("open acceptance unavailable")
 		store.witness = &retainedFailureWitness{failure: acceptErr}
-		result, err := store.OpenAt(t.Context(), selectChild(storage.ChildName{Parent: directoryTarget(root), RawLeaf: []byte("file")}), storage.OpenAtOptions{
+		result, err := store.OpenAt(t.Context(), selectChild(storage.ChildName{Parent: directoryTarget(root), RawLeaf: []byte("file")}), storage.OpenAtOptions{MetadataAccess: storage.ReadMetadata | storage.WriteMetadata,
 			Read: true, Create: true, Exclusive: true, Existing: storage.Keep, Action: fileAction(t),
 			Target: storage.ChildCondition{State: storage.Absent}, Use: storage.UseClaim{Uses: storage.ReadData},
 		})
@@ -345,7 +345,7 @@ func TestCloseDeleteIntentFollowsRenameWithoutDeletingTheSuccessor(t *testing.T)
 	}
 	name := storage.ChildName{Parent: directoryTarget(root), RawLeaf: []byte("name")}
 	intentID := storage.DeleteIntentID("0123456789abcdef0123456789abcdef")
-	opened, err := store.OpenAt(metastore.WithReferenceSession(t.Context(), nil), selectChild(name), storage.OpenAtOptions{
+	opened, err := store.OpenAt(metastore.WithReferenceSession(t.Context(), nil), selectChild(name), storage.OpenAtOptions{MetadataAccess: storage.ReadMetadata | storage.WriteMetadata,
 		Read: true, Create: true, Exclusive: true, Target: storage.ChildCondition{State: storage.Absent},
 		Action: fileAction(t), Existing: storage.Keep,
 		Use:         storage.UseClaim{Uses: storage.ReadData | storage.DeleteName},
@@ -462,7 +462,7 @@ func TestDeleteCleanupFailureIsReportedAndRetryable(t *testing.T) {
 		t.Fatal(err)
 	}
 	intentID := storage.DeleteIntentID("11111111111111111111111111111111")
-	opened, err := store.OpenAt(t.Context(), selectChild(storage.ChildName{Parent: directoryTarget(root), RawLeaf: []byte("victim")}), storage.OpenAtOptions{
+	opened, err := store.OpenAt(t.Context(), selectChild(storage.ChildName{Parent: directoryTarget(root), RawLeaf: []byte("victim")}), storage.OpenAtOptions{MetadataAccess: storage.ReadMetadata | storage.WriteMetadata,
 		Read: true, Create: true, Exclusive: true, Existing: storage.Keep, Action: fileAction(t),
 		Target:      storage.ChildCondition{State: storage.Absent},
 		Use:         storage.UseClaim{Uses: storage.ReadData | storage.DeleteName},
@@ -598,7 +598,7 @@ func TestIdentityRemovalPublishesOnlyRegularContentBytes(t *testing.T) {
 		t.Fatal(err)
 	}
 	var replacement [][2]int64
-	replaced, err := store.OpenAt(accountingContext(t, &replacement), selectChild(storage.ChildName{Parent: directoryTarget(root), RawLeaf: []byte("file")}), storage.OpenAtOptions{
+	replaced, err := store.OpenAt(accountingContext(t, &replacement), selectChild(storage.ChildName{Parent: directoryTarget(root), RawLeaf: []byte("file")}), storage.OpenAtOptions{MetadataAccess: storage.ReadMetadata | storage.WriteMetadata,
 		Read: true, Create: true, Target: storage.ChildCondition{State: storage.SameNode, NodeID: uint64(current.ID)},
 		Action: fileAction(t), Existing: storage.ReplaceNode,
 		Use: storage.UseClaim{Uses: storage.ReadData | storage.DeleteName},
@@ -661,7 +661,7 @@ func TestPendingDeletePublishesTheRemovedRegularBytes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	opened, err := store.OpenAt(t.Context(), selectChild(storage.ChildName{Parent: directoryTarget(root), RawLeaf: []byte("victim")}), storage.OpenAtOptions{
+	opened, err := store.OpenAt(t.Context(), selectChild(storage.ChildName{Parent: directoryTarget(root), RawLeaf: []byte("victim")}), storage.OpenAtOptions{MetadataAccess: storage.ReadMetadata | storage.WriteMetadata,
 		Read: true, Write: true, Create: true, Exclusive: true, Existing: storage.Keep, Action: fileAction(t),
 		Target:      storage.ChildCondition{State: storage.Absent},
 		Use:         storage.UseClaim{Uses: storage.ReadData | storage.WriteData | storage.DeleteName},

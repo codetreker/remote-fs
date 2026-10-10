@@ -2,6 +2,7 @@ package locked
 
 import (
 	"context"
+	"errors"
 	"syscall"
 
 	"github.com/codetreker/remote-fs/packages/storage"
@@ -30,6 +31,11 @@ func (s *fileSession) OpenAt(ctx context.Context, selection storage.ChildSelecti
 	backend, err := capability(s.FileSession, storage.AtomicFileOpener.CheckAtomicFileOpen)
 	if err != nil {
 		return storage.OpenResult{}, err
+	}
+	if options.MetadataAccess != 0 {
+		if err := s.CheckOpenMetadataAccess(); err != nil {
+			return storage.OpenResult{}, err
+		}
 	}
 	result, err := backend.OpenAt(s.storage.mutationContext(ctx), selection, options)
 	result.File = s.storage.wrapFile(result.File)
@@ -111,6 +117,11 @@ func (s *fileSession) CheckNodeReferences() error {
 
 func (s *fileSession) CheckFileActions() error {
 	_, err := capability(s.FileSession, storage.FileActions.CheckFileActions)
+	return err
+}
+
+func (s *fileSession) CheckRecoverableReferenceClose() error {
+	_, err := capability(s.FileSession, storage.RecoverableReferenceClose.CheckRecoverableReferenceClose)
 	return err
 }
 
@@ -258,6 +269,31 @@ func (s *fileSession) Drop(ctx context.Context, owner storage.UseOwner, domain s
 type referenceCapabilities struct {
 	backend any
 	storage *Storage
+}
+
+func (r *referenceCapabilities) CloseWithAction(ctx context.Context, attempt storage.CloseAttempt) (storage.ReferenceCloseResult, error) {
+	backend, err := capability(r.backend, func(c storage.ReferenceCloseActions) error { return nil })
+	if err != nil {
+		return storage.ReferenceCloseResult{}, err
+	}
+	result, err := backend.CloseWithAction(readContext(ctx), attempt)
+	return result, errors.Join(err, result.Check(err))
+}
+
+func (r *referenceCapabilities) QueryCloseAttempt(ctx context.Context, attempt storage.CloseAttempt) (storage.FileActionReceipt, error) {
+	backend, err := capability(r.backend, func(c storage.ReferenceCloseActions) error { return nil })
+	if err != nil {
+		return storage.FileActionReceipt{}, err
+	}
+	return backend.QueryCloseAttempt(readContext(ctx), attempt)
+}
+
+func (r *referenceCapabilities) CloseOwnerStatus(ctx context.Context) (storage.CloseOwnerStatus, error) {
+	backend, err := capability(r.backend, func(c storage.ReferenceCloseActions) error { return nil })
+	if err != nil {
+		return storage.CloseOwnerStatus{}, err
+	}
+	return backend.CloseOwnerStatus(readContext(ctx))
 }
 
 func (r *referenceCapabilities) CheckScopedReference() error {

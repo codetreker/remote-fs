@@ -11,30 +11,8 @@ import (
 	"github.com/codetreker/remote-fs/packages/storage"
 )
 
-// This fixture defines ASCII ordering only; Windows casing is tested natively.
 func testNameCompare(left, right []uint16) (int, error) {
-	for i := 0; i < min(len(left), len(right)); i++ {
-		a, b := left[i], right[i]
-		if a >= 'a' && a <= 'z' {
-			a -= 'a' - 'A'
-		}
-		if b >= 'a' && b <= 'z' {
-			b -= 'a' - 'A'
-		}
-		if a < b {
-			return -1, nil
-		}
-		if a > b {
-			return 1, nil
-		}
-	}
-	if len(left) < len(right) {
-		return -1, nil
-	}
-	if len(left) > len(right) {
-		return 1, nil
-	}
-	return 0, nil
+	return portableNameCompare(left, right)
 }
 
 func TestSMBNamesPreserveLiteralPathAndDirectoryIntent(t *testing.T) {
@@ -71,7 +49,7 @@ func TestSMBNamesPreserveLiteralPathAndDirectoryIntent(t *testing.T) {
 }
 
 func TestSMBNamesEnforceUTF16AndLiteralLeafEligibility(t *testing.T) {
-	for _, name := range []string{"file", "COM0", "LPT10", "CONSOLE", "résumé", "é", strings.Repeat("x", 255), strings.Repeat("😀", 127) + "x"} {
+	for _, name := range []string{"file", "COM0", "LPT10", "CONSOLE", "résumé", "é", strings.Repeat("x", 255), strings.Repeat("é", 255), strings.Repeat("😀", 127) + "x"} {
 		if err := checkWindowsLeaf(name); err != nil {
 			t.Fatalf("eligible leaf %q: %v", name, err)
 		}
@@ -80,7 +58,7 @@ func TestSMBNamesEnforceUTF16AndLiteralLeafEligibility(t *testing.T) {
 			t.Fatalf("literal UTF16 changed: %q %v", decoded, err)
 		}
 	}
-	for _, name := range []string{"", ".", "..", "con", "NuL.txt", "CON .txt", "com1", "COM¹", "lpt².txt", "LPT³", "trail.", "trail ", "a?b", "a*b", "a:b", "a\\b", "a/b", "a|b", "a<b", "a>b", "a\"b", "a\t", string([]byte{0xff}), strings.Repeat("x", 256), strings.Repeat("😀", 128)} {
+	for _, name := range []string{"", ".", "..", "con", "NuL.txt", "CON .txt", "com1", "COM¹", "lpt².txt", "LPT³", "trail.", "trail ", "a?b", "a*b", "a:b", "a\\b", "a/b", "a|b", "a<b", "a>b", "a\"b", "a\t", string([]byte{0xff}), strings.Repeat("x", 256), strings.Repeat("é", 256), strings.Repeat("😀", 128)} {
 		if err := checkWindowsLeaf(name); !errors.Is(err, errNameInvalid) {
 			t.Fatalf("ineligible leaf %q accepted: %v", name, err)
 		}
@@ -108,6 +86,8 @@ func TestSMBNamesValidateWholeDirectoryBeforeSelection(t *testing.T) {
 		{"unrelated collision", []storage.Entry{entry("wanted", 2), entry("Other", 3), entry("OTHER", 4)}, errNameAmbiguous},
 		{"duplicate identity", []storage.Entry{entry("a", 2), entry("b", 2)}, syscall.EIO},
 		{"zero identity", []storage.Entry{entry("a", 0)}, syscall.EIO},
+		{"invalid kind", []storage.Entry{{Name: "wanted", Attr: storage.Attr{ID: 2, Kind: storage.NodeRegular}}, {Name: "peer", Attr: storage.Attr{ID: 3, Kind: storage.NodeKind(255)}}}, syscall.EIO},
+		{"negative size", []storage.Entry{{Name: "wanted", Attr: storage.Attr{ID: 2, Kind: storage.NodeRegular}}, {Name: "peer", Attr: storage.Attr{ID: 3, Kind: storage.NodeRegular, Size: -1}}}, syscall.EIO},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			if _, err := projectDirectory(test.entries, testNameCompare); !errors.Is(err, test.want) {
@@ -134,5 +114,8 @@ func TestSMBNamesValidateWholeDirectoryBeforeSelection(t *testing.T) {
 	}
 	if _, _, err := selectName(projection, nameUnits("a"), broken); !errors.Is(err, failure) {
 		t.Fatalf("selection error hidden: %v", err)
+	}
+	if _, err := projectDirectory(make([]storage.Entry, storage.MaxDirectoryEntries+1), testNameCompare); !errors.Is(err, syscall.EFBIG) {
+		t.Fatalf("directory entry bound: %v", err)
 	}
 }

@@ -345,7 +345,8 @@ func (n *node) openFile(ctx context.Context, name storage.ChildName, options sto
 	}
 	request := storage.OpenAtOptions{
 		Read: options.Read, Write: options.Write, Create: options.Create, Exclusive: options.Exclusive,
-		Target: target, Action: action, Existing: effect, Use: storage.UseClaim{Uses: uses},
+		MetadataAccess: storage.ReadMetadata | storage.WriteMetadata,
+		Target:         target, Action: action, Existing: effect, Use: storage.UseClaim{Uses: uses},
 		Initial: storage.InitialState{OnCreate: storage.InitialFields{Metadata: options.InitialMetadata}},
 	}
 	selection := storage.ChildSelection{Name: name}
@@ -680,7 +681,7 @@ func (v *volume) fillAttr(out *gofuse.Attr, attr storage.Attr) syscall.Errno {
 	if attr.ID == 0 || !attr.IsDir() && attr.Size < 0 {
 		return syscall.EIO
 	}
-	if err := attr.CheckAllocation(); err != nil || !attr.AllocationKnown || attr.AllocationSize%linuxStatBlockSize != 0 {
+	if err := attr.CheckAllocation(); err != nil || !attr.AllocationKnown {
 		return syscall.EIO
 	}
 	mode, errno := attributeMode(attr)
@@ -692,6 +693,9 @@ func (v *volume) fillAttr(out *gofuse.Attr, attr storage.Attr) syscall.Errno {
 		out.Size = uint64(attr.Size)
 	}
 	out.Blocks = uint64(attr.AllocationSize) / linuxStatBlockSize
+	if attr.AllocationSize%linuxStatBlockSize != 0 {
+		out.Blocks++
+	}
 	accessed, changed := attr.AccessTime, attr.ModTime
 	out.Atime, out.Atimensec = uint64(accessed.Unix()), uint32(accessed.Nanosecond())
 	out.Mtime, out.Mtimensec = uint64(changed.Unix()), uint32(changed.Nanosecond())

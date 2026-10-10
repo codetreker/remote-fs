@@ -13,7 +13,12 @@ import (
 
 var ordinalCompare = windows.NewLazySystemDLL("kernel32.dll").NewProc("CompareStringOrdinal")
 
-func nameComparisonAvailable() error { return ordinalCompare.Find() }
+func platformNameComparer() (nameComparer, error) {
+	if err := ordinalCompare.Find(); err != nil {
+		return nil, err
+	}
+	return nativeNameCompare, nil
+}
 
 // Pointer arguments escape before DLL lookup or stack growth can move them.
 //

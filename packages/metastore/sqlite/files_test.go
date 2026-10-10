@@ -39,6 +39,249 @@ func openPublicationFile(t *testing.T) (*LockingStore, metastore.File) {
 	return s, f
 }
 
+func TestCloseReinspectsAfterNoCleanupAndFailedExactUseDrop(t *testing.T) {
+	store, file := openPublicationFile(t)
+	retained := file.(*retainedFile)
+	id := retained.id
+	if err := retained.Retire(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.coordinator.commit.acquire(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	finalized, err := retained.finalizeForCloseLocked(t.Context())
+	if err != nil || finalized {
+		store.coordinator.commit.release()
+		t.Fatalf("linked file needed cleanup = %v, %v", finalized, err)
+	}
+	failed, cancel := context.WithCancel(t.Context())
+	cancel()
+	err = store.fileDomain.coordinator.DropUseExact(failed, uint64(id), retained.scope, retained.use)
+	store.coordinator.commit.release()
+	if !errors.Is(err, context.Canceled) || retained.finalizationDone {
+		t.Fatalf("failed exact drop = %v, finalizationDone %v", err, retained.finalizationDone)
+	}
+	if err := store.Remove(t.Context(), "file"); err != nil {
+		t.Fatal(err)
+	}
+	result, err := retained.CloseWithResult(t.Context())
+	if err != nil || !result.Released {
+		t.Fatalf("retry close = %+v, %v", result, err)
+	}
+	var remaining int
+	if err := store.read.QueryRowContext(t.Context(), `SELECT count(*) FROM nodes WHERE volume=? AND id=?`, store.volume, id).Scan(&remaining); err != nil || remaining != 0 {
+		t.Fatalf("detached node remained = %d, %v", remaining, err)
+	}
+}
+
+func TestMissingExactUseClaimMakesCloseUnknownAndFencesConflictingOpen(t *testing.T) {
+	config := lockingTestConfig(t)
+	config.Allowance = 8192
+	store, err := OpenLocking(t.Context(), config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var file *retainedFile
+	poisoned := false
+	t.Cleanup(func() {
+		if file != nil {
+			if poisoned {
+				if err := store.coordinator.commit.acquire(context.Background()); err != nil {
+					t.Errorf("cleanup poisoned reference: %v", err)
+				} else {
+					delete(store.files, file)
+					delete(store.coordinator.pins, retainedNode{store.volume, file.id})
+					store.fileDomain.files--
+					store.coordinator.commit.release()
+				}
+			} else if err := file.Close(context.Background()); err != nil {
+				t.Errorf("close reference: %v", err)
+			}
+		}
+		if err := store.Close(); poisoned && (err == nil || !store.Terminal()) || !poisoned && err != nil {
+			t.Errorf("close store after injected corruption: %v, terminal %v", err, store.Terminal())
+		}
+	})
+	opened, err := store.OpenFile(t.Context(), "file", storage.FileOpenOptions{
+		OpenAccess: storage.OpenAccess{Read: true, Create: true},
+		Use:        storage.UseClaim{Uses: storage.ReadData, Deny: storage.ReadData},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	file = opened.(*retainedFile)
+	if err := file.Retire(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.fileDomain.coordinator.DropUse(t.Context(), uint64(file.id), file.scope); err != nil {
+		t.Fatal(err)
+	}
+	result, err := file.CloseWithResult(t.Context())
+	poisoned = true
+	if result.Released || result.Determined || !errors.Is(err, storage.ErrInvalidScope) || storage.ErrnoOf(err) != syscall.EIO {
+		t.Fatalf("missing claim result = %+v, %v", result, err)
+	}
+	if competing, err := store.OpenFile(t.Context(), "file", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true}}); competing != nil || storage.ErrnoOf(err) != syscall.EIO {
+		t.Fatalf("poisoned authority admitted conflicting open: reference=%v error=%v", competing, err)
+	}
+}
+
+func TestCommittedFinalizationDoesNotRepeatAfterFailedExactUseDrop(t *testing.T) {
+	config := lockingTestConfig(t)
+	config.Allowance = 4096
+	store, err := OpenLocking(t.Context(), config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Errorf("close store: %v", err)
+		}
+	})
+	key, err := store.Reserve(t.Context(), "file", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Commit(t.Context(), "file", metastore.Object{Key: key, Size: 1, ModTime: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	opened, err := store.OpenFile(t.Context(), "file", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	file := opened.(*retainedFile)
+	if err := store.Remove(t.Context(), "file"); err != nil {
+		t.Fatal(err)
+	}
+	closeCtx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	finalizations := 0
+	closeCtx = storage.WithPublicationAccounting(closeCtx, func(previous, next int64) (storage.PublicationSettlement, error) {
+		return func(result storage.PublicationResult) error {
+			if result == storage.PublicationApplied && previous > 0 && next == 0 {
+				finalizations++
+				cancel()
+			}
+			return nil
+		}, nil
+	})
+	first, err := file.CloseWithResult(closeCtx)
+	if first.Released || !first.Determined || !errors.Is(err, context.Canceled) || finalizations != 1 {
+		t.Fatalf("post-commit exact use failure = %+v, %v, finalizations %d", first, err, finalizations)
+	}
+	if count := store.coordinator.pins[retainedNode{store.volume, file.id}]; count != 1 {
+		t.Fatalf("failed exact drop released physical pin: %d", count)
+	}
+	if err := store.fileDomain.coordinator.CheckUse(t.Context(), uint64(file.id), file.scope, storage.ReadData); err != nil {
+		t.Fatalf("failed exact drop lost the original use claim: %v", err)
+	}
+	before, err := store.Space(t.Context())
+	if err != nil || before.Used != 0 {
+		t.Fatalf("committed cleanup quota = %+v, %v", before, err)
+	}
+	replayPublications := 0
+	retryCtx := storage.WithPublicationAccounting(t.Context(), func(int64, int64) (storage.PublicationSettlement, error) {
+		replayPublications++
+		return func(storage.PublicationResult) error { return nil }, nil
+	})
+	if result, err := file.CloseWithResult(retryCtx); err != nil || !result.Released {
+		t.Fatalf("close after committed cleanup = %+v, %v", result, err)
+	}
+	if replayPublications != 0 {
+		t.Fatalf("retry repeated committed finalization %d times", replayPublications)
+	}
+	after, err := store.Space(t.Context())
+	if err != nil || after.Used != 0 || after.Avail != before.Avail {
+		t.Fatalf("replayed cleanup changed quota: before %+v, after %+v, error %v", before, after, err)
+	}
+}
+
+func TestPendingCloseIntentFinalizationSurvivesFailedExactUseDrop(t *testing.T) {
+	config := lockingTestConfig(t)
+	config.Allowance = 4096
+	store, err := OpenLocking(t.Context(), config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Errorf("close store: %v", err)
+		}
+	})
+	root, err := store.Stat(t.Context(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	intentID := storage.DeleteIntentID("44444444444444444444444444444444")
+	opened, err := store.OpenAt(t.Context(), selectChild(storage.ChildName{Parent: directoryTarget(root), RawLeaf: []byte("victim")}), storage.OpenAtOptions{MetadataAccess: storage.ReadMetadata | storage.WriteMetadata,
+		Read: true, Write: true, Create: true, Exclusive: true, Existing: storage.Keep, Action: fileAction(t),
+		Target:      storage.ChildCondition{State: storage.Absent},
+		Use:         storage.UseClaim{Uses: storage.ReadData | storage.WriteData | storage.DeleteName, Deny: storage.DeleteName},
+		CloseIntent: &storage.CloseIntent{Owner: testDeleteIntentOwner, ID: intentID, Trigger: storage.OnReferenceClose, Condition: storage.UnlinkFile},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	file := opened.File.(*retainedFile)
+	before, err := file.Node(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, err := file.Reserve(t.Context(), 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.Commit(t.Context(), before.Revision, metastore.Object{Key: key, Size: 5, ModTime: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	closeCtx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	var intentPublishes, cleanupPublishes int
+	closeCtx = storage.WithPublicationAccounting(closeCtx, func(previous, next int64) (storage.PublicationSettlement, error) {
+		return func(result storage.PublicationResult) error {
+			if result == storage.PublicationApplied {
+				if previous > 0 && next == 0 {
+					cleanupPublishes++
+					cancel()
+				} else {
+					intentPublishes++
+				}
+			}
+			return nil
+		}, nil
+	})
+	first, err := file.CloseWithResult(closeCtx)
+	if first.Released || !first.Determined || !errors.Is(err, context.Canceled) || intentPublishes != 1 || cleanupPublishes != 1 {
+		t.Fatalf("close intent finalization = %+v, %v, intent %d, cleanup %d", first, err, intentPublishes, cleanupPublishes)
+	}
+	status, err := store.QueryDeleteIntent(t.Context(), testDeleteIntentOwner, intentID)
+	if err != nil || status.Outcome != storage.DeleteIntentCompleted {
+		t.Fatalf("durable intent after committed finalization = %+v, %v", status, err)
+	}
+	if count := store.coordinator.pins[retainedNode{store.volume, file.id}]; count != 1 {
+		t.Fatalf("failed exact drop released pin: %d", count)
+	}
+	if err := store.fileDomain.coordinator.CheckUse(t.Context(), uint64(file.id), file.scope, storage.DeleteName); err != nil {
+		t.Fatalf("failed exact drop lost original claim: %v", err)
+	}
+	replayPublishes := 0
+	retryCtx := storage.WithPublicationAccounting(t.Context(), func(int64, int64) (storage.PublicationSettlement, error) {
+		replayPublishes++
+		return func(storage.PublicationResult) error { return nil }, nil
+	})
+	if result, err := file.CloseWithResult(retryCtx); err != nil || !result.Released || replayPublishes != 0 {
+		t.Fatalf("retry repeated intent or cleanup = %+v, %v, publications %d", result, err, replayPublishes)
+	}
+	status, err = store.QueryDeleteIntent(t.Context(), testDeleteIntentOwner, intentID)
+	if err != nil || status.Outcome != storage.DeleteIntentCompleted {
+		t.Fatalf("intent after retry = %+v, %v", status, err)
+	}
+	space, err := store.Space(t.Context())
+	if err != nil || space.Used != 0 {
+		t.Fatalf("intent retry quota = %+v, %v", space, err)
+	}
+}
+
 func TestRetiredReferenceCannotPublishAPreviouslyReservedObject(t *testing.T) {
 	s, f := openPublicationFile(t)
 	before, err := f.Node(t.Context())

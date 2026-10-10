@@ -35,31 +35,96 @@ type fileRegistry struct {
 	wake           chan struct{}
 	done           chan struct{}
 	err            error
-	terminalErr    error
+	terminalErr    closeErrorSummary
 }
 
+const maxRetainedCloseErrors = 16
+
+// Close errors can precede Handler.Close by arbitrarily many retired sessions.
+// Keep the first failure and a bounded sample of later failures while counting
+// every released reference whose cleanup failed.
+type closeErrorSummary struct {
+	count   uint64
+	samples []error
+}
+
+func (s *closeErrorSummary) add(err error) {
+	if err == nil {
+		return
+	}
+	s.count++
+	retained := retainFileError(err)
+	if len(s.samples) < maxRetainedCloseErrors {
+		s.samples = append(s.samples, retained)
+		return
+	}
+	copy(s.samples[1:], s.samples[2:])
+	s.samples[len(s.samples)-1] = retained
+}
+
+func (s closeErrorSummary) result() error {
+	if s.count == 0 {
+		return nil
+	}
+	return &closeErrors{count: s.count, samples: append([]error(nil), s.samples...)}
+}
+
+type closeErrors struct {
+	count   uint64
+	samples []error
+}
+
+func (e *closeErrors) Error() string {
+	return fmt.Sprintf("%d file reference cleanup failures: %v", e.count, errors.Join(e.samples...))
+}
+
+func (e *closeErrors) Unwrap() []error { return e.samples }
+
 type servedFileSession struct {
-	dataActions    int
-	cleanupActions int
-	authority      string
-	revision       uint64
-	mu             sync.Mutex
-	native         storage.FileSession
-	files          map[string]*servedFile
-	actions        map[storage.LockRequestID]*servedFileAction
-	options        storage.FileSessionOptions
-	started        time.Time
-	expires        time.Time
-	retired        bool
-	explicitClose  bool
-	autoClose      bool
+	dataActions         int
+	cleanupActions      int
+	cleanupReserved     int
+	closeAction         storage.LockRequestID
+	closeGeneration     uint64
+	closeDetermined     bool
+	closeReconciling    bool
+	closeReleaseErr     error
+	sessionCloseReserve int
+	recoverable         bool
+	stableIdentity      bool
+	closeIDs            map[storage.LockRequestID]closeIDUse
+	authority           string
+	revision            uint64
+	mu                  sync.Mutex
+	native              storage.FileSession
+	files               map[string]*servedFile
+	actions             map[storage.LockRequestID]*servedFileAction
+	options             storage.FileSessionOptions
+	started             time.Time
+	expires             time.Time
+	retired             bool
+	explicitClose       bool
+	autoClose           bool
 }
 
 type servedFile struct {
-	native    retainedReference
-	pending   time.Time
-	closing   bool
-	replaying int
+	native          retainedReference
+	pending         time.Time
+	closing         bool
+	replaying       int
+	closeReserve    int
+	closeAction     storage.LockRequestID
+	closeGeneration uint64
+	closeDetermined bool
+	closeImplicit   bool
+}
+
+type closeIDUse struct {
+	owner       string
+	generation  uint64
+	implicit    bool
+	notExecuted bool
+	proofEpoch  uint64
 }
 
 type retainedReference interface {
@@ -71,6 +136,7 @@ type retainedReference interface {
 
 type servedFileAction struct {
 	retryMu          sync.Mutex
+	id               storage.LockRequestID
 	op               storage.Operation
 	cleanup          bool
 	digest           [32]byte
@@ -78,9 +144,18 @@ type servedFileAction struct {
 	expires          time.Time
 	response         fileResponse
 	file             string
+	closeOwner       string
+	closeGeneration  uint64
+	closeImplicit    bool
+	priorAction      storage.LockRequestID
+	priorGeneration  uint64
+	priorDetermined  bool
+	priorImplicit    bool
+	priorClosing     bool
 	err              error
 	closeSemanticErr error
 	barrierPending   bool
+	uncertain        bool
 }
 
 type terminalFileClose struct {
@@ -120,11 +195,23 @@ func (s *servedFileSession) epoch(now time.Time) uint64 {
 	return uint64(now.Sub(s.started)/s.options.History) + 1
 }
 
+func (s *servedFileSession) pruneCloseIDsLocked(httpEpoch, nativeEpoch uint64) {
+	for id, use := range s.closeIDs {
+		idEpoch, err := id.Epoch()
+		if err != nil {
+			continue
+		}
+		if use.implicit && idEpoch < httpEpoch && httpEpoch-idEpoch >= 2 || !use.implicit && nativeEpoch != 0 && idEpoch < nativeEpoch {
+			delete(s.closeIDs, id)
+		}
+	}
+}
+
 func (r *fileRegistry) startLocked() {
 	if !r.running {
 		r.done = make(chan struct{})
 		if r.closed {
-			r.err = r.terminalErr
+			r.err = r.terminalErr.result()
 		}
 		r.running = true
 		go r.run()
@@ -223,10 +310,19 @@ func (r *fileRegistry) run() {
 			for key, a := range s.actions {
 				select {
 				case <-a.done:
-					if !now.Before(a.expires) {
+					if !now.Before(a.expires) && !a.uncertain {
 						delete(s.actions, key)
 						if a.cleanup {
 							s.cleanupActions--
+							if a.op == storage.OpFileClose {
+								if file := s.files[a.closeOwner]; file != nil {
+									file.closeReserve++
+									s.cleanupReserved++
+								}
+							} else if a.op == storage.OpFileSessionClose && s.sessionCloseReserve < 2 {
+								s.sessionCloseReserve++
+								s.cleanupReserved++
+							}
 						} else {
 							s.dataActions--
 						}
@@ -248,13 +344,21 @@ func (r *fileRegistry) run() {
 						r.mu.Unlock()
 					} else if result.Released {
 						r.mu.Lock()
-						r.terminalErr = errors.Join(r.terminalErr, err)
+						r.terminalErr.add(err)
 						r.mu.Unlock()
 					}
 				}
 				if result.Released {
+					reconciled := r.reconcileReleasedClose(context.Background(), s, cap, f, "")
 					s.mu.Lock()
-					delete(s.files, cap)
+					if reconciled {
+						s.cleanupReserved -= f.closeReserve
+						f.closeReserve = 0
+						delete(s.files, cap)
+					} else {
+						s.retired = true
+						retire = true
+					}
 					s.mu.Unlock()
 				}
 			}
@@ -267,7 +371,7 @@ func (r *fileRegistry) run() {
 			pending := false
 			for _, s := range r.sessions {
 				s.mu.Lock()
-				pending = pending || s.explicitClose
+				pending = pending || s.explicitClose || s.closeReconciling
 				s.mu.Unlock()
 			}
 			r.mu.Unlock()
@@ -285,35 +389,53 @@ func (r *fileRegistry) closeRetiringSession(id string, session *servedFileSessio
 		return
 	}
 	session.autoClose = true
+	reconciling, releaseErr := session.closeReconciling, session.closeReleaseErr
 	session.mu.Unlock()
 
-	result, closeErr := session.native.CloseWithResult(context.Background())
-	err := errors.Join(closeErr, result.Check(closeErr))
+	result := storage.ReferenceCloseResult{Released: true, Determined: true}
+	err := releaseErr
+	if !reconciling {
+		var closeErr error
+		result, closeErr = session.native.CloseWithResult(context.Background())
+		err = errors.Join(closeErr, result.Check(closeErr))
+	}
+	reconciled := false
+	if result.Released {
+		reconciled = r.reconcileSessionFileCloses(context.Background(), session)
+	}
 	r.mu.Lock()
-	if result.Released && r.sessions[id] == session {
+	if result.Released && reconciled && r.sessions[id] == session {
 		delete(r.sessions, id)
+		now := time.Now()
 		terminal := &terminalFileClose{
-			epoch: session.epoch(time.Now()), history: session.options.History,
-			expires: time.Now().Add(2 * session.options.History), releaseErr: retainFileError(err),
+			epoch: session.epoch(now), history: session.options.History,
+			expires: now.Add(2 * session.options.History), releaseErr: retainFileError(err),
 			actions: make(map[storage.LockRequestID]*servedFileAction),
 		}
 		session.mu.Lock()
 		for id, action := range session.actions {
-			if action.op == storage.OpFileSessionClose {
+			if (action.op == storage.OpFileClose || action.op == storage.OpFileSessionClose) && (now.Before(action.expires) || action.uncertain) {
+				if action.uncertain && !now.Before(action.expires) {
+					action.expires = now.Add(session.options.History)
+				}
 				terminal.actions[id] = action
 			}
 		}
 		session.mu.Unlock()
 		r.terminalCloses[id] = terminal
 	}
-	if err != nil && closing {
+	if err != nil && closing && !reconciling {
 		r.recordCloseErrorLocked(err, result.Released)
-	} else if err != nil && result.Released {
-		r.terminalErr = errors.Join(r.terminalErr, err)
+	} else if err != nil && result.Released && !reconciling {
+		r.terminalErr.add(err)
 	}
 	r.mu.Unlock()
 	session.mu.Lock()
-	if !result.Released {
+	session.closeReconciling = result.Released && !reconciled
+	if session.closeReconciling {
+		session.closeReleaseErr = retainFileError(err)
+	}
+	if !result.Released || !reconciled {
 		session.autoClose = false
 	}
 	session.mu.Unlock()
@@ -322,8 +444,130 @@ func (r *fileRegistry) closeRetiringSession(id string, session *servedFileSessio
 func (r *fileRegistry) recordCloseErrorLocked(err error, released bool) {
 	r.err = errors.Join(r.err, err)
 	if released {
-		r.terminalErr = errors.Join(r.terminalErr, err)
+		r.terminalErr.add(err)
 	}
+}
+
+func (r *fileRegistry) reconcileReleasedClose(ctx context.Context, session *servedFileSession, capability string, file *servedFile, active storage.LockRequestID) bool {
+	closer, ok := file.native.(storage.ReferenceCloseActions)
+	if !ok {
+		return true
+	}
+	session.mu.Lock()
+	actions := make([]*servedFileAction, 0, 2)
+	for _, action := range session.actions {
+		if action.op == storage.OpFileClose && action.closeOwner == capability && action.id != active {
+			actions = append(actions, action)
+		}
+	}
+	session.mu.Unlock()
+	settled := true
+	for _, action := range actions {
+		// Initial publication owns the result until done. Reconciliation never
+		// waits for a sibling retry, whose native close may still be in flight.
+		select {
+		case <-action.done:
+		default:
+			settled = false
+			continue
+		}
+		if !action.retryMu.TryLock() {
+			settled = false
+			continue
+		}
+		if action.response.CloseResult != nil && action.response.CloseResult.Determined {
+			action.retryMu.Unlock()
+			continue
+		}
+		if ctx.Err() != nil {
+			settled = false
+			action.retryMu.Unlock()
+			continue
+		}
+		actionID := storage.FileActionID(action.id)
+		if actionID == "" {
+			action.retryMu.Unlock()
+			continue
+		}
+		attempt := storage.CloseAttempt{Action: actionID, Generation: action.closeGeneration}
+		var result storage.ReferenceCloseResult
+		var closeErr error
+		boundCompleted := false
+		if action.closeImplicit {
+			result, closeErr = file.native.CloseWithResult(ctx)
+		} else {
+			receipt, queryErr := closer.QueryCloseAttempt(ctx, attempt)
+			if queryErr != nil {
+				settled = false
+			} else if receipt.Outcome == storage.FileActionCompleted && receipt.Action == actionID {
+				boundCompleted = true
+				result, closeErr = closer.CloseWithAction(ctx, attempt)
+				if !result.Released && !result.Determined {
+					settled = false
+				}
+			}
+		}
+		if result.Released || boundCompleted && result.Determined {
+			action.response.CloseResult = referenceCloseResultOf(result)
+			action.response.CloseResult.BarrierPending = result.Released
+			action.response.Barrier = nil
+			action.closeSemanticErr = retainFileError(closeErr)
+			action.err = action.closeSemanticErr
+			action.barrierPending = result.Released
+			session.mu.Lock()
+			action.uncertain = false
+			action.expires = time.Now().Add(session.options.History)
+			session.mu.Unlock()
+		} else if ctx.Err() != nil {
+			settled = false
+		}
+		action.retryMu.Unlock()
+	}
+	return settled
+}
+
+func (r *fileRegistry) reconcileSessionFileCloses(ctx context.Context, session *servedFileSession) bool {
+	session.mu.Lock()
+	files := make(map[string]*servedFile, len(session.files))
+	for cap, file := range session.files {
+		files[cap] = file
+	}
+	session.mu.Unlock()
+	settled := true
+	for cap, file := range files {
+		if !r.reconcileReleasedClose(ctx, session, cap, file, "") {
+			settled = false
+		}
+	}
+	return settled
+}
+
+func (r *fileRegistry) terminalizeSession(id string, session *servedFileSession, epoch uint64, expires time.Time, releaseErr error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.sessions[id] != session {
+		return
+	}
+	delete(r.sessions, id)
+	terminal := &terminalFileClose{
+		epoch: epoch, history: session.options.History, expires: expires,
+		releaseErr: releaseErr, actions: make(map[storage.LockRequestID]*servedFileAction),
+	}
+	session.mu.Lock()
+	now := time.Now()
+	for actionID, recorded := range session.actions {
+		if (recorded.op == storage.OpFileClose || recorded.op == storage.OpFileSessionClose) && (now.Before(recorded.expires) || recorded.uncertain) {
+			if recorded.uncertain && !now.Before(recorded.expires) {
+				recorded.expires = now.Add(session.options.History)
+			}
+			terminal.actions[actionID] = recorded
+			if recorded.expires.After(terminal.expires) {
+				terminal.expires = recorded.expires
+			}
+		}
+	}
+	session.mu.Unlock()
+	r.terminalCloses[id] = terminal
 }
 
 func (h *Handler) serveFile(w http.ResponseWriter, r *http.Request) {
@@ -459,6 +703,11 @@ func (h *Handler) serveFile(w http.ResponseWriter, r *http.Request) {
 	digest := sha256.Sum256(append(journalBody, []byte(r.Header.Get(HeaderMutationScope))...))
 	response, err := h.fileCall(r.Context(), req, digest)
 	if err != nil {
+		var closeProof *storage.CloseActionNotExecutedError
+		if errors.As(err, &closeProof) {
+			h.writeFileResponse(w, StatusStorageError, ErrorResponse{Errno: "ESTALE", Message: closeProof.Error(), CloseNotExecutedEpoch: closeProof.CurrentEpoch}, control)
+			return
+		}
 		if response.Attempt != nil {
 			h.writeFileResponse(w, StatusStorageError, ErrorResponse{Errno: storage.ErrnoNameOf(err), Message: err.Error(), CapabilityCode: capabilityErrorCode(err), Attempt: response.Attempt}, control)
 			return
@@ -493,8 +742,8 @@ func partialFileResult(request fileRequest, response fileResponse) *fileResponse
 		include = response.DeletePage != nil
 	case storage.OpFileClose, storage.OpFileSessionClose:
 		include = response.CloseResult != nil
-	case storage.OpFileOpenAt, storage.OpFileOpenNodeRef, storage.OpFileOpenChildRef:
-		include = response.File != "" || response.Attr != nil || response.Outcome != 0 || response.Barrier != nil
+	case storage.OpFileOpen, storage.OpFileOpenNode, storage.OpFileOpenAt, storage.OpFileOpenNodeRef, storage.OpFileOpenChildRef:
+		include = response.File != "" || response.Node != 0 || response.Attr != nil || response.Outcome != 0 || response.Barrier != nil
 	case storage.OpFileMutateName, storage.OpFileMutate:
 		include = response.Attr != nil || response.Barrier != nil
 	case storage.OpFileSetPendingUnlink, storage.OpFileClearPendingUnlink:
@@ -568,6 +817,9 @@ func validateFileArguments(req fileRequest, maximum storage.FileSessionOptions) 
 
 func (h *Handler) fileCall(ctx context.Context, req fileRequest, digest [32]byte) (fileResponse, error) {
 	registry := h.files
+	if req.Op == storage.OpFileBackendIdentity {
+		return h.backendIdentity(ctx)
+	}
 	if req.Op == storage.OpFileSessionOpen {
 		return registry.enroll(ctx, req.Options)
 	}
@@ -591,6 +843,10 @@ func (h *Handler) fileCall(ctx context.Context, req fileRequest, digest [32]byte
 	epoch := session.epoch(now)
 	if req.Op == storage.OpFileQueryAction {
 		if action := session.actions[storage.LockRequestID(req.FileAction)]; action != nil && (action.op == storage.OpFileClose || action.op == storage.OpFileSessionClose) {
+			if req.File != "" && (action.op != storage.OpFileClose || action.closeOwner != req.File || action.closeGeneration != req.CloseGeneration) {
+				session.mu.Unlock()
+				return fileResponse{}, syscall.EINVAL
+			}
 			session.mu.Unlock()
 			select {
 			case <-action.done:
@@ -599,12 +855,94 @@ func (h *Handler) fileCall(ctx context.Context, req fileRequest, digest [32]byte
 			}
 			action.retryMu.Lock()
 			outcome := storage.FileActionUnknown
-			if action.response.CloseResult != nil && action.response.CloseResult.Released {
+			if action.response.CloseResult != nil && action.response.CloseResult.Determined {
 				outcome = storage.FileActionCompleted
+			} else if req.File != "" && action.op == storage.OpFileClose && !action.closeImplicit {
+				session.mu.Lock()
+				file := session.files[req.File]
+				session.mu.Unlock()
+				if file != nil {
+					if closer, ok := file.native.(storage.ReferenceCloseActions); ok {
+						bound, queryErr := closer.QueryCloseAttempt(ctx, storage.CloseAttempt{Action: req.FileAction, Generation: req.CloseGeneration})
+						if queryErr != nil {
+							action.retryMu.Unlock()
+							return fileResponse{}, queryErr
+						}
+						if bound.Action == req.FileAction && bound.Operation == storage.OpFileClose && bound.Outcome == storage.FileActionCompleted {
+							outcome = storage.FileActionCompleted
+						}
+						if bound.Outcome == storage.FileActionNotExecuted {
+							owner, ownerErr := closer.CloseOwnerStatus(ctx)
+							if ownerErr != nil {
+								action.retryMu.Unlock()
+								return fileResponse{}, ownerErr
+							}
+							if err := owner.Check(); err != nil {
+								action.retryMu.Unlock()
+								return fileResponse{}, err
+							}
+							session.mu.Lock()
+							if session.actions[action.id] == action {
+								if _, retained := session.closeIDs[action.id]; !retained && len(session.closeIDs) >= session.options.MaxCloseActions {
+									session.mu.Unlock()
+									action.retryMu.Unlock()
+									return fileResponse{}, syscall.EAGAIN
+								}
+								delete(session.actions, action.id)
+								if session.closeIDs == nil {
+									session.closeIDs = make(map[storage.LockRequestID]closeIDUse)
+								}
+								session.closeIDs[action.id] = closeIDUse{owner: req.File, generation: req.CloseGeneration, notExecuted: true, proofEpoch: owner.CurrentEpoch}
+								session.cleanupActions--
+								session.cleanupReserved++
+								file.closeReserve++
+								file.closeAction, file.closeGeneration = action.priorAction, action.priorGeneration
+								file.closeDetermined, file.closeImplicit, file.closing = action.priorDetermined, action.priorImplicit, action.priorClosing
+							}
+							session.mu.Unlock()
+							outcome = storage.FileActionNotExecuted
+						}
+					}
+				}
 			}
 			receipt := storage.FileActionReceipt{Action: req.FileAction, Operation: action.op, Outcome: outcome}
 			action.retryMu.Unlock()
 			return fileResponse{Epoch: epoch, ActionReceipt: &receipt}, nil
+		}
+		if use, found := session.closeIDs[storage.LockRequestID(req.FileAction)]; found && use.notExecuted {
+			if req.File != "" && (use.owner != req.File || use.generation != req.CloseGeneration) {
+				session.mu.Unlock()
+				return fileResponse{}, syscall.EINVAL
+			}
+			session.mu.Unlock()
+			receipt := storage.FileActionReceipt{Action: req.FileAction, Operation: storage.OpFileClose, Outcome: storage.FileActionNotExecuted}
+			return fileResponse{Epoch: epoch, ActionReceipt: &receipt}, nil
+		}
+		if req.File != "" {
+			file := session.files[req.File]
+			session.mu.Unlock()
+			if file == nil || file.native == nil {
+				return fileResponse{}, syscall.ESTALE
+			}
+			closer, ok := file.native.(storage.ReferenceCloseActions)
+			if !ok {
+				return fileResponse{}, syscall.EOPNOTSUPP
+			}
+			receipt, queryErr := closer.QueryCloseAttempt(ctx, storage.CloseAttempt{Action: req.FileAction, Generation: req.CloseGeneration})
+			if queryErr != nil {
+				return fileResponse{}, queryErr
+			}
+			return fileResponse{Epoch: epoch, ActionReceipt: &receipt}, nil
+		}
+	}
+	if req.Op == storage.OpFileClose {
+		if use, found := session.closeIDs[req.Action]; found && use.notExecuted {
+			if use.owner != req.File || use.generation != req.CloseGeneration {
+				session.mu.Unlock()
+				return fileResponse{}, syscall.EINVAL
+			}
+			session.mu.Unlock()
+			return fileResponse{}, &storage.CloseActionNotExecutedError{CurrentEpoch: use.proofEpoch}
 		}
 	}
 	if fileActionRequired(req.Op) {
@@ -635,9 +973,34 @@ func (h *Handler) fileCall(ctx context.Context, req fileRequest, digest [32]byte
 				}
 			}
 			previous.retryMu.Lock()
-			defer previous.retryMu.Unlock()
 			if replayedFile != "" {
 				defer h.finishSemanticOpenReplay(session, replayedFile)
+			}
+			retryClose := !previous.barrierPending && (previous.response.CloseResult == nil || !previous.response.CloseResult.Determined) &&
+				(req.Op == storage.OpFileClose && session.recoverable || req.Op == storage.OpFileSessionClose)
+			if retryClose {
+				response, retryErr := h.performFile(ctx, session, req)
+				response.Epoch = epoch
+				previous.response = response
+				previous.err = retainFileActionError(retryErr)
+				var barrierFailure *fileBarrierError
+				previous.barrierPending = errors.As(retryErr, &barrierFailure)
+				if previous.barrierPending {
+					previous.closeSemanticErr = retainFileError(barrierFailure.prior)
+				}
+				session.mu.Lock()
+				wasUncertain := previous.uncertain
+				previous.uncertain = response.CloseResult == nil || !response.CloseResult.Determined
+				if wasUncertain && !previous.uncertain {
+					previous.expires = time.Now().Add(session.options.History)
+				}
+				if file := session.files[req.File]; file != nil {
+					file.closeDetermined = response.CloseResult != nil && response.CloseResult.Determined && !response.CloseResult.Released
+				}
+				if req.Op == storage.OpFileSessionClose {
+					session.closeDetermined = response.CloseResult != nil && response.CloseResult.Determined && !response.CloseResult.Released
+				}
+				session.mu.Unlock()
 			}
 			if previous.barrierPending {
 				response, retryErr := h.finishFileMutation(ctx, previous.response)
@@ -645,12 +1008,129 @@ func (h *Handler) fileCall(ctx context.Context, req fileRequest, digest [32]byte
 				previous.err = errors.Join(previous.closeSemanticErr, retainFileActionError(retryErr))
 				previous.barrierPending = retryErr != nil
 			}
-			if previous.err != nil && !previous.barrierPending {
-				return previous.response, &recordedFileError{cause: previous.err}
+			response, resultErr := previous.response, previous.err
+			barrierPending, expires := previous.barrierPending, previous.expires
+			releaseErr := resultErr
+			if barrierPending {
+				releaseErr = previous.closeSemanticErr
 			}
-			return previous.response, previous.err
+			previous.retryMu.Unlock()
+			h.finishPublishedClose(ctx, session, req, response, expires, releaseErr)
+			if resultErr != nil && !barrierPending {
+				return response, &recordedFileError{cause: resultErr}
+			}
+			return response, resultErr
 		}
-		if session.autoClose || session.explicitClose {
+		nativeExplicitClose := req.Op == storage.OpFileClose && !req.CloseImplicit && session.recoverable
+		if req.Op == storage.OpFileClose && !req.CloseImplicit && !session.recoverable {
+			session.mu.Unlock()
+			return fileResponse{}, syscall.EOPNOTSUPP
+		}
+		var nativeEpoch uint64
+		var nativeOwner storage.CloseOwnerStatus
+		adoptingNative := false
+		var priorCloseAction storage.LockRequestID
+		var priorCloseGeneration uint64
+		var priorCloseDetermined, priorFileClosing, priorCloseImplicit bool
+		if req.Op == storage.OpFileClose || req.Op == storage.OpFileSessionClose {
+			if nativeExplicitClose {
+				file := session.files[req.File]
+				if file == nil || file.native == nil {
+					session.mu.Unlock()
+					return fileResponse{}, syscall.ESTALE
+				}
+				closer, ok := file.native.(storage.ReferenceCloseActions)
+				if !ok {
+					session.mu.Unlock()
+					return fileResponse{}, syscall.EOPNOTSUPP
+				}
+				status, statusErr := closer.CloseOwnerStatus(ctx)
+				if statusErr != nil {
+					session.mu.Unlock()
+					return fileResponse{}, statusErr
+				}
+				if err := status.Check(); err != nil {
+					session.mu.Unlock()
+					return fileResponse{}, err
+				}
+				if status.Released {
+					session.mu.Unlock()
+					return fileResponse{}, syscall.ESTALE
+				}
+				nativeOwner = status
+				nativeEpoch = status.CurrentEpoch
+				if nativeEpoch == 0 {
+					session.mu.Unlock()
+					return fileResponse{}, syscall.EIO
+				}
+				if status.Current != nil {
+					adoptingNative = status.Current.Action == storage.FileActionID(req.Action) && status.Current.Generation == req.CloseGeneration
+					if !adoptingNative {
+						session.mu.Unlock()
+						return fileResponse{}, syscall.EBUSY
+					}
+				} else if !status.Ready || session.autoClose || session.explicitClose {
+					session.mu.Unlock()
+					return fileResponse{}, syscall.EAGAIN
+				}
+			}
+			session.pruneCloseIDsLocked(epoch, nativeEpoch)
+			if use, reused := session.closeIDs[req.Action]; reused {
+				if adoptingNative && !use.notExecuted && use.owner == req.File && use.generation == req.CloseGeneration {
+					// The native owner still identifies this exact attempt after HTTP history expiry.
+				} else {
+					session.mu.Unlock()
+					if use.notExecuted && nativeExplicitClose && use.owner == req.File && use.generation == req.CloseGeneration {
+						return fileResponse{}, &storage.CloseActionNotExecutedError{CurrentEpoch: nativeEpoch}
+					}
+					return fileResponse{}, syscall.ESTALE
+				}
+			}
+		}
+		if req.Op == storage.OpFileClose || req.Op == storage.OpFileSessionClose {
+			var previous storage.LockRequestID
+			var generation uint64
+			var determined bool
+			if req.Op == storage.OpFileClose {
+				file := session.files[req.File]
+				if file == nil || file.native == nil {
+					session.mu.Unlock()
+					return fileResponse{}, syscall.ESTALE
+				}
+				previous, generation, determined = file.closeAction, file.closeGeneration, file.closeDetermined
+				priorCloseAction, priorCloseGeneration, priorCloseDetermined, priorFileClosing = file.closeAction, file.closeGeneration, file.closeDetermined, file.closing
+				priorCloseImplicit = file.closeImplicit
+			} else {
+				previous, generation, determined = session.closeAction, session.closeGeneration, session.closeDetermined
+			}
+			if nativeExplicitClose {
+				priorImplicit := req.Op == storage.OpFileClose && session.files[req.File].closeImplicit
+				if previous != "" && !determined && !(adoptingNative && (previous == req.Action && generation == req.CloseGeneration || priorImplicit)) {
+					session.mu.Unlock()
+					return fileResponse{}, syscall.EAGAIN
+				}
+				if !adoptingNative && req.CloseGeneration != nativeOwner.NextGeneration {
+					session.mu.Unlock()
+					return fileResponse{}, syscall.EAGAIN
+				}
+			} else if previous == "" && req.CloseGeneration != 1 || !nativeExplicitClose && previous != "" && (!determined || req.CloseGeneration != generation+1) {
+				session.mu.Unlock()
+				return fileResponse{}, syscall.EAGAIN
+			}
+			if nativeExplicitClose && !adoptingNative && actionEpoch != nativeEpoch {
+				if actionEpoch > nativeEpoch {
+					session.mu.Unlock()
+					return fileResponse{}, syscall.EINVAL
+				}
+				session.mu.Unlock()
+				return fileResponse{}, &storage.CloseActionNotExecutedError{CurrentEpoch: nativeEpoch}
+			}
+			if len(session.closeIDs) >= session.options.MaxCloseActions {
+				session.mu.Unlock()
+				return fileResponse{}, syscall.EAGAIN
+			}
+		}
+		if (session.autoClose || session.explicitClose) && req.Op != storage.OpFileClose {
 			session.mu.Unlock()
 			registry.mu.Lock()
 			terminal := registry.terminalCloses[req.Session]
@@ -660,7 +1140,7 @@ func (h *Handler) fileCall(ctx context.Context, req fileRequest, digest [32]byte
 			}
 			return fileResponse{}, syscall.EAGAIN
 		}
-		if actionEpoch != epoch {
+		if actionEpoch != epoch && !nativeExplicitClose {
 			session.mu.Unlock()
 			// The immediately preceding window still has every admitted result.
 			// Absence here proves this action never ran; older windows cannot prove it.
@@ -678,26 +1158,61 @@ func (h *Handler) fileCall(ctx context.Context, req fileRequest, digest [32]byte
 			return fileResponse{}, syscall.ESTALE
 		}
 		cleanup := req.Op == storage.OpFileRangeDrop || req.Op == storage.OpFileRetireUseOwner || req.Op == storage.OpFileClose || req.Op == storage.OpFileSessionClose
-		if cleanup && session.cleanupActions >= registry.limits.MaxCleanupActions {
-			if req.Op == storage.OpFileClose || req.Op == storage.OpFileSessionClose {
-				session.mu.Unlock()
-				return fileResponse{}, syscall.EAGAIN
-			}
-			session.retired = true
+		reservedClose := req.Op == storage.OpFileSessionClose || req.Op == storage.OpFileClose && session.recoverable
+		if cleanup && !reservedClose && session.cleanupActions+session.cleanupReserved >= registry.limits.MaxCleanupActions {
 			session.mu.Unlock()
-			err := session.native.Close(ctx)
-			return fileResponse{}, errors.Join(syscall.EIO, err)
+			return fileResponse{}, syscall.EAGAIN
 		}
 		if !cleanup && session.dataActions >= registry.limits.MaxActions {
 			session.mu.Unlock()
 			return fileResponse{}, syscall.EAGAIN
 		}
 		if cleanup {
+			if reservedClose {
+				if req.Op == storage.OpFileClose {
+					file := session.files[req.File]
+					if file.closeReserve == 0 {
+						session.mu.Unlock()
+						return fileResponse{}, syscall.EAGAIN
+					}
+					file.closeReserve--
+					file.closeAction = req.Action
+					file.closeGeneration = req.CloseGeneration
+					file.closeDetermined = false
+					file.closeImplicit = req.CloseImplicit
+				} else {
+					if session.sessionCloseReserve == 0 {
+						session.mu.Unlock()
+						return fileResponse{}, syscall.EAGAIN
+					}
+					session.sessionCloseReserve--
+					session.closeAction = req.Action
+					session.closeGeneration = req.CloseGeneration
+					session.closeDetermined = false
+				}
+				session.cleanupReserved--
+			} else if session.cleanupActions+session.cleanupReserved >= registry.limits.MaxCleanupActions {
+				session.mu.Unlock()
+				return fileResponse{}, syscall.EAGAIN
+			}
+			if req.Op == storage.OpFileClose && !reservedClose {
+				file := session.files[req.File]
+				file.closeAction = req.Action
+				file.closeGeneration = req.CloseGeneration
+				file.closeDetermined = false
+				file.closeImplicit = req.CloseImplicit
+			}
 			session.cleanupActions++
 		} else {
 			session.dataActions++
 		}
-		action := &servedFileAction{op: req.Op, cleanup: cleanup, digest: digest, done: make(chan struct{}), expires: now.Add(2*session.options.History - now.Sub(session.started)%session.options.History)}
+		if req.Op == storage.OpFileClose || req.Op == storage.OpFileSessionClose {
+			if session.closeIDs == nil {
+				session.closeIDs = make(map[storage.LockRequestID]closeIDUse)
+			}
+			session.closeIDs[req.Action] = closeIDUse{owner: req.File, generation: req.CloseGeneration, implicit: !nativeExplicitClose}
+		}
+		action := &servedFileAction{id: req.Action, op: req.Op, cleanup: cleanup, digest: digest, done: make(chan struct{}), expires: now.Add(2*session.options.History - now.Sub(session.started)%session.options.History), closeOwner: req.File, closeGeneration: req.CloseGeneration, closeImplicit: req.CloseImplicit, priorAction: priorCloseAction, priorGeneration: priorCloseGeneration, priorDetermined: priorCloseDetermined, priorImplicit: priorCloseImplicit, priorClosing: priorFileClosing}
 		session.actions[req.Action] = action
 		if req.Op == storage.OpFileSessionClose {
 			session.explicitClose = true
@@ -707,9 +1222,35 @@ func (h *Handler) fileCall(ctx context.Context, req fileRequest, digest [32]byte
 		response.Epoch = epoch
 		var barrierFailure *fileBarrierError
 		session.mu.Lock()
+		var closeProof *storage.CloseActionNotExecutedError
+		if nativeExplicitClose && errors.As(err, &closeProof) {
+			action.response = fileResponse{Epoch: epoch, Data: []byte{}}
+			action.err = err
+			close(action.done)
+			delete(session.actions, req.Action)
+			use := session.closeIDs[req.Action]
+			use.notExecuted = true
+			use.proofEpoch = closeProof.CurrentEpoch
+			session.closeIDs[req.Action] = use
+			session.cleanupActions--
+			if file := session.files[req.File]; file != nil {
+				session.cleanupReserved++
+				file.closeReserve++
+				file.closeAction = priorCloseAction
+				file.closeGeneration = priorCloseGeneration
+				file.closeDetermined = priorCloseDetermined
+				file.closeImplicit = priorCloseImplicit
+				file.closing = priorFileClosing
+			}
+			session.mu.Unlock()
+			return fileResponse{}, err
+		}
 		action.response = response
 		action.file = response.File
 		action.err = retainFileActionError(err)
+		if req.Op == storage.OpFileClose || req.Op == storage.OpFileSessionClose {
+			action.uncertain = response.CloseResult == nil || !response.CloseResult.Determined
+		}
 		action.barrierPending = errors.As(err, &barrierFailure)
 		if action.barrierPending && (req.Op == storage.OpFileClose || req.Op == storage.OpFileSessionClose) {
 			action.closeSemanticErr = retainFileError(barrierFailure.prior)
@@ -723,21 +1264,20 @@ func (h *Handler) fileCall(ctx context.Context, req fileRequest, digest [32]byte
 		if req.Op == storage.OpFileSessionClose && (response.CloseResult == nil || !response.CloseResult.Released) {
 			session.explicitClose = false
 		}
-		session.mu.Unlock()
-		if req.Op == storage.OpFileSessionClose && response.CloseResult != nil && response.CloseResult.Released {
-			registry.mu.Lock()
-			if registry.sessions[req.Session] == session {
-				delete(registry.sessions, req.Session)
-				registry.terminalCloses[req.Session] = &terminalFileClose{
-					epoch: epoch, history: session.options.History, expires: action.expires,
-					releaseErr: releaseErr, actions: map[storage.LockRequestID]*servedFileAction{req.Action: action},
-				}
+		if req.Op == storage.OpFileSessionClose {
+			session.closeDetermined = response.CloseResult != nil && response.CloseResult.Determined && !response.CloseResult.Released
+		} else if req.Op == storage.OpFileClose {
+			if file := session.files[req.File]; file != nil {
+				file.closeDetermined = response.CloseResult != nil && response.CloseResult.Determined && !response.CloseResult.Released
 			}
-			registry.mu.Unlock()
 		}
+		expires := action.expires
+		session.mu.Unlock()
+		h.finishPublishedClose(ctx, session, req, response, expires, releaseErr)
 		return response, err
 	}
-	if session.autoClose || session.explicitClose {
+	boundCleanupRead := req.Op == storage.OpFileCloseOwnerStatus || req.Op == storage.OpFileQueryAction && req.File != ""
+	if (session.autoClose || session.explicitClose) && req.Op != storage.OpFileClose && !boundCleanupRead {
 		session.mu.Unlock()
 		registry.mu.Lock()
 		terminal := registry.terminalCloses[req.Session]
@@ -747,7 +1287,7 @@ func (h *Handler) fileCall(ctx context.Context, req fileRequest, digest [32]byte
 		}
 		return fileResponse{}, syscall.EAGAIN
 	}
-	if req.Op != storage.OpFileSessionClose && req.Op != storage.OpFileClose && (session.retired || !now.Before(session.expires)) {
+	if req.Op != storage.OpFileSessionClose && req.Op != storage.OpFileClose && !boundCleanupRead && (session.retired || !now.Before(session.expires)) {
 		session.mu.Unlock()
 		return fileResponse{}, syscall.ESTALE
 	}
@@ -757,6 +1297,61 @@ func (h *Handler) fileCall(ctx context.Context, req fileRequest, digest [32]byte
 	return response, err
 }
 
+func (h *Handler) finishPublishedClose(ctx context.Context, session *servedFileSession, req fileRequest, response fileResponse, expires time.Time, releaseErr error) {
+	if response.CloseResult == nil || !response.CloseResult.Released {
+		return
+	}
+	registry := h.files
+	if req.Op == storage.OpFileSessionClose {
+		if registry.reconcileSessionFileCloses(ctx, session) {
+			registry.terminalizeSession(req.Session, session, response.Epoch, expires, releaseErr)
+		} else {
+			session.mu.Lock()
+			session.explicitClose = false
+			session.closeReconciling = true
+			session.closeReleaseErr = retainFileError(releaseErr)
+			session.mu.Unlock()
+			registry.wakeCleanup()
+		}
+		return
+	}
+	if req.Op != storage.OpFileClose {
+		return
+	}
+	session.mu.Lock()
+	file := session.files[req.File]
+	session.mu.Unlock()
+	if file == nil {
+		return
+	}
+	settled := registry.reconcileReleasedClose(ctx, session, req.File, file, req.Action)
+	session.mu.Lock()
+	for _, action := range session.actions {
+		if action.op == storage.OpFileClose && action.closeOwner == req.File && action.closeImplicit && action.uncertain {
+			settled = false
+			break
+		}
+	}
+	if settled {
+		session.cleanupReserved -= file.closeReserve
+		file.closeReserve = 0
+		delete(session.files, req.File)
+	} else {
+		session.retired = true
+	}
+	session.mu.Unlock()
+	if !settled {
+		registry.wakeCleanup()
+	}
+}
+
+func (r *fileRegistry) wakeCleanup() {
+	select {
+	case r.wake <- struct{}{}:
+	default:
+	}
+}
+
 func (h *Handler) replayTerminalFileClose(ctx context.Context, req fileRequest, digest [32]byte, terminal *terminalFileClose) (fileResponse, error) {
 	terminal.mu.Lock()
 	now := time.Now()
@@ -764,8 +1359,38 @@ func (h *Handler) replayTerminalFileClose(ctx context.Context, req fileRequest, 
 		terminal.mu.Unlock()
 		return fileResponse{}, syscall.ESTALE
 	}
+	if req.Op == storage.OpFileCloseOwnerStatus {
+		matches := make([]*servedFileAction, 0, 2)
+		for _, action := range terminal.actions {
+			if action.op == storage.OpFileClose && action.closeOwner == req.File && now.Before(action.expires) {
+				matches = append(matches, action)
+			}
+		}
+		epoch := terminal.epoch
+		terminal.mu.Unlock()
+		for _, action := range matches {
+			select {
+			case <-action.done:
+			case <-ctx.Done():
+				return fileResponse{}, ctx.Err()
+			}
+			action.retryMu.Lock()
+			released := action.response.CloseResult != nil && action.response.CloseResult.Released && action.response.CloseResult.Determined
+			generation := action.closeGeneration
+			action.retryMu.Unlock()
+			if released {
+				status := storage.CloseOwnerStatus{Released: true, NextGeneration: generation, CurrentEpoch: epoch}
+				return fileResponse{Epoch: epoch, CloseOwnerStatus: closeOwnerStatusResultOf(status)}, nil
+			}
+		}
+		return fileResponse{}, syscall.ESTALE
+	}
 	if req.Op == storage.OpFileQueryAction {
 		action := terminal.actions[storage.LockRequestID(req.FileAction)]
+		if req.File != "" && action != nil && (action.op != storage.OpFileClose || action.closeOwner != req.File || action.closeGeneration != req.CloseGeneration) {
+			terminal.mu.Unlock()
+			return fileResponse{}, syscall.EINVAL
+		}
 		epoch := terminal.epoch
 		terminal.mu.Unlock()
 		outcome := storage.FileActionRetired
@@ -779,7 +1404,7 @@ func (h *Handler) replayTerminalFileClose(ctx context.Context, req fileRequest, 
 			action.retryMu.Lock()
 			operation = action.op
 			outcome = storage.FileActionUnknown
-			if action.response.CloseResult != nil && action.response.CloseResult.Released {
+			if action.response.CloseResult != nil && action.response.CloseResult.Determined {
 				outcome = storage.FileActionCompleted
 			}
 			action.retryMu.Unlock()
@@ -787,34 +1412,18 @@ func (h *Handler) replayTerminalFileClose(ctx context.Context, req fileRequest, 
 		receipt := storage.FileActionReceipt{Action: req.FileAction, Operation: operation, Outcome: outcome}
 		return fileResponse{Epoch: epoch, ActionReceipt: &receipt}, nil
 	}
-	if req.Op != storage.OpFileSessionClose {
+	if req.Op != storage.OpFileSessionClose && req.Op != storage.OpFileClose {
 		terminal.mu.Unlock()
 		return fileResponse{}, syscall.ESTALE
 	}
 	action := terminal.actions[req.Action]
 	if action == nil {
-		if len(terminal.actions) >= h.files.limits.MaxCleanupActions+1 {
-			terminal.mu.Unlock()
-			return fileResponse{}, syscall.EAGAIN
-		}
-		response := fileResponse{Epoch: terminal.epoch, Data: []byte{}, CloseResult: &referenceCloseResult{Released: true}}
-		action = &servedFileAction{
-			op: storage.OpFileSessionClose, digest: digest, done: make(chan struct{}),
-			expires: now.Add(2 * terminal.history), response: response, closeSemanticErr: terminal.releaseErr,
-		}
-		terminal.actions[req.Action] = action
-		if action.expires.After(terminal.expires) {
-			terminal.expires = action.expires
-		}
 		terminal.mu.Unlock()
-		response, barrierErr := h.finishFileMutation(ctx, response)
-		action.retryMu.Lock()
-		action.response = response
-		action.err = errors.Join(terminal.releaseErr, retainFileActionError(barrierErr))
-		action.barrierPending = barrierErr != nil
-		close(action.done)
-		action.retryMu.Unlock()
-		return response, errors.Join(terminal.releaseErr, barrierErr)
+		return fileResponse{}, syscall.ESTALE
+	}
+	if action.op != req.Op || action.closeOwner != req.File || action.closeGeneration != req.CloseGeneration {
+		terminal.mu.Unlock()
+		return fileResponse{}, syscall.EINVAL
 	}
 	if action.digest != digest {
 		terminal.mu.Unlock()
@@ -968,11 +1577,11 @@ func (h *Handler) performFile(ctx context.Context, s *servedFileSession, req fil
 			s.mu.Unlock()
 			return response, syscall.ESTALE
 		}
-		if file == nil || file.native == nil || file.closing && req.Op != storage.OpFileClose {
+		if file == nil || file.native == nil || file.closing && req.Op != storage.OpFileClose && req.Op != storage.OpFileCloseOwnerStatus {
 			s.mu.Unlock()
 			return response, syscall.ESTALE
 		}
-		if !file.pending.IsZero() && req.Op != storage.OpFileClose {
+		if !file.pending.IsZero() && req.Op != storage.OpFileClose && req.Op != storage.OpFileCloseOwnerStatus {
 			s.mu.Unlock()
 			return response, syscall.ESTALE
 		}
@@ -984,6 +1593,23 @@ func (h *Handler) performFile(ctx context.Context, s *servedFileSession, req fil
 		switch req.Op {
 		case storage.OpFileStat:
 			attr, err = file.native.Stat(ctx)
+		case storage.OpFileCloseOwnerStatus:
+			closer, ok := file.native.(storage.ReferenceCloseActions)
+			if !ok {
+				return response, syscall.EOPNOTSUPP
+			}
+			status, statusErr := closer.CloseOwnerStatus(ctx)
+			if statusErr != nil {
+				return response, statusErr
+			}
+			if err := status.Check(); err != nil {
+				return response, err
+			}
+			s.mu.Lock()
+			s.pruneCloseIDsLocked(s.epoch(time.Now()), status.CurrentEpoch)
+			status.Ready = status.Ready && file.closeReserve > 0 && len(s.closeIDs) < s.options.MaxCloseActions && (file.closeAction == "" || file.closeDetermined) && !s.autoClose && !s.explicitClose
+			s.mu.Unlock()
+			response.CloseOwnerStatus = closeOwnerStatusResultOf(status)
 		case storage.OpFileRead:
 			data, ok := file.native.(storage.File)
 			if !ok {
@@ -1019,14 +1645,22 @@ func (h *Handler) performFile(ctx context.Context, s *servedFileSession, req fil
 		case storage.OpFileObserveName, storage.OpFileState, storage.OpFileScope, storage.OpFileSetMetadata, storage.OpFileSetPendingUnlink, storage.OpFileClearPendingUnlink, storage.OpFileMutate:
 			response, err = performReferenceCapability(ctx, file.native, req)
 		case storage.OpFileClose:
-			result, closeErr := file.native.CloseWithResult(ctx)
+			if !req.CloseImplicit && !s.recoverable {
+				return response, syscall.EOPNOTSUPP
+			}
+			var result storage.ReferenceCloseResult
+			var closeErr error
+			if s.recoverable && !req.CloseImplicit {
+				closer, ok := file.native.(storage.ReferenceCloseActions)
+				if !ok {
+					return response, syscall.EOPNOTSUPP
+				}
+				result, closeErr = closer.CloseWithAction(ctx, storage.CloseAttempt{Action: storage.FileActionID(req.Action), Generation: req.CloseGeneration})
+			} else {
+				result, closeErr = file.native.CloseWithResult(ctx)
+			}
 			response.CloseResult = referenceCloseResultOf(result)
 			err = errors.Join(closeErr, result.Check(closeErr))
-			if result.Released {
-				s.mu.Lock()
-				delete(s.files, req.File)
-				s.mu.Unlock()
-			}
 		default:
 			return response, syscall.EINVAL
 		}
@@ -1124,6 +1758,10 @@ func (r *fileRegistry) enroll(ctx context.Context, options storage.FileSessionOp
 		r.mu.Unlock()
 		return fileResponse{}, syscall.EOPNOTSUPP
 	}
+	if r.limits.MaxCleanupActions < 2 {
+		r.mu.Unlock()
+		return fileResponse{}, syscall.EAGAIN
+	}
 	if len(r.sessions)+r.enrolling >= r.limits.MaxSessions || len(r.sessions)+len(r.terminalCloses)+r.enrolling >= 2*r.limits.MaxSessions {
 		r.mu.Unlock()
 		return fileResponse{}, syscall.EAGAIN
@@ -1144,7 +1782,9 @@ func (r *fileRegistry) enroll(ctx context.Context, options storage.FileSessionOp
 	status, err := native.Status(ctx)
 	capabilities, capabilityErr := sessionCapabilitiesOf(native)
 	err = errors.Join(err, capabilityErr)
-	session := &servedFileSession{authority: status.Epoch, revision: status.Revision, native: native, files: make(map[string]*servedFile), actions: make(map[storage.LockRequestID]*servedFileAction), options: options, started: started, expires: started.Add(status.Remaining)}
+	identity, identityErr := sessionIdentityOf(ctx, native, capabilities, status)
+	err = errors.Join(err, identityErr)
+	session := &servedFileSession{authority: status.Epoch, revision: status.Revision, native: native, files: make(map[string]*servedFile), actions: make(map[storage.LockRequestID]*servedFileAction), options: options, started: started, expires: started.Add(status.Remaining), sessionCloseReserve: 2, cleanupReserved: 2, recoverable: capabilities.CloseRecovery, stableIdentity: capabilities.StableIdentity}
 	r.mu.Lock()
 	closed := r.closed
 	session.retired = closed || err != nil
@@ -1159,14 +1799,14 @@ func (r *fileRegistry) enroll(ctx context.Context, options storage.FileSessionOp
 	}
 	status.Remaining = maxDuration(time.Until(session.expires))
 	status.HistoryRemaining = maxDuration(status.HistoryRemaining - time.Since(started))
-	return fileResponse{Session: id, Epoch: session.epoch(time.Now()), Status: &status, Capabilities: capabilities}, nil
+	return fileResponse{Session: id, Epoch: session.epoch(time.Now()), Status: &status, Capabilities: capabilities, SessionIdentity: identity}, nil
 }
 
 func checkFileSessionOptions(options, maximum storage.FileSessionOptions) error {
 	if err := options.Check(); err != nil {
 		return err
 	}
-	if options.MaxFileSize > maximum.MaxFileSize || options.Lease > maximum.Lease || options.History > maximum.History || options.MaxFiles > maximum.MaxFiles || options.MaxOperations > maximum.MaxOperations || options.MaxWaiters > maximum.MaxWaiters || options.MaxLockOwners > maximum.MaxLockOwners || options.MaxLockRanges > maximum.MaxLockRanges || options.MaxPendingLocks > maximum.MaxPendingLocks || options.MaxLockActions > maximum.MaxLockActions {
+	if options.MaxFileSize > maximum.MaxFileSize || options.Lease > maximum.Lease || options.History > maximum.History || options.MaxFiles > maximum.MaxFiles || options.MaxOperations > maximum.MaxOperations || options.MaxWaiters > maximum.MaxWaiters || options.MaxLockOwners > maximum.MaxLockOwners || options.MaxLockRanges > maximum.MaxLockRanges || options.MaxPendingLocks > maximum.MaxPendingLocks || options.MaxLockActions > maximum.MaxLockActions || options.MaxCloseActions > maximum.MaxCloseActions {
 		return fmt.Errorf("file session exceeds server resource limits: %w", syscall.EINVAL)
 	}
 	return nil

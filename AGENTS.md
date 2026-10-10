@@ -80,19 +80,32 @@ fails rather than skips without it. The emulator's tag is pinned there because e
 Azurite release moves the highest `x-ms-version` its blob service will accept, and the
 pinned SDK sits exactly on that ceiling.
 
-[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs those same commands on every
-pull request and on every commit that reaches `main`. Two Linux jobs divide the layers that
-need no mountpoint from the ones that mount filesystems. They are split because a mount can
-wedge, and a wedged job should not take the rest of the answer down with it. The Windows
-Server 2025 job runs race tests and vet for `packages/smb/...`, covering native SSPI,
-Windows name comparison, and the SMB adapter. It does not qualify Windows 11 redirector or
-WNet behavior. Exhaustive coverage is the Linux run's job, and it starts itself. Both Linux
-jobs bring up the same emulator through [`deployments/ci/docker-compose.yml`](deployments/ci/docker-compose.yml)
-before their Blob-dependent tests, waiting for it to answer requests. The mounted job needs
-it for the real Azure binary lock and restart tests; its later module-wide coverage gate
-uses the same running emulator.
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs the CI checks on every
+pull request and on every commit that reaches `main`. Three Linux jobs divide the work:
+`checks` builds, vets, checks formatting and links, runs the serial full-load acceptance,
+and runs the nonmounting race suite except the root SQLite package; `sqlite-race` runs that
+package alone with the race detector; `mounted` runs the FUSE and end-to-end race suite,
+checks that mounts are gone, and executes the module-wide coverage gate. A wedged mount
+cannot hide the nonmounting results. The root SQLite race binary has its own runner because
+parallel package contention can exhaust its ten-minute cumulative watchdog while its
+tests are still advancing. The separate job retains `-count=1`, the same per-binary
+`-timeout 10m`, and the strict no-skip verdict check. The protected branch requires the
+existing `checks` status, so `checks` depends on `sqlite-race`, still runs when that job
+fails or is skipped, and has a final step that fails unless `sqlite-race` succeeded.
+[The CI isolation decision](.agents/notes/implemented/process/2026-09-29-isolate-sqlite-race-ci.md)
+records the scheduling and required-check link. A focused Windows Server 2025 job runs
+the native SSPI package tests and vet, plus the root SMB and wire race suites through
+the strict verdict runner. The root suite compares every UTF-16 code unit and the
+resulting order with the native Windows ordinal name API. Windows 11 redirector and
+WNet behavior require their separate acceptance environment.
 
-All three jobs use [the shared Go setup action](.github/actions/setup-go/action.yml), which
+`checks` and `mounted` each start the emulator in
+[`deployments/ci/docker-compose.yml`](deployments/ci/docker-compose.yml) before their
+Blob-dependent tests, waiting for it to answer requests. The mounted job needs it for
+the real Azure binary lock and restart tests; its later coverage gate uses the same
+running emulator. The SQLite race job has no Blob dependency.
+
+All four jobs use [the shared Go setup action](.github/actions/setup-go/action.yml), which
 pins Go 1.26.8 and owns a combined module/build cache for each job, toolchain,
 dependency hash and source SHA. A same-job prefix and a verified legacy archive
 can seed new snapshots. This cache reuses compilation work; every test still runs

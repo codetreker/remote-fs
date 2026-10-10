@@ -140,18 +140,32 @@ func resolveTestName(ctx context.Context, backend *namespaceTestBackend, session
 	if err != nil {
 		return resolvedCreateName{}, err
 	}
-	return resolveNameWithComparer(ctx, backend, session, path, limits, authorize, testNameCompare)
+	return resolveNameWithComparer(ctx, backend, session, 1, path, limits, authorize, testNameCompare)
 }
 func allowNamespace(context.Context, storage.Operation) error { return nil }
 
-func TestServerUsesPrivateNameComparerForPortableCreateCoverage(t *testing.T) {
+func TestSMBNamespaceUsesProductionNameComparer(t *testing.T) {
 	backend, session := namespaceFixture()
-	server := &Server{config: Config{Limits: DefaultLimits(), Authorize: authz.AuthorizerFunc(func(context.Context, authz.AccessRequest) error { return nil })}, nameComparer: testNameCompare}
+	server := &Server{config: Config{Limits: DefaultLimits(), Authorize: authz.AuthorizerFunc(func(context.Context, authz.AccessRequest) error { return nil })}}
 	export := &Export{server: server, share: Share{Volume: "v", Backend: backend}}
-	tree := &tree{export: export, authority: &authoritySession{raw: session}}
+	tree := &tree{export: export, authority: &authoritySession{raw: session, identity: storage.FileSessionIdentityResult{Backend: storage.BackendIdentityResult{RootNodeID: 1}}}}
 	resolved, err := resolveCreateName(t.Context(), tree, `folder\ACTUAL`)
 	if err != nil || string(resolved.Selection.Name.RawLeaf) != "Actual" || resolved.Condition.NodeID != 3 {
-		t.Fatalf("injected comparison did not resolve literal raw leaf: %+v %v", resolved, err)
+		t.Fatalf("production comparison did not resolve literal raw leaf: %+v %v", resolved, err)
+	}
+	session.views[2].entries = append(session.views[2].entries,
+		storage.Entry{Name: "é", Attr: storage.Attr{ID: 4, Kind: storage.NodeRegular}},
+		storage.Entry{Name: "ſ", Attr: storage.Attr{ID: 5, Kind: storage.NodeRegular}},
+		storage.Entry{Name: "S", Attr: storage.Attr{ID: 6, Kind: storage.NodeRegular}},
+	)
+	resolved, err = resolveCreateName(t.Context(), tree, `folder\É`)
+	if err != nil || string(resolved.Selection.Name.RawLeaf) != "é" || resolved.Condition.NodeID != 4 {
+		t.Fatalf("production comparison replaced Windows Unicode/raw semantics: %+v %v", resolved, err)
+	}
+	session.views[2].entries = append(session.views[2].entries, storage.Entry{Name: "É", Attr: storage.Attr{ID: 7, Kind: storage.NodeRegular}})
+	resolved, err = resolveCreateName(t.Context(), tree, `folder\Actual`)
+	if !errors.Is(err, errNameAmbiguous) || !reflect.DeepEqual(resolved, resolvedCreateName{}) {
+		t.Fatalf("production comparison accepted unrelated Unicode ambiguity: %+v %v", resolved, err)
 	}
 }
 
@@ -264,6 +278,20 @@ func TestSMBNamespacePreservesFailuresWithoutAbsenceOrRetry(t *testing.T) {
 	if _, err := resolveTestName(t.Context(), backend, session, "Folder", DefaultLimits(), allowNamespace); !errors.Is(err, syscall.EOPNOTSUPP) || len(session.calls) != 0 {
 		t.Fatalf("unsupported observer: %v", err)
 	}
+	backend, session = namespaceFixture()
+	session.checkErr = syscall.ENOENT
+	if _, err := resolveTestName(t.Context(), backend, session, "Folder", DefaultLimits(), allowNamespace); !errors.Is(err, syscall.ENOENT) || storage.ErrnoOf(err) != syscall.EIO || len(session.calls) != 0 {
+		t.Fatalf("observer capability ENOENT became proven absence: %v", err)
+	}
+	if err := checkCreateNameCapability(session); !errors.Is(err, syscall.ENOENT) || storage.ErrnoOf(err) != syscall.EIO {
+		t.Fatalf("capability preflight ENOENT became proven absence: %v", err)
+	}
+	backend, session = namespaceFixture()
+	ctx, cancel = context.WithCancel(t.Context())
+	session.before = func(*namespaceTestSession, storage.DirectoryTarget) { cancel() }
+	if result, err := resolveTestName(ctx, backend, session, "Folder", DefaultLimits(), allowNamespace); !errors.Is(err, context.Canceled) || !reflect.DeepEqual(result, resolvedCreateName{}) || len(session.calls) != 1 {
+		t.Fatalf("canceled observation supplied a selection: %+v %v", result, err)
+	}
 }
 
 func TestSMBNamespaceGuardsRejectChangedPrefixesAndFinalFacts(t *testing.T) {
@@ -309,6 +337,73 @@ func TestSMBNamespaceRefusesUnrelatedInvalidOrAmbiguousNames(t *testing.T) {
 		if err == nil || !reflect.DeepEqual(result, resolvedCreateName{}) {
 			t.Fatalf("filtered directory yielded success: %+v %v", result, err)
 		}
+	}
+}
+
+func TestSMBNamespacePinsVerifiedRootBeforeObservation(t *testing.T) {
+	for _, name := range []string{"", `folder\Actual`} {
+		backend, session := namespaceFixture()
+		backend.root.ID = 7
+		result, err := resolveTestName(t.Context(), backend, session, name, DefaultLimits(), allowNamespace)
+		if !errors.Is(err, syscall.EIO) || !reflect.DeepEqual(result, resolvedCreateName{}) || len(session.calls) != 0 || backend.loads != 0 {
+			t.Fatalf("substituted root adopted for %q: %+v %v loads=%d observations=%d", name, result, err, backend.loads, len(session.calls))
+		}
+	}
+	backend, session := namespaceFixture()
+	path, err := parseSMBPath("Folder")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := resolveNameWithComparer(t.Context(), backend, session, 0, path, DefaultLimits(), allowNamespace, portableNameCompare); !errors.Is(err, ErrConfig) || backend.calls != 0 || len(session.calls) != 0 {
+		t.Fatalf("missing pinned identity guessed from root Stat: %v", err)
+	}
+}
+
+func TestSMBNamespaceUsesWindowsCodeUnitAliases(t *testing.T) {
+	entry := func(name string, id uint64) storage.Entry {
+		return storage.Entry{Name: name, Attr: storage.Attr{ID: id, Kind: storage.NodeRegular}}
+	}
+	backend, session := namespaceFixture()
+	session.views[2].entries = []storage.Entry{entry("é", 3), entry("ſ", 4), entry("S", 5)}
+	for _, test := range []struct {
+		requested, raw string
+		id             uint64
+	}{{"É", "é", 3}, {"ſ", "ſ", 4}, {"s", "S", 5}} {
+		result, err := resolveTestName(t.Context(), backend, session, `folder\`+test.requested, DefaultLimits(), allowNamespace)
+		if err != nil || result.Condition.State != storage.SameNode || result.Condition.NodeID != test.id || string(result.Selection.Name.RawLeaf) != test.raw {
+			t.Fatalf("Windows alias selected incorrect raw binding: %+v %v", result, err)
+		}
+	}
+	session.views[2].entries = append(session.views[2].entries, entry("É", 6))
+	for _, request := range []string{"é", "ſ", "missing"} {
+		result, err := resolveTestName(t.Context(), backend, session, `folder\`+request, DefaultLimits(), allowNamespace)
+		if !errors.Is(err, errNameAmbiguous) || !reflect.DeepEqual(result, resolvedCreateName{}) {
+			t.Fatalf("whole Unicode-ambiguous observation accepted for %q: %+v %v", request, result, err)
+		}
+	}
+}
+
+func TestSMBNamespaceRejectsSelectedSymlinkWithoutFollowingIt(t *testing.T) {
+	backend, session := namespaceFixture()
+	session.views[2].entries = append(session.views[2].entries, storage.Entry{Name: "link", Attr: storage.Attr{ID: 4, Kind: storage.NodeSymlink}})
+	if result, err := resolveTestName(t.Context(), backend, session, `Folder\Actual`, DefaultLimits(), allowNamespace); err != nil || result.Condition.NodeID != 3 {
+		t.Fatalf("unrelated representable symlink name prevented regular open: %+v %v", result, err)
+	}
+	for _, name := range []string{`Folder\link`, `Folder\link\child`, `Folder\link\`} {
+		session.calls = nil
+		result, err := resolveTestName(t.Context(), backend, session, name, DefaultLimits(), allowNamespace)
+		if !errors.Is(err, syscall.EOPNOTSUPP) || !reflect.DeepEqual(result, resolvedCreateName{}) || len(session.calls) != 2 {
+			t.Fatalf("reparse target followed or opened for %q: %+v %v observations=%d", name, result, err, len(session.calls))
+		}
+	}
+}
+
+func TestSMBNamespaceRejectsAncestorIdentityInObservedChildren(t *testing.T) {
+	backend, session := namespaceFixture()
+	session.views[2].entries = append(session.views[2].entries, storage.Entry{Name: "peer", Attr: storage.Attr{ID: 1, Kind: storage.NodeDirectory}})
+	result, err := resolveTestName(t.Context(), backend, session, `Folder\Actual`, DefaultLimits(), allowNamespace)
+	if !errors.Is(err, syscall.EIO) || !reflect.DeepEqual(result, resolvedCreateName{}) {
+		t.Fatalf("ancestor identity reused by unrelated child: %+v %v", result, err)
 	}
 }
 

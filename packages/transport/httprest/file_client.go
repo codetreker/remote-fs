@@ -24,7 +24,7 @@ type fileRequestAdmission struct {
 
 func fileReadOnly(op storage.Operation) bool {
 	switch op {
-	case storage.OpFileRead, storage.OpFileStat, storage.OpFileStatNode, storage.OpFileLookupAt, storage.OpFileReadDirNode, storage.OpFileObserveDirectoryMetadata, storage.OpFileObserveName, storage.OpFileQueryAction, storage.OpFileQueryDeleteIntent, storage.OpFileListDeleteIntents, storage.OpFileState, storage.OpFileScope, storage.OpFileRangeGetConflict, storage.OpFileRangeQuery, storage.OpFileStatus:
+	case storage.OpFileBackendIdentity, storage.OpFileRead, storage.OpFileStat, storage.OpFileStatNode, storage.OpFileLookupAt, storage.OpFileReadDirNode, storage.OpFileObserveDirectoryMetadata, storage.OpFileObserveName, storage.OpFileQueryAction, storage.OpFileCloseOwnerStatus, storage.OpFileQueryDeleteIntent, storage.OpFileListDeleteIntents, storage.OpFileState, storage.OpFileScope, storage.OpFileRangeGetConflict, storage.OpFileRangeQuery, storage.OpFileStatus:
 		return true
 	}
 	return false
@@ -40,23 +40,30 @@ func requestInterruptible(ctx context.Context, r Request) bool {
 func fileScopeEnabled(ctx context.Context) bool { v, _ := ctx.Value(fileScopeKey{}).(bool); return v }
 
 type remoteFileSession struct {
-	storage             *Storage
-	id                  string
-	mu                  sync.Mutex
-	closeCallMu         sync.Mutex
-	reconcileMu         sync.Mutex
-	epoch               uint64
-	failed              error
-	closed              bool
-	closeAction         storage.LockRequestID
-	closeBarrier        *MutationBarrier
-	closeErr            error
-	closeBarrierPending bool
-	closeScope          locking.MutationScope
-	pending             map[string]pendingFileAction
-	inflight            int
-	pendingLimit        int
-	capabilities        fileCapabilities
+	storage              *Storage
+	id                   string
+	mu                   sync.Mutex
+	closeCallMu          sync.Mutex
+	reconcileMu          sync.Mutex
+	epoch                uint64
+	failed               error
+	closed               bool
+	closeAction          storage.LockRequestID
+	closeGeneration      uint64
+	closeDeterminedFalse bool
+	closeBarrier         *MutationBarrier
+	closeErr             error
+	closeBarrierPending  bool
+	closeScope           locking.MutationScope
+	pending              map[string]pendingFileAction
+	unclaimed            map[string]*remoteFile
+	unclaimedLimit       int
+	closeActionLimit     int
+	closeHistory         time.Duration
+	inflight             int
+	pendingLimit         int
+	capabilities         fileCapabilities
+	identity             storage.FileSessionIdentityResult
 }
 
 type pendingFileAction struct {
@@ -69,26 +76,51 @@ type pendingFileAction struct {
 }
 
 type remoteFile struct {
-	session             *remoteFileSession
-	id                  string
-	node                uint64
-	mu                  sync.Mutex
-	closeCallMu         sync.Mutex
-	closed              bool
-	closeAction         storage.LockRequestID
-	closeBarrier        *MutationBarrier
-	closeErr            error
-	closeBarrierPending bool
-	closeScope          locking.MutationScope
-	capabilities        fileCapabilities
+	session              *remoteFileSession
+	id                   string
+	node                 uint64
+	mu                   sync.Mutex
+	closeCallMu          sync.Mutex
+	closed               bool
+	closeAction          storage.LockRequestID
+	closeGeneration      uint64
+	closeDeterminedFalse bool
+	closeImplicit        bool
+	closeNotExecuted     map[storage.CloseAttempt]remoteCloseProof
+	closePendingProof    *remoteClosePendingProof
+	closeBarrier         *MutationBarrier
+	closeErr             error
+	closeBarrierPending  bool
+	closeScope           locking.MutationScope
+	closeScopeSet        bool
+	capabilities         fileCapabilities
+}
+
+type remoteClosePendingProof struct {
+	attempt            storage.CloseAttempt
+	previousAction     storage.LockRequestID
+	previousGeneration uint64
+	previousDetermined bool
+	previousImplicit   bool
+	previousScope      locking.MutationScope
+	previousScopeSet   bool
+}
+
+type remoteCloseProof struct {
+	epoch   uint64
+	expires time.Time
 }
 
 // CloseBarrierPendingError preserves a confirmed release while its replication
 // barrier remains unresolved. Repeating the same close action may settle it.
-type CloseBarrierPendingError struct{ Cause error }
+type CloseBarrierPendingError struct {
+	State       storage.CloseSettlementState
+	SemanticErr error
+	Cause       error
+}
 
-func (e *CloseBarrierPendingError) Error() string { return e.Cause.Error() }
-func (e *CloseBarrierPendingError) Unwrap() error { return e.Cause }
+func (e *CloseBarrierPendingError) Error() string   { return e.Cause.Error() }
+func (e *CloseBarrierPendingError) Unwrap() []error { return []error{e.SemanticErr, e.Cause} }
 
 func (s *Storage) CheckFileStorage() error { return nil }
 
@@ -215,7 +247,11 @@ func (s *Storage) NewFileSession(ctx context.Context, options storage.FileSessio
 	if response.Session == "" || response.Status == nil || response.Status.Retired || response.Status.Remaining <= 0 {
 		return nil, unreachable(Request{Op: OpFile}, errors.New("file session creation returned no live capability"))
 	}
-	return &remoteFileSession{storage: s, id: response.Session, epoch: response.Epoch, pendingLimit: options.MaxLockActions, capabilities: *response.Capabilities}, nil
+	var identity storage.FileSessionIdentityResult
+	if response.SessionIdentity != nil {
+		identity = response.SessionIdentity.storage()
+	}
+	return &remoteFileSession{storage: s, id: response.Session, epoch: response.Epoch, pendingLimit: options.MaxLockActions, unclaimedLimit: options.MaxFiles, closeActionLimit: options.MaxCloseActions, closeHistory: options.History, capabilities: *response.Capabilities, identity: identity}, nil
 }
 
 func (s *remoteFileSession) call(ctx context.Context, req fileRequest) (fileResponse, error) {
@@ -266,6 +302,10 @@ func (s *remoteFileSession) call(ctx context.Context, req fileRequest) (fileResp
 		return response, err
 	}
 	s.mu.Lock()
+	if retainsFileReference(req.Op) && s.unclaimedLimit > 0 && len(s.unclaimed)+s.inflight >= s.unclaimedLimit {
+		s.mu.Unlock()
+		return fileResponse{}, syscall.EAGAIN
+	}
 	if s.failed != nil && req.Op != storage.OpFileSessionClose {
 		err := s.failed
 		s.mu.Unlock()
@@ -336,7 +376,7 @@ func (s *remoteFileSession) call(ctx context.Context, req fileRequest) (fileResp
 		cancel()
 		if recoveryErr == nil && !recovered.Retry {
 			response, err = recovered, nil
-		} else if recordedFileOutcome(recoveryErr) {
+		} else if recordedFileOutcome(recoveryErr) || releasedCloseBarrierPending(req, recovered) {
 			response, err = recovered, recoveryErr
 		} else if recoveryAction != "" {
 			s.mu.Lock()
@@ -367,6 +407,14 @@ func (s *remoteFileSession) call(ctx context.Context, req fileRequest) (fileResp
 		s.mu.Unlock()
 	}
 	return response, err
+}
+
+func retainsFileReference(op storage.Operation) bool {
+	switch op {
+	case storage.OpFileOpen, storage.OpFileOpenNode, storage.OpFileOpenAt, storage.OpFileOpenNodeRef, storage.OpFileOpenChildRef:
+		return true
+	}
+	return false
 }
 
 func checkReportedAllocation(response fileResponse) error {
@@ -400,6 +448,11 @@ func checkReportedAllocation(response fileResponse) error {
 func recordedFileOutcome(err error) bool {
 	var operation *operationError
 	return errors.As(err, &operation) && operation.recorded
+}
+
+func releasedCloseBarrierPending(req fileRequest, response fileResponse) bool {
+	return (req.Op == storage.OpFileClose || req.Op == storage.OpFileSessionClose) &&
+		response.CloseResult != nil && response.CloseResult.Released && response.CloseResult.BarrierPending
 }
 
 func freezeFileRequest(req fileRequest) (fileRequest, error) {
@@ -470,7 +523,7 @@ func (s *remoteFileSession) resolvePending(ctx context.Context) error {
 		response, err := s.storage.fileCall(recovery, pending.request)
 		cancel()
 		if err != nil {
-			if recordedFileOutcome(err) {
+			if recordedFileOutcome(err) || releasedCloseBarrierPending(pending.request, response) {
 				s.mu.Lock()
 				copy := response
 				pending.response = &copy
@@ -531,6 +584,11 @@ func (s *remoteFileSession) takePendingResult(incoming fileRequest, incomingScop
 func (s *remoteFileSession) open(ctx context.Context, req fileRequest) (storage.File, *MutationBarrier, error) {
 	response, err := s.call(ctx, req)
 	if err != nil {
+		if response.File != "" {
+			cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			err = errors.Join(err, s.closeUnclaimedFile(cleanup, response.File, response.Epoch))
+			cancel()
+		}
 		return nil, nil, err
 	}
 	if response.File == "" {
@@ -627,16 +685,41 @@ func (s *remoteFileSession) Close(ctx context.Context) error {
 }
 
 func (s *remoteFileSession) closeUnclaimedFile(ctx context.Context, file string, epoch uint64) error {
-	action, err := storage.NewLockRequestID(epoch)
-	if err != nil {
+	s.mu.Lock()
+	if s.unclaimed == nil {
+		s.unclaimed = make(map[string]*remoteFile)
+	}
+	owner := s.unclaimed[file]
+	if owner == nil {
+		owner = &remoteFile{session: s, id: file}
+		s.unclaimed[file] = owner
+	}
+	if epoch > s.epoch {
+		s.epoch = epoch
+	}
+	s.mu.Unlock()
+	owner.mu.Lock()
+	action := owner.closeAction
+	generation := owner.closeGeneration
+	advance := owner.closeDeterminedFalse
+	owner.mu.Unlock()
+	if action == "" || advance {
+		id, idErr := storage.NewFileActionID(epoch)
+		if idErr != nil {
+			return idErr
+		}
+		action = storage.LockRequestID(id)
+		generation++
+	}
+	result, _, err := owner.closeWithActionAndBarrier(ctx, storage.CloseAttempt{Action: storage.FileActionID(action), Generation: generation}, true)
+	if result.Released {
+		s.mu.Lock()
+		delete(s.unclaimed, file)
+		s.mu.Unlock()
 		return err
 	}
-	response, err := s.storage.fileCall(ctx, fileRequest{Op: storage.OpFileClose, Session: s.id, File: file, Action: action})
-	if response.CloseResult == nil || !response.CloseResult.Released {
-		if err == nil {
-			return unreachable(Request{Op: OpFileControl}, errors.New("unclaimed file close did not prove release"))
-		}
-		return err
+	if err == nil {
+		return unreachable(Request{Op: OpFileControl}, errors.New("unclaimed file close did not prove release"))
 	}
 	return err
 }
@@ -647,7 +730,14 @@ func (s *remoteFileSession) CloseWithBarrier(ctx context.Context) (storage.Refer
 
 func (s *remoteFileSession) CloseWithResult(ctx context.Context) (storage.ReferenceCloseResult, error) {
 	result, _, err := s.closeWithResultAndBarrier(ctx)
-	return result, err
+	return result, neutralCloseSettlement(err)
+}
+
+func (s *remoteFileSession) CheckRecoverableReferenceClose() error {
+	if s.capabilities.CloseRecovery {
+		return nil
+	}
+	return syscall.EOPNOTSUPP
 }
 
 func (s *remoteFileSession) closeWithResultAndBarrier(ctx context.Context) (storage.ReferenceCloseResult, *MutationBarrier, error) {
@@ -658,12 +748,20 @@ func (s *remoteFileSession) closeWithResultAndBarrier(ctx context.Context) (stor
 		barrier := s.closeBarrier
 		err := s.closeErr
 		s.mu.Unlock()
-		return storage.ReferenceCloseResult{Released: true}, barrier, err
+		return storage.ReferenceCloseResult{Released: true, Determined: true}, barrier, err
 	}
 	wasReleased := s.closed
 	previousBarrier := s.closeBarrier
 	previousErr := s.closeErr
+	if s.closeDeterminedFalse {
+		s.closeGeneration++
+		s.closeAction = ""
+		s.closeDeterminedFalse = false
+	}
 	if s.closeAction == "" {
+		if s.closeGeneration == 0 {
+			s.closeGeneration = 1
+		}
 		var err error
 		s.closeAction, err = storage.NewLockRequestID(s.epoch)
 		if err != nil {
@@ -674,13 +772,14 @@ func (s *remoteFileSession) closeWithResultAndBarrier(ctx context.Context) (stor
 		s.closeScope = locking.CloneScope(s.closeScope)
 	}
 	action := s.closeAction
+	generation := s.closeGeneration
 	scope := locking.CloneScope(s.closeScope)
 	s.mu.Unlock()
 	ctx = locking.WithScope(ctx, scope)
-	r, e := s.storage.fileCall(ctx, fileRequest{Op: storage.OpFileSessionClose, Session: s.id, Action: action})
+	r, e := s.storage.fileCall(ctx, fileRequest{Op: storage.OpFileSessionClose, Session: s.id, Action: action, CloseGeneration: generation})
 	if e == nil && r.Retry {
 		if wasReleased {
-			return storage.ReferenceCloseResult{Released: true}, previousBarrier, errors.Join(previousErr, unreachable(Request{Op: OpFileControl}, errors.New("released close lost its action receipt")))
+			return storage.ReferenceCloseResult{Released: true, Determined: true}, previousBarrier, closeReplayError(previousErr, unreachable(Request{Op: OpFileControl}, errors.New("released close lost its action receipt")))
 		}
 		action, e = storage.NewLockRequestID(r.Epoch)
 		if e != nil {
@@ -690,15 +789,16 @@ func (s *remoteFileSession) closeWithResultAndBarrier(ctx context.Context) (stor
 		s.closeAction = action
 		s.epoch = r.Epoch
 		s.mu.Unlock()
-		r, e = s.storage.fileCall(ctx, fileRequest{Op: storage.OpFileSessionClose, Session: s.id, Action: action})
+		r, e = s.storage.fileCall(ctx, fileRequest{Op: storage.OpFileSessionClose, Session: s.id, Action: action, CloseGeneration: generation})
 		if e == nil && r.Retry {
 			return storage.ReferenceCloseResult{}, nil, syscall.EAGAIN
 		}
 	}
 	if r.CloseResult != nil && r.CloseResult.Released {
-		e = closeBarrierResultError(r.CloseResult, e)
+		e = closeReplayResultError(r.CloseResult, wasReleased, previousErr, e)
 		s.mu.Lock()
 		s.closed = true
+		s.unclaimed = nil
 		s.closeBarrier = r.Barrier
 		s.closeErr = e
 		s.closeBarrierPending = r.CloseResult.BarrierPending
@@ -707,15 +807,17 @@ func (s *remoteFileSession) closeWithResultAndBarrier(ctx context.Context) (stor
 	}
 	if r.CloseResult != nil {
 		if wasReleased {
-			return storage.ReferenceCloseResult{Released: true}, previousBarrier, errors.Join(previousErr, unreachable(Request{Op: OpFileControl}, errors.New("close replay revoked confirmed release")))
+			return storage.ReferenceCloseResult{Released: true, Determined: true}, previousBarrier, closeReplayError(previousErr, unreachable(Request{Op: OpFileControl}, errors.New("close replay revoked confirmed release")))
 		}
-		s.mu.Lock()
-		s.closeAction = ""
-		s.mu.Unlock()
+		if r.CloseResult.Determined {
+			s.mu.Lock()
+			s.closeDeterminedFalse = true
+			s.mu.Unlock()
+		}
 		return r.CloseResult.storage(), r.Barrier, e
 	}
 	if wasReleased {
-		return storage.ReferenceCloseResult{Released: true}, previousBarrier, errors.Join(previousErr, e)
+		return storage.ReferenceCloseResult{Released: true, Determined: true}, previousBarrier, closeReplayError(previousErr, e)
 	}
 	return storage.ReferenceCloseResult{}, nil, e
 }
@@ -724,10 +826,17 @@ func closeBarrierResultError(result *referenceCloseResult, err error) error {
 	if !result.BarrierPending {
 		return err
 	}
-	if err == nil {
-		err = syscall.EIO
+	cause := err
+	if cause == nil {
+		cause = syscall.EIO
 	}
-	return &CloseBarrierPendingError{Cause: err}
+	semantic := err
+	// The wire combines barrier failures with the native outcome as EIO. Its
+	// exact native error is recovered from the same receipt after settlement.
+	if storage.ErrnoOf(err) == syscall.EIO {
+		semantic = nil
+	}
+	return &CloseBarrierPendingError{State: storage.CloseSettlementPending, SemanticErr: semantic, Cause: cause}
 }
 
 func (f *remoteFile) call(ctx context.Context, r fileRequest) (fileResponse, error) {
@@ -827,7 +936,288 @@ func (f *remoteFile) CloseWithBarrier(ctx context.Context) (storage.ReferenceClo
 
 func (f *remoteFile) CloseWithResult(ctx context.Context) (storage.ReferenceCloseResult, error) {
 	result, _, err := f.closeWithResultAndBarrier(ctx)
-	return result, err
+	return result, neutralCloseSettlement(err)
+}
+
+func (f *remoteFile) CloseWithAction(ctx context.Context, attempt storage.CloseAttempt) (storage.ReferenceCloseResult, error) {
+	result, _, err := f.CloseWithActionAndBarrier(ctx, attempt)
+	return result, neutralCloseSettlement(err)
+}
+
+func (f *remoteFile) CloseWithActionAndBarrier(ctx context.Context, attempt storage.CloseAttempt) (storage.ReferenceCloseResult, *MutationBarrier, error) {
+	return f.closeWithActionAndBarrier(ctx, attempt, false)
+}
+
+func (f *remoteFile) closeWithActionAndBarrier(ctx context.Context, attempt storage.CloseAttempt, implicit bool) (storage.ReferenceCloseResult, *MutationBarrier, error) {
+	if !implicit && !f.session.capabilities.CloseRecovery {
+		return storage.ReferenceCloseResult{}, nil, syscall.EOPNOTSUPP
+	}
+	if err := attempt.Check(); err != nil {
+		return storage.ReferenceCloseResult{}, nil, err
+	}
+	f.closeCallMu.Lock()
+	defer f.closeCallMu.Unlock()
+	f.mu.Lock()
+	f.pruneCloseProofsLocked(time.Now())
+	if f.closePendingProof != nil && f.closePendingProof.attempt == attempt {
+		f.mu.Unlock()
+		resolved, proofErr := f.resolvePendingCloseProof(ctx)
+		if proofErr != nil {
+			return storage.ReferenceCloseResult{}, nil, proofErr
+		}
+		if resolved {
+			return storage.ReferenceCloseResult{}, nil, unreachable(Request{Op: OpFileControl}, errors.New("resolved close proof has no result"))
+		}
+		f.mu.Lock()
+	}
+	adoptImplicit := false
+	if !implicit && f.closeImplicit && f.closeAction != "" && f.closeAction != storage.LockRequestID(attempt.Action) && !f.closeDeterminedFalse {
+		f.mu.Unlock()
+		owner, statusErr := f.CloseOwnerStatus(ctx)
+		if statusErr != nil {
+			return storage.ReferenceCloseResult{}, nil, statusErr
+		}
+		if owner.Current == nil || *owner.Current != attempt {
+			return storage.ReferenceCloseResult{}, nil, syscall.EBUSY
+		}
+		adoptImplicit = true
+		f.mu.Lock()
+	}
+	if rejected, found := f.closeNotExecuted[attempt]; found {
+		f.mu.Unlock()
+		return storage.ReferenceCloseResult{}, nil, &storage.CloseActionNotExecutedError{CurrentEpoch: rejected.epoch}
+	}
+	if f.closeAction == storage.LockRequestID(attempt.Action) && f.closeGeneration != 0 && f.closeGeneration != attempt.Generation {
+		f.mu.Unlock()
+		return storage.ReferenceCloseResult{}, nil, syscall.EINVAL
+	}
+	historical := attempt.Generation < f.closeGeneration
+	newExplicit := !implicit && !historical && (f.closeAction != storage.LockRequestID(attempt.Action) || f.closeGeneration != attempt.Generation)
+	if newExplicit && !adoptImplicit {
+		f.mu.Unlock()
+		owner, statusErr := f.CloseOwnerStatus(ctx)
+		if statusErr != nil {
+			return storage.ReferenceCloseResult{}, nil, statusErr
+		}
+		if owner.Current != nil {
+			if *owner.Current != attempt {
+				return storage.ReferenceCloseResult{}, nil, syscall.EBUSY
+			}
+		} else {
+			if !owner.Ready {
+				return storage.ReferenceCloseResult{}, nil, syscall.EAGAIN
+			}
+			if attempt.Generation != owner.NextGeneration {
+				return storage.ReferenceCloseResult{}, nil, syscall.EINVAL
+			}
+			requestedEpoch, epochErr := attempt.Action.Epoch()
+			if epochErr != nil {
+				return storage.ReferenceCloseResult{}, nil, epochErr
+			}
+			if requestedEpoch > owner.CurrentEpoch {
+				return storage.ReferenceCloseResult{}, nil, syscall.EINVAL
+			}
+			if requestedEpoch == owner.CurrentEpoch {
+				receipt, queryErr := f.QueryCloseAttempt(ctx, attempt)
+				if queryErr != nil {
+					return storage.ReferenceCloseResult{}, nil, queryErr
+				}
+				if receipt.Outcome != storage.FileActionNotExecuted {
+					return storage.ReferenceCloseResult{}, nil, syscall.EBUSY
+				}
+			}
+		}
+		f.mu.Lock()
+	}
+	_, previousNotExecuted := f.closeNotExecuted[storage.CloseAttempt{Action: storage.FileActionID(f.closeAction), Generation: f.closeGeneration}]
+	if !historical && f.closeAction != "" && f.closeAction != storage.LockRequestID(attempt.Action) && !f.closeDeterminedFalse && !previousNotExecuted && !adoptImplicit {
+		f.mu.Unlock()
+		return storage.ReferenceCloseResult{}, nil, syscall.EAGAIN
+	}
+	if !historical && f.closeAction != "" && f.closeAction != storage.LockRequestID(attempt.Action) && attempt.Generation != f.closeGeneration+1 && !(previousNotExecuted && attempt.Generation == f.closeGeneration) && !adoptImplicit {
+		f.mu.Unlock()
+		return storage.ReferenceCloseResult{}, nil, syscall.EINVAL
+	}
+	previousAction, previousGeneration := f.closeAction, f.closeGeneration
+	previousDetermined, previousImplicit := f.closeDeterminedFalse, f.closeImplicit
+	previousScope, previousScopeSet := locking.CloneScope(f.closeScope), f.closeScopeSet
+	wasReleased := f.closed && !historical && f.closeAction == storage.LockRequestID(attempt.Action) && f.closeGeneration == attempt.Generation
+	previousBarrier, previousErr := f.closeBarrier, f.closeErr
+	if !historical {
+		f.closeAction = storage.LockRequestID(attempt.Action)
+		f.closeGeneration = attempt.Generation
+		f.closeDeterminedFalse = false
+		f.closeImplicit = implicit
+	}
+	if !f.closeScopeSet {
+		f.closeScope, _ = f.session.outgoingMutationScope(ctx, fileRequest{Op: storage.OpFileClose})
+		f.closeScope = locking.CloneScope(f.closeScope)
+		f.closeScopeSet = true
+	}
+	scope := locking.CloneScope(f.closeScope)
+	f.mu.Unlock()
+	ctx = locking.WithScope(ctx, scope)
+	response, err := f.session.storage.fileCall(ctx, fileRequest{Op: storage.OpFileClose, Session: f.session.id, File: f.id, Action: storage.LockRequestID(attempt.Action), CloseGeneration: attempt.Generation, CloseImplicit: implicit})
+	if wasReleased && response.CloseResult == nil {
+		if err == nil {
+			err = unreachable(Request{Op: OpFileControl}, errors.New("released close replay returned no result"))
+		}
+		return storage.ReferenceCloseResult{Released: true, Determined: true}, previousBarrier, closeReplayError(previousErr, err)
+	}
+	if response.Retry {
+		if !implicit {
+			return storage.ReferenceCloseResult{}, nil, unreachable(Request{Op: OpFileControl}, errors.New("explicit close action received an HTTP epoch retry"))
+		}
+		newID, idErr := storage.NewFileActionID(response.Epoch)
+		if idErr != nil {
+			return storage.ReferenceCloseResult{}, nil, idErr
+		}
+		f.mu.Lock()
+		f.closeAction = storage.LockRequestID(newID)
+		f.mu.Unlock()
+		attempt.Action = newID
+		response, err = f.session.storage.fileCall(ctx, fileRequest{Op: storage.OpFileClose, Session: f.session.id, File: f.id, Action: storage.LockRequestID(newID), CloseGeneration: attempt.Generation, CloseImplicit: true})
+		if response.Retry {
+			return storage.ReferenceCloseResult{}, nil, syscall.EAGAIN
+		}
+	}
+	var closeProof *storage.CloseActionNotExecutedError
+	if errors.As(err, &closeProof) {
+		f.mu.Lock()
+		f.pruneCloseProofsLocked(time.Now())
+		if f.closeNotExecuted == nil {
+			f.closeNotExecuted = make(map[storage.CloseAttempt]remoteCloseProof)
+		}
+		if len(f.closeNotExecuted) >= f.session.closeActionLimit {
+			f.mu.Unlock()
+			return storage.ReferenceCloseResult{}, nil, syscall.EAGAIN
+		}
+		f.closeNotExecuted[attempt] = remoteCloseProof{epoch: closeProof.CurrentEpoch, expires: time.Now().Add(f.session.closeHistory)}
+		if newExplicit {
+			f.closeAction, f.closeGeneration = previousAction, previousGeneration
+			f.closeDeterminedFalse, f.closeImplicit = previousDetermined, previousImplicit
+			f.closeScope, f.closeScopeSet = previousScope, previousScopeSet
+		}
+		f.closePendingProof = nil
+		f.mu.Unlock()
+		return storage.ReferenceCloseResult{}, nil, err
+	}
+	if newExplicit && (response.CloseResult == nil || !response.CloseResult.Determined) && err != nil {
+		var serverError *operationError
+		if errors.As(err, &serverError) && !serverError.unknown && !serverError.recorded {
+			f.mu.Lock()
+			f.closePendingProof = &remoteClosePendingProof{
+				attempt: attempt, previousAction: previousAction, previousGeneration: previousGeneration,
+				previousDetermined: previousDetermined, previousImplicit: previousImplicit,
+				previousScope: previousScope, previousScopeSet: previousScopeSet,
+			}
+			f.mu.Unlock()
+			queryContext, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			resolved, proofErr := f.resolvePendingCloseProof(queryContext)
+			cancel()
+			if resolved {
+				return storage.ReferenceCloseResult{}, nil, proofErr
+			}
+		}
+	}
+	if response.CloseResult == nil {
+		return storage.ReferenceCloseResult{}, nil, err
+	}
+	if wasReleased && !response.CloseResult.Released {
+		return storage.ReferenceCloseResult{Released: true, Determined: true}, previousBarrier, closeReplayError(previousErr, unreachable(Request{Op: OpFileControl}, errors.New("close replay revoked confirmed release")))
+	}
+	if historical {
+		return response.CloseResult.storage(), response.Barrier, err
+	}
+	if response.CloseResult.Released {
+		err = closeReplayResultError(response.CloseResult, wasReleased, previousErr, err)
+		f.mu.Lock()
+		f.closed = true
+		f.closeBarrier = response.Barrier
+		f.closeErr = err
+		f.closeBarrierPending = response.CloseResult.BarrierPending
+		f.mu.Unlock()
+	} else if response.CloseResult.Determined {
+		f.mu.Lock()
+		f.closeDeterminedFalse = true
+		f.mu.Unlock()
+	}
+	return response.CloseResult.storage(), response.Barrier, err
+}
+
+func (f *remoteFile) resolvePendingCloseProof(ctx context.Context) (bool, error) {
+	f.mu.Lock()
+	pending := f.closePendingProof
+	f.mu.Unlock()
+	if pending == nil {
+		return false, nil
+	}
+	receipt, err := f.QueryCloseAttempt(ctx, pending.attempt)
+	if err != nil {
+		return false, err
+	}
+	if receipt.Outcome != storage.FileActionNotExecuted {
+		f.mu.Lock()
+		f.closePendingProof = nil
+		f.mu.Unlock()
+		return false, nil
+	}
+	owner, err := f.CloseOwnerStatus(ctx)
+	if err != nil {
+		return false, err
+	}
+	f.mu.Lock()
+	f.pruneCloseProofsLocked(time.Now())
+	if len(f.closeNotExecuted) >= f.session.closeActionLimit {
+		f.mu.Unlock()
+		return false, syscall.EAGAIN
+	}
+	if f.closeNotExecuted == nil {
+		f.closeNotExecuted = make(map[storage.CloseAttempt]remoteCloseProof)
+	}
+	f.closeNotExecuted[pending.attempt] = remoteCloseProof{epoch: owner.CurrentEpoch, expires: time.Now().Add(f.session.closeHistory)}
+	f.closeAction, f.closeGeneration = pending.previousAction, pending.previousGeneration
+	f.closeDeterminedFalse, f.closeImplicit = pending.previousDetermined, pending.previousImplicit
+	f.closeScope, f.closeScopeSet = pending.previousScope, pending.previousScopeSet
+	f.closePendingProof = nil
+	f.mu.Unlock()
+	return true, &storage.CloseActionNotExecutedError{CurrentEpoch: owner.CurrentEpoch}
+}
+
+func (f *remoteFile) pruneCloseProofsLocked(now time.Time) {
+	for attempt, proof := range f.closeNotExecuted {
+		if !now.Before(proof.expires) && (f.closeAction != storage.LockRequestID(attempt.Action) || f.closeGeneration != attempt.Generation) {
+			delete(f.closeNotExecuted, attempt)
+		}
+	}
+}
+
+func (f *remoteFile) QueryCloseAttempt(ctx context.Context, attempt storage.CloseAttempt) (storage.FileActionReceipt, error) {
+	if err := attempt.Check(); err != nil {
+		return storage.FileActionReceipt{}, err
+	}
+	response, err := f.session.storage.fileCall(ctx, fileRequest{Op: storage.OpFileQueryAction, Session: f.session.id, File: f.id, FileAction: attempt.Action, CloseGeneration: attempt.Generation})
+	if err != nil {
+		return storage.FileActionReceipt{}, err
+	}
+	if response.ActionReceipt == nil || response.ActionReceipt.Action != attempt.Action || response.ActionReceipt.Operation != storage.OpFileClose {
+		return storage.FileActionReceipt{}, unreachable(Request{Op: OpFileControl}, errors.New("close query returned an unrelated action"))
+	}
+	return *response.ActionReceipt, nil
+}
+
+func (f *remoteFile) CloseOwnerStatus(ctx context.Context) (storage.CloseOwnerStatus, error) {
+	if !f.session.capabilities.CloseRecovery || !f.capabilities.CloseRecovery {
+		return storage.CloseOwnerStatus{}, syscall.EOPNOTSUPP
+	}
+	response, err := f.session.storage.fileCall(ctx, fileRequest{Op: storage.OpFileCloseOwnerStatus, Session: f.session.id, File: f.id})
+	if err != nil {
+		return storage.CloseOwnerStatus{}, err
+	}
+	if response.CloseOwnerStatus == nil {
+		return storage.CloseOwnerStatus{}, unreachable(Request{Op: OpFileControl}, errors.New("close owner status is absent"))
+	}
+	return response.CloseOwnerStatus.storage()
 }
 
 func (f *remoteFile) closeWithResultAndBarrier(ctx context.Context) (storage.ReferenceCloseResult, *MutationBarrier, error) {
@@ -838,12 +1228,21 @@ func (f *remoteFile) closeWithResultAndBarrier(ctx context.Context) (storage.Ref
 		barrier := f.closeBarrier
 		err := f.closeErr
 		f.mu.Unlock()
-		return storage.ReferenceCloseResult{Released: true}, barrier, err
+		return storage.ReferenceCloseResult{Released: true, Determined: true}, barrier, err
 	}
 	wasReleased := f.closed
 	previousBarrier := f.closeBarrier
 	previousErr := f.closeErr
+	if f.closeDeterminedFalse {
+		f.closeGeneration++
+		f.closeAction = ""
+		f.closeDeterminedFalse = false
+		f.closeImplicit = true
+	}
 	if f.closeAction == "" {
+		if f.closeGeneration == 0 {
+			f.closeGeneration = 1
+		}
 		f.session.mu.Lock()
 		epoch := f.session.epoch
 		f.session.mu.Unlock()
@@ -855,21 +1254,31 @@ func (f *remoteFile) closeWithResultAndBarrier(ctx context.Context) (storage.Ref
 		}
 		f.closeScope, _ = f.session.outgoingMutationScope(ctx, fileRequest{Op: storage.OpFileClose})
 		f.closeScope = locking.CloneScope(f.closeScope)
+		f.closeScopeSet = true
+		f.closeImplicit = true
 	}
 	action := f.closeAction
+	generation := f.closeGeneration
+	implicit := f.closeImplicit
 	scope := locking.CloneScope(f.closeScope)
 	f.mu.Unlock()
 	ctx = locking.WithScope(ctx, scope)
 	var r fileResponse
 	var e error
-	if wasReleased {
-		r, e = f.session.storage.fileCall(ctx, fileRequest{Op: storage.OpFileClose, Session: f.session.id, File: f.id, Action: action})
+	f.session.mu.Lock()
+	sessionClosed := f.session.closed
+	f.session.mu.Unlock()
+	if wasReleased || sessionClosed {
+		r, e = f.session.storage.fileCall(ctx, fileRequest{Op: storage.OpFileClose, Session: f.session.id, File: f.id, Action: action, CloseGeneration: generation, CloseImplicit: implicit})
 	} else {
-		r, e = f.session.call(ctx, fileRequest{Op: storage.OpFileClose, File: f.id, Action: action})
+		r, e = f.session.call(ctx, fileRequest{Op: storage.OpFileClose, File: f.id, Action: action, CloseGeneration: generation, CloseImplicit: implicit})
 	}
-	if e == nil && r.Retry {
+	if e == nil && r.Retry && !implicit {
+		return storage.ReferenceCloseResult{}, nil, unreachable(Request{Op: OpFileControl}, errors.New("explicit close action received an HTTP epoch retry"))
+	}
+	if e == nil && r.Retry && implicit {
 		if wasReleased {
-			return storage.ReferenceCloseResult{Released: true}, previousBarrier, errors.Join(previousErr, unreachable(Request{Op: OpFileControl}, errors.New("released close lost its action receipt")))
+			return storage.ReferenceCloseResult{Released: true, Determined: true}, previousBarrier, closeReplayError(previousErr, unreachable(Request{Op: OpFileControl}, errors.New("released close lost its action receipt")))
 		}
 		action, e = storage.NewLockRequestID(r.Epoch)
 		if e != nil {
@@ -878,13 +1287,17 @@ func (f *remoteFile) closeWithResultAndBarrier(ctx context.Context) (storage.Ref
 		f.mu.Lock()
 		f.closeAction = action
 		f.mu.Unlock()
-		r, e = f.session.call(ctx, fileRequest{Op: storage.OpFileClose, File: f.id, Action: action})
+		if sessionClosed {
+			r, e = f.session.storage.fileCall(ctx, fileRequest{Op: storage.OpFileClose, Session: f.session.id, File: f.id, Action: action, CloseGeneration: generation, CloseImplicit: implicit})
+		} else {
+			r, e = f.session.call(ctx, fileRequest{Op: storage.OpFileClose, File: f.id, Action: action, CloseGeneration: generation, CloseImplicit: implicit})
+		}
 		if e == nil && r.Retry {
 			return storage.ReferenceCloseResult{}, nil, syscall.EAGAIN
 		}
 	}
 	if r.CloseResult != nil && r.CloseResult.Released {
-		e = closeBarrierResultError(r.CloseResult, e)
+		e = closeReplayResultError(r.CloseResult, wasReleased, previousErr, e)
 		f.mu.Lock()
 		f.closed = true
 		f.closeBarrier = r.Barrier
@@ -895,15 +1308,17 @@ func (f *remoteFile) closeWithResultAndBarrier(ctx context.Context) (storage.Ref
 	}
 	if r.CloseResult != nil {
 		if wasReleased {
-			return storage.ReferenceCloseResult{Released: true}, previousBarrier, errors.Join(previousErr, unreachable(Request{Op: OpFileControl}, errors.New("close replay revoked confirmed release")))
+			return storage.ReferenceCloseResult{Released: true, Determined: true}, previousBarrier, closeReplayError(previousErr, unreachable(Request{Op: OpFileControl}, errors.New("close replay revoked confirmed release")))
 		}
-		f.mu.Lock()
-		f.closeAction = ""
-		f.mu.Unlock()
+		if r.CloseResult.Determined {
+			f.mu.Lock()
+			f.closeDeterminedFalse = true
+			f.mu.Unlock()
+		}
 		return r.CloseResult.storage(), r.Barrier, e
 	}
 	if wasReleased {
-		return storage.ReferenceCloseResult{Released: true}, previousBarrier, errors.Join(previousErr, e)
+		return storage.ReferenceCloseResult{Released: true, Determined: true}, previousBarrier, closeReplayError(previousErr, e)
 	}
 	return storage.ReferenceCloseResult{}, nil, e
 }

@@ -162,6 +162,11 @@ func (s *remoteFileSession) OpenAtWithBarrier(ctx context.Context, selection sto
 	if err := s.CheckAtomicFileOpen(); err != nil {
 		return storage.OpenResult{}, nil, err
 	}
+	if options.MetadataAccess != 0 {
+		if err := s.CheckOpenMetadataAccess(); err != nil {
+			return storage.OpenResult{}, nil, err
+		}
+	}
 	if err := selection.Check(); err != nil {
 		return storage.OpenResult{}, nil, err
 	}
@@ -400,6 +405,18 @@ func (r *remoteNodeReference) CloseWithResult(ctx context.Context) (storage.Refe
 }
 func (r *remoteNodeReference) CloseWithBarrier(ctx context.Context) (storage.ReferenceCloseResult, *MutationBarrier, error) {
 	return r.file.CloseWithBarrier(ctx)
+}
+func (r *remoteNodeReference) CloseWithAction(ctx context.Context, attempt storage.CloseAttempt) (storage.ReferenceCloseResult, error) {
+	return r.file.CloseWithAction(ctx, attempt)
+}
+func (r *remoteNodeReference) CloseWithActionAndBarrier(ctx context.Context, attempt storage.CloseAttempt) (storage.ReferenceCloseResult, *MutationBarrier, error) {
+	return r.file.CloseWithActionAndBarrier(ctx, attempt)
+}
+func (r *remoteNodeReference) QueryCloseAttempt(ctx context.Context, attempt storage.CloseAttempt) (storage.FileActionReceipt, error) {
+	return r.file.QueryCloseAttempt(ctx, attempt)
+}
+func (r *remoteNodeReference) CloseOwnerStatus(ctx context.Context) (storage.CloseOwnerStatus, error) {
+	return r.file.CloseOwnerStatus(ctx)
 }
 func (r *remoteNodeReference) CheckScopedReference() error { return r.file.CheckScopedReference() }
 func (r *remoteNodeReference) Scope(ctx context.Context) (storage.UseScope, error) {

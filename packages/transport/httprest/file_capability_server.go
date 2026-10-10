@@ -67,6 +67,34 @@ func capabilitiesOf(value any) (*fileCapabilities, error) {
 
 func sessionCapabilitiesOf(value storage.FileSession) (*fileCapabilities, error) {
 	caps, err := capabilitiesOf(value)
+	check := func(target *bool, call func() error) {
+		if checkErr := call(); checkErr == nil {
+			*target = true
+		} else if storage.ErrnoOf(checkErr) != syscall.EOPNOTSUPP {
+			err = errors.Join(err, checkErr)
+		}
+	}
+	if c, ok := value.(storage.FileSessionIdentity); ok {
+		check(&caps.SessionIdentity, c.CheckFileSessionIdentity)
+	}
+	if c, ok := value.(storage.StableReferenceIdentity); ok {
+		check(&caps.StableIdentity, c.CheckStableReferenceIdentity)
+	}
+	if c, ok := value.(storage.OpenMetadataAccess); ok {
+		check(&caps.OpenMetadata, c.CheckOpenMetadataAccess)
+	}
+	if recovery, ok := value.(storage.RecoverableReferenceClose); ok {
+		check(&caps.CloseRecovery, func() error {
+			if err := recovery.CheckRecoverableReferenceClose(); err != nil {
+				return err
+			}
+			inline, ok := value.(storage.InlineCloseSettlement)
+			if !ok {
+				return syscall.EOPNOTSUPP
+			}
+			return inline.CheckInlineCloseSettlement()
+		})
+	}
 	if reporter, ok := value.(storage.AllocationReporting); ok {
 		checkErr := reporter.CheckAllocationReporting()
 		if checkErr == nil {
@@ -102,6 +130,7 @@ func sessionCapabilitiesOf(value storage.FileSession) (*fileCapabilities, error)
 
 func referenceCapabilitiesOf(value retainedReference) (*fileCapabilities, error) {
 	caps, err := capabilitiesOf(value)
+	_, caps.CloseRecovery = value.(storage.ReferenceCloseActions)
 	if capability, ok := value.(storage.ReferenceMetadataAccess); ok {
 		checkErr := capability.CheckMetadataAccess()
 		if checkErr == nil {
@@ -133,8 +162,19 @@ func (h *Handler) openReference(ctx context.Context, session *servedFileSession,
 		session.mu.Unlock()
 		return response, syscall.EAGAIN
 	}
+	reserveClose := session.recoverable
+	if reserveClose && session.cleanupActions+session.cleanupReserved+2 > h.files.limits.MaxCleanupActions {
+		session.mu.Unlock()
+		return response, syscall.EAGAIN
+	}
+	if reserveClose {
+		session.cleanupReserved += 2
+	}
 	capability := fileCapability()
 	entry := &servedFile{closing: true}
+	if reserveClose {
+		entry.closeReserve = 2
+	}
 	session.files[capability] = entry
 	session.mu.Unlock()
 
@@ -146,6 +186,16 @@ func (h *Handler) openReference(ctx context.Context, session *servedFileSession,
 	case storage.OpFileOpenNode:
 		reference, err = session.native.OpenNode(ctx, request.Node, request.Open)
 	case storage.OpFileOpenAt:
+		if request.OpenAt.MetadataAccess != 0 {
+			metadata, ok := session.native.(storage.OpenMetadataAccess)
+			if !ok {
+				err = syscall.EOPNOTSUPP
+				break
+			}
+			if err = metadata.CheckOpenMetadataAccess(); err != nil {
+				break
+			}
+		}
 		provider, ok := session.native.(storage.AtomicFileOpener)
 		if !ok {
 			err = syscall.EOPNOTSUPP
@@ -185,6 +235,7 @@ func (h *Handler) openReference(ctx context.Context, session *servedFileSession,
 	if !retainedReferencePresent(reference) {
 		reference = nil
 		delete(session.files, capability)
+		session.cleanupReserved -= entry.closeReserve
 	} else {
 		entry.native = reference
 		entry.closing = false
@@ -205,11 +256,15 @@ func (h *Handler) openReference(ctx context.Context, session *servedFileSession,
 	if capabilityErr != nil {
 		openErr = errors.Join(openErr, capabilityErr, syscall.EIO)
 	}
+	if session.recoverable && !response.Capabilities.CloseRecovery {
+		openErr = errors.Join(openErr, syscall.EOPNOTSUPP)
+	}
 	if (request.Op == storage.OpFileOpenNodeRef || request.Op == storage.OpFileOpenChildRef) && (!response.Capabilities.Scope || !response.Capabilities.State) {
 		openErr = errors.Join(openErr, errors.New("node reference lacks mandatory scope or state capability"), syscall.EIO)
 	}
 	identityInvalid := false
-	if response.Capabilities.ReferenceName {
+	stableOpen := session.stableIdentity && (request.Op == storage.OpFileOpenAt || request.Op == storage.OpFileOpenNodeRef || request.Op == storage.OpFileOpenChildRef)
+	if response.Capabilities.ReferenceName || stableOpen {
 		node, identityErr := storage.ReferenceNodeID(reference)
 		if identityErr != nil {
 			identityInvalid = true

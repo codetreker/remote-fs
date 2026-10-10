@@ -74,6 +74,7 @@ type pendingRequest struct {
 }
 
 type pendingKey struct{}
+type relatedFileKey struct{}
 type pendingFrameKey struct{}
 
 type requestFrame struct {
@@ -106,6 +107,7 @@ type session struct {
 	signer                       *signing.Session
 	preauth                      [64]byte
 	openingTrees                 int
+	fileIncarnation              uint64
 	nextFileID                   uint64
 	trees                        map[uint32]*tree
 	authorities                  map[*Export]*authoritySession
@@ -329,13 +331,8 @@ func (c *connection) process(requests []wire.Request) error {
 	var output []byte
 	var inheritedSession uint64
 	var inheritedTree uint32
-	var inheritedFileID wire.FileID
 	var previousStatus uint32
-	responseBytes := 0
-	for _, request := range requests {
-		responseBytes += responseBudget(request)
-	}
-	responseFits := responseBytes <= c.server.config.Limits.MaxFrameBytes
+	var inheritedFile wire.FileID
 	for index, request := range requests {
 		original := request
 		if request.Header.Flags&wire.FlagRelated != 0 {
@@ -352,6 +349,11 @@ func (c *connection) process(requests []wire.Request) error {
 		pending.treeID = request.Header.TreeID
 		c.mu.Unlock()
 		ctx := context.WithValue(pending.ctx, pendingFrameKey{}, requestFrame{connection: c, id: pending.frame})
+		if request.Header.Flags&wire.FlagRelated != 0 {
+			ctx = context.WithValue(ctx, relatedFileKey{}, inheritedFile)
+		} else {
+			inheritedFile = wire.FileID{}
+		}
 		header := request.Header
 		header.Flags = 0
 		header.NextCommand = 0
@@ -362,9 +364,8 @@ func (c *connection) process(requests []wire.Request) error {
 
 		var body []byte
 		var signer *signing.Session
-		var createdFileID wire.FileID
 		if request.Header.Flags&wire.FlagRelated != 0 && previousStatus != 0 || ctx.Err() != nil ||
-			!responseFits {
+			responseBudget(request) > c.server.config.Limits.MaxFrameBytes-len(output)-80*(len(requests)-index-1) {
 			header.Status = statusResources
 			if ctx.Err() != nil {
 				header.Status = statusError(ctx.Err())
@@ -385,7 +386,7 @@ func (c *connection) process(requests []wire.Request) error {
 				}
 			}
 		} else {
-			body, header.Status, signer = c.dispatch(ctx, request, original, &header, inheritedFileID, &createdFileID)
+			body, header.Status, signer = c.dispatch(ctx, request, original, &header)
 		}
 		pending.cancel()
 		if pending.async {
@@ -397,9 +398,11 @@ func (c *connection) process(requests []wire.Request) error {
 			body = wire.ErrorResponseBody()
 		}
 		inheritedSession, inheritedTree, previousStatus = header.SessionID, header.TreeID, header.Status
-		inheritedFileID = wire.FileID{}
-		if header.Command == wire.Create && header.Status == statusOK {
-			inheritedFileID = createdFileID
+		if header.Command == wire.Create {
+			inheritedFile = wire.FileID{}
+			if header.Status == statusOK && len(body) >= 80 {
+				copy(inheritedFile[:], body[64:80])
+			}
 		}
 		if request.Header.Flags&wire.FlagRelated != 0 {
 			header.Flags |= wire.FlagRelated
@@ -551,8 +554,6 @@ func responseBudget(request wire.Request) int {
 		return 72 + 65535
 	case wire.Create:
 		return 152
-	case wire.Close:
-		return 128
 	default:
 		return 128
 	}
@@ -608,11 +609,11 @@ func (c *connection) addStatus(status *Status) {
 			status.ExpiredSessions++
 		}
 		session.mu.Lock()
-		status.Trees += len(session.trees) + session.openingTrees
 		trees := make([]*tree, 0, len(session.trees))
 		for _, tree := range session.trees {
 			trees = append(trees, tree)
 		}
+		status.Trees += len(session.trees) + session.openingTrees
 		authorities := make([]*authoritySession, 0, len(session.authorities))
 		for _, authority := range session.authorities {
 			authorities = append(authorities, authority)
@@ -621,6 +622,16 @@ func (c *connection) addStatus(status *Status) {
 		for _, tree := range trees {
 			tree.fileMu.Lock()
 			status.Handles += len(tree.handles)
+			for _, h := range tree.handles {
+				switch handleState(h.state.Load()) {
+				case handleReserved:
+					status.OpeningHandles++
+				case handleCleanupOnly:
+					status.CleanupOnlyHandles++
+				case handleBarrierOnly:
+					status.BarrierOnlyHandles++
+				}
+			}
 			tree.fileMu.Unlock()
 		}
 		for _, authority := range authorities {

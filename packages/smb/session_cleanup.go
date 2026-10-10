@@ -194,7 +194,6 @@ func (c *connection) closeTreeContext(ctx context.Context, tree *tree) error {
 		if tree.closed {
 			return nil
 		}
-		idle := tree.fenceFileWork()
 		tree.stopOnce.Do(func() { close(tree.done) })
 		c.mu.Lock()
 		for _, pending := range c.pending {
@@ -204,17 +203,18 @@ func (c *connection) closeTreeContext(ctx context.Context, tree *tree) error {
 			}
 		}
 		c.mu.Unlock()
-		if err := waitFileWork(ctx, idle); err != nil {
+		if err := waitFileWork(ctx, tree.fenceFileWork()); err != nil {
 			return err
 		}
 		if tree.kind == controlTree {
 			tree.closed = true
 			return nil
 		}
-		handleErr := tree.closeFileHandles(WithPrincipal(ctx, tree.authority.principal))
-		tree.fileMu.Lock()
-		retainedHandles := len(tree.handles)
-		tree.fileMu.Unlock()
+
+		ctx = WithPrincipal(ctx, tree.authority.principal)
+		if err := tree.closeFileHandles(ctx); err != nil {
+			return err
+		}
 		authority := tree.authority
 		if err := authority.treeCloseMu.lock(ctx); err != nil {
 			return err
@@ -229,18 +229,12 @@ func (c *connection) closeTreeContext(ctx context.Context, tree *tree) error {
 		}
 		authority.mu.Unlock()
 		authority.installMu.Unlock()
-		if retainedHandles != 0 && !last {
-			return handleErr
-		}
-		var authorityErr error
 		if last {
-			authorityErr = authority.close(ctx)
-			if !authority.isClosed() {
-				return errors.Join(handleErr, authorityErr)
+			if err := authority.close(ctx); err != nil {
+				return err
 			}
-			tree.releaseAllFileHandles()
 			if err := authority.wait(ctx); err != nil {
-				return errors.Join(handleErr, authorityErr, err)
+				return err
 			}
 		}
 		authority.mu.Lock()
@@ -251,7 +245,7 @@ func (c *connection) closeTreeContext(ctx context.Context, tree *tree) error {
 		tree.export.refs--
 		tree.export.trees--
 		c.server.mu.Unlock()
-		return errors.Join(handleErr, authorityErr)
+		return nil
 	})
 }
 

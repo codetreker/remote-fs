@@ -4,12 +4,28 @@ type FileID [16]byte
 
 var InvalidFileID = FileID{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}
 
+// IsRelatedPlaceholder identifies the FileId inherited from a preceding
+// CREATE in the same related compound; it is never a handle-table key.
+func (id FileID) IsRelatedPlaceholder() bool {
+	return id == InvalidFileID
+}
+
+// HasPartialRelatedPlaceholder rejects inheritance of only one FileId half.
+// Allocated handles must avoid an all-ones value in either half.
+func (id FileID) HasPartialRelatedPlaceholder() bool {
+	persistent := le.Uint64(id[:8]) == ^uint64(0)
+	volatile := le.Uint64(id[8:]) == ^uint64(0)
+	return persistent != volatile
+}
+
 type CreateContext struct {
 	Name []byte
 	Data []byte
 }
 
 type CreateRequest struct {
+	// SecurityFlags is retained as received and must be ignored by consumers.
+	// https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-smb2/e8fb45c1-a03d-44ca-b7ae-47385cfd7997
 	SecurityFlags byte
 	OplockLevel   byte
 	Impersonation uint32
@@ -29,13 +45,8 @@ type CloseRequest struct {
 
 func (request Request) Create() (CreateRequest, error) {
 	var result CreateRequest
-	if err := request.fixed(Create, 57, 56); err != nil {
+	if err := request.fixed(Create, 57, 57); err != nil {
 		return result, err
-	}
-	for _, value := range request.Body[8:24] {
-		if value != 0 {
-			return result, ErrMalformed
-		}
 	}
 	result.SecurityFlags = request.Body[2]
 	result.OplockLevel = request.Body[3]
@@ -48,6 +59,9 @@ func (request Request) Create() (CreateRequest, error) {
 
 	nameOffset := uint32(le.Uint16(request.Body[44:46]))
 	nameLength := uint32(le.Uint16(request.Body[46:48]))
+	if nameOffset&7 != 0 {
+		return result, ErrMalformed
+	}
 	name, err := request.field(nameOffset, nameLength, HeaderSize+56)
 	if err != nil {
 		return result, err
@@ -59,11 +73,16 @@ func (request Request) Create() (CreateRequest, error) {
 
 	contextOffset := le.Uint32(request.Body[48:52])
 	contextLength := le.Uint32(request.Body[52:56])
-	contexts, err := request.field(contextOffset, contextLength, HeaderSize+56)
-	if err != nil || contextLength != 0 && contextOffset&7 != 0 {
+	if contextLength == 0 && contextOffset != 0 || contextLength != 0 && contextOffset&7 != 0 {
 		return result, ErrMalformed
 	}
-	if nameLength != 0 && contextLength != 0 && uint64(nameOffset)+uint64(nameLength) > uint64(contextOffset) {
+	contexts, err := request.field(contextOffset, contextLength, HeaderSize+56)
+	if err != nil {
+		return result, ErrMalformed
+	}
+	if nameLength != 0 && contextLength != 0 &&
+		uint64(nameOffset) < uint64(contextOffset)+uint64(contextLength) &&
+		uint64(contextOffset) < uint64(nameOffset)+uint64(nameLength) {
 		return result, ErrMalformed
 	}
 	for len(contexts) != 0 {
@@ -80,8 +99,8 @@ func (request Request) Create() (CreateRequest, error) {
 		}
 		nameStart, nameSize := uint64(le.Uint16(contexts[4:6])), uint64(le.Uint16(contexts[6:8]))
 		dataStart, dataSize := uint64(le.Uint16(contexts[10:12])), uint64(le.Uint32(contexts[12:16]))
-		if nameSize == 0 || nameStart < 16 || nameStart+nameSize > uint64(end) ||
-			dataSize != 0 && (dataStart < 16 || dataStart+dataSize > uint64(end) ||
+		if nameSize < 4 || nameStart < 16 || nameStart&7 != 0 || nameStart+nameSize > uint64(end) ||
+			dataSize != 0 && (dataStart < 16 || dataStart&7 != 0 || dataStart+dataSize > uint64(end) ||
 				dataStart < nameStart+nameSize && nameStart < dataStart+dataSize) {
 			return result, ErrMalformed
 		}
@@ -107,13 +126,11 @@ func (request Request) Close() (CloseRequest, error) {
 		request.Header.NextCommand != 0 && len(request.Body) != align8(HeaderSize+24)-HeaderSize {
 		return result, ErrMalformed
 	}
-	for _, value := range request.Body[4:8] {
-		if value != 0 {
-			return result, ErrMalformed
-		}
-	}
 	result.Flags = le.Uint16(request.Body[2:4])
 	copy(result.FileID[:], request.Body[8:24])
+	if result.FileID.HasPartialRelatedPlaceholder() {
+		return CloseRequest{}, ErrMalformed
+	}
 	return result, nil
 }
 

@@ -1,6 +1,7 @@
 package smb
 
 import (
+	"bytes"
 	"context"
 	"syscall"
 
@@ -26,6 +27,8 @@ const (
 	accessGenericWrite   uint32 = 0x40000000
 	accessGenericRead    uint32 = 0x80000000
 	createDirectory      uint32 = 0x00000001
+	createSyncAlert      uint32 = 0x00000010
+	createSyncNonAlert   uint32 = 0x00000020
 	createNonDirectory   uint32 = 0x00000040
 	createDeleteOnClose  uint32 = 0x00001000
 	createOpenByFileID   uint32 = 0x00002000
@@ -37,11 +40,15 @@ type openIntent struct {
 	reset, directory               bool
 	use                            storage.UseClaim
 	metadataOnly                   bool
+	metadata                       storage.MetadataPermissions
 }
 
 func normalizeAccess(access uint32) (uint32, error) {
 	if access&accessGenericAll != 0 {
-		access |= accessReadData | accessWriteData | accessAppend | accessReadEA | accessWriteEA | accessExecute | accessReadAttr | accessWriteAttr | accessDelete | accessReadCtrl | accessSync
+		// FILE_ALL_ACCESS includes rights outside the supported access set. Keep
+		// them in the expansion so unsupported requests are refused as a whole.
+		// https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-smb2/77b36d0f-6016-458a-a7a0-0f4a72ae1534
+		access |= 0x001f01ff
 	}
 	if access&accessGenericRead != 0 {
 		access |= accessReadData | accessReadEA | accessReadAttr | accessReadCtrl | accessSync
@@ -62,10 +69,10 @@ func normalizeAccess(access uint32) (uint32, error) {
 
 func classifyCreate(request wire.CreateRequest) (openIntent, error) {
 	var intent openIntent
-	if request.SecurityFlags != 0 || request.ShareAccess&^uint32(7) != 0 || request.Options&createDirectory != 0 && request.Options&createNonDirectory != 0 {
+	if request.ShareAccess&^uint32(7) != 0 || request.Options&createDirectory != 0 && request.Options&createNonDirectory != 0 {
 		return intent, syscall.EINVAL
 	}
-	if request.Options&(createDeleteOnClose|createOpenByFileID) != 0 || request.Options&^(createDirectory|createNonDirectory|0x20) != 0 {
+	if request.Options&(createDeleteOnClose|createOpenByFileID) != 0 || request.Options&^(createDirectory|createNonDirectory|createSyncAlert|createSyncNonAlert) != 0 {
 		return intent, syscall.EOPNOTSUPP
 	}
 	if request.OplockLevel != 0 && request.OplockLevel != 1 && request.OplockLevel != 8 && request.OplockLevel != 9 && request.OplockLevel != 0xff || request.Impersonation > 3 || !validDOSAttributes(request.Attributes) {
@@ -78,11 +85,23 @@ func classifyCreate(request wire.CreateRequest) (openIntent, error) {
 	if err != nil {
 		return intent, err
 	}
+	if request.Options&(createSyncAlert|createSyncNonAlert) == createSyncAlert|createSyncNonAlert {
+		return intent, syscall.EINVAL
+	}
+	if request.Options&(createSyncAlert|createSyncNonAlert) != 0 && access&accessSync == 0 {
+		return intent, syscall.EACCES
+	}
 	intent.access = access
 	intent.directory = request.Options&createDirectory != 0
-	intent.read = access&(accessReadData|accessExecute) != 0
+	intent.read = access&accessReadData != 0
 	intent.write = access&(accessWriteData|accessAppend) != 0
 	intent.metadataOnly = !intent.read && !intent.write
+	if access&(accessReadEA|accessReadAttr) != 0 {
+		intent.metadata |= storage.ReadMetadata
+	}
+	if access&(accessWriteEA|accessWriteAttr) != 0 {
+		intent.metadata |= storage.WriteMetadata
+	}
 	switch request.Disposition {
 	case 1: // FILE_OPEN
 	case 2: // FILE_CREATE
@@ -99,26 +118,26 @@ func classifyCreate(request wire.CreateRequest) (openIntent, error) {
 	if intent.reset && (!intent.write || intent.directory) || intent.directory && request.Disposition >= 4 || intent.metadataOnly && intent.reset {
 		return intent, syscall.EACCES
 	}
-	if intent.directory && intent.read {
-		intent.use.Uses = storage.ReadEntries
-	} else {
-		if intent.read {
+	if access&(accessReadData|accessExecute) != 0 {
+		if intent.directory {
+			intent.use.Uses |= storage.ReadEntries
+		} else {
 			intent.use.Uses |= storage.ReadData
 		}
-		if intent.write {
-			intent.use.Uses |= storage.WriteData
-		}
+	}
+	if intent.write {
+		intent.use.Uses |= storage.WriteData
 	}
 	if access&accessDelete != 0 {
 		intent.use.Uses |= storage.DeleteName
 	}
-	if request.ShareAccess&1 == 0 {
+	if intent.use.Uses != 0 && request.ShareAccess&1 == 0 {
 		intent.use.Deny |= storage.ReadData | storage.ReadEntries
 	}
-	if request.ShareAccess&2 == 0 {
+	if intent.use.Uses != 0 && request.ShareAccess&2 == 0 {
 		intent.use.Deny |= storage.WriteData
 	}
-	if request.ShareAccess&4 == 0 {
+	if intent.use.Uses != 0 && request.ShareAccess&4 == 0 {
 		intent.use.Deny |= storage.DeleteName
 	}
 	return intent, nil
@@ -128,7 +147,7 @@ func (c *connection) authorizeOpen(ctx context.Context, t *tree, operation stora
 	authorize := func(operation storage.Operation, access storage.OpenAccess) error {
 		return c.server.config.Authorize.Authorize(ctx, authz.AccessRequest{Volume: t.export.share.Volume, Operation: operation, Open: access})
 	}
-	if err := authorize(operation, storage.OpenAccess{Read: intent.read || intent.access&accessReadAttr != 0, Write: intent.write || intent.access&accessWriteAttr != 0, Create: intent.create, Exclusive: intent.exclusive, Truncate: intent.reset}); err != nil {
+	if err := authorize(operation, storage.OpenAccess{Read: intent.read || intent.access&accessExecute != 0 || intent.metadata&storage.ReadMetadata != 0, Write: intent.write || intent.metadata&storage.WriteMetadata != 0, Create: intent.create, Exclusive: intent.exclusive, Truncate: intent.reset}); err != nil {
 		return err
 	}
 	if len(initial.OnCreate.Metadata)+len(initial.OnReset.Metadata) != 0 {
@@ -165,9 +184,16 @@ func (c *connection) createFile(ctx context.Context, s *session, t *tree, reques
 		releaseReservation()
 		return nil, namespaceStatus(err), wire.FileID{}
 	}
-	if resolved.Root && (intent.create || intent.reset || parsed.Options&createNonDirectory != 0) {
-		releaseReservation()
-		return nil, createStatusError(syscall.EISDIR), wire.FileID{}
+	if resolved.Root {
+		if intent.exclusive {
+			releaseReservation()
+			return nil, createStatusError(syscall.EEXIST), wire.FileID{}
+		}
+		if intent.reset || parsed.Options&createNonDirectory != 0 {
+			releaseReservation()
+			return nil, createStatusError(syscall.EISDIR), wire.FileID{}
+		}
+		intent.create = false
 	}
 	if resolved.DirectoryRequired && parsed.Options&createNonDirectory != 0 {
 		releaseReservation()
@@ -190,7 +216,7 @@ func (c *connection) createFile(ctx context.Context, s *session, t *tree, reques
 		releaseReservation()
 		return nil, createStatusError(syscall.EISDIR), wire.FileID{}
 	}
-	if isDirectory && intent.read {
+	if isDirectory && intent.access&(accessReadData|accessExecute) != 0 {
 		intent.use.Uses &^= storage.ReadData
 		intent.use.Uses |= storage.ReadEntries
 	}
@@ -207,17 +233,22 @@ func (c *connection) createFile(ctx context.Context, s *session, t *tree, reques
 		}
 	}
 	if resolved.Attr != nil {
+		resolved.Condition.ExpectedMetadata = map[string][]byte{windowsMetadataKey: bytes.Clone(resolved.Attr.Metadata[windowsMetadataKey].Version)}
 		attributes, projectionErr := projectWindowsAttributes(*resolved.Attr)
 		if projectionErr != nil {
 			releaseReservation()
 			return nil, createStatusError(projectionErr), wire.FileID{}
 		}
-		if attributes&dosReadOnly != 0 && (intent.write || intent.reset || intent.access&accessDelete != 0) {
+		if !isDirectory && attributes&dosReadOnly != 0 && intent.write {
 			releaseReservation()
 			return nil, createStatusError(syscall.EACCES), wire.FileID{}
 		}
 		if intent.reset {
-			initial.OnReset.Metadata, err = withWindowsMetadata(nil, windowsMetadata{Attributes: (attributes | dosArchive) &^ dosNormal})
+			if attributes&(dosHidden|dosSystem)&^parsed.Attributes != 0 {
+				releaseReservation()
+				return nil, createStatusError(syscall.EACCES), wire.FileID{}
+			}
+			initial.OnReset.Metadata, err = withWindowsMetadata(nil, windowsMetadata{Attributes: (parsed.Attributes | dosArchive) &^ dosNormal})
 			if err != nil {
 				releaseReservation()
 				return nil, createStatusError(err), wire.FileID{}
@@ -232,7 +263,7 @@ func (c *connection) createFile(ctx context.Context, s *session, t *tree, reques
 	}
 	if resolved.Root {
 		operation = storage.OpFileOpenNodeRef
-		resolved.Condition = storage.ChildCondition{State: storage.SameNode, NodeID: resolved.RootID}
+		resolved.Condition.State, resolved.Condition.NodeID = storage.SameNode, resolved.RootID
 	}
 	if err = c.authorizeOpen(ctx, t, operation, intent, initial); err != nil {
 		releaseReservation()
@@ -252,16 +283,14 @@ func (c *connection) createFile(ctx context.Context, s *session, t *tree, reques
 		return nil, createStatusError(err), wire.FileID{}
 	}
 	handle.action, handle.access = action, intent.access
+	handle.recordOpenDiagnostic()
 	var attr storage.Attr
 	var outcome storage.OpenOutcome
 	var open func(context.Context) (storage.Attr, storage.OpenOutcome, error)
 	if resolved.Root || isDirectory || intent.metadataOnly {
 		references := t.authority.raw.(storage.NodeReferences)
 		options := storage.NodeRefOptions{Kind: storage.NodeRegular, Target: resolved.Condition, Action: action, Use: intent.use,
-			MetadataAccess: storage.ReadMetadata, Create: intent.create, Exclusive: intent.exclusive, InitialState: initial}
-		if intent.access&(accessWriteEA|accessWriteAttr) != 0 {
-			options.MetadataAccess |= storage.WriteMetadata
-		}
+			MetadataAccess: intent.metadata, Create: intent.create, Exclusive: intent.exclusive, InitialState: initial}
 		if isDirectory {
 			options.Kind = storage.NodeDirectory
 		}
@@ -280,7 +309,7 @@ func (c *connection) createFile(ctx context.Context, s *session, t *tree, reques
 			return opened.Attr, opened.Outcome, openErr
 		}
 	} else {
-		options := storage.OpenAtOptions{Read: intent.read, Write: intent.write, Create: intent.create, Exclusive: intent.exclusive,
+		options := storage.OpenAtOptions{Read: intent.read, Write: intent.write, MetadataAccess: intent.metadata, Create: intent.create, Exclusive: intent.exclusive,
 			Target: resolved.Condition, Action: action, Use: intent.use, Existing: storage.Keep, Initial: initial}
 		if intent.reset {
 			options.Existing = storage.ResetContent
@@ -295,7 +324,7 @@ func (c *connection) createFile(ctx context.Context, s *session, t *tree, reques
 	}
 	attr, outcome, err = open(ctx)
 	if handle.file == nil && handle.node == nil {
-		handle.pendingOpen = c.pendingOpenRecovery(t, handle, operation, intent, initial, open)
+		handle.pendingOpen = c.pendingOpenRecovery(t, handle, operation, open)
 	}
 	if err != nil {
 		return nil, c.finishFailedOpen(ctx, t, handle, err), wire.FileID{}
@@ -307,8 +336,18 @@ func (c *connection) createFile(ctx context.Context, s *session, t *tree, reques
 	if err != nil {
 		return nil, c.finishFailedOpen(ctx, t, handle, err), wire.FileID{}
 	}
-	if outcome < storage.Opened || outcome > storage.Reset {
+	if !validCreateOutcome(parsed.Disposition, outcome) || (attr.IsDir() != isDirectory) || attr.Kind == storage.NodeSymlink || outcome == storage.Created && (attr.BirthTime == nil || attr.ChangeTime == nil) || outcome == storage.Reset && attr.ChangeTime == nil {
 		return nil, c.finishFailedOpen(ctx, t, handle, syscall.EIO), wire.FileID{}
+	}
+	state, stateErr := t.authority.raw.Status(ctx)
+	if stateErr != nil {
+		return nil, c.finishFailedOpen(ctx, t, handle, stateErr), wire.FileID{}
+	}
+	if state.Epoch != t.authority.identity.SessionEpoch || state.Remaining <= 0 || state.Retired || state.Fenced {
+		return nil, c.finishFailedOpen(ctx, t, handle, syscall.ESTALE), wire.FileID{}
+	}
+	if err := handle.bindReference(ctx, t, attr, intent.use); err != nil {
+		return nil, c.finishFailedOpen(ctx, t, handle, err), wire.FileID{}
 	}
 	response := wire.CreateResponse{CreateAction: uint32(outcome), CreationTime: metadata.CreationTime,
 		LastAccessTime: metadata.LastAccessTime, LastWriteTime: metadata.LastWriteTime, ChangeTime: metadata.ChangeTime,
@@ -316,7 +355,52 @@ func (c *connection) createFile(ctx context.Context, s *session, t *tree, reques
 	return wire.CreateResponseBody(response), statusOK, handle.id
 }
 
+func validCreateOutcome(disposition uint32, outcome storage.OpenOutcome) bool {
+	switch disposition {
+	case 1:
+		return outcome == storage.Opened
+	case 2:
+		return outcome == storage.Created
+	case 3:
+		return outcome == storage.Opened || outcome == storage.Created
+	case 4:
+		return outcome == storage.Reset
+	case 5:
+		return outcome == storage.Created || outcome == storage.Reset
+	default:
+		return false
+	}
+}
+
 func checkCreateCapabilities(session storage.FileSession) error {
+	identity, ok := session.(storage.FileSessionIdentity)
+	if !ok {
+		return syscall.EOPNOTSUPP
+	}
+	if err := identity.CheckFileSessionIdentity(); err != nil {
+		return err
+	}
+	stable, ok := session.(storage.StableReferenceIdentity)
+	if !ok {
+		return syscall.EOPNOTSUPP
+	}
+	if err := stable.CheckStableReferenceIdentity(); err != nil {
+		return err
+	}
+	metadata, ok := session.(storage.OpenMetadataAccess)
+	if !ok {
+		return syscall.EOPNOTSUPP
+	}
+	if err := metadata.CheckOpenMetadataAccess(); err != nil {
+		return err
+	}
+	recovery, ok := session.(storage.RecoverableReferenceClose)
+	if !ok {
+		return syscall.EOPNOTSUPP
+	}
+	if err := recovery.CheckRecoverableReferenceClose(); err != nil {
+		return err
+	}
 	reporter, ok := session.(storage.AllocationReporting)
 	if !ok {
 		return syscall.EOPNOTSUPP
@@ -348,12 +432,8 @@ func checkCreateCapabilities(session storage.FileSession) error {
 	return actions.CheckFileActions()
 }
 
-func (c *connection) pendingOpenRecovery(t *tree, handle *fileHandle, operation storage.Operation, intent openIntent, initial storage.InitialState, open func(context.Context) (storage.Attr, storage.OpenOutcome, error)) func(context.Context) (bool, error) {
+func (c *connection) pendingOpenRecovery(t *tree, handle *fileHandle, operation storage.Operation, open func(context.Context) (storage.Attr, storage.OpenOutcome, error)) func(context.Context) (bool, error) {
 	return func(ctx context.Context) (bool, error) {
-		volume := t.export.share.Volume
-		if err := c.server.config.Authorize.Authorize(ctx, authz.AccessRequest{Volume: volume, Operation: storage.OpFileQueryAction}); err != nil {
-			return false, err
-		}
 		receipt, err := t.authority.raw.(storage.FileActions).QueryFileAction(ctx, handle.action)
 		if err != nil {
 			return false, err
@@ -367,17 +447,12 @@ func (c *connection) pendingOpenRecovery(t *tree, handle *fileHandle, operation 
 		if receipt.Outcome == storage.FileActionRetired || receipt.Operation == "" && receipt.Outcome != storage.FileActionNotExecuted {
 			return false, syscall.EIO
 		}
-		if err := c.authorizeOpen(ctx, t, operation, intent, initial); err != nil {
-			return false, err
-		}
 		_, _, err = open(ctx)
 		if handle.file == nil && handle.node == nil {
 			if err != nil {
-				if authErr := c.server.config.Authorize.Authorize(ctx, authz.AccessRequest{Volume: volume, Operation: storage.OpFileQueryAction}); authErr == nil {
-					if final, queryErr := t.authority.raw.(storage.FileActions).QueryFileAction(ctx, handle.action); queryErr == nil &&
-						final.Check() == nil && final.Action == handle.action && final.Operation == operation && final.Outcome == storage.FileActionNotExecuted {
-						return true, err
-					}
+				if final, queryErr := t.authority.raw.(storage.FileActions).QueryFileAction(ctx, handle.action); queryErr == nil &&
+					final.Check() == nil && final.Action == handle.action && final.Operation == operation && final.Outcome == storage.FileActionNotExecuted {
+					return true, err
 				}
 			}
 			if err == nil {
@@ -396,59 +471,4 @@ func (c *connection) finishFailedOpen(ctx context.Context, t *tree, handle *file
 		c.server.cleanupFailure(closeErr)
 	}
 	return createStatusError(openErr)
-}
-
-func (c *connection) closeFile(ctx context.Context, s *session, t *tree, request wire.Request, inherited wire.FileID) ([]byte, uint32) {
-	parsed, err := request.Close()
-	if err != nil || parsed.Flags&^uint16(1) != 0 {
-		return nil, statusInvalid
-	}
-	if parsed.FileID == wire.InvalidFileID && request.Header.Flags&wire.FlagRelated != 0 {
-		parsed.FileID = inherited
-	}
-	if parsed.FileID == (wire.FileID{}) || parsed.FileID == wire.InvalidFileID {
-		return nil, closeStatusError(syscall.EBADF)
-	}
-	if !t.beginFileWork(s) {
-		return nil, statusNetworkDeleted
-	}
-	defer t.endFileWork()
-	handle := t.findFileHandle(parsed.FileID)
-	if handle == nil {
-		return nil, closeStatusError(syscall.EBADF)
-	}
-	if err := handle.requestCloseMu.lock(ctx); err != nil {
-		return nil, closeStatusError(err)
-	}
-	defer handle.requestCloseMu.unlock()
-	if t.findFileHandle(parsed.FileID) != handle {
-		return nil, closeStatusError(syscall.EBADF)
-	}
-	if err := c.server.config.Authorize.Authorize(ctx, authz.AccessRequest{Volume: t.export.share.Volume, Operation: storage.OpFileClose}); err != nil {
-		return nil, closeStatusError(err)
-	}
-	response := wire.CloseResponse{}
-	if parsed.Flags&1 != 0 {
-		if err := c.server.config.Authorize.Authorize(ctx, authz.AccessRequest{Volume: t.export.share.Volume, Operation: storage.OpFileStat}); err == nil {
-			var attr storage.Attr
-			if handle.file != nil {
-				attr, err = handle.file.Stat(ctx)
-			} else if handle.node != nil {
-				attr, err = handle.node.Stat(ctx)
-			}
-			if err == nil {
-				var metadata createMetadata
-				metadata, err = projectCreateMetadata(attr)
-				if err == nil {
-					response.Flags = 1
-					response.CreationTime, response.LastAccessTime, response.LastWriteTime, response.ChangeTime = metadata.CreationTime, metadata.LastAccessTime, metadata.LastWriteTime, metadata.ChangeTime
-					response.AllocationSize, response.EndOfFile, response.Attributes = metadata.AllocationSize, metadata.EndOfFile, metadata.Attributes
-				}
-			}
-		}
-	}
-	if err := t.closeFileHandle(ctx, handle); err != nil {
-		return nil, closeStatusError(err)
-	}
-	return wire.CloseResponseBody(response), statusOK
 }

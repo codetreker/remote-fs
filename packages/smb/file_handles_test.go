@@ -12,9 +12,10 @@ import (
 )
 
 type handleFileStub struct {
-	result storage.ReferenceCloseResult
-	err    error
-	closes atomic.Int32
+	result  storage.ReferenceCloseResult
+	err     error
+	closes  atomic.Int32
+	attempt *storage.CloseAttempt
 }
 
 func (*handleFileStub) Stat(context.Context) (storage.Attr, error) {
@@ -201,7 +202,7 @@ func TestFileHandleCloseKeepsOnlyUnreleasedOwnership(t *testing.T) {
 	}
 	failure := errors.New("close outcome unavailable")
 	retainedFile := &handleFileStub{err: failure}
-	releasedFile := &handleFileStub{result: storage.ReferenceCloseResult{Released: true}, err: syscall.ENOTEMPTY}
+	releasedFile := &handleFileStub{result: storage.ReferenceCloseResult{Released: true, Determined: true}, err: syscall.ENOTEMPTY}
 	retained.file, released.file = retainedFile, releasedFile
 	tree.endFileWork()
 	if err := tree.closeFileHandles(t.Context()); !errors.Is(err, failure) || !errors.Is(err, syscall.ENOTEMPTY) {
@@ -210,7 +211,7 @@ func TestFileHandleCloseKeepsOnlyUnreleasedOwnership(t *testing.T) {
 	if tree.findFileHandle(retained.id) != retained || tree.findFileHandle(released.id) != nil {
 		t.Fatal("close result did not determine ownership")
 	}
-	retainedFile.result = storage.ReferenceCloseResult{Released: true}
+	retainedFile.result = storage.ReferenceCloseResult{Released: true, Determined: true}
 	retainedFile.err = nil
 	if err := tree.closeFileHandles(t.Context()); err != nil {
 		t.Fatal(err)
@@ -231,7 +232,7 @@ func TestPendingOpenRetainsSlotUntilSameActionRecovery(t *testing.T) {
 		t.Fatal(err)
 	}
 	failure := errors.New("open result unknown")
-	file := &handleFileStub{result: storage.ReferenceCloseResult{Released: true}}
+	file := &handleFileStub{result: storage.ReferenceCloseResult{Released: true, Determined: true}}
 	attempts := 0
 	handle.pendingOpen = func(context.Context) (bool, error) {
 		attempts++
@@ -270,40 +271,39 @@ func (s *resultSessionStub) CloseWithResult(context.Context) (storage.ReferenceC
 	return s.result, s.err
 }
 
-func TestLastTreeSessionCloseDischargesUnresolvedOpen(t *testing.T) {
-	for _, released := range []bool{false, true} {
-		t.Run(map[bool]string{false: "retained", true: "released"}[released], func(t *testing.T) {
-			failure := errors.New("open outcome unknown")
-			server := &Server{config: Config{Limits: DefaultLimits()}}
-			export := &Export{server: server, refs: 1, trees: 1}
-			done := make(chan struct{})
-			close(done)
-			authority := &authoritySession{raw: &resultSessionStub{endpointFileSession: newEndpointFileSession(), result: storage.ReferenceCloseResult{Released: released}, err: func() error {
-				if released {
-					return nil
-				}
-				return failure
-			}()},
-				export: export, refs: 1, done: done}
-			tree := &tree{kind: volumeTree, id: 1, sessionID: 2, export: export, authority: authority, done: make(chan struct{})}
-			s := &session{id: 2}
-			if !tree.beginFileWork(s) {
-				t.Fatal("file admission refused")
-			}
-			handle, err := tree.reserveFileHandle(s, 1)
-			if err != nil {
-				t.Fatal(err)
-			}
-			handle.pendingOpen = func(context.Context) (bool, error) { return false, failure }
-			tree.endFileWork()
-			c := &connection{server: server, pending: make(map[uint64]*pendingRequest)}
-			err = c.closeTreeContext(t.Context(), tree)
-			if !errors.Is(err, failure) {
-				t.Fatalf("cleanup error: %v", err)
-			}
-			if tree.closed != released || (tree.findFileHandle(handle.id) == nil) != released {
-				t.Fatalf("owner state after session close: released=%v tree.closed=%v", released, tree.closed)
-			}
-		})
+func TestTreeRetirementRetainsUnresolvedOpenBeforeSessionClose(t *testing.T) {
+	failure := errors.New("open outcome unknown")
+	server := &Server{config: Config{Limits: DefaultLimits()}}
+	export := &Export{server: server, refs: 1, trees: 1}
+	raw := newEndpointFileSession()
+	done := make(chan struct{})
+	close(done)
+	authority := &authoritySession{raw: raw, export: export, refs: 1, done: done}
+	tree := &tree{id: 1, sessionID: 2, export: export, authority: authority, done: make(chan struct{})}
+	s := &session{id: 2}
+	tree.beginFileWork(s)
+	handle, err := tree.reserveFileHandle(s, 1)
+	if err != nil {
+		t.Fatal(err)
 	}
+	handle.pendingOpen = func(context.Context) (bool, error) { return false, failure }
+	tree.endFileWork()
+	c := &connection{server: server, pending: make(map[uint64]*pendingRequest)}
+	if err := c.closeTreeContext(t.Context(), tree); !errors.Is(err, failure) {
+		t.Fatalf("cleanup %v", err)
+	}
+	if tree.closed || tree.findFileHandle(handle.id) == nil || raw.closes != 0 {
+		t.Fatal("unresolved owner was discharged by session retirement")
+	}
+}
+
+func (f *handleFileStub) CloseOwnerStatus(context.Context) (storage.CloseOwnerStatus, error) {
+	return storage.CloseOwnerStatus{Ready: true, NextGeneration: 1, CurrentEpoch: 1}, nil
+}
+func (f *handleFileStub) QueryCloseAttempt(_ context.Context, a storage.CloseAttempt) (storage.FileActionReceipt, error) {
+	return storage.FileActionReceipt{Action: a.Action, Operation: storage.OpFileClose, Outcome: storage.FileActionUnknown}, nil
+}
+func (f *handleFileStub) CloseWithAction(ctx context.Context, a storage.CloseAttempt) (storage.ReferenceCloseResult, error) {
+	f.attempt = &a
+	return f.CloseWithResult(ctx)
 }

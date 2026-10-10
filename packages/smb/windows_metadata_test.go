@@ -76,7 +76,7 @@ func TestCreateAllocationProjectionUsesAuthoritativeCapture(t *testing.T) {
 	for _, test := range []struct {
 		size, allocated int64
 	}{
-		{0, 0}, {1, 4096}, {4096, 4096}, {4097, 8192},
+		{0, 0}, {1, 512}, {1, 4096}, {4096, 4096}, {4097, 8192},
 	} {
 		attr := base
 		attr.Size, attr.AllocationSize = test.size, test.allocated
@@ -96,7 +96,6 @@ func TestCreateAllocationProjectionUsesAuthoritativeCapture(t *testing.T) {
 		{"unknown", false, 0},
 		{"unknown nonzero", false, 4096},
 		{"negative", true, -4096},
-		{"unaligned", true, 4097},
 	} {
 		attr := base
 		attr.Size = 1

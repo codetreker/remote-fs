@@ -2,7 +2,9 @@ package sqlite
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"math"
@@ -23,18 +25,18 @@ type retainedNode struct{ volume, id int64 }
 // All fields are protected by the database commit gate. Physical retention is
 // distinct from active publication authority, which is revoked before I/O drains.
 type retainedFile struct {
-	scope          storage.UseScope
-	session        *advisory.Session
-	use            storage.UseClaim
-	metadata       storage.MetadataPermissions
-	closeIntent    storage.DeleteIntentID
-	store          *Store
-	id             int64
-	read, write    bool
-	active, closed bool
-	useDropped     bool
-	retireResult   error
-	closeErr       error
+	scope            storage.UseScope
+	session          *advisory.Session
+	use              storage.UseClaim
+	metadata         storage.MetadataPermissions
+	closeIntent      storage.DeleteIntentID
+	store            *Store
+	id               int64
+	read, write      bool
+	active, closed   bool
+	finalizationDone bool
+	retireResult     error
+	closeErr         error
 }
 
 var _ metastore.FileStore = (*Store)(nil)
@@ -423,6 +425,9 @@ func (f *retainedFile) SetAttr(ctx context.Context, change storage.AttrChange) (
 	if err := change.Check(); err != nil {
 		return metastore.FileState{}, err
 	}
+	if f.metadata&storage.WriteMetadata == 0 {
+		return metastore.FileState{}, syscall.EBADF
+	}
 	var state metastore.FileState
 	err := f.store.mutatePublication(ctx, &volumeIntent{kind: locking.SetAttrMutation, node: f.id, scope: f.scope}, func(tx *sql.Tx) error {
 		if err := f.check(); err != nil {
@@ -512,28 +517,6 @@ func (f *retainedFile) retireLocked(ctx context.Context) error {
 	return nil
 }
 
-func (f *retainedFile) DropUse(ctx context.Context) error {
-	if err := f.store.coordinator.commit.acquire(ctx); err != nil {
-		return err
-	}
-	defer f.store.coordinator.commit.release()
-	return f.dropUseLocked(ctx)
-}
-
-func (f *retainedFile) dropUseLocked(ctx context.Context) error {
-	if f.useDropped {
-		return nil
-	}
-	if f.active {
-		return syscall.EBUSY
-	}
-	if err := f.store.fileDomain.coordinator.DropUse(ctx, uint64(f.id), f.scope); err != nil {
-		return err
-	}
-	f.useDropped = true
-	return nil
-}
-
 func (f *retainedFile) Close(ctx context.Context) error {
 	_, err := f.CloseWithResult(ctx)
 	return err
@@ -544,57 +527,50 @@ func (f *retainedFile) CloseWithResult(ctx context.Context) (storage.ReferenceCl
 		return storage.ReferenceCloseResult{}, err
 	}
 	defer f.store.coordinator.commit.release()
-	terminalResult := f.retireResult
-	if !f.useDropped {
-		if err := f.retireLocked(ctx); err != nil {
-			return storage.ReferenceCloseResult{}, sqlerr.Failure(err)
-		}
-		terminalResult = f.retireResult
-		if err := f.dropUseLocked(ctx); err != nil {
-			return storage.ReferenceCloseResult{}, errors.Join(sqlerr.Failure(terminalResult), sqlerr.Failure(err))
-		}
-		f.useDropped = true
-	}
 	if f.closed {
-		return storage.ReferenceCloseResult{Released: true}, f.closeErr
+		return storage.ReferenceCloseResult{Released: true, Determined: true}, f.closeErr
 	}
 	if f.closeErr != nil {
 		return storage.ReferenceCloseResult{}, f.closeErr
 	}
+	terminalResult := f.retireResult
+	if err := f.retireLocked(ctx); err != nil {
+		if f.store.coordinator.healthy() == nil && !storage.IsPublicationAccountingUncertain(err) {
+			return storage.ReferenceCloseResult{Determined: true}, sqlerr.Failure(err)
+		}
+		return storage.ReferenceCloseResult{}, sqlerr.Failure(err)
+	}
+	terminalResult = f.retireResult
 	s := f.store
 	key := retainedNode{s.volume, f.id}
 	count := s.coordinator.pins[key]
-	if count < 1 {
-		return storage.ReferenceCloseResult{}, syscall.EIO
+	if count < 1 || s.fileDomain.files < 1 {
+		return f.poisonCloseLocked(syscall.EIO)
+	}
+	if _, ok := s.files[f]; !ok {
+		return f.poisonCloseLocked(syscall.EIO)
+	}
+	if count == 1 && !f.finalizationDone {
+		finalized, err := f.finalizeForCloseLocked(ctx)
+		if err != nil {
+			if errors.Is(err, storage.ErrInvalidScope) {
+				err = errors.Join(syscall.EIO, err)
+			}
+			if errors.Is(err, storage.ErrInvalidScope) || s.coordinator.healthy() != nil || storage.IsPublicationAccountingUncertain(err) {
+				result, fenceErr := f.poisonCloseLocked(err)
+				return result, errors.Join(sqlerr.Failure(terminalResult), fenceErr)
+			}
+			return storage.ReferenceCloseResult{Determined: true}, errors.Join(sqlerr.Failure(terminalResult), sqlerr.Failure(err))
+		}
+		f.finalizationDone = finalized
+	}
+	if err := s.fileDomain.coordinator.DropUseExact(ctx, uint64(f.id), f.scope, f.use); err != nil {
+		if errors.Is(err, storage.ErrInvalidScope) {
+			return f.poisonCloseLocked(errors.Join(syscall.EIO, err))
+		}
+		return storage.ReferenceCloseResult{Determined: true}, errors.Join(sqlerr.Failure(terminalResult), err)
 	}
 	if count == 1 {
-		var state metastore.ReferenceState
-		err := s.inspect(ctx, func(tx *sql.Tx) error {
-			var err error
-			state, err = s.referenceState(ctx, tx, f.id)
-			return err
-		})
-		if err != nil {
-			return storage.ReferenceCloseResult{}, sqlerr.Failure(err)
-		}
-		if state.PendingUnlink {
-			err = s.finalizePendingUnlinkLocked(ctx, f.id)
-		} else if state.State.Detached {
-			err = s.mutateTransactionLocked(ctx, ctx, &volumeIntent{kind: locking.RemoveMutation, node: f.id, cleanup: true}, func(tx *sql.Tx) error {
-				return s.discardNode(ctx, tx, state.State.Node)
-			})
-		}
-		if err != nil {
-			if s.coordinator.healthy() != nil || storage.IsPublicationAccountingUncertain(err) {
-				f.closeErr = sqlerr.Failure(err)
-				s.coordinator.poisonWith(f.closeErr)
-				if s.locks != nil {
-					s.locks.Fence(f.closeErr)
-				}
-				return storage.ReferenceCloseResult{}, errors.Join(sqlerr.Failure(terminalResult), f.closeErr)
-			}
-			return storage.ReferenceCloseResult{}, errors.Join(sqlerr.Failure(terminalResult), sqlerr.Failure(err))
-		}
 		delete(s.coordinator.pins, key)
 	} else {
 		s.coordinator.pins[key] = count - 1
@@ -603,10 +579,41 @@ func (f *retainedFile) CloseWithResult(ctx context.Context) (storage.ReferenceCl
 	s.fileDomain.files--
 	f.closed = true
 	f.closeErr = sqlerr.Failure(terminalResult)
-	return storage.ReferenceCloseResult{Released: true}, f.closeErr
+	return storage.ReferenceCloseResult{Released: true, Determined: true}, f.closeErr
+}
+
+func (f *retainedFile) finalizeForCloseLocked(ctx context.Context) (bool, error) {
+	s := f.store
+	var state metastore.ReferenceState
+	if err := s.inspect(ctx, func(tx *sql.Tx) error {
+		var err error
+		state, err = s.referenceState(ctx, tx, f.id)
+		return err
+	}); err != nil {
+		return false, err
+	}
+	if state.PendingUnlink {
+		return true, s.finalizePendingUnlinkLocked(ctx, f.id, f)
+	}
+	if state.State.Detached {
+		return true, s.mutateTransactionLocked(ctx, ctx, &volumeIntent{kind: locking.RemoveMutation, node: f.id, cleanup: true}, func(tx *sql.Tx) error {
+			return s.discardNode(ctx, tx, state.State.Node)
+		})
+	}
+	return false, nil
+}
+
+func (f *retainedFile) poisonCloseLocked(err error) (storage.ReferenceCloseResult, error) {
+	f.closeErr = sqlerr.Failure(err)
+	f.store.coordinator.poisonWith(f.closeErr)
+	if f.store.locks != nil {
+		f.store.locks.Fence(f.closeErr)
+	}
+	return storage.ReferenceCloseResult{}, f.closeErr
 }
 
 type fileDomain struct {
+	authority             storage.AuthorityIncarnation
 	config                advisory.Config
 	coordinator           *advisory.Coordinator
 	stores                int
@@ -624,8 +631,13 @@ func (s *Store) attachFileDomain(options Options) error {
 		if err != nil {
 			return err
 		}
+		var nonce [16]byte
+		if _, err := rand.Read(nonce[:]); err != nil {
+			return err
+		}
 		domain = &fileDomain{config: options.Advisory, coordinator: coordinator,
-			maxFiles: options.MaxRetainedFiles, maxDeleteIntents: options.MaxDeleteIntents}
+			authority: storage.AuthorityIncarnation(hex.EncodeToString(nonce[:])),
+			maxFiles:  options.MaxRetainedFiles, maxDeleteIntents: options.MaxDeleteIntents}
 		s.coordinator.domains[s.volume] = domain
 	} else if domain.config != options.Advisory || domain.maxFiles != options.MaxRetainedFiles || domain.maxDeleteIntents != options.MaxDeleteIntents {
 		return fmt.Errorf("shared SQLite volume file limits differ from its active owner: %w", syscall.EINVAL)

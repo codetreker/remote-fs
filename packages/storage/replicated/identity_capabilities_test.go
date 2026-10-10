@@ -88,6 +88,7 @@ func TestIdentityCapabilitiesConfirmAuthorityResultsThroughTheReplica(t *testing
 	}, storage.OpenAtOptions{
 		Read: true, Write: true, Target: storage.ChildCondition{State: storage.SameNode, NodeID: fileAttr.ID},
 		Action: replicatedFileActionFor(t, session), Use: storage.UseClaim{Uses: storage.ReadData | storage.WriteData | storage.DeleteName}, Existing: storage.Keep,
+		MetadataAccess: storage.ReadMetadata | storage.WriteMetadata,
 	})
 	if err != nil || opened.File == nil || opened.Attr.ID != fileAttr.ID || opened.Outcome != storage.Opened {
 		t.Fatalf("open-at=%+v error=%v", opened, err)

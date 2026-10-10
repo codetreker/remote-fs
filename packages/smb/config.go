@@ -26,21 +26,22 @@ type Config struct {
 // Limits bounds every resource retained by the endpoint. Callers select the
 // defaults explicitly; an omitted individual field never means unbounded.
 type Limits struct {
-	MaxExports, MaxConnections, MaxSessions, MaxTrees int
-	MaxHandles                                        int
-	MaxRequests, MaxCompound, MaxContexts             int
-	MaxFrameBytes, MaxIOBytes, MaxTokenBytes          int
-	MaxDirectoryBytes                                 int64
-	HandshakeTimeout, RequestTimeout, CleanupTimeout  time.Duration
-	FileSession                                       storage.FileSessionOptions
+	MaxExports, MaxConnections, MaxSessions, MaxTrees   int
+	MaxRequests, MaxCompound, MaxContexts               int
+	MaxHandles, MaxUnresolvedOwners, MaxDiagnosticBytes int
+	MaxDirectoryBytes                                   int
+	MaxFrameBytes, MaxIOBytes, MaxTokenBytes            int
+	HandshakeTimeout, RequestTimeout, CleanupTimeout    time.Duration
+	FileSession                                         storage.FileSessionOptions
 }
 
 func DefaultLimits() Limits {
 	return Limits{
 		MaxExports: 32, MaxConnections: 16, MaxSessions: 16, MaxTrees: 32,
-		MaxHandles: 256, MaxDirectoryBytes: 8 << 20,
 		MaxRequests: 128, MaxCompound: 32, MaxContexts: 16,
-		MaxFrameBytes: 2 << 20, MaxIOBytes: 1 << 20, MaxTokenBytes: 65535,
+		MaxHandles: 256, MaxUnresolvedOwners: 256, MaxDiagnosticBytes: 256 * 256,
+		MaxDirectoryBytes: 8 << 20,
+		MaxFrameBytes:     2 << 20, MaxIOBytes: 1 << 20, MaxTokenBytes: 65535,
 		HandshakeTimeout: 30 * time.Second, RequestTimeout: time.Minute,
 		CleanupTimeout: 30 * time.Second, FileSession: storage.DefaultFileSessionOptions(),
 	}
@@ -48,8 +49,8 @@ func DefaultLimits() Limits {
 
 func (l Limits) check() error {
 	if l.MaxExports < 1 || l.MaxConnections < 1 || l.MaxSessions < 1 || l.MaxTrees < 1 ||
-		l.MaxHandles < 1 || l.MaxHandles > 65535 || l.MaxDirectoryBytes < 1 || l.MaxDirectoryBytes > storage.MaxDirectoryBytes ||
 		l.MaxRequests < 1 || l.MaxRequests > 65535 || l.MaxCompound < 1 || l.MaxCompound > 128 || l.MaxCompound > l.MaxRequests ||
+		l.MaxDirectoryBytes < 1 || l.MaxHandles < 1 || l.MaxUnresolvedOwners < 1 || l.MaxDiagnosticBytes < diagnosticOwnerBytes ||
 		l.MaxContexts < 1 || l.MaxIOBytes < 65536 || l.MaxIOBytes > 8<<20 ||
 		l.MaxFrameBytes < l.MaxIOBytes+65536 || l.MaxFrameBytes > 0xffffff ||
 		l.MaxTokenBytes < 1 || l.MaxTokenBytes > 65535 ||
@@ -63,14 +64,17 @@ type Share struct {
 	Name string
 	// Volume is the trusted host-selected identity used for authorization. It
 	// must remain stable when a share is renamed or republished.
-	Volume  string
-	Backend storage.FileStorage
+	Volume        string
+	BackendVolume storage.VolumeID
+	RootNodeID    uint64
+	Backend       storage.FileStorage
 }
 
 // Status reports resources still owned, including cleanup-only owners.
 type Status struct {
-	Serving, Stopping, Stopped                                 bool
-	Exports, StoppingExports, Connections, RetainedConnections int
-	Sessions, ExpiredSessions, Trees, Handles, PendingRequests int
-	FencedAuthorities, CleanupFailures                         int
+	Serving, Stopping, Stopped                                      bool
+	Exports, StoppingExports, Connections, RetainedConnections      int
+	Sessions, ExpiredSessions, Trees, PendingRequests               int
+	FencedAuthorities, CleanupFailures                              int
+	Handles, OpeningHandles, CleanupOnlyHandles, BarrierOnlyHandles int
 }

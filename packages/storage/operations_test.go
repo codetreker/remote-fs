@@ -23,6 +23,7 @@ func TestOperationConstantsIdentifyDistinctSemanticActions(t *testing.T) {
 		storage.OpReplicationSnapshot:         "replication.snapshot",
 		storage.OpReplicationCheckpoint:       "replication.checkpoint",
 		storage.OpFileSessionOpen:             "file.session-open",
+		storage.OpFileBackendIdentity:         "file.backend-identity",
 		storage.OpFileStatus:                  "file.status",
 		storage.OpFileRenew:                   "file.renew",
 		storage.OpFileSessionClose:            "file.session-close",
@@ -62,6 +63,7 @@ func TestOperationConstantsIdentifyDistinctSemanticActions(t *testing.T) {
 		storage.OpFileSetPendingUnlink:        "file.set-pending-unlink",
 		storage.OpFileClearPendingUnlink:      "file.clear-pending-unlink",
 		storage.OpFileMutate:                  "file.mutate",
+		storage.OpFileCloseOwnerStatus:        "file.close-owner-status",
 		storage.OpFileClose:                   "file.close",
 		storage.OpLockSessionEnrollment:       "lock.session-enrollment",
 		storage.OpLockSessionOpen:             "lock.session-open",
@@ -78,8 +80,8 @@ func TestOperationConstantsIdentifyDistinctSemanticActions(t *testing.T) {
 		storage.OpLockStatus:                  "lock.status",
 	}
 	cases[storage.OpFileObserveDirectoryMetadata] = "file.observe-directory-metadata"
-	if len(cases) != 70 {
-		t.Fatalf("operation vocabulary has %d entries, want 70", len(cases))
+	if len(cases) != 72 {
+		t.Fatalf("operation vocabulary has %d entries, want 72", len(cases))
 	}
 	for operation, want := range cases {
 		if string(operation) != want {

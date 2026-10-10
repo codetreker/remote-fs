@@ -53,7 +53,7 @@ func checkCreateNameCapability(session storage.FileSession) error {
 	if !ok {
 		return syscall.EOPNOTSUPP
 	}
-	return observer.CheckDirectoryMetadataObservation()
+	return namespaceFailure(observer.CheckDirectoryMetadataObservation())
 }
 
 // resolveCreateName captures the complete Windows-visible namespace before
@@ -66,31 +66,31 @@ func resolveCreateName(ctx context.Context, t *tree, name string) (resolvedCreat
 	authorize := func(ctx context.Context, operation storage.Operation) error {
 		return server.config.Authorize.Authorize(ctx, authz.AccessRequest{Volume: t.export.share.Volume, Operation: operation})
 	}
-	return resolveName(ctx, t.export.share.Backend, t.authority.raw, name, server.config.Limits, authorize, server.nameComparer)
+	return resolveName(ctx, t.export.share.Backend, t.authority.raw, t.authority.identity.Backend.RootNodeID, name, server.config.Limits, authorize, server.nameComparer)
 }
 
-func resolveName(ctx context.Context, backend storage.FileStorage, session storage.FileSession, name string, limits Limits, authorize func(context.Context, storage.Operation) error, compare nameComparer) (resolvedCreateName, error) {
+func resolveName(ctx context.Context, backend storage.FileStorage, session storage.FileSession, pinnedRootNodeID uint64, name string, limits Limits, authorize func(context.Context, storage.Operation) error, compare nameComparer) (resolvedCreateName, error) {
 	path, err := parseSMBPath(name)
 	if err != nil {
 		return resolvedCreateName{}, err
 	}
 	if compare == nil {
-		if err := nameComparisonAvailable(); err != nil {
-			return resolvedCreateName{}, err
+		compare, err = platformNameComparer()
+		if err != nil {
+			return resolvedCreateName{}, namespaceFailure(err)
 		}
-		compare = nativeNameCompare
 	}
-	return resolveNameWithComparer(ctx, backend, session, path, limits, authorize, compare)
+	return resolveNameWithComparer(ctx, backend, session, pinnedRootNodeID, path, limits, authorize, compare)
 }
 
-func resolveNameWithComparer(ctx context.Context, backend storage.FileStorage, session storage.FileSession, path smbPath, limits Limits, authorize func(context.Context, storage.Operation) error, compare nameComparer) (resolvedCreateName, error) {
-	if backend == nil || authorize == nil || compare == nil || limits.MaxDirectoryBytes <= 0 || limits.MaxFrameBytes <= 0 {
+func resolveNameWithComparer(ctx context.Context, backend storage.FileStorage, session storage.FileSession, pinnedRootNodeID uint64, path smbPath, limits Limits, authorize func(context.Context, storage.Operation) error, compare nameComparer) (resolvedCreateName, error) {
+	if backend == nil || session == nil || pinnedRootNodeID == 0 || authorize == nil || compare == nil || limits.MaxDirectoryBytes <= 0 || limits.MaxFrameBytes <= 0 {
 		return resolvedCreateName{}, ErrConfig
 	}
 	if err := ctx.Err(); err != nil {
 		return resolvedCreateName{}, err
 	}
-	limit := min(limits.MaxDirectoryBytes, int64(storage.MaxDirectoryBytes))
+	limit := min(int64(limits.MaxDirectoryBytes), int64(storage.MaxDirectoryBytes))
 	if len(path.components) > storage.MaxNamespaceGuards {
 		return resolvedCreateName{}, syscall.EFBIG
 	}
@@ -105,7 +105,7 @@ func resolveNameWithComparer(ctx context.Context, backend storage.FileStorage, s
 		return resolvedCreateName{}, namespaceFailure(err)
 	}
 	rootContext := storage.WithBoundedAttrResult(ctx, limit, func(attr storage.Attr, metadataBytes int64) error {
-		if attr.ID == 0 || !attr.IsDir() || attr.Size < 0 {
+		if attr.ID != pinnedRootNodeID || !attr.IsDir() || attr.Size < 0 {
 			return syscall.EIO
 		}
 		charge, err := storage.MetadataRetentionBytes(metadataBytes)
@@ -121,6 +121,9 @@ func resolveNameWithComparer(ctx context.Context, backend storage.FileStorage, s
 	if err != nil {
 		return resolvedCreateName{}, namespaceFailure(err)
 	}
+	if err := ctx.Err(); err != nil {
+		return resolvedCreateName{}, err
+	}
 	metadataBytes, err := storage.MetadataSize(root.Metadata)
 	if err != nil {
 		return resolvedCreateName{}, err
@@ -130,18 +133,19 @@ func resolveNameWithComparer(ctx context.Context, backend storage.FileStorage, s
 	if err := storage.CheckAttrResultBudget(rootContext, scalar, int64(metadataBytes)); err != nil {
 		return resolvedCreateName{}, err
 	}
-	rootID := root.ID
+	rootID := pinnedRootNodeID
 	guards := storage.NamespaceGuards{RootID: rootID}
 	if len(path.components) == 0 {
 		attr := root.Clone()
 		return resolvedCreateName{RootID: rootID, Root: true, Condition: storage.ChildCondition{State: storage.SameNode, NodeID: rootID}, Attr: &attr, DirectoryRequired: true}, nil
 	}
+	root.Metadata = nil
 	observer, ok := session.(storage.DirectoryMetadataObserver)
 	if !ok {
 		return resolvedCreateName{}, syscall.EOPNOTSUPP
 	}
 	if err := observer.CheckDirectoryMetadataObservation(); err != nil {
-		return resolvedCreateName{}, err
+		return resolvedCreateName{}, namespaceFailure(err)
 	}
 	parent := storage.DirectoryTarget{NodeID: rootID}
 	for index, part := range path.components {
@@ -167,6 +171,10 @@ func resolveNameWithComparer(ctx context.Context, backend storage.FileStorage, s
 			result.Fail(err)
 			return resolvedCreateName{}, namespaceFailure(err)
 		}
+		if err := ctx.Err(); err != nil {
+			result.Fail(err)
+			return resolvedCreateName{}, err
+		}
 		if err := observation.Check(parent, options); err != nil {
 			result.Fail(err)
 			return resolvedCreateName{}, err
@@ -183,6 +191,9 @@ func resolveNameWithComparer(ctx context.Context, backend storage.FileStorage, s
 		if err != nil {
 			return resolvedCreateName{}, err
 		}
+		if err := ctx.Err(); err != nil {
+			return resolvedCreateName{}, err
+		}
 		guards.Directories = append(guards.Directories, storage.DirectoryObservation{ParentID: observation.Observation.ParentID, Revision: bytes.Clone(observation.Observation.Revision)})
 		if err := guards.Check(); err != nil {
 			return resolvedCreateName{}, err
@@ -196,6 +207,9 @@ func resolveNameWithComparer(ctx context.Context, backend storage.FileStorage, s
 			return resolvedCreateName{RootID: rootID, Selection: selection, Condition: storage.ChildCondition{State: storage.Absent}, DirectoryRequired: path.directoryRequired}, nil
 		}
 		entry := entries[selected]
+		if entry.Attr.Kind == storage.NodeSymlink {
+			return resolvedCreateName{}, syscall.EOPNOTSUPP
+		}
 		leaf := []byte(entry.Name)
 		guards.Edges = append(guards.Edges, storage.ObservedEdge{ParentID: parent.NodeID, RawLeaf: leaf, ChildID: entry.Attr.ID})
 		if err := guards.Check(); err != nil {
@@ -250,6 +264,14 @@ func newNameObservationResult(limit int64, parent uint64, guards storage.Namespa
 		}
 		if attr.ID == 0 || attr.ID == parent || attr.Kind.Check() != nil || attr.Size < 0 {
 			return 0, syscall.EIO
+		}
+		if attr.ID == guards.RootID {
+			return 0, syscall.EIO
+		}
+		for _, directory := range guards.Directories {
+			if attr.ID == directory.ParentID {
+				return 0, syscall.EIO
+			}
 		}
 		charge, err := storage.ObservedEntryBytes(nameBytes, metadataBytes)
 		if err != nil {

@@ -54,7 +54,7 @@ func (s *failedFirstCloseSession) OpenFile(ctx context.Context, path string, opt
 
 func (f *failedFirstCloseFile) CloseWithResult(ctx context.Context) (storage.ReferenceCloseResult, error) {
 	if f.backend.failed.CompareAndSwap(false, true) {
-		return storage.ReferenceCloseResult{Released: false}, syscall.EIO
+		return storage.ReferenceCloseResult{Released: false, Determined: true}, syscall.EIO
 	}
 	return f.File.CloseWithResult(ctx)
 }
@@ -161,7 +161,7 @@ func TestHTTPCloseRetainedErrorUsesFreshActionAndLostResponseReplaysSameAction(t
 
 func TestCloseWireRequiresExplicitReleaseResult(t *testing.T) {
 	req := fileRequest{Op: storage.OpFileClose}
-	valid := fileResponse{Epoch: 1, Data: []byte{}, CloseResult: &referenceCloseResult{Released: true}}
+	valid := fileResponse{Epoch: 1, Data: []byte{}, CloseResult: &referenceCloseResult{Released: true, Determined: true}}
 	if err := validateFileResponse(req, valid); err != nil {
 		t.Fatal(err)
 	}
@@ -178,7 +178,7 @@ func TestCloseWireRequiresExplicitReleaseResult(t *testing.T) {
 	if err := validatePartialFileResponse(req, fileResponse{Epoch: 1, Data: []byte{}, CloseResult: &referenceCloseResult{Released: false}}); err != nil {
 		t.Fatalf("rejected explicit retained ownership on error: %v", err)
 	}
-	pending := fileResponse{Epoch: 1, Data: []byte{}, CloseResult: &referenceCloseResult{Released: true, BarrierPending: true}}
+	pending := fileResponse{Epoch: 1, Data: []byte{}, CloseResult: &referenceCloseResult{Released: true, Determined: true, BarrierPending: true}}
 	if err := validatePartialFileResponse(req, pending); err != nil {
 		t.Fatalf("rejected recoverable close barrier state: %v", err)
 	}
@@ -240,10 +240,15 @@ func TestHTTPCloseReplaysReleasedActionUntilBarrierKnown(t *testing.T) {
 				first, err = session.CloseWithResult(t.Context())
 			}
 			var pending *CloseBarrierPendingError
-			if !first.Released || barrier != nil || !errors.As(err, &pending) || log.calls.Load() != before+1 {
+			var neutral *storage.CloseSettlementError
+			marked := errors.As(err, &pending)
+			if kind == "session" {
+				marked = errors.As(err, &neutral) && neutral.State == storage.CloseSettlementPending
+			}
+			if !first.Released || barrier != nil || !marked || log.calls.Load() != before+1 {
 				t.Fatalf("initial close=%+v barrier=%+v err=%v barrierCalls=%d", first, barrier, err, log.calls.Load())
 			}
-			if pending.Error() != pending.Cause.Error() || !errors.Is(pending, syscall.EIO) {
+			if !errors.Is(err, syscall.EIO) || kind == "file" && pending.Error() != pending.Cause.Error() {
 				t.Fatalf("pending close lost its original error chain: %v", pending)
 			}
 			var settled storage.ReferenceCloseResult
@@ -279,7 +284,7 @@ func TestHTTPActiveCloseReceiptTracksConcurrentReplay(t *testing.T) {
 	}
 	action := &servedFileAction{
 		op: storage.OpFileClose, done: make(chan struct{}),
-		response: fileResponse{Epoch: 1, CloseResult: &referenceCloseResult{Released: true}},
+		response: fileResponse{Epoch: 1, CloseResult: &referenceCloseResult{Released: true, Determined: true}},
 	}
 	close(action.done)
 	session := &servedFileSession{
@@ -294,7 +299,7 @@ func TestHTTPActiveCloseReceiptTracksConcurrentReplay(t *testing.T) {
 		defer work.Done()
 		for i := 0; i < 1000; i++ {
 			action.retryMu.Lock()
-			action.response = fileResponse{Epoch: 1, CloseResult: &referenceCloseResult{Released: true, BarrierPending: i%2 == 0}}
+			action.response = fileResponse{Epoch: 1, CloseResult: &referenceCloseResult{Released: true, Determined: true, BarrierPending: i%2 == 0}}
 			action.retryMu.Unlock()
 		}
 	}()
@@ -307,7 +312,7 @@ func TestHTTPActiveCloseReceiptTracksConcurrentReplay(t *testing.T) {
 	work.Wait()
 }
 
-func TestHTTPCloseActionEpochRolloverKeepsTheEffectiveActionID(t *testing.T) {
+func TestHTTPImplicitCloseEpochRolloverUsesCurrentID(t *testing.T) {
 	for _, kind := range []string{"file", "session"} {
 		t.Run(kind, func(t *testing.T) {
 			client, handler, backend := retainedHTTPFixture(t, DefaultFileLimits())
@@ -319,6 +324,7 @@ func TestHTTPCloseActionEpochRolloverKeepsTheEffectiveActionID(t *testing.T) {
 				t.Fatal(err)
 			}
 			remote := session.(*remoteFileSession)
+			initialEpoch := remote.epoch
 			file, err := session.OpenFile(t.Context(), "file", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true}})
 			if err != nil {
 				t.Fatal(err)
@@ -344,7 +350,7 @@ func TestHTTPCloseActionEpochRolloverKeepsTheEffectiveActionID(t *testing.T) {
 				action = remote.closeAction
 			}
 			epoch, epochErr := action.Epoch()
-			if err != nil || !result.Released || epochErr != nil || epoch != 2 {
+			if err != nil || !result.Released || epochErr != nil || epoch != initialEpoch+1 {
 				t.Fatalf("close after epoch rollover=%+v err=%v action=%q epoch=%d epochErr=%v", result, err, action, epoch, epochErr)
 			}
 		})
@@ -410,7 +416,7 @@ func TestHTTPFileAndSessionCloseReplayAfterCapabilityRetirement(t *testing.T) {
 	if err != nil || !result.Released {
 		t.Fatalf("file close=%+v err=%v", result, err)
 	}
-	replayed, err := client.fileCall(ctx, fileRequest{Op: storage.OpFileClose, Session: remote.id, File: remoteFile.id, Action: remoteFile.closeAction})
+	replayed, err := client.fileCall(ctx, fileRequest{Op: storage.OpFileClose, Session: remote.id, File: remoteFile.id, Action: remoteFile.closeAction, CloseGeneration: remoteFile.closeGeneration, CloseImplicit: true})
 	if err != nil || replayed.CloseResult == nil || !replayed.CloseResult.Released {
 		t.Fatalf("file replay=%+v err=%v", replayed.CloseResult, err)
 	}
@@ -423,7 +429,7 @@ func TestHTTPFileAndSessionCloseReplayAfterCapabilityRetirement(t *testing.T) {
 	if err != nil || !result.Released {
 		t.Fatalf("session close=%+v err=%v", result, err)
 	}
-	replayed, err = client.fileCall(ctx, fileRequest{Op: storage.OpFileSessionClose, Session: remote.id, Action: remote.closeAction})
+	replayed, err = client.fileCall(ctx, fileRequest{Op: storage.OpFileSessionClose, Session: remote.id, Action: remote.closeAction, CloseGeneration: remote.closeGeneration})
 	if err != nil || replayed.CloseResult == nil || !replayed.CloseResult.Released {
 		t.Fatalf("session replay=%+v err=%v", replayed.CloseResult, err)
 	}
@@ -437,7 +443,7 @@ func TestHTTPFileAndSessionCloseReplayAfterCapabilityRetirement(t *testing.T) {
 	terminal.expires = time.Now().Add(-time.Second)
 	terminal.mu.Unlock()
 	handler.files.mu.Unlock()
-	_, err = client.fileCall(ctx, fileRequest{Op: storage.OpFileSessionClose, Session: remote.id, Action: remote.closeAction})
+	_, err = client.fileCall(ctx, fileRequest{Op: storage.OpFileSessionClose, Session: remote.id, Action: remote.closeAction, CloseGeneration: remote.closeGeneration})
 	if !errors.Is(err, syscall.ESTALE) {
 		t.Fatalf("expired receipt returned %v, want ESTALE", err)
 	}
@@ -529,7 +535,7 @@ func TestHTTPExplicitSessionCloseKeepsItsReceiptDuringBackgroundRetirement(t *te
 	if err != nil {
 		t.Fatal(err)
 	}
-	secondRequest := fileRequest{Op: storage.OpFileSessionClose, Session: remote.id, Action: secondAction}
+	secondRequest := fileRequest{Op: storage.OpFileSessionClose, Session: remote.id, Action: secondAction, CloseGeneration: 2}
 	if _, err := client.fileCall(t.Context(), secondRequest); !errors.Is(err, syscall.EAGAIN) {
 		t.Fatalf("second close was admitted during the first: %v", err)
 	}
@@ -553,7 +559,7 @@ func TestHTTPExplicitSessionCloseKeepsItsReceiptDuringBackgroundRetirement(t *te
 	if err := <-resultCh; err != nil {
 		t.Fatal(err)
 	}
-	replay, err := client.fileCall(t.Context(), fileRequest{Op: storage.OpFileSessionClose, Session: remote.id, Action: remote.closeAction})
+	replay, err := client.fileCall(t.Context(), fileRequest{Op: storage.OpFileSessionClose, Session: remote.id, Action: remote.closeAction, CloseGeneration: remote.closeGeneration})
 	if err != nil || replay.CloseResult == nil || !replay.CloseResult.Released {
 		t.Fatalf("retired close replay=%+v err=%v", replay.CloseResult, err)
 	}
@@ -562,11 +568,11 @@ func TestHTTPExplicitSessionCloseKeepsItsReceiptDuringBackgroundRetirement(t *te
 		t.Fatalf("retired close receipt=%+v err=%v", receipt.ActionReceipt, err)
 	}
 	secondResult, err := client.fileCall(t.Context(), secondRequest)
-	if err != nil || secondResult.CloseResult == nil || !secondResult.CloseResult.Released {
-		t.Fatalf("second close after retirement=%+v err=%v", secondResult.CloseResult, err)
+	if secondResult.CloseResult != nil || !errors.Is(err, syscall.ESTALE) {
+		t.Fatalf("new close after retirement=%+v err=%v", secondResult.CloseResult, err)
 	}
 	secondReceipt, err := client.fileCall(t.Context(), fileRequest{Op: storage.OpFileQueryAction, Session: remote.id, FileAction: storage.FileActionID(secondAction)})
-	if err != nil || secondReceipt.ActionReceipt == nil || secondReceipt.ActionReceipt.Outcome != storage.FileActionCompleted {
+	if err != nil || secondReceipt.ActionReceipt == nil || secondReceipt.ActionReceipt.Outcome != storage.FileActionRetired {
 		t.Fatalf("second close receipt=%+v err=%v", secondReceipt.ActionReceipt, err)
 	}
 }
@@ -592,7 +598,7 @@ func (b *failedFirstSessionCloseBackend) NewFileSession(ctx context.Context, opt
 
 func (s *failedFirstSessionCloseSession) CloseWithResult(ctx context.Context) (storage.ReferenceCloseResult, error) {
 	if s.backend.calls.Add(1) == 1 {
-		return storage.ReferenceCloseResult{}, syscall.EIO
+		return storage.ReferenceCloseResult{Determined: true}, syscall.EIO
 	}
 	result, err := s.FileSession.CloseWithResult(ctx)
 	if err != nil {
@@ -610,7 +616,7 @@ func TestHTTPSweeperReleaseAfterDefiniteCloseFailureRetainsRecovery(t *testing.T
 	_, native := memoryfixture.New(t, "close-retirement-failure", 1<<20, locking.DefaultOptions())
 	backend := &failedFirstSessionCloseBackend{Storage: native, terminalError: syscall.ENOTEMPTY}
 	limits := DefaultFileLimits()
-	limits.MaxCleanupActions = 1
+	limits.MaxCleanupActions = 2
 	options := DefaultHandlerOptions()
 	options.Files = limits
 	handler, err := NewHandlerWithOptions(backend, nil, options)
@@ -664,24 +670,20 @@ func TestHTTPSweeperReleaseAfterDefiniteCloseFailureRetainsRecovery(t *testing.T
 		}
 		terminal.mu.Unlock()
 	}
-	failed, failedErr := client.fileCall(t.Context(), fileRequest{Op: storage.OpFileSessionClose, Session: remote.id, Action: failedAction})
+	failed, failedErr := client.fileCall(t.Context(), fileRequest{Op: storage.OpFileSessionClose, Session: remote.id, Action: failedAction, CloseGeneration: 1})
 	if failed.CloseResult == nil || failed.CloseResult.Released || !errors.Is(failedErr, syscall.EIO) {
 		t.Fatalf("original failed action changed result=%+v err=%v", failed.CloseResult, failedErr)
 	}
 	result, err = session.CloseWithResult(t.Context())
-	if !result.Released || !errors.Is(err, syscall.ENOTEMPTY) {
-		t.Fatalf("fresh close after sweeper release=%+v err=%v", result, err)
+	if result.Released || !errors.Is(err, syscall.ESTALE) {
+		t.Fatalf("unbound close after sweeper release=%+v err=%v", result, err)
 	}
 	if backend.calls.Load() != 2 {
 		t.Fatalf("reconciliation reclosed native session: %d calls", backend.calls.Load())
 	}
-	replay, replayErr := client.fileCall(t.Context(), fileRequest{Op: storage.OpFileSessionClose, Session: remote.id, Action: remote.closeAction})
-	if replay.CloseResult == nil || !replay.CloseResult.Released || !errors.Is(replayErr, syscall.ENOTEMPTY) {
-		t.Fatalf("terminal action replay=%+v err=%v", replay.CloseResult, replayErr)
-	}
 	receipt, err := client.fileCall(t.Context(), fileRequest{Op: storage.OpFileQueryAction, Session: remote.id, FileAction: storage.FileActionID(remote.closeAction)})
-	if err != nil || receipt.ActionReceipt == nil || receipt.ActionReceipt.Outcome != storage.FileActionCompleted {
-		t.Fatalf("terminal action receipt=%+v err=%v", receipt.ActionReceipt, err)
+	if err != nil || receipt.ActionReceipt == nil || receipt.ActionReceipt.Outcome != storage.FileActionRetired {
+		t.Fatalf("unbound close receipt=%+v err=%v", receipt.ActionReceipt, err)
 	}
 }
 

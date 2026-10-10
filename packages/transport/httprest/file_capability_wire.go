@@ -31,6 +31,7 @@ type NodeReferencesWithBarrier interface {
 type NodeReferenceWithBarrier interface {
 	storage.NodeReference
 	CloseWithBarrier(context.Context) (storage.ReferenceCloseResult, *MutationBarrier, error)
+	CloseWithActionAndBarrier(context.Context, storage.CloseAttempt) (storage.ReferenceCloseResult, *MutationBarrier, error)
 	SetAttrWithBarrier(context.Context, storage.AttrChange) (storage.Attr, *MutationBarrier, error)
 }
 
@@ -230,24 +231,25 @@ func (value initialState) storage() storage.InitialState {
 }
 
 type openAtOptions struct {
-	Read        bool                   `json:"read"`
-	Write       bool                   `json:"write"`
-	Create      bool                   `json:"create"`
-	Exclusive   bool                   `json:"exclusive"`
-	Target      childCondition         `json:"target"`
-	Action      storage.FileActionID   `json:"action"`
-	Use         storage.UseClaim       `json:"use"`
-	Existing    storage.ExistingEffect `json:"existing"`
-	Initial     initialState           `json:"initial"`
-	CloseIntent *closeIntent           `json:"closeIntent,omitempty"`
+	MetadataAccess storage.MetadataPermissions `json:"metadataAccess"`
+	Read           bool                        `json:"read"`
+	Write          bool                        `json:"write"`
+	Create         bool                        `json:"create"`
+	Exclusive      bool                        `json:"exclusive"`
+	Target         childCondition              `json:"target"`
+	Action         storage.FileActionID        `json:"action"`
+	Use            storage.UseClaim            `json:"use"`
+	Existing       storage.ExistingEffect      `json:"existing"`
+	Initial        initialState                `json:"initial"`
+	CloseIntent    *closeIntent                `json:"closeIntent,omitempty"`
 }
 
 func openAtOptionsOf(value storage.OpenAtOptions) *openAtOptions {
-	return &openAtOptions{Read: value.Read, Write: value.Write, Create: value.Create, Exclusive: value.Exclusive, Target: childConditionOf(value.Target), Action: value.Action, Use: value.Use, Existing: value.Existing, Initial: initialStateOf(value.Initial), CloseIntent: closeIntentOf(value.CloseIntent)}
+	return &openAtOptions{MetadataAccess: value.MetadataAccess, Read: value.Read, Write: value.Write, Create: value.Create, Exclusive: value.Exclusive, Target: childConditionOf(value.Target), Action: value.Action, Use: value.Use, Existing: value.Existing, Initial: initialStateOf(value.Initial), CloseIntent: closeIntentOf(value.CloseIntent)}
 }
 
 func (value openAtOptions) storage() storage.OpenAtOptions {
-	result := storage.OpenAtOptions{Read: value.Read, Write: value.Write, Create: value.Create, Exclusive: value.Exclusive, Target: value.Target.storage(), Action: value.Action, Use: value.Use, Existing: value.Existing, Initial: value.Initial.storage()}
+	result := storage.OpenAtOptions{MetadataAccess: value.MetadataAccess, Read: value.Read, Write: value.Write, Create: value.Create, Exclusive: value.Exclusive, Target: value.Target.storage(), Action: value.Action, Use: value.Use, Existing: value.Existing, Initial: value.Initial.storage()}
 	if value.CloseIntent != nil {
 		intent := value.CloseIntent.storage()
 		result.CloseIntent = &intent
@@ -426,15 +428,52 @@ type deleteIntentPage struct {
 
 type referenceCloseResult struct {
 	Released       bool `json:"released"`
+	Determined     bool `json:"determined"`
 	BarrierPending bool `json:"barrierPending,omitempty"`
 }
 
+type closeAttemptResult struct {
+	Action     storage.FileActionID `json:"action"`
+	Generation uint64               `json:"generation"`
+}
+
+type closeOwnerStatusResult struct {
+	Released       bool                      `json:"released"`
+	Ready          bool                      `json:"ready"`
+	Current        *closeAttemptResult       `json:"current,omitempty"`
+	CurrentOutcome storage.FileActionOutcome `json:"currentOutcome"`
+	NextGeneration uint64                    `json:"nextGeneration"`
+	CurrentEpoch   uint64                    `json:"currentEpoch"`
+}
+
+func closeOwnerStatusResultOf(value storage.CloseOwnerStatus) *closeOwnerStatusResult {
+	result := &closeOwnerStatusResult{
+		Released: value.Released, Ready: value.Ready, CurrentOutcome: value.CurrentOutcome,
+		NextGeneration: value.NextGeneration, CurrentEpoch: value.CurrentEpoch,
+	}
+	if value.Current != nil {
+		result.Current = &closeAttemptResult{Action: value.Current.Action, Generation: value.Current.Generation}
+	}
+	return result
+}
+
+func (value closeOwnerStatusResult) storage() (storage.CloseOwnerStatus, error) {
+	result := storage.CloseOwnerStatus{
+		Released: value.Released, Ready: value.Ready, CurrentOutcome: value.CurrentOutcome,
+		NextGeneration: value.NextGeneration, CurrentEpoch: value.CurrentEpoch,
+	}
+	if value.Current != nil {
+		result.Current = &storage.CloseAttempt{Action: value.Current.Action, Generation: value.Current.Generation}
+	}
+	return result, result.Check()
+}
+
 func referenceCloseResultOf(value storage.ReferenceCloseResult) *referenceCloseResult {
-	return &referenceCloseResult{Released: value.Released}
+	return &referenceCloseResult{Released: value.Released, Determined: value.Determined || value.Released}
 }
 
 func (value referenceCloseResult) storage() storage.ReferenceCloseResult {
-	return storage.ReferenceCloseResult{Released: value.Released}
+	return storage.ReferenceCloseResult{Released: value.Released, Determined: value.Determined}
 }
 
 func deleteIntentPageOf(value storage.DeleteIntentPage) (*deleteIntentPage, error) {

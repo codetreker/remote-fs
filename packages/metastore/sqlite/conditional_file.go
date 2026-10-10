@@ -81,6 +81,9 @@ func (f *retainedFile) MutateFile(ctx context.Context, command storage.FileMutat
 	if metadataOnly && f.metadata&storage.WriteMetadata == 0 || !metadataOnly && !f.write {
 		return metastore.FileState{}, syscall.EBADF
 	}
+	if (!command.Attr.Empty() || len(command.Metadata) != 0) && f.metadata&storage.WriteMetadata == 0 {
+		return metastore.FileState{}, syscall.EBADF
+	}
 	var state metastore.FileState
 	err := f.store.mutatePublication(ctx, &volumeIntent{kind: locking.SetAttrMutation, node: f.id}, func(tx *sql.Tx) error {
 		if err := f.check(); err != nil {
@@ -132,6 +135,9 @@ func (f *retainedFile) CommitMutation(ctx context.Context, command storage.FileM
 		return metastore.FileState{}, syscall.EINVAL
 	}
 	if !f.write {
+		return metastore.FileState{}, syscall.EBADF
+	}
+	if (!command.Attr.Empty() || len(command.Metadata) != 0) && f.metadata&storage.WriteMetadata == 0 {
 		return metastore.FileState{}, syscall.EBADF
 	}
 	ctx = metastore.WithFileAccess(ctx, mutationAccess(command))

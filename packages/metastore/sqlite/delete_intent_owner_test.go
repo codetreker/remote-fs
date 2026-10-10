@@ -17,7 +17,7 @@ func createOwnedIntent(t *testing.T, store *LockingStore, name string, owner sto
 	}
 	opened, err := store.OpenAt(t.Context(), storage.ChildSelection{Name: storage.ChildName{
 		Parent: directoryTarget(root), RawLeaf: []byte(name),
-	}}, storage.OpenAtOptions{
+	}}, storage.OpenAtOptions{MetadataAccess: storage.ReadMetadata | storage.WriteMetadata,
 		Read: true, Create: true, Exclusive: true, Existing: storage.Keep,
 		Target: storage.ChildCondition{State: storage.Absent}, Action: fileAction(t),
 		Use:         storage.UseClaim{Uses: storage.ReadData | storage.DeleteName},
