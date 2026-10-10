@@ -49,7 +49,7 @@ storage.Operation 是覆盖路径、文件会话、复制和锁控制的 transpo
 | `file.session-open` | `/v5/file`，`file.session-open` | 建立 FileSession |
 | `file.status` | `/v5/file-control`，`file.status` | 查询 FileSession 状态与历史边界 |
 | `file.renew` | `/v5/file-control`，`file.renew` | 续期 FileSession |
-| `file.session-close` | `/v5/file-control`，`file.session-close` | 关闭 FileSession |
+| `file.session-close` | `/v5/file-control`，`file.session-close` 或内部 `file.session-release-result` | 关闭 FileSession，或只读核对确切 session 的已保留全父释放事实 |
 | `file.stat-node` | `/v5/file`，`file.stat-node` | 按节点身份读取属性 |
 | `file.set-node-attr` | `/v5/file`，`file.set-node-attr` | 按节点身份修改属性 |
 | `file.open` | `/v5/file`，`file.open` | 按路径打开，携带 OpenAccess |

@@ -50,6 +50,9 @@ type fileHandle struct {
 	closing         bool
 	requestCloseMu  contextLock
 	cleanup         cleanupGate
+	closeLifetime   contextLock
+	terminalErr     error
+	terminal        bool
 }
 
 func (t *tree) beginFileWork(s *session) bool {
@@ -224,7 +227,14 @@ func (h *fileHandle) closeActions() (storage.ReferenceCloseActions, error) {
 }
 
 func (t *tree) closeFileHandle(ctx context.Context, handle *fileHandle) (closeErr error) {
-	defer func() { handle.lastStatus.Store(closeStatusError(closeErr)) }()
+	if err := handle.closeLifetime.lock(ctx); err != nil {
+		return err
+	}
+	defer handle.closeLifetime.unlock()
+	if handle.terminal {
+		return handle.terminalErr
+	}
+	defer func() { handle.lastStatus.Store(closeStatusError(closeErr)); handle.terminalErr = closeErr }()
 	return handle.cleanup.run(ctx, func() error {
 		handle.closing = true
 		if !handle.released {

@@ -39,7 +39,7 @@ SQLite 的 Volume 由已验证 DatabaseID 与 root NodeID 组成；共享 fileDo
 | `packages/smb/internal/wire/files.go`、`create_contexts.go` | 有界 CREATE/CLOSE 解析、FileId 与 context 结构、响应编码 |
 | `packages/smb/names.go`、`namespace.go`、`name_compare_*.go` | Windows 名字可表示性、UTF-16 比较、完整目录观察与 ancestry guards |
 | `packages/smb/commands_file.go`、`windows_metadata.go` | CREATE 意图、访问／disposition 映射、授权、原子结果验证与 Windows 属性／时间投影 |
-| `packages/smb/file_handles.go`、`commands_close.go`、`handle_diagnostics.go` | typed FileId owner、容量、固定关闭尝试、释放／settlement 与 CLOSE 响应 |
+| `packages/smb/file_handles.go`、`commands_close.go`、`authority_recovery.go`、`handle_diagnostics.go` | typed FileId owner、容量、固定关闭尝试、释放／settlement 与 CLOSE 响应 |
 | `packages/smb/connection.go`、`commands_session.go` | 保留验签字节的命令分派和 frame 内 related FileId |
 | `packages/smb/tree_capabilities.go`、`authority_session.go`、`session_cleanup.go`、`server.go`、`config.go` | 实际 backend/session 绑定、tree admission、退休、上限与状态 |
 | `packages/storage/file_identity.go`、`close_settlement.go` 与 native／wrapper／HTTP 的投影 | 中立身份、独立 metadata 授予和完整链结算事实；不解释 Windows 标志 |
@@ -98,7 +98,15 @@ well-formed DHnQ、DH2Q、RqLs、AlSi 和协议 reserved GUID context 只解析�
 
 Pending/Unknown marker 中 SemanticErr 与暂时 Cause 分开；同一尝试结算成功只移除 marker。CloseOwnerStatus.Released 或动作 Completed 不替代 typed close result 和 settlement。旧 history 过期、authority 换代或证据不足时报告 I/O 未知，不能按旧路径或新 session 接管原引用。
 
-TREE_DISCONNECT、LOGOFF、断线与 stop 先 fence tree，等已接纳工作结束，再排空该 tree 自己的 FileId，最后减少共享 authority ref；最后一个 tree 才关闭 FileSession。内部退休推进已接受的清理责任，不重新请求业务授权；新的外部关闭仍授权。失败继续持有 owner、export 与容量。Unpublish 对仍有 live tree 或在途 connect/request 的 export 保持 busy；静止后的清理遵守同一责任结算。
+TREE_DISCONNECT、LOGOFF、断线与 stop 先 fence tree，等已接纳工作结束，再按确切引用清理该 tree 的 FileId，最后减少共享 authority ref。单个 tree 退出时，其它 live tree 继续使用共享 FileSession；无法重取 typed reference 的匿名未决打开仍由原 owner 持有，不能为清理它关闭兄弟 tree 的 authority。
+
+CREATE 响应丢失且没有返回 typed reference 时，lease 到期可能使原 action 查询永久 ESTALE；共享父 session 退休也可能使已有 HTTP 引用无法继续取回精确关闭结果。这些情况不证明原动作未执行或成功。整份 authority 退休时，只有在 authority retirement gate 内固定的 tree membership 与 authority refs 完全对应、没有正在建立的 tree、全部共享 tree 已 fenced 且已接纳工作排空，才允许使用父释放证明。恢复器先尽力按原引用／打开意图执行精确清理，再取得全部 owner 的 closeLifetime gate，以确切 raw FileSession.CloseWithResult 核对父责任。
+
+result.Check 通过、Released=true 且没有 CloseSettlementError 证明整个 session 的所有子引用与完整链结算结束；Released 的肯定事实不额外要求 Determined。随后在每个 handle cleanup 的串行化下，将所有剩余 typed 与匿名 owner 终结，清除 pending callback，计数／诊断 charge 各归还一次。迟到关闭返回所保留的 terminalErr，不再重投已终结 owner。原 CREATE 与逐引用动作历史不被改写为 NotExecuted 或 Completed；每份引用的未知错误、缓存语义错误与父关闭原语义错误继续报告，即使资源 bookkeeping 已结束。
+
+HTTP 的隐式 session CloseWithResult 仅在精确动作路径返回 ESTALE 且缺失 typed close result 时，使用内部只读 file.session-release-result 核对确切 session capability。该投影只接受保留期内、已验证 native 全父 Released 和 inline settlement 的终态，取得 server barrier 并返回原 releaseErr；不新建动作、回执、native close 或延长 TTL。缺失、到期、未确认终态及 barrier 故障仍是未知错误。显式 CloseWithAction 和动作查询保持原行为，未把父事实改造成某次 action 的结果。
+
+父释放未知、明确未释放或 settlement Pending/Unknown 均保留尚未结清 owner、export 与容量，以同一父 FileSession 重试结算。整份 LOGOFF、断线、续期失败或全部 tree stopping 可以取得上述父证明；单个退出而有 live 兄弟 tree 时不能使用这条路径。内部退休推进已接受的清理责任，不重新请求业务授权；新的外部关闭仍授权。Unpublish 对 live tree 或在途 connect/request 保持 busy，静止后的清理遵守同一责任结算。
 
 状态分别报告 live、opening、cleanup-only 与 barrier-only handles，按条数和字节预留诊断。Server.HandleOwners() 返回 opaque FileId/session/tree/NodeID、open action、close attempt、owner 状态与 LastStatus uint32；没有 SID、密钥、原始路径、内容或原始 backend 错误。状态不因协议表项退役而把未结清责任算作回收。
 

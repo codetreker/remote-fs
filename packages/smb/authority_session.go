@@ -31,6 +31,7 @@ type authoritySession struct {
 	orphan      bool
 	stopping    bool
 	closed      bool
+	closeErr    error
 	initErr     error
 	ready       chan struct{}
 	done        chan struct{}
@@ -79,23 +80,39 @@ func (a *authoritySession) close(ctx context.Context) error {
 	return a.closeMu.run(ctx, func() error {
 		a.installMu.Lock()
 		a.stopping = true
-		already := a.closed
+		already, settledErr := a.closed, a.closeErr
 		if a.cancel != nil {
 			a.cancel()
 		}
 		a.installMu.Unlock()
 		if already {
-			return nil
+			return settledErr
 		}
+		var semanticErr error
 		if a.raw != nil {
-			if err := a.raw.Close(WithPrincipal(ctx, a.principal)); err != nil {
+			result, err := a.raw.CloseWithResult(WithPrincipal(ctx, a.principal))
+			if checkErr := result.Check(err); checkErr != nil {
+				return errors.Join(err, checkErr)
+			}
+			var settlement *storage.CloseSettlementError
+			if errors.As(err, &settlement) {
+				a.installMu.Lock()
+				if a.closeErr == nil {
+					a.closeErr = settlement.SemanticErr
+				}
+				a.installMu.Unlock()
 				return err
 			}
+			if !result.Released {
+				return err
+			}
+			semanticErr = errors.Join(settledErr, err)
 		}
 		a.installMu.Lock()
 		a.closed = true
+		a.closeErr = semanticErr
 		a.installMu.Unlock()
-		return nil
+		return semanticErr
 	})
 }
 

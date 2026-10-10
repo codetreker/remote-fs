@@ -23,6 +23,9 @@ type fileRequestAdmission struct {
 }
 
 func fileReadOnly(op storage.Operation) bool {
+	if op == opFileSessionReleaseResult {
+		return true
+	}
 	switch op {
 	case storage.OpFileBackendIdentity, storage.OpFileRead, storage.OpFileStat, storage.OpFileStatNode, storage.OpFileLookupAt, storage.OpFileReadDirNode, storage.OpFileObserveDirectoryMetadata, storage.OpFileObserveName, storage.OpFileQueryAction, storage.OpFileCloseOwnerStatus, storage.OpFileQueryDeleteIntent, storage.OpFileListDeleteIntents, storage.OpFileState, storage.OpFileScope, storage.OpFileRangeGetConflict, storage.OpFileRangeQuery, storage.OpFileStatus:
 		return true
@@ -792,6 +795,14 @@ func (s *remoteFileSession) closeWithResultAndBarrier(ctx context.Context) (stor
 		r, e = s.storage.fileCall(ctx, fileRequest{Op: storage.OpFileSessionClose, Session: s.id, Action: action, CloseGeneration: generation})
 		if e == nil && r.Retry {
 			return storage.ReferenceCloseResult{}, nil, syscall.EAGAIN
+		}
+	}
+	if r.CloseResult == nil && errors.Is(e, syscall.ESTALE) {
+		fact, factErr := s.sessionReleaseResult(ctx)
+		if fact.CloseResult != nil {
+			r, e = fact, factErr
+		} else {
+			e = errors.Join(e, factErr)
 		}
 	}
 	if r.CloseResult != nil && r.CloseResult.Released {

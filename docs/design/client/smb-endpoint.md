@@ -55,7 +55,7 @@ authentication exchange 受 `HandshakeTimeout` 约束，完成后的 identity �
 | `namespace.go` | 完整权威 sibling 观察、pinned root、revision/edge ancestry guards |
 | `tree_capabilities.go`、`authority_session.go` | backend/session identity、完整能力预检、共享 FileSession 与续期 |
 | `commands_file.go`、`windows_metadata.go` | CREATE 意图、访问／share／disposition、Windows metadata 与原子结果投影 |
-| `file_handles.go`、`commands_close.go`、`handle_diagnostics.go` | typed owner、准入／容量、恢复、关闭尝试与结算 |
+| `file_handles.go`、`commands_close.go`、`authority_recovery.go`、`handle_diagnostics.go` | typed owner、准入／容量、恢复、关闭尝试与结算 |
 | `session_cleanup.go`、`connection.go`、`server.go` | tree/session/export 退休、compound 执行与 signer 所有权 |
 
 每个 authority session 保存不可变 `FileSessionIdentityResult{Backend, SessionEpoch}`。Backend 的 Volume、Authority 与 RootNodeID 全部必须和经验证 backend 相同，Volume／Root 还须匹配宿主 pin，SessionEpoch 必须等于其 Status.Epoch。Share.Volume 只用于业务授权。新的 tree 在公布成功前完成 AtomicFileOpener、NodeReferences、DirectoryMetadataObserver、StableReferenceIdentity、OpenMetadataAccess、FileActions、AllocationReporting 与 RecoverableReferenceClose 的完整链检查；wrapper 缺失能力时明确拒绝。身份与中立能力的定义见[文件句柄设计](../server/file-handles.md#一身份与会话)。
@@ -90,7 +90,7 @@ CREATE 在对象效果前预留 response frame 空间、FileId 与 owner。serve
 
 FileId 使用不复用的 session 实例与单调计数，避开全部或半个 all-ones 值；查找同时验证 session、tree 与固定 identity descriptor。owner 拥有一份 File 或 NodeReference、固定 NodeID、实际 access、Use、open action 和当前 close attempt。状态为 Reserved、Live、CleanupOnly 或 BarrierOnly；取消、编码／发送失败和 tree 退休不能丢弃已取得引用或未知动作。
 
-每个 tree 单独登记文件操作。retirement 先 fence 新准入，取消 pending request，等此前已接纳操作结束，再清理该 tree 的 FileId。backend I/O 与等待不持有 tree/session map lock。同一 SMB session/export 的多个 tree 共用 authority session，但 FileId 不在 tree 间迁移；自己的 handles 完全结清后才减少 authority ref，最后一个 tree 才关闭 raw FileSession。
+每个 tree 单独登记文件操作。retirement 先 fence 新准入，取消 pending request，等此前已接纳操作结束，再按确切引用清理该 tree 的 FileId。backend I/O 与等待不持有 tree/session map lock。同一 SMB session/export 的多个 tree 共用 authority session，FileId 不在 tree 间迁移；单个 tree 退出而兄弟 tree 仍 live 时，未结清 owner 保留，不关闭兄弟的 FileSession。整份 authority 退休的父释放证明可以结清剩余 typed 或匿名 owner，随后减少 tree/authority refs。
 
 一次 connection 持有 negotiate transcript、credit 集合、pending requests 和 session table；全局 registry 另计所有 connection 的 session charge。仅从 connection map 删除 session 不释放全局容量。TreeId/SessionId 单调分配并检查耗尽。每份 response frame 在 session retirement 前登记为 signer 使用者；native/auth/tree 退休与最后 response 构造／签名均结束后，才移除 registry owner 并清零 signing key。
 
@@ -102,7 +102,13 @@ Released=false、Determined=false 只续作原尝试；Released=false、Determin
 
 Released=true 但错误含 CloseSettlementError 时，owner 转为 BarrierOnly，保留原 attempt 和独立 SemanticErr，后续只结算该动作。Pending 与 Unknown 分别表示已知未完成、证据不可达；marker 缺席才确认完整链结算，原生语义错误仍可同时存在。identity 换代、receipt 过期或证据不足产生 I/O 未知；不会按新 session 或旧路径重新打开。中立关闭与 HTTP receipt 机制见[文件句柄设计](../server/file-handles.md#一身份与会话)。
 
-TREE_DISCONNECT 清理自己的 handles，再释放共享 authority ref。LOGOFF 发布 session retirement，取消除当前 LOGOFF 外的请求，关闭 authentication、全部 tree 和 orphan authority，最后等待 response frame。连接断开执行同一无授权内部退休路径。续期或业务检查失败使 authority fenced 并进入清理，旧 revision 不延长已确认 deadline。失败或未知继续持有 export、session 与全局容量供原 owner 重试。
+CREATE 丢失响应、没有 typed reference 且原 action 因 lease 到期持续 ESTALE，或已有引用在父 HTTP session 退休后无法取得精确结果时，端点保留原未知错误与 owner。authority retirement gate 固定 tree membership，验证它与 refs 完全对应、没有 opening tree，全部共享 tree 已 fenced/drained，authority 禁止新 tree/open。恢复器先推进各 owner 的原引用／pending-open 精确清理，再串行取得全部 closeLifetime gate，调用确切 raw FileSession.CloseWithResult。
+
+result.Check 有效、Released=true 且无 CloseSettlementError 是整个父 session 全部引用与完整链 settlement 的终结证明，不额外要求 Determined。恢复器在每个 handle cleanup 内终结全部剩余 typed/匿名 owner、清除 callback、归还 charge 一次；逐引用的 terminalErr、缓存 SemanticErr、原 open Unknown 和 close attempt/history 继续保留，迟到调用返回错误而不重投。父语义错误也缓存并报告，原动作不被改写为成功或未执行。父 Unknown／未释放／Pending／Unknown settlement 保留剩余责任并重试同一 parent。
+
+隐式 HTTP FileSession.CloseWithResult 仅在原精确动作路径返回 ESTALE 且缺失 typed close result 时，以内部 file.session-release-result 读取确切 session capability 的有限终态。投影只返回已验证 native 全父释放／inline settlement、当前 server barrier 与原 releaseErr，不新建 action/receipt、延长 history 或再次 native close；不存在、到期、未验证终态或 barrier 故障仍报错。显式动作接口与 receipt 结果保持原语义，投影不提供逐动作结论。
+
+TREE_DISCONNECT 清理自己的 handles，再释放共享 authority ref；有 live 兄弟 tree 时不能使用匿名 owner 的父关闭恢复。LOGOFF 发布 session retirement，取消除当前 LOGOFF 外的请求，关闭 authentication、全部 tree 和 orphan authority，最后等待 response frame。连接断开执行同一无授权内部退休路径。续期或业务检查失败使 authority fenced 并进入清理，旧 revision 不延长已确认 deadline。失败或未知继续持有 export、session 与全局容量供原 owner 重试。
 
 Export.Unpublish 对 live tree 或正在取得 export 的 connect/request 返回 busy，原 mapping、tree 与 FileSession 保持有效；没有使用者后才清理并移除。export cleanup 只加入持有目标 export 的 connection/session/authority；不等待另一 export 的清理。退休 session 中已经关闭的非最后 authority 立即释放自己的 entry/export ref，其余 authority 继续承担 session retirement。最后 authority 即使 raw session 已关闭，也保留 entry/ref，直到在调用方 context 内取得 authentication lock，并以不可取消 commit 同时移除 authority、记录 resourcesClosed 和释放 export ref。超时保留该已关闭 owner，后续重试不重复 raw close。等待同一 owner 的 authentication/cleanup 服从调用方 context。
 

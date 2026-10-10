@@ -92,6 +92,8 @@ type servedFileSession struct {
 	sessionCloseReserve int
 	recoverable         bool
 	stableIdentity      bool
+	inlineSettlement    bool
+	releaseFact         bool
 	closeIDs            map[storage.LockRequestID]closeIDUse
 	authority           string
 	revision            uint64
@@ -159,12 +161,13 @@ type servedFileAction struct {
 }
 
 type terminalFileClose struct {
-	mu         sync.Mutex
-	epoch      uint64
-	history    time.Duration
-	expires    time.Time
-	releaseErr error
-	actions    map[storage.LockRequestID]*servedFileAction
+	mu          sync.Mutex
+	epoch       uint64
+	history     time.Duration
+	expires     time.Time
+	releaseErr  error
+	releaseFact bool
+	actions     map[storage.LockRequestID]*servedFileAction
 }
 
 type fileBarrierError struct {
@@ -397,6 +400,7 @@ func (r *fileRegistry) closeRetiringSession(id string, session *servedFileSessio
 	if !reconciling {
 		var closeErr error
 		result, closeErr = session.native.CloseWithResult(context.Background())
+		session.observeSessionRelease(result, closeErr)
 		err = errors.Join(closeErr, result.Check(closeErr))
 	}
 	reconciled := false
@@ -413,6 +417,7 @@ func (r *fileRegistry) closeRetiringSession(id string, session *servedFileSessio
 			actions: make(map[storage.LockRequestID]*servedFileAction),
 		}
 		session.mu.Lock()
+		terminal.releaseFact = session.releaseFact
 		for id, action := range session.actions {
 			if (action.op == storage.OpFileClose || action.op == storage.OpFileSessionClose) && (now.Before(action.expires) || action.uncertain) {
 				if action.uncertain && !now.Before(action.expires) {
@@ -554,6 +559,7 @@ func (r *fileRegistry) terminalizeSession(id string, session *servedFileSession,
 		releaseErr: releaseErr, actions: make(map[storage.LockRequestID]*servedFileAction),
 	}
 	session.mu.Lock()
+	terminal.releaseFact = session.releaseFact
 	now := time.Now()
 	for actionID, recorded := range session.actions {
 		if (recorded.op == storage.OpFileClose || recorded.op == storage.OpFileSessionClose) && (now.Before(recorded.expires) || recorded.uncertain) {
@@ -740,7 +746,7 @@ func partialFileResult(request fileRequest, response fileResponse) *fileResponse
 		include = response.DeleteStatus != nil
 	case storage.OpFileListDeleteIntents:
 		include = response.DeletePage != nil
-	case storage.OpFileClose, storage.OpFileSessionClose:
+	case storage.OpFileClose, storage.OpFileSessionClose, opFileSessionReleaseResult:
 		include = response.CloseResult != nil
 	case storage.OpFileOpen, storage.OpFileOpenNode, storage.OpFileOpenAt, storage.OpFileOpenNodeRef, storage.OpFileOpenChildRef:
 		include = response.File != "" || response.Node != 0 || response.Attr != nil || response.Outcome != 0 || response.Barrier != nil
@@ -817,6 +823,9 @@ func validateFileArguments(req fileRequest, maximum storage.FileSessionOptions) 
 
 func (h *Handler) fileCall(ctx context.Context, req fileRequest, digest [32]byte) (fileResponse, error) {
 	registry := h.files
+	if req.Op == opFileSessionReleaseResult {
+		return h.sessionReleaseResult(ctx, req.Session)
+	}
 	if req.Op == storage.OpFileBackendIdentity {
 		return h.backendIdentity(ctx)
 	}
@@ -1539,6 +1548,7 @@ func (h *Handler) performFile(ctx context.Context, s *servedFileSession, req fil
 		s.retired = true
 		s.mu.Unlock()
 		result, closeErr := s.native.CloseWithResult(ctx)
+		s.observeSessionRelease(result, closeErr)
 		response.CloseResult = referenceCloseResultOf(result)
 		err = errors.Join(closeErr, result.Check(closeErr))
 	case storage.OpFileStatNode:
@@ -1785,6 +1795,9 @@ func (r *fileRegistry) enroll(ctx context.Context, options storage.FileSessionOp
 	identity, identityErr := sessionIdentityOf(ctx, native, capabilities, status)
 	err = errors.Join(err, identityErr)
 	session := &servedFileSession{authority: status.Epoch, revision: status.Revision, native: native, files: make(map[string]*servedFile), actions: make(map[storage.LockRequestID]*servedFileAction), options: options, started: started, expires: started.Add(status.Remaining), sessionCloseReserve: 2, cleanupReserved: 2, recoverable: capabilities.CloseRecovery, stableIdentity: capabilities.StableIdentity}
+	if inline, ok := native.(storage.InlineCloseSettlement); ok {
+		session.inlineSettlement = inline.CheckInlineCloseSettlement() == nil
+	}
 	r.mu.Lock()
 	closed := r.closed
 	session.retired = closed || err != nil

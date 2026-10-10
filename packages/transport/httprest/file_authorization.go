@@ -9,6 +9,9 @@ import (
 
 func (h *Handler) authorizeFile(ctx context.Context, request fileRequest) error {
 	accesses := []authz.AccessRequest{{Operation: request.Op}}
+	if request.Op == opFileSessionReleaseResult {
+		accesses[0].Operation = storage.OpFileSessionClose
+	}
 	appendOperation := func(operation storage.Operation) {
 		for _, access := range accesses {
 			if access.Operation == operation && access.Open == (storage.OpenAccess{}) {

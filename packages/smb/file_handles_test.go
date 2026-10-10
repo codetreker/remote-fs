@@ -271,7 +271,7 @@ func (s *resultSessionStub) CloseWithResult(context.Context) (storage.ReferenceC
 	return s.result, s.err
 }
 
-func TestTreeRetirementRetainsUnresolvedOpenBeforeSessionClose(t *testing.T) {
+func TestTreeRetirementWithoutAuthorityMembershipRetainsUnknownOpen(t *testing.T) {
 	failure := errors.New("open outcome unknown")
 	server := &Server{config: Config{Limits: DefaultLimits()}}
 	export := &Export{server: server, refs: 1, trees: 1}

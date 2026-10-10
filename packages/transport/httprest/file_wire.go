@@ -13,6 +13,9 @@ const OpFileControl Op = "file-control"
 const MaxFileControlBytes int64 = 256 << 10
 
 func fileControl(op storage.Operation) bool {
+	if op == opFileSessionReleaseResult {
+		return true
+	}
 	switch op {
 	case storage.OpFileBackendIdentity, storage.OpFileStatus, storage.OpFileRenew, storage.OpFileSessionClose, storage.OpFileQueryAction, storage.OpFileCloseOwnerStatus, storage.OpFileQueryDeleteIntent, storage.OpFileListDeleteIntents, storage.OpFileAcknowledgeDeleteIntent, storage.OpFileClose, storage.OpFileAck, storage.OpFileState, storage.OpFileScope, storage.OpFileNewUseOwner, storage.OpFileRetireUseOwner, storage.OpFileRangeGetConflict, storage.OpFileRangeApply, storage.OpFileRangeQuery, storage.OpFileRangeCancel, storage.OpFileRangeDrop, storage.OpFileSetPendingUnlink, storage.OpFileClearPendingUnlink:
 		return true
