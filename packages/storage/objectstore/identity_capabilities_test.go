@@ -72,7 +72,7 @@ func TestAtomicOpenJournalPreservesIdentityAndRejectsChangedIntent(t *testing.T)
 		},
 		RootID: root.ID,
 	}}
-	options := storage.OpenAtOptions{
+	options := storage.OpenAtOptions{MetadataAccess: storage.ReadMetadata | storage.WriteMetadata,
 		Read: true, Target: storage.ChildCondition{State: storage.SameNode, NodeID: want.ID},
 		Action: action, Use: storage.UseClaim{Uses: storage.ReadData}, Existing: storage.Keep,
 	}
@@ -120,7 +120,7 @@ func TestAtomicOpenJournalTreatsEmptyAndAbsentGuardsAsTheSameIntent(t *testing.T
 	}
 	session := fileSessionFor(t, volume, storage.DefaultFileSessionOptions())
 	opener := session.(storage.AtomicFileOpener)
-	options := storage.OpenAtOptions{
+	options := storage.OpenAtOptions{MetadataAccess: storage.ReadMetadata | storage.WriteMetadata,
 		Read: true, Target: storage.ChildCondition{State: storage.SameNode, NodeID: file.ID},
 		Action: fileActionFor(t, session), Use: storage.UseClaim{Uses: storage.ReadData}, Existing: storage.Keep,
 	}
@@ -160,7 +160,7 @@ func TestDurableCloseIntentDeletesOriginalIdentityAndCanBeAcknowledged(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	options := storage.OpenAtOptions{
+	options := storage.OpenAtOptions{MetadataAccess: storage.ReadMetadata | storage.WriteMetadata,
 		Read: true, Target: storage.ChildCondition{State: storage.SameNode, NodeID: want.ID},
 		Action: fileActionFor(t, session), Use: storage.UseClaim{Uses: storage.ReadData | storage.DeleteName}, Existing: storage.Keep,
 		CloseIntent: &storage.CloseIntent{ID: intent, Owner: owner, Trigger: storage.OnReferenceClose, Condition: storage.UnlinkFile},

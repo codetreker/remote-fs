@@ -32,6 +32,11 @@ func (s *fileSession) OpenAt(ctx context.Context, selection storage.ChildSelecti
 	if err != nil {
 		return storage.OpenResult{}, err
 	}
+	if options.MetadataAccess != 0 {
+		if err := s.CheckOpenMetadataAccess(); err != nil {
+			return storage.OpenResult{}, err
+		}
+	}
 	result, err := backend.OpenAt(s.storage.mutationContext(ctx), selection, options)
 	result.File = s.storage.wrapFile(result.File)
 	return result, err

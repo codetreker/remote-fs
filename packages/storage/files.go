@@ -87,8 +87,9 @@ type File interface {
 	WriteAt(ctx context.Context, offset int64, data []byte) (Attr, error)
 	Truncate(context.Context, int64) (Attr, error)
 
-	// SetAttr permits common time changes on read-only descriptors, subject
-	// to volume permission policy. Sync confirms reference health and any
+	// SetAttr requires metadata write access, independently of byte access.
+	// OpenFile and OpenNode grant metadata read and write access.
+	// Sync confirms reference health and any
 	// durability barrier the backend requires; no dirty content awaits Close.
 	SetAttr(context.Context, AttrChange) (Attr, error)
 	Sync(context.Context) error

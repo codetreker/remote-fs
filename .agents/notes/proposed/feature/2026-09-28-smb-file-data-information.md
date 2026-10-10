@@ -6,7 +6,7 @@ Status: proposed
 
 SMB `CREATE` 取得稳定 FileId 后，Windows 程序仍需要经该引用读写内容、截断、刷新并查询或修改文件信息。路径可在打开后改名、删除或指向另一个节点；每次按旧路径重新查找会把已打开的引用转给新对象。Windows 的属性、时间和空间信息还不能由零值、固定 cluster 或本机缓存猜测。写入后补设 `ARCHIVE` 会在两次权威操作之间暴露不符合 R-WIN-5 的状态，且响应丢失时无法判断哪一半完成。
 
-本提案是[Windows 网络驱动器总提案](2026-09-16-windows-network-drive-support.md)中 7.4 的独立交付；依赖 [7.3 的有界 CREATE/CLOSE](2026-09-28-smb-bounded-create-close.md)所持有的 FileId、FileSession、引用清理、共享准入与同动作回执。它实现 [R-FS-6 至 R-FS-9、R-WIN-2、R-WIN-4、R-WIN-5](../../../../docs/spec/requirements.md) 在身份文件 I/O 与信息查询上的部分，不宣布整个 Windows drive 已完成。
+本提案是[Windows 网络驱动器总提案](2026-09-16-windows-network-drive-support.md)中 7.4 的独立交付；依赖 [7.3 的有界 CREATE/CLOSE](../../implemented/feature/2026-09-28-smb-bounded-create-close.md)所持有的 FileId、FileSession、引用清理、共享准入与同动作回执。它实现 [R-FS-6 至 R-FS-9、R-WIN-2、R-WIN-4、R-WIN-5](../../../../docs/spec/requirements.md) 在身份文件 I/O 与信息查询上的部分，不宣布整个 Windows drive 已完成。
 
 ## 提案
 

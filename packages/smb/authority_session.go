@@ -16,9 +16,12 @@ import (
 // One authenticated SMB session shares one FileSession per export. Trees are
 // protocol aliases over that authority lifetime, not independent remote owners.
 type authoritySession struct {
-	raw       storage.FileSession
-	export    *Export
-	principal Principal
+	raw        storage.FileSession
+	identity   storage.FileSessionIdentityResult
+	connection *connection
+	smbSession *session
+	export     *Export
+	principal  Principal
 
 	installMu   sync.RWMutex
 	mu          sync.Mutex
@@ -28,6 +31,7 @@ type authoritySession struct {
 	orphan      bool
 	stopping    bool
 	closed      bool
+	closeErr    error
 	initErr     error
 	ready       chan struct{}
 	done        chan struct{}
@@ -76,23 +80,39 @@ func (a *authoritySession) close(ctx context.Context) error {
 	return a.closeMu.run(ctx, func() error {
 		a.installMu.Lock()
 		a.stopping = true
-		already := a.closed
+		already, settledErr := a.closed, a.closeErr
 		if a.cancel != nil {
 			a.cancel()
 		}
 		a.installMu.Unlock()
 		if already {
-			return nil
+			return settledErr
 		}
+		var semanticErr error
 		if a.raw != nil {
-			if err := a.raw.Close(WithPrincipal(ctx, a.principal)); err != nil {
+			result, err := a.raw.CloseWithResult(WithPrincipal(ctx, a.principal))
+			if checkErr := result.Check(err); checkErr != nil {
+				return errors.Join(err, checkErr)
+			}
+			var settlement *storage.CloseSettlementError
+			if errors.As(err, &settlement) {
+				a.installMu.Lock()
+				if a.closeErr == nil {
+					a.closeErr = settlement.SemanticErr
+				}
+				a.installMu.Unlock()
 				return err
 			}
+			if !result.Released {
+				return err
+			}
+			semanticErr = errors.Join(settledErr, err)
 		}
 		a.installMu.Lock()
 		a.closed = true
+		a.closeErr = semanticErr
 		a.installMu.Unlock()
-		return nil
+		return semanticErr
 	})
 }
 
@@ -106,7 +126,13 @@ func (a *authoritySession) wait(ctx context.Context) error {
 }
 
 func (a *authoritySession) renew(ctx context.Context, limits Limits) {
-	defer close(a.done)
+	var failure error
+	defer func() {
+		close(a.done)
+		if failure != nil {
+			a.retireAfterRenewalFailure(ctx, failure, limits.CleanupTimeout)
+		}
+	}()
 	for {
 		a.installMu.RLock()
 		remaining, stopping := time.Until(a.deadline), a.stopping
@@ -116,7 +142,7 @@ func (a *authoritySession) renew(ctx context.Context, limits Limits) {
 		}
 		interval := min(limits.FileSession.Lease/3, remaining/2)
 		if interval <= 0 {
-			a.retireAfterRenewalFailure(ctx, syscall.ESTALE, limits.CleanupTimeout)
+			failure = syscall.ESTALE
 			return
 		}
 		timer := time.NewTimer(interval)
@@ -130,7 +156,7 @@ func (a *authoritySession) renew(ctx context.Context, limits Limits) {
 		remaining = time.Until(a.deadline)
 		a.installMu.RUnlock()
 		if remaining <= 0 {
-			a.retireAfterRenewalFailure(ctx, syscall.ESTALE, limits.CleanupTimeout)
+			failure = syscall.ESTALE
 			return
 		}
 		call, cancel := context.WithTimeout(WithPrincipal(ctx, a.principal), min(interval, remaining))
@@ -146,17 +172,50 @@ func (a *authoritySession) renew(ctx context.Context, limits Limits) {
 		}
 		cancel()
 		if err != nil {
-			a.retireAfterRenewalFailure(ctx, err, limits.CleanupTimeout)
+			failure = err
 			return
 		}
 	}
 }
 
 func (a *authoritySession) retireAfterRenewalFailure(parent context.Context, cause error, timeout time.Duration) {
+	a.installMu.Lock()
+	a.stopping = true
+	a.installMu.Unlock()
 	cleanup, cancel := context.WithTimeout(context.WithoutCancel(parent), timeout)
-	closeErr := a.close(cleanup)
-	cancel()
-	a.export.server.cleanupFailure(errors.Join(cause, closeErr))
+	defer cancel()
+	if a.connection == nil || a.smbSession == nil {
+		a.export.server.cleanupFailure(errors.Join(cause, syscall.EIO))
+		return
+	}
+	s, c := a.smbSession, a.connection
+	s.mu.Lock()
+	trees := make([]*tree, 0)
+	for _, t := range s.trees {
+		if t.authority == a {
+			trees = append(trees, t)
+		}
+	}
+	s.mu.Unlock()
+	for _, t := range trees {
+		t.fenceFileWork()
+	}
+	var errs []error
+	for _, t := range trees {
+		if err := c.closeTreeContext(cleanup, t); err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		s.mu.Lock()
+		if s.trees[t.id] == t {
+			delete(s.trees, t.id)
+		}
+		s.mu.Unlock()
+	}
+	if err := c.closeExportAuthority(cleanup, s, a.export); err != nil {
+		errs = append(errs, err)
+	}
+	a.export.server.cleanupFailure(errors.Join(cause, errors.Join(errs...)))
 }
 
 func (c *connection) connectVolume(ctx context.Context, s *session, key string, header *wire.Header) (body []byte, status uint32) {
@@ -212,7 +271,7 @@ func (c *connection) connectVolume(ctx context.Context, s *session, key string, 
 	if creator {
 		principal, _ := PrincipalFromContext(ctx)
 		authority = &authoritySession{
-			export: export, principal: principal, orphan: true,
+			export: export, principal: principal, orphan: true, connection: c, smbSession: s,
 			ready: make(chan struct{}), done: make(chan struct{}),
 		}
 		s.authorities[export] = authority
@@ -271,10 +330,30 @@ func (c *connection) connectVolume(ctx context.Context, s *session, key string, 
 	}
 
 	if creator {
-		raw, err := export.share.Backend.NewFileSession(ctx, server.config.Limits.FileSession)
+		var backendIdentity storage.BackendIdentityResult
+		err := server.config.Authorize.Authorize(ctx, authz.AccessRequest{Volume: export.share.Volume, Operation: storage.OpFileBackendIdentity})
+		if err == nil {
+			backendIdentity, err = export.share.Backend.(storage.BackendIdentity).BackendIdentity(ctx)
+		}
+		if err == nil && (backendIdentity.Check() != nil || backendIdentity.Volume != export.share.BackendVolume || backendIdentity.RootNodeID != export.share.RootNodeID) {
+			err = syscall.EIO
+		}
+		var raw storage.FileSession
+		if err == nil {
+			raw, err = export.share.Backend.NewFileSession(ctx, server.config.Limits.FileSession)
+		}
 		authority.raw = raw
 		if err == nil && raw == nil {
 			err = syscall.EIO
+		}
+		if err == nil {
+			err = checkTreeCapabilities(raw)
+		}
+		if err == nil {
+			authority.identity, err = raw.(storage.FileSessionIdentity).FileSessionIdentity(ctx)
+			if err == nil && (authority.identity.Check() != nil || authority.identity.Backend != backendIdentity) {
+				err = syscall.EIO
+			}
 		}
 		if err == nil {
 			err = server.config.Authorize.Authorize(ctx, authz.AccessRequest{Volume: export.share.Volume, Operation: storage.OpFileStatus})
@@ -282,6 +361,9 @@ func (c *connection) connectVolume(ctx context.Context, s *session, key string, 
 		if err == nil {
 			var current storage.FileSessionStatus
 			current, err = raw.Status(ctx)
+			if err == nil && current.Epoch != authority.identity.SessionEpoch {
+				err = syscall.EIO
+			}
 			if err == nil {
 				err = authority.acceptStatus(current)
 			}

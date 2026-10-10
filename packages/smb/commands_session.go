@@ -100,6 +100,15 @@ func (c *connection) dispatch(ctx context.Context, request, original wire.Reques
 		body, status := c.control(s, tree, request)
 		return body, status, signer
 	}
+	switch request.Header.Command {
+	case wire.Create:
+		body, status, _ := c.createFile(ctx, s, tree, request)
+		return body, status, signer
+	case wire.Close:
+		inherited, _ := ctx.Value(relatedFileKey{}).(wire.FileID)
+		body, status := c.closeFile(ctx, s, tree, request, inherited)
+		return body, status, signer
+	}
 	if request.Header.Command != wire.TreeDisconnect {
 		return nil, statusUnsupported, signer
 	}

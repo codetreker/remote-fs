@@ -45,10 +45,11 @@ storage.Operation 是覆盖路径、文件会话、复制和锁控制的 transpo
 | `replication.resubscribe` | `/v5/resubscribe` | 按游标续订及其后续输出 |
 | `replication.snapshot` | `/v5/snapshot` | 捕获快照及发送整份快照 |
 | `replication.checkpoint` | `/v5/checkpoint` | 读取日志化身与已提交位置 |
+| `file.backend-identity` | `/v5/file-control`，`file.backend-identity` | 在 session enrollment 前验证实际 backend 的 volume／authority／根身份 |
 | `file.session-open` | `/v5/file`，`file.session-open` | 建立 FileSession |
 | `file.status` | `/v5/file-control`，`file.status` | 查询 FileSession 状态与历史边界 |
 | `file.renew` | `/v5/file-control`，`file.renew` | 续期 FileSession |
-| `file.session-close` | `/v5/file-control`，`file.session-close` | 关闭 FileSession |
+| `file.session-close` | `/v5/file-control`，`file.session-close` 或内部 `file.session-release-result` | 关闭 FileSession，或只读核对确切 session 的已保留全父释放事实 |
 | `file.stat-node` | `/v5/file`，`file.stat-node` | 按节点身份读取属性 |
 | `file.set-node-attr` | `/v5/file`，`file.set-node-attr` | 按节点身份修改属性 |
 | `file.open` | `/v5/file`，`file.open` | 按路径打开，携带 OpenAccess |
@@ -104,7 +105,7 @@ storage.Operation 是覆盖路径、文件会话、复制和锁控制的 transpo
 
 副本构建还需要 replication.checkpoint 的明确许可；允许订阅或快照不隐含这项权限。Checkpoint 是一次普通读取，遵循入口授权、通用传输预算和安全错误规则，不建立持续输出。
 
-`FileOpenOptions` 嵌入共享的 `storage.OpenAccess`；file.open／file.open-node 继续把这五项意图放入 `AccessRequest.Open`。OpenAt、OpenNodeRef 与 OpenChildRef 也携带由 metadata 权限、Use 与打开效果导出的 OpenAccess。OpenAt/OpenChildRef 的顶层 child/guards 在进入策略前完成结构和 guard 上限校验，server 再把它们组装为 `ChildSelection`；guards 是 authority 核对的名字证据，不增加授权 Operation，也不作为策略资源。一个复杂动作按固定顺序产生基础 Operation 及它实际包含的 remove、set-attr、set-metadata 或 set-pending 等补充 Operation；每项分别调用同一 Authorizer，任一拒绝都发生在 native action 前。NodeID、Scope、metadata token、namespace guard、action ID、delete-intent owner、cursor 和 ID 不作为业务身份。带 Create 的打开即使最终选择已有对象，也报告创建意图。
+`FileOpenOptions` 嵌入共享的 `storage.OpenAccess`；file.open／file.open-node 继续把这五项意图放入 `AccessRequest.Open`。OpenAt、OpenNodeRef 与 OpenChildRef 也携带由 metadata 权限、Use 与打开效果导出的 OpenAccess；Use 是冲突声明，不独自授予 byte 或 metadata 方法。OpenAt 的 metadata 权限由显式 MetadataAccess 指定，不从字节 Read/Write 推导。OpenAt/OpenChildRef 的顶层 child/guards 在进入策略前完成结构和 guard 上限校验，server 再把它们组装为 `ChildSelection`；guards 是 authority 核对的名字证据，不增加授权 Operation，也不作为策略资源。一个复杂动作按固定顺序产生基础 Operation 及它实际包含的 remove、set-attr、set-metadata 或 set-pending 等补充 Operation；每项分别调用同一 Authorizer，任一拒绝都发生在 native action 前。NodeID、Scope、metadata token、namespace guard、action ID、delete-intent owner、cursor 和 ID 不作为业务身份。带 Create 的打开即使最终选择已有对象，也报告创建意图。
 
 `volume.write` 可以创建缺失文件，单独拒绝 volume.create 不能禁止创建。应用枚举、完整目录 metadata 与 reference current-name 分别授权；允许 `file.read-dir-node` 不授予另两项，DirectoryMetadataObserver 也不从 `ReadEntries` 或 `ReadMetadata` 推导权限。metadata、range apply 与 range drop 同样分别授权；查询、取消或已有 owner 不能绕过本次策略。range mode 不代替内容读写权限，后续数据访问仍检查 file.read / file.write。FUSE 的 flock/POSIX 解释不进入 AccessRequest。
 

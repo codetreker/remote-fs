@@ -240,10 +240,15 @@ func TestHTTPCloseReplaysReleasedActionUntilBarrierKnown(t *testing.T) {
 				first, err = session.CloseWithResult(t.Context())
 			}
 			var pending *CloseBarrierPendingError
-			if !first.Released || barrier != nil || !errors.As(err, &pending) || log.calls.Load() != before+1 {
+			var neutral *storage.CloseSettlementError
+			marked := errors.As(err, &pending)
+			if kind == "session" {
+				marked = errors.As(err, &neutral) && neutral.State == storage.CloseSettlementPending
+			}
+			if !first.Released || barrier != nil || !marked || log.calls.Load() != before+1 {
 				t.Fatalf("initial close=%+v barrier=%+v err=%v barrierCalls=%d", first, barrier, err, log.calls.Load())
 			}
-			if pending.Error() != pending.Cause.Error() || !errors.Is(pending, syscall.EIO) {
+			if !errors.Is(err, syscall.EIO) || kind == "file" && pending.Error() != pending.Cause.Error() {
 				t.Fatalf("pending close lost its original error chain: %v", pending)
 			}
 			var settled storage.ReferenceCloseResult

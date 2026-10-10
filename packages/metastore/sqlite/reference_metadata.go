@@ -48,6 +48,9 @@ func (s *Store) SetMetadata(ctx context.Context, id uint64, namespace string, ex
 }
 
 func (f *retainedFile) SetMetadata(ctx context.Context, namespace string, expected, data []byte) (storage.OpaquePayload, error) {
+	if f.metadata&storage.WriteMetadata == 0 {
+		return storage.OpaquePayload{}, syscall.EBADF
+	}
 	if err := f.CheckMetadataAccess(); err != nil {
 		return storage.OpaquePayload{}, err
 	}

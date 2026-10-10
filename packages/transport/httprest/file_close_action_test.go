@@ -62,6 +62,9 @@ func (b rejectedCloseBackend) NewFileSession(ctx context.Context, options storag
 }
 
 func (*rejectedCloseSession) CheckRecoverableReferenceClose() error { return nil }
+func (s *rejectedCloseSession) CheckInlineCloseSettlement() error {
+	return s.FileSession.(storage.InlineCloseSettlement).CheckInlineCloseSettlement()
+}
 
 func (s *rejectedCloseSession) OpenFile(ctx context.Context, path string, options storage.FileOpenOptions) (storage.File, error) {
 	native, err := s.FileSession.OpenFile(ctx, path, options)
@@ -124,6 +127,9 @@ func (b mixedCloseBackend) NewFileSession(ctx context.Context, options storage.F
 }
 
 func (*mixedCloseSession) CheckRecoverableReferenceClose() error { return nil }
+func (s *mixedCloseSession) CheckInlineCloseSettlement() error {
+	return s.FileSession.(storage.InlineCloseSettlement).CheckInlineCloseSettlement()
+}
 
 func (s *mixedCloseSession) OpenFile(ctx context.Context, path string, options storage.FileOpenOptions) (storage.File, error) {
 	native, err := s.FileSession.OpenFile(ctx, path, options)
@@ -217,6 +223,9 @@ func (b lyingRecoveryBackend) NewFileSession(ctx context.Context, options storag
 }
 
 func (*lyingRecoverySession) CheckRecoverableReferenceClose() error { return nil }
+func (s *lyingRecoverySession) CheckInlineCloseSettlement() error {
+	return s.FileSession.(storage.InlineCloseSettlement).CheckInlineCloseSettlement()
+}
 
 func (s *lyingRecoverySession) OpenFile(ctx context.Context, path string, options storage.FileOpenOptions) (storage.File, error) {
 	native, err := s.FileSession.OpenFile(ctx, path, options)
@@ -242,6 +251,9 @@ func (b hiddenReleaseBackend) NewFileSession(ctx context.Context, options storag
 }
 
 func (*hiddenReleaseSession) CheckRecoverableReferenceClose() error { return nil }
+func (s *hiddenReleaseSession) CheckInlineCloseSettlement() error {
+	return s.FileSession.(storage.InlineCloseSettlement).CheckInlineCloseSettlement()
+}
 
 func (s *hiddenReleaseSession) OpenFile(ctx context.Context, path string, options storage.FileOpenOptions) (storage.File, error) {
 	native, err := s.FileSession.OpenFile(ctx, path, options)
@@ -287,6 +299,9 @@ func (b *racedEpochBackend) NewFileSession(ctx context.Context, options storage.
 }
 
 func (s *racedEpochSession) CheckRecoverableReferenceClose() error { return nil }
+func (s *racedEpochSession) CheckInlineCloseSettlement() error {
+	return s.FileSession.(storage.InlineCloseSettlement).CheckInlineCloseSettlement()
+}
 
 func (s *racedEpochSession) Status(ctx context.Context) (storage.FileSessionStatus, error) {
 	status, err := s.FileSession.Status(ctx)
@@ -360,6 +375,9 @@ type stagedCloseSession struct {
 }
 
 func (*stagedCloseSession) CheckRecoverableReferenceClose() error { return nil }
+func (s *stagedCloseSession) CheckInlineCloseSettlement() error {
+	return s.FileSession.(storage.InlineCloseSettlement).CheckInlineCloseSettlement()
+}
 
 func (s *stagedCloseSession) OpenFile(ctx context.Context, path string, options storage.FileOpenOptions) (storage.File, error) {
 	native, err := s.FileSession.OpenFile(ctx, path, options)

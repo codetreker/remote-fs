@@ -31,6 +31,11 @@ func (s *fileSession) OpenAt(ctx context.Context, selection storage.ChildSelecti
 	if err != nil {
 		return storage.OpenResult{}, err
 	}
+	if options.MetadataAccess != 0 {
+		if err := s.CheckOpenMetadataAccess(); err != nil {
+			return storage.OpenResult{}, err
+		}
+	}
 	result, err := fileMutation(s.storage, ctx, "atomic open", func(ctx context.Context) (storage.OpenResult, error) {
 		return backing.OpenAt(ctx, selection, options)
 	})

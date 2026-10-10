@@ -345,7 +345,8 @@ func (n *node) openFile(ctx context.Context, name storage.ChildName, options sto
 	}
 	request := storage.OpenAtOptions{
 		Read: options.Read, Write: options.Write, Create: options.Create, Exclusive: options.Exclusive,
-		Target: target, Action: action, Existing: effect, Use: storage.UseClaim{Uses: uses},
+		MetadataAccess: storage.ReadMetadata | storage.WriteMetadata,
+		Target:         target, Action: action, Existing: effect, Use: storage.UseClaim{Uses: uses},
 		Initial: storage.InitialState{OnCreate: storage.InitialFields{Metadata: options.InitialMetadata}},
 	}
 	selection := storage.ChildSelection{Name: name}

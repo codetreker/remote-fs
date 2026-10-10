@@ -67,6 +67,8 @@ type fileSession struct {
 	options            storage.FileSessionOptions
 	cleanup            context.Context
 	epoch              string
+	backendIdentity    storage.BackendIdentityResult
+	hasBackendIdentity bool
 	mu                 sync.Mutex
 	active             bool
 	expires            time.Time
@@ -146,6 +148,20 @@ func (s *Storage) NewFileSession(ctx context.Context, options storage.FileSessio
 	if err != nil {
 		return nil, err
 	}
+	var backendIdentity storage.BackendIdentityResult
+	identity, hasIdentity := native.(storage.BackendIdentity)
+	if hasIdentity {
+		if err := identity.CheckBackendIdentity(); err != nil {
+			return nil, err
+		}
+		backendIdentity, err = identity.BackendIdentity(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if err := backendIdentity.Check(); err != nil {
+			return nil, err
+		}
+	}
 	var nonce [16]byte
 	if _, err := rand.Read(nonce[:]); err != nil {
 		return nil, err
@@ -162,6 +178,7 @@ func (s *Storage) NewFileSession(ctx context.Context, options storage.FileSessio
 	options.MaxFileSize = min(options.MaxFileSize, maxBytes)
 	fs := &fileSession{storage: s, native: native, domain: domain, options: options,
 		cleanup: context.WithoutCancel(ctx), epoch: hex.EncodeToString(nonce[:]),
+		backendIdentity: backendIdentity, hasBackendIdentity: hasIdentity,
 		active: true, expires: time.Now().Add(options.Lease), revision: 1,
 		files: make(map[retainedReference]struct{}), actions: make(map[storage.FileActionID]*fileAction),
 		closeActions: make(map[storage.FileActionID]*referenceCloseReceipt), closeRefs: make(map[*referenceCloseState]struct{})}
@@ -275,7 +292,8 @@ func (fs *fileSession) open(ctx context.Context, options storage.FileOpenOptions
 		return nil, fs.finishOpen(nil, err)
 	}
 	f := &openFile{session: fs, native: native, options: options, active: true,
-		closing: referenceCloseState{next: 1}}
+		metadata: storage.ReadMetadata | storage.WriteMetadata,
+		closing:  referenceCloseState{next: 1}}
 	err = fs.finishOpen(f, err)
 	if err != nil {
 		err = errors.Join(err, f.retire())

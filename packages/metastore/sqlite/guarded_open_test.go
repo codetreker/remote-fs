@@ -79,7 +79,7 @@ func TestGuardedChildSelectionAcceptsFreshDirectoryAndEdgeEvidence(t *testing.T)
 		t.Fatal(err)
 	}
 
-	opened, err := store.OpenAt(t.Context(), selection, storage.OpenAtOptions{
+	opened, err := store.OpenAt(t.Context(), selection, storage.OpenAtOptions{MetadataAccess: storage.ReadMetadata | storage.WriteMetadata,
 		Read: true, Target: storage.ChildCondition{State: storage.SameNode, NodeID: uint64(file.ID)},
 		Action: fileAction(t), Use: storage.UseClaim{Uses: storage.ReadData}, Existing: storage.Keep,
 	})
@@ -117,7 +117,7 @@ func TestGuardedResetRejectsCaseEquivalentSiblingWithoutPartialEffects(t *testin
 		t.Fatal(err)
 	}
 	intent := storage.DeleteIntentID("11111111111111111111111111111111")
-	result, err := store.OpenAt(t.Context(), selection, storage.OpenAtOptions{
+	result, err := store.OpenAt(t.Context(), selection, storage.OpenAtOptions{MetadataAccess: storage.ReadMetadata | storage.WriteMetadata,
 		Read: true, Write: true,
 		Target: storage.ChildCondition{State: storage.SameNode, NodeID: uint64(file.ID)}, Action: fileAction(t),
 		Use:      storage.UseClaim{Uses: storage.ReadData | storage.WriteData | storage.DeleteName, Deny: storage.ReadData},
@@ -135,7 +135,7 @@ func TestGuardedResetRejectsCaseEquivalentSiblingWithoutPartialEffects(t *testin
 	if status, err := store.QueryDeleteIntent(t.Context(), testDeleteIntentOwner, intent); err != nil || status.Outcome != storage.DeleteIntentUnknown {
 		t.Fatalf("failed guarded reset armed close intent: %+v, %v", status, err)
 	}
-	probe, err := store.OpenAt(t.Context(), selectChild(selection.Name), storage.OpenAtOptions{
+	probe, err := store.OpenAt(t.Context(), selectChild(selection.Name), storage.OpenAtOptions{MetadataAccess: storage.ReadMetadata | storage.WriteMetadata,
 		Read: true, Target: storage.ChildCondition{State: storage.SameNode, NodeID: uint64(file.ID)},
 		Action: fileAction(t), Use: storage.UseClaim{Uses: storage.ReadData}, Existing: storage.Keep,
 	})
@@ -170,7 +170,7 @@ func TestGuardedCreateRejectsCaseEquivalentSiblingWithoutCreatingTheSelectedName
 		t.Fatal(err)
 	}
 
-	result, err := store.OpenAt(t.Context(), selection, storage.OpenAtOptions{
+	result, err := store.OpenAt(t.Context(), selection, storage.OpenAtOptions{MetadataAccess: storage.ReadMetadata | storage.WriteMetadata,
 		Read: true, Create: true, Exclusive: true, Target: storage.ChildCondition{State: storage.Absent},
 		Action: fileAction(t), Use: storage.UseClaim{Uses: storage.ReadData}, Existing: storage.Keep,
 	})
@@ -189,7 +189,7 @@ func TestGuardedReplaceRejectsCaseEquivalentSiblingWithoutReplacingTheSelectedNo
 		t.Fatal(err)
 	}
 
-	result, err := store.OpenAt(t.Context(), selection, storage.OpenAtOptions{
+	result, err := store.OpenAt(t.Context(), selection, storage.OpenAtOptions{MetadataAccess: storage.ReadMetadata | storage.WriteMetadata,
 		Read: true, Write: true, Create: true,
 		Target: storage.ChildCondition{State: storage.SameNode, NodeID: uint64(file.ID)}, Action: fileAction(t),
 		Use: storage.UseClaim{Uses: storage.ReadData | storage.WriteData | storage.DeleteName}, Existing: storage.ReplaceNode,
@@ -288,7 +288,7 @@ func TestGuardedChildSelectionReportsInvalidParentScopeBeforeStaleGuards(t *test
 		t.Fatal(err)
 	}
 
-	result, err := store.OpenAt(t.Context(), selection, storage.OpenAtOptions{
+	result, err := store.OpenAt(t.Context(), selection, storage.OpenAtOptions{MetadataAccess: storage.ReadMetadata | storage.WriteMetadata,
 		Read: true, Target: storage.ChildCondition{State: storage.SameNode, NodeID: uint64(file.ID)},
 		Action: fileAction(t), Use: storage.UseClaim{Uses: storage.ReadData}, Existing: storage.Keep,
 	})
@@ -344,7 +344,7 @@ func TestStaleGuardPrecedesChildSelectionFailures(t *testing.T) {
 		{
 			name:      "absent child",
 			selection: selection("missing"),
-			options: storage.OpenAtOptions{
+			options: storage.OpenAtOptions{MetadataAccess: storage.ReadMetadata | storage.WriteMetadata,
 				Read: true, Target: storage.ChildCondition{State: storage.Any},
 				Use: storage.UseClaim{Uses: storage.ReadData}, Existing: storage.Keep,
 			},
@@ -352,7 +352,7 @@ func TestStaleGuardPrecedesChildSelectionFailures(t *testing.T) {
 		{
 			name:      "exclusive existing child",
 			selection: selection("file"),
-			options: storage.OpenAtOptions{
+			options: storage.OpenAtOptions{MetadataAccess: storage.ReadMetadata | storage.WriteMetadata,
 				Read: true, Create: true, Exclusive: true, Target: storage.ChildCondition{State: storage.Absent},
 				Use: storage.UseClaim{Uses: storage.ReadData}, Existing: storage.Keep,
 			},
@@ -360,7 +360,7 @@ func TestStaleGuardPrecedesChildSelectionFailures(t *testing.T) {
 		{
 			name:      "wrong child kind",
 			selection: selection("directory"),
-			options: storage.OpenAtOptions{
+			options: storage.OpenAtOptions{MetadataAccess: storage.ReadMetadata | storage.WriteMetadata,
 				Read: true, Target: storage.ChildCondition{State: storage.SameNode, NodeID: uint64(directory.ID)},
 				Use: storage.UseClaim{Uses: storage.ReadData}, Existing: storage.Keep,
 			},
@@ -368,7 +368,7 @@ func TestStaleGuardPrecedesChildSelectionFailures(t *testing.T) {
 		{
 			name:      "wrong child identity",
 			selection: selection("file"),
-			options: storage.OpenAtOptions{
+			options: storage.OpenAtOptions{MetadataAccess: storage.ReadMetadata | storage.WriteMetadata,
 				Read: true, Target: storage.ChildCondition{State: storage.SameNode, NodeID: uint64(directory.ID)},
 				Use: storage.UseClaim{Uses: storage.ReadData}, Existing: storage.Keep,
 			},
@@ -410,7 +410,7 @@ func TestAnyTargetResetAndReplaceAccountForTheSelectedNode(t *testing.T) {
 			if test.existing == storage.ReplaceNode {
 				uses |= storage.DeleteName
 			}
-			result, err := store.OpenAt(accountingContext(t, &accounting), selection, storage.OpenAtOptions{
+			result, err := store.OpenAt(accountingContext(t, &accounting), selection, storage.OpenAtOptions{MetadataAccess: storage.ReadMetadata | storage.WriteMetadata,
 				Read: true, Write: true, Create: test.existing == storage.ReplaceNode,
 				Target: storage.ChildCondition{State: storage.Any}, Action: fileAction(t),
 				Use: storage.UseClaim{Uses: uses}, Existing: test.existing,
@@ -452,7 +452,7 @@ func TestAnyTargetResetAndReplaceHonorTheSelectedNodeLock(t *testing.T) {
 			}
 			result, err := store.OpenAt(t.Context(), selectChild(storage.ChildName{
 				Parent: directoryTarget(root), RawLeaf: []byte("file"),
-			}), storage.OpenAtOptions{
+			}), storage.OpenAtOptions{MetadataAccess: storage.ReadMetadata | storage.WriteMetadata,
 				Read: true, Write: true, Create: test.existing == storage.ReplaceNode,
 				Target: storage.ChildCondition{State: storage.Any}, Action: fileAction(t),
 				Use: storage.UseClaim{Uses: uses}, Existing: test.existing,
@@ -478,7 +478,7 @@ func TestKeepWithCloseIntentDoesNotPublishBeforeTheCloseTransition(t *testing.T)
 		t.Fatal("arming a close intent attempted early publication accounting")
 		return nil, syscall.EIO
 	})
-	result, err := store.OpenAt(openContext, selection, storage.OpenAtOptions{
+	result, err := store.OpenAt(openContext, selection, storage.OpenAtOptions{MetadataAccess: storage.ReadMetadata | storage.WriteMetadata,
 		Read: true, Target: storage.ChildCondition{State: storage.SameNode, NodeID: uint64(file.ID)},
 		Action: fileAction(t), Use: storage.UseClaim{Uses: storage.ReadData | storage.DeleteName}, Existing: storage.Keep,
 		CloseIntent: &storage.CloseIntent{Owner: testDeleteIntentOwner,

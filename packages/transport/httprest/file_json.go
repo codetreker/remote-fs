@@ -50,7 +50,7 @@ func validFileCapability(cap string) bool {
 
 func validateFileRequest(r fileRequest) error {
 	expected := fileRequest{Op: r.Op, Session: r.Session, Action: r.Action, Path: []byte{}, Data: []byte{}}
-	if r.Op == storage.OpFileSessionOpen {
+	if r.Op == storage.OpFileSessionOpen || r.Op == storage.OpFileBackendIdentity {
 		if r.Session != "" {
 			return errors.New("new file session names a previous session")
 		}
@@ -66,9 +66,10 @@ func validateFileRequest(r fileRequest) error {
 	}
 	reference := false
 	switch r.Op {
+	case storage.OpFileBackendIdentity:
 	case storage.OpFileSessionOpen:
 		expected.Options = r.Options
-	case storage.OpFileStatus, storage.OpFileRenew:
+	case storage.OpFileStatus, storage.OpFileRenew, opFileSessionReleaseResult:
 	case storage.OpFileSessionClose:
 		expected.CloseGeneration = r.CloseGeneration
 	case storage.OpFileQueryAction:
@@ -263,7 +264,13 @@ func validateFileRequest(r fileRequest) error {
 }
 
 func validateFileResponse(req fileRequest, r fileResponse) error {
-	if r.Epoch == 0 {
+	if req.Op == opFileSessionReleaseResult && r.Retry {
+		return errors.New("session release fact cannot carry an action retry")
+	}
+	if req.Op == storage.OpFileBackendIdentity && r.Epoch != 0 {
+		return errors.New("backend identity response carries a session action epoch")
+	}
+	if req.Op != storage.OpFileBackendIdentity && r.Epoch == 0 {
 		return errors.New("file response carries no action epoch")
 	}
 	expected := fileResponse{Epoch: r.Epoch, Data: []byte{}}
@@ -274,10 +281,13 @@ func validateFileResponse(req fileRequest, r fileResponse) error {
 		expected.Retry = true
 	} else {
 		switch req.Op {
+		case storage.OpFileBackendIdentity:
+			expected.BackendIdentity = r.BackendIdentity
 		case storage.OpFileSessionOpen:
 			expected.Session = r.Session
 			expected.Status = r.Status
 			expected.Capabilities = r.Capabilities
+			expected.SessionIdentity = r.SessionIdentity
 		case storage.OpFileStatus, storage.OpFileRenew:
 			expected.Status = r.Status
 		case storage.OpFileQueryAction:
@@ -314,7 +324,7 @@ func validateFileResponse(req fileRequest, r fileResponse) error {
 			expected.Barrier = r.Barrier
 		case storage.OpFileSync:
 			expected.Barrier = r.Barrier
-		case storage.OpFileClose, storage.OpFileSessionClose:
+		case storage.OpFileClose, storage.OpFileSessionClose, opFileSessionReleaseResult:
 			expected.Barrier = r.Barrier
 			expected.CloseResult = r.CloseResult
 		case storage.OpFileScope:
@@ -347,9 +357,24 @@ func validateFileResponse(req fileRequest, r fileResponse) error {
 		return nil
 	}
 	switch req.Op {
+	case opFileSessionReleaseResult:
+		if r.CloseResult == nil || !r.CloseResult.Released || !r.CloseResult.Determined {
+			return errors.New("session release fact does not confirm release")
+		}
+		if r.CloseResult.BarrierPending && r.Barrier != nil {
+			return errors.New("pending session release carries a barrier")
+		}
+	case storage.OpFileBackendIdentity:
+		if r.BackendIdentity == nil {
+			return errors.New("backend identity is absent")
+		}
+		return r.BackendIdentity.storage().Check()
 	case storage.OpFileSessionOpen:
 		if !validFileCapability(r.Session) || r.Status == nil || r.Capabilities == nil {
 			return errors.New("file session response has no valid capability or status")
+		}
+		if err := validateSessionIdentity(r); err != nil {
+			return err
 		}
 	case storage.OpFileStatus, storage.OpFileRenew:
 		if r.Status == nil {
@@ -561,7 +586,7 @@ func validatePartialFileResponse(req fileRequest, response fileResponse) error {
 		if err := page.Check(req.DeleteOwner, req.DeleteAfter, req.DeleteLimit); err != nil {
 			return err
 		}
-	case storage.OpFileClose, storage.OpFileSessionClose:
+	case storage.OpFileClose, storage.OpFileSessionClose, opFileSessionReleaseResult:
 		expected.CloseResult = response.CloseResult
 		expected.Barrier = response.Barrier
 		if response.CloseResult == nil {
@@ -572,6 +597,9 @@ func validatePartialFileResponse(req fileRequest, response fileResponse) error {
 		}
 		if response.CloseResult.BarrierPending && (!response.CloseResult.Released || response.Barrier != nil) {
 			return errors.New("partial close result has inconsistent barrier state")
+		}
+		if req.Op == opFileSessionReleaseResult && (!response.CloseResult.Released || !response.CloseResult.Determined) {
+			return errors.New("partial session release fact does not confirm release")
 		}
 	case storage.OpFileOpen, storage.OpFileOpenNode, storage.OpFileOpenAt, storage.OpFileOpenNodeRef, storage.OpFileOpenChildRef:
 		expected.File = response.File

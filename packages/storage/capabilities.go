@@ -63,6 +63,13 @@ func (r ReferenceCloseResult) Check(err error) error {
 	if !r.Released && err == nil {
 		return errors.New("close retained ownership without an error: invalid result")
 	}
+	var settlement *CloseSettlementError
+	if errors.As(err, &settlement) {
+		if !r.Released {
+			return syscall.EINVAL
+		}
+		return settlement.Check()
+	}
 	return nil
 }
 
@@ -410,6 +417,7 @@ type InitialState struct {
 
 type OpenAtOptions struct {
 	Read, Write       bool
+	MetadataAccess    MetadataPermissions
 	Create, Exclusive bool
 	Target            ChildCondition
 	Action            FileActionID

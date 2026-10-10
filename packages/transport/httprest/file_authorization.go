@@ -9,6 +9,9 @@ import (
 
 func (h *Handler) authorizeFile(ctx context.Context, request fileRequest) error {
 	accesses := []authz.AccessRequest{{Operation: request.Op}}
+	if request.Op == opFileSessionReleaseResult {
+		accesses[0].Operation = storage.OpFileSessionClose
+	}
 	appendOperation := func(operation storage.Operation) {
 		for _, access := range accesses {
 			if access.Operation == operation && access.Open == (storage.OpenAccess{}) {
@@ -24,6 +27,13 @@ func (h *Handler) authorizeFile(ctx context.Context, request fileRequest) error 
 	case storage.OpFileOpenAt:
 		options := request.OpenAt.storage()
 		accesses[0].Open = storage.OpenAccess{Read: options.Read, Write: options.Write, Create: options.Create, Exclusive: options.Exclusive, Truncate: options.Existing == storage.ResetContent}
+		if options.MetadataAccess&storage.ReadMetadata != 0 {
+			appendOperation(storage.OpFileStat)
+		}
+		if options.MetadataAccess&storage.WriteMetadata != 0 {
+			appendOperation(storage.OpFileSetAttr)
+			appendOperation(storage.OpFileSetMetadata)
+		}
 		if options.Existing == storage.ReplaceNode {
 			appendOperation(storage.OpVolumeRemove)
 		}

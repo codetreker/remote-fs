@@ -17,6 +17,7 @@ type openFile struct {
 	native     metastore.File
 	uses       referenceUses
 	options    storage.FileOpenOptions
+	metadata   storage.MetadataPermissions
 	active     bool
 	operations sync.WaitGroup
 	retireMu   sync.Mutex
@@ -60,6 +61,9 @@ func (f *openFile) state(ctx context.Context) (metastore.FileState, error) {
 }
 
 func (f *openFile) Stat(ctx context.Context) (storage.Attr, error) {
+	if f.metadata&storage.ReadMetadata == 0 {
+		return storage.Attr{}, syscall.EBADF
+	}
 	ctx, done, err := f.begin(ctx)
 	if err != nil {
 		return storage.Attr{}, err
@@ -304,6 +308,9 @@ func (f *openFile) cleanupObject(key metastore.Key, quarantine bool) error {
 func (f *openFile) SetAttr(ctx context.Context, change storage.AttrChange) (storage.Attr, error) {
 	if err := change.Check(); err != nil {
 		return storage.Attr{}, err
+	}
+	if f.metadata&storage.WriteMetadata == 0 {
+		return storage.Attr{}, syscall.EBADF
 	}
 	ctx, done, err := f.begin(ctx)
 	if err != nil {

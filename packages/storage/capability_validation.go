@@ -181,7 +181,8 @@ func (o OpenAtOptions) Check() error {
 	if !o.Read && !o.Write || o.Exclusive && !o.Create || o.Existing < Keep || o.Existing > ReplaceNode {
 		return syscall.EINVAL
 	}
-	if (o.Use.Uses&ReadData != 0) != o.Read || (o.Use.Uses&WriteData != 0) != o.Write || o.Use.Uses&ReadEntries != 0 {
+	if o.Read && o.Use.Uses&ReadData == 0 || o.Write && o.Use.Uses&WriteData == 0 || o.Use.Uses&ReadEntries != 0 ||
+		o.MetadataAccess&^(ReadMetadata|WriteMetadata) != 0 {
 		return syscall.EINVAL
 	}
 	if o.Target.State == Absent && !o.Create || o.Exclusive && o.Target.State == SameNode {

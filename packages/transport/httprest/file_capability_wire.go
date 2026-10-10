@@ -231,24 +231,25 @@ func (value initialState) storage() storage.InitialState {
 }
 
 type openAtOptions struct {
-	Read        bool                   `json:"read"`
-	Write       bool                   `json:"write"`
-	Create      bool                   `json:"create"`
-	Exclusive   bool                   `json:"exclusive"`
-	Target      childCondition         `json:"target"`
-	Action      storage.FileActionID   `json:"action"`
-	Use         storage.UseClaim       `json:"use"`
-	Existing    storage.ExistingEffect `json:"existing"`
-	Initial     initialState           `json:"initial"`
-	CloseIntent *closeIntent           `json:"closeIntent,omitempty"`
+	MetadataAccess storage.MetadataPermissions `json:"metadataAccess"`
+	Read           bool                        `json:"read"`
+	Write          bool                        `json:"write"`
+	Create         bool                        `json:"create"`
+	Exclusive      bool                        `json:"exclusive"`
+	Target         childCondition              `json:"target"`
+	Action         storage.FileActionID        `json:"action"`
+	Use            storage.UseClaim            `json:"use"`
+	Existing       storage.ExistingEffect      `json:"existing"`
+	Initial        initialState                `json:"initial"`
+	CloseIntent    *closeIntent                `json:"closeIntent,omitempty"`
 }
 
 func openAtOptionsOf(value storage.OpenAtOptions) *openAtOptions {
-	return &openAtOptions{Read: value.Read, Write: value.Write, Create: value.Create, Exclusive: value.Exclusive, Target: childConditionOf(value.Target), Action: value.Action, Use: value.Use, Existing: value.Existing, Initial: initialStateOf(value.Initial), CloseIntent: closeIntentOf(value.CloseIntent)}
+	return &openAtOptions{MetadataAccess: value.MetadataAccess, Read: value.Read, Write: value.Write, Create: value.Create, Exclusive: value.Exclusive, Target: childConditionOf(value.Target), Action: value.Action, Use: value.Use, Existing: value.Existing, Initial: initialStateOf(value.Initial), CloseIntent: closeIntentOf(value.CloseIntent)}
 }
 
 func (value openAtOptions) storage() storage.OpenAtOptions {
-	result := storage.OpenAtOptions{Read: value.Read, Write: value.Write, Create: value.Create, Exclusive: value.Exclusive, Target: value.Target.storage(), Action: value.Action, Use: value.Use, Existing: value.Existing, Initial: value.Initial.storage()}
+	result := storage.OpenAtOptions{MetadataAccess: value.MetadataAccess, Read: value.Read, Write: value.Write, Create: value.Create, Exclusive: value.Exclusive, Target: value.Target.storage(), Action: value.Action, Use: value.Use, Existing: value.Existing, Initial: value.Initial.storage()}
 	if value.CloseIntent != nil {
 		intent := value.CloseIntent.storage()
 		result.CloseIntent = &intent

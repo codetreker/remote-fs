@@ -72,17 +72,68 @@ type closeActionBarrier interface {
 }
 
 func persistentCloseError(err error) error {
+	return closeErrorPart(err, true)
+}
+
+func closeErrorPart(err error, semantic bool) error {
 	var pending *httprest.CloseBarrierPendingError
-	if errors.As(err, &pending) {
+	var unsettled *storage.CloseSettlementError
+	if !errors.As(err, &pending) && !errors.As(err, &unsettled) {
+		return err
+	}
+	switch err := err.(type) {
+	case *httprest.CloseBarrierPendingError:
+		if semantic {
+			return closeErrorPart(err.SemanticErr, semantic)
+		}
+		return closeErrorPart(err.Cause, semantic)
+	case *storage.CloseSettlementError:
+		if semantic {
+			return closeErrorPart(err.SemanticErr, semantic)
+		}
+		return closeErrorPart(err.Cause, semantic)
+	case interface{ Unwrap() []error }:
+		children := err.Unwrap()
+		parts := make([]error, len(children))
+		for i, child := range children {
+			parts[i] = closeErrorPart(child, semantic)
+		}
+		return errors.Join(parts...)
+	case interface{ Unwrap() error }:
+		return closeErrorPart(err.Unwrap(), semantic)
+	default:
+		return err
+	}
+}
+
+func lowerCloseSettlement(err error) *storage.CloseSettlementError {
+	var lower *storage.CloseSettlementError
+	if !errors.As(err, &lower) {
 		return nil
 	}
-	return err
+	state, cause := lower.State, closeErrorPart(lower.Cause, false)
+	if invalid := lower.Check(); invalid != nil {
+		state = storage.CloseSettlementUnknown
+		cause = errors.Join(cause, fmt.Errorf("invalid lower close settlement: %w", invalid), syscall.EIO)
+	}
+	return &storage.CloseSettlementError{State: state, SemanticErr: persistentCloseError(err), Cause: cause}
+}
+
+func settledAuthorityBarrier(barrier *httprest.MutationBarrier, err error) *httprest.MutationBarrier {
+	var lower *storage.CloseSettlementError
+	if errors.As(err, &lower) {
+		return nil
+	}
+	return barrier
 }
 
 func replayHistoricalClose(ctx context.Context, remote closeActionBarrier, attempt storage.CloseAttempt) (storage.ReferenceCloseResult, error) {
 	result, _, err := remote.CloseWithActionAndBarrier(ctx, attempt)
 	if result.Released {
-		return result, errors.Join(err, fmt.Errorf("historical close replay contradicts a later attempt: %w", syscall.EIO))
+		return result, &storage.CloseSettlementError{
+			State: storage.CloseSettlementUnknown, SemanticErr: persistentCloseError(err),
+			Cause: errors.Join(closeErrorPart(err, false), fmt.Errorf("historical close replay contradicts a later attempt: %w", syscall.EIO)),
+		}
 	}
 	return result, errors.Join(err, result.Check(err))
 }
@@ -224,7 +275,10 @@ func (c *retainedClose) close(ctx context.Context, session *fileSession, remote 
 				return replayHistoricalClose(ctx, remote.(closeActionBarrier), *attempt)
 			}
 			c.mu.Unlock()
-			result, _, err := remote.(closeActionBarrier).CloseWithActionAndBarrier(ctx, *attempt)
+			result, barrier, err := remote.(closeActionBarrier).CloseWithActionAndBarrier(ctx, *attempt)
+			if result.Released {
+				_, err = session.base.confirmReleasedClose(ctx, "close-"+kind, barrier, err)
+			}
 			return result, errors.Join(err, result.Check(err))
 		}
 		if attempt != nil && c.closeAttemptSet && c.closeAttempt != *attempt {
@@ -529,7 +583,10 @@ func (c *retainedClose) close(ctx context.Context, session *fileSession, remote 
 		}
 	}
 	if previous.Released && !result.Released {
-		return previous, errors.Join(previousOriginalErr, authorityErr, fmt.Errorf("released %s close lost barrier replay: %w", kind, syscall.EIO))
+		return previous, &storage.CloseSettlementError{
+			State: storage.CloseSettlementUnknown, SemanticErr: persistentCloseError(previousOriginalErr),
+			Cause: errors.Join(closeErrorPart(authorityErr, false), fmt.Errorf("released %s close lost barrier replay: %w", kind, syscall.EIO)),
+		}
 	}
 	rawAuthorityErr := authorityErr
 	if previous.Released && previousBarrier == nil {
@@ -598,7 +655,7 @@ func (c *retainedClose) close(ctx context.Context, session *fileSession, remote 
 	settled, err := session.base.confirmReleasedClose(ctx, "close-"+kind, barrier, authorityErr)
 	c.mu.Lock()
 	c.closeResult = result
-	c.closeBarrier = barrier
+	c.closeBarrier = settledAuthorityBarrier(barrier, authorityErr)
 	c.closeAuthorityErr = rawAuthorityErr
 	if !previous.Released {
 		c.closeOriginalErr = rawAuthorityErr

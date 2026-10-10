@@ -8,6 +8,10 @@
 
 `FileSession` 拥有有限时长、文件与节点引用、在途操作、use owner、范围动作历史和文件动作历史。`OpenFile` 以路径解析目标，`OpenNode` 直接使用节点 ID；`OpenAt` 以 `ChildSelection` 在一个目录身份下原子选择普通文件；`OpenNodeRef` 与同样接受 `ChildSelection` 的 `OpenChildRef` 返回没有字节方法的 `NodeReference`。`StatNode` 与 `SetNodeAttr` 继续提供短调用形式。路径变化不改变已经返回的 File 或 NodeReference。打开不读取完整内容，也不自动取得 advisory range 或 S/X grant。
 
+`BackendIdentity` 在不建立 FileSession 的情况下返回 `BackendIdentityResult{Volume, Authority, RootNodeID}`。Volume 是持久存储身份，不是路径或授权 label；Authority 是共享排序域的当前 incarnation；RootNodeID 是该 volume 的固定根身份。SQLite 从已验证的数据库 ID 与 root NodeID 组成 Volume，并为共享 `fileDomain` 分配密码学随机 Authority；重新建立排序域使用新 incarnation，不改变持久 Volume，也不增加 schema。getter 在原生所有权、健康或当前根无法验证时失败。
+
+`FileSessionIdentity` 返回创建 session 时捕获的同一 Backend descriptor 与 `SessionEpoch`。getter 重新核对当前 backend descriptor；SessionEpoch 必须等于该 session 的 `Status.Epoch`。wrappers 和 HTTP 逐层传递并验证完整 tuple，不能用每个 session 的随机值冒充共享 Authority。`StableReferenceIdentity` 的完整链预检承诺 OpenAt、OpenNodeRef 和 OpenChildRef 返回的引用都实现 `ReferenceIdentity`，包括 error 与非 nil 引用同时返回的清理责任；ReferenceNodeID 非零、不可变，引用退休后仍保留。
+
 | 打开条件 | 权威结果 |
 |---|---|
 | `ExpectedID` 与实际目标不符，或 `OpenNode` 的身份已不存在 | `ESTALE`，不改用同名新节点 |
@@ -21,11 +25,15 @@
 
 `FileOpenOptions` 嵌入 `storage.OpenAccess`，共享 Read、Write、Create、Truncate、Exclusive 五项打开意图；ExpectedID、InitialMetadata 与 Use 是旧路径打开的参数。`OpenAtOptions` 另用 Keep、ResetContent、ReplaceNode 表达已有目标效果，按实际分支应用 initial fields。`ChildSelection` 的 guards、创建与排他判断、目标身份与 metadata 条件、清空或替换、Use claim、关闭删除义务、返回 Attr/Outcome 和引用保留属于同一次权威结果。
 
-打开自动把 Read/Write 转为 `ReadData` / `WriteData`，再与显式 Use 合并。`UseClaim{Uses,Deny}` 与同一节点上的其它 claim 双向比较；任一 Deny 与对方 Uses 相交时，新打开在取得引用前以冲突失败。Use 不授予 File 方法、业务权限或 Strong proof。
+旧路径打开自动把 Read/Write 转为 `ReadData` / `WriteData`，再与显式 Use 合并。OpenAt 要求 `Read ⇒ Uses.ReadData`、`Write ⇒ Uses.WriteData`；额外的 Use 可以声明非字节访问的冲突关系。`UseClaim{Uses,Deny}` 与同一节点上的其它 claim 双向比较；任一 Deny 与对方 Uses 相交时，新打开在取得引用前以冲突失败。Use 不授予 File 方法、业务权限或 Strong proof。
+
+`OpenAtOptions.MetadataAccess` 独立控制 File 的属性／metadata 读取与修改；零值不授予这两类权限，Read、Write 和 Uses 也不隐含它们。原子打开结果本身仍返回同次捕获的 Attr，不需要另一次 Stat。`OpenMetadataAccess` 在 FileSession 上预检整个链是否保持这项区分。旧路径 OpenFile/OpenNode 保留其已有 metadata 访问语义；Truncate 只依赖字节写权。
 
 `NodeReference` 只提供属性、Scope、State 与关闭；它不提供 ReadAt、WriteAt 或 Truncate。`NodeRefOptions.MetadataAccess` 控制属性与 metadata 权限，Use 可声明 ReadData／WriteData 以参与其它入口的兼容性检查，但不会据此增加字节方法。NodeReference 编译期包含 `ScopedReference` 与 `ReferenceStateAccess`，因此通过 `NodeReferences` preflight 后不会在取得目录引用后才以 `EOPNOTSUPP` 拒绝 Scope 或 State。
 
-`FileSession`、`File` 和 `NodeReference` 的 `CloseWithResult` 返回 `ReferenceCloseResult{Released, Determined}` 与错误。`Released=true` 本身确认引用已释放；旧实现可能未设置 `Determined`，action-aware 实现也将它设为 true。删除义务的语义错误可以和该释放事实共存。仅当 `Released=false` 时，`Determined=true` 表示 authority 已证明原引用、pin、Use claim 和容量仍保留，调用方可以发起下一次关闭；`Released=false, Determined=false` 表示结果未知，只能继续核对原尝试。`Close` 是只返回错误的便利入口，遵守同一生命周期。包装层和 HTTP 保留完整结果，不根据错误类型、断线或取消推断释放。
+`FileSession`、`File` 和 `NodeReference` 的 `CloseWithResult` 返回 `ReferenceCloseResult{Released, Determined}` 与错误。FileSession 的肯定 Released 覆盖其拥有的全部子引用；结合完整链已结算事实，它可作为已停止并排空 parent 的责任终结证明，不提供逐 action 成功／未执行结论。`Released=true` 本身确认引用已释放；旧实现可能未设置 `Determined`，action-aware 实现也将它设为 true。删除义务的语义错误可以和该释放事实共存。仅当 `Released=false` 时，`Determined=true` 表示 authority 已证明原引用、pin、Use claim 和容量仍保留，调用方可以发起下一次关闭；`Released=false, Determined=false` 表示结果未知，只能继续核对原尝试。`Close` 是只返回错误的便利入口，遵守同一生命周期。包装层和 HTTP 保留完整结果，不根据错误类型、断线或取消推断释放。
+
+每个已确认释放、但完整 adapter 链尚未结算的返回都携带中立 `CloseSettlementError{State, SemanticErr, Cause}`。Pending 表示已知结算工作未完成，Unknown 表示必要证据无法取得；两者都续作原关闭尝试。SemanticErr 保存原生语义错误，Cause 保存暂时的结算错误，错误链保留两者。结算完成后移除 marker，只返回原 SemanticErr；marker 缺席表示结算已确认，即使仍有语义错误。CloseOwnerStatus 的 Released 与 action receipt 的 Completed 均不能单独证明 settlement。
 
 `ReferenceCloseActions` 在 File 和 NodeReference 上提供 `CloseWithAction(ctx, CloseAttempt{Action, Generation})` 及 `QueryCloseAttempt`；后者只返回动作状态，不含释放事实或原语义错误。第一次 generation 为 1。相同 generation 和 action ID 的已确定结果重投返回原 close 结果。Unknown 的同 ID 重投可以安全重新进入 native close，以 `finalizationDone`、严格 claim 核对和引用释放 fence 结算原尝试；不得重复权威删除或释放效果。只有确定未释放才能递增 generation 并以新 ID 再试。未知结果换 ID、无未执行证明的新 ID 冒用旧 generation、旧 ID 过期后重新执行都被拒绝。只有新显式尝试的 ID 落后于当前清理 epoch、且在回执准入及引用效果前返回 `CloseActionNotExecutedError{CurrentEpoch}`，调用方才可在原 generation 用当前 epoch 的新 ID 再试。未来 epoch ID 以 `EINVAL` 拒绝且不占回执；普通 `ESTALE` 或取消不构成证明。缺失的旧 epoch ID 在清理 epoch 前进后查询为 Retired，不会重新形成关闭效果。`RecoverableReferenceClose.CheckRecoverableReferenceClose` 在 FileSession 上验证完整包装链和打开前保留的关闭回执容量；每份可能成功的引用至少保留两次尝试，另为 session-close 保留额度。普通数据动作历史或会话数据准入饱和不占用这些保留位置。已释放后若 mutation barrier 未确认，同一动作只继续结算 barrier；引用不会重新变为可用。
 
@@ -43,6 +51,8 @@ advisory session 的普通 `Status`／历史在退休后仍拒绝；仅 `WithClo
 
 | 接口 | 当前责任 |
 |---|---|
+| `BackendIdentity` / `FileSessionIdentity` | 验证持久 volume、共享 authority incarnation、固定根与 session epoch 的实际绑定 |
+| `StableReferenceIdentity` / `OpenMetadataAccess` | 在打开效果前保证不可变引用身份和独立 metadata 权限贯穿完整链 |
 | `AtomicFileOpener` | 按带可选 namespace guards 的子项选择原子打开、创建、清空或替换普通文件 |
 | `NamespaceAccess` | 按父 NodeID/Scope 执行 LookupAt 与 MutateName |
 | `DirectoryReader` | 按 DirectoryTarget 执行完整、有界、身份绑定的应用枚举 |
@@ -52,6 +62,7 @@ advisory session 的普通 `Status`／历史在退休后仍拒绝；仅 `WithClo
 | `ReferenceIdentity` / `ReferenceNameObserver` | 核对保留引用的固定 NodeID，并观察 Root、Linked 或 Detached 当前绑定 |
 | `FileActions` | 核对 session 内有限 action receipt，按持久 owner 查询、分页发现并显式 ACK durable 删除终态 |
 | `ReferenceCloseActions` / `RecoverableReferenceClose` | 对精确引用按 action ID 与 generation 关闭，读取绑定引用的清理状态，并在可能成功的打开之前验证清理回执保留 |
+| `InlineCloseSettlement` | 保证 session/ref 的 Released 结果已在完整链内结算；用于 HTTP server 的 CloseRecovery 宣告 |
 | `MetadataAccess` | 按 NodeID 对一个 metadata namespace 作 CAS |
 | `ReferenceMetadataAccess` | 通过保留 File 对一个 metadata namespace 作 CAS |
 | `UseOwners` | 以有效 File scope 注册和退役 range owner |
@@ -172,13 +183,19 @@ FUSE 将 `flock` 映射到 whole-file domain，将传统 POSIX `fcntl` 映射到
 
 HTTP 文件请求先执行[业务授权](authorization.md)，再读取或触碰 Session、File、NodeReference、动作历史或 durable intent。OpenAt/OpenNodeRef/OpenChildRef 先授权自身 Operation 和导出的 OpenAccess，再按固定顺序授权实际包含的 remove、set-attr、set-metadata 或 set-pending 效果；全部允许后 native action 才执行。LookupAt、ReadDirNode、ObserveDirectoryMetadata、ObserveName、MutateName、条件 mutation、pending set/clear、action query、intent list/query/ACK 分别使用自己的规范 Operation。已有 bearer 引用、owner、action ID 或 durable intent ID 都不能绕过当前请求授权；authority 自主完成已经接受的固定删除效果时不重新解释成外部请求。
 
-HTTP v5 统一转发基础 volume、中立 Attr、metadata、文件引用、目录／名字观察、range 和强 S/X。请求的 `op` 直接使用 `storage.Operation` 的规范值；二进制内容、原始叶名、revision、metadata version 和 payload 使用 canonical base64。`file.open-at` 与 `file.open-child-ref` 保留既有顶层 `child` 并接受可选顶层 `guards`，server 把二者组装为 `ChildSelection`。协议拒绝未知、重复、缺席、null 或无关字段，所有结果都携带 v5 marker 与封闭 errno 词汇；v3 路由不提供兼容旁路。
+HTTP v5 统一转发基础 volume、中立 Attr、metadata、文件引用、目录／名字观察、range 和强 S/X。请求的 `op` 直接使用 `storage.Operation` 的规范值；二进制内容、原始叶名、revision、metadata version 和 payload 使用 canonical base64。`file.open-at` 与 `file.open-child-ref` 保留既有顶层 `child` 并接受可选顶层 `guards`，server 把二者组装为 `ChildSelection`；OpenAt options 必须显式携带 lower-camel `metadataAccess`，零值按无权限处理。协议拒绝未知、重复、缺席、null 或无关字段，所有结果都携带 v5 marker 与封闭 errno 词汇；v3 路由不提供兼容旁路。
+
+`file.backend-identity` 是 `/v5/file-control` 上不要求 session capability 的只读操作，先独立授权，再查询 handler 实际注册的 backend；成功响应携带 backend descriptor，transport epoch 固定为零。session-open 响应在 `sessionIdentity` capability 为 true 时携带独立 lower-camel DTO：`sessionIdentity{backend{volume,authority,rootNodeId},sessionEpoch}`；两端验证完整值，client 再核对 SessionEpoch 与 status epoch。该 descriptor 不回显 HandlerOptions.Volume，也不从 URL 推导存储身份。
 
 delete-intent query 使用顶层 `deleteOwner` 与 `deleteIntent`，list 使用 `deleteOwner`、`deleteAfter` 与 `deleteLimit`，ACK 命令携带 `owner`、`intent` 与 `action`。CloseIntent 的嵌套值也携带 `owner`。这些字段在访问持久账本前验证，HTTP 的 list、query 和 ACK 分别授权；同一个 owner 的页游标可跨 authority 重启继续使用。
 
-server 的 session 能力宣告 AtomicOpen、Namespace、References、FileActions、CloseRecovery、Metadata、Owners、Ranges 与 DirectoryMetadata；DirectoryMetadata 只在 DirectoryReader 和 DirectoryMetadataObserver 的完整 backing chain 都可用时为 true。remote client 用这个 bit 同时 gate ReadDirNode 与 ObserveDirectoryMetadata，Namespace bit 只覆盖 LookupAt 与 MutateName。File 与 NodeReference 按实际方法宣告 Metadata、Scope、State、Delete、Conditional 与 ReferenceName；CloseRecovery 只有原生 session 与每份引用的完整关闭链都可恢复时才宣告。v5 client 只在对应 bool 为 true 时暴露可选接口，任意未知 capability 字段仍是协议错误。
+server 的 session 能力宣告 AtomicOpen、Namespace、References、FileActions、CloseRecovery、Metadata、Owners、Ranges、DirectoryMetadata、SessionIdentity、StableIdentity 与 OpenMetadata，wire 使用 lower-camel bool。DirectoryMetadata 只在 DirectoryReader 和 DirectoryMetadataObserver 的完整 backing chain 都可用时为 true。remote client 用这个 bit 同时 gate ReadDirNode 与 ObserveDirectoryMetadata，Namespace bit 只覆盖 LookupAt 与 MutateName。File 与 NodeReference 按实际方法宣告 Metadata、Scope、State、Delete、Conditional 与 ReferenceName；StableIdentity 另承诺两类引用的稳定 ReferenceNodeID，client 即使未取得 ReferenceName 也验证返回身份。v5 client 只在对应 bool 为 true 时暴露可选接口，任意未知 capability 字段仍是协议错误。
+
+HTTP handler 只有在原生 session 通过 RecoverableReferenceClose 和 InlineCloseSettlement 的完整链检查时宣告 CloseRecovery。InlineCloseSettlement 保证 session/ref 的 CloseWithResult 和引用 CloseWithAction 一旦报告 Released，下游已无待结算责任。SQLite 提供该保证，objectstore、locked 与 limited 逐层检查；HTTP client 与 replicated 返回 `EOPNOTSUPP`。因此在 HTTP server 下嵌入仍有 downstream barrier 的链不能宣告可恢复关闭。普通 native → HTTP client → replica 链继续通过中立 settlement marker 向 SMB 保留结算责任；SMB 不要求 inline settlement。
 
 OpenAt、OpenNodeRef 与 OpenChildRef response 携带 storage action 捕获的 node 与 outcome；旧 Open/OpenNode 保留原有 transport journal 与 ACK 形状，不因此取得 storage `FileActionID`。`file.close` 与 `file.session-close` 的请求携带 `closeGeneration`。显式 `CloseWithAction` 的 caller action ID 贯穿 HTTP 与 native；隐式 `CloseWithResult` 使用独立 HTTP transport ID，server 调用 native `CloseWithResult`；内置 objectstore 自行持有清理 ID。显式新动作的 ID 落后于 native 清理 epoch 且无效果时，错误体的 `closeNotExecutedEpoch` 传回可信当前 epoch；未来 epoch 直接 `EINVAL`。client 对当前清理 epoch 的新候选 ID，在提交本地 cursor 前执行绑定原引用的 `QueryCloseAttempt`，只有精确 NotExecuted 才继续。旧 epoch 候选由 server 的效果前 typed 未执行证明结算；其它拒绝或查询故障保留有界待核对状态，只有同 ID 绑定查询得到 NotExecuted 才撤销暂存的本地候选。未执行证明在本地按 History 保留后裁剪，server 对原 ID 保留证明时同时保存其 `proofEpoch`，同 ID 重投不会被后来的引用释放改写为另一结果。响应携带 `closeResult.released`、`closeResult.determined`、`closeResult.barrierPending` 与可选清理 barrier。`released=true` 且 `barrierPending=true` 只出现在无 barrier 的错误响应中：引用已经释放，但已发生的名字效果尚未取得 mutation barrier；client 以 `CloseBarrierPendingError` 保留原错误链、同一 ActionID 和 generation，后续 CloseWithAction 或 CloseWithActionAndBarrier 重投并等待确认，不能把引用重新交给调用方或报告确认成功。再次传输失败仍保留已确认的释放事实、原语义错误和待核对动作。`barrierPending=false` 是最终结果，无 Log 时可以没有 barrier；原生关闭的语义错误仍如实返回。client 不能从 errno 或 `QueryFileAction` 的 Completed 推导 barrier 状态。client 必须验证新原子打开的引用身份与原 action 一致，不能用一次新的 Stat 填补缺失字段。
+
+内部 `file.session-release-result` 在 `/v5/file-control` 读取确切 session capability 的已保留父释放事实，不接受 action 或 generation，业务语义映射现有 OpFileSessionClose。server 在实际 raw close 返回有效 Released 且完整链 InlineCloseSettlement 通过时记录 releaseFact；终态继续使用原 expires，保存原 releaseErr。查询只在记录存在且未到期、父释放已验证时返回 Released，并重新取得 server barrier；没有新 action/receipt、TTL refresh、native Close 或逐动作结果合成。记录缺失／到期为 ESTALE，未验证为不支持，handler 已关闭或 barrier 不可证实仍报错。HTTP client 仅在隐式 FileSession.CloseWithResult 的原精确动作路径返回 ESTALE 且缺失 typed close result 时使用这个投影；显式 CloseWithAction、QueryFileAction 与 CloseOwnerStatus 不因它改变原回执语义。父证明的 Released 与原 releaseErr 保持独立，不能因语义错误丢弃肯定释放，也不能在 barrier 未结算时终结完整责任。
 
 `file.close-owner-status` 是独立的 `/v5/file-control` 读取：请求携带原 session 与确切 file capability，响应的 `closeOwnerStatus` 用独立 lower-camel DTO 编码中立值：`released`、`ready`、可选 `current`（`action`、`generation`）、`currentOutcome`、`nextGeneration` 和 `currentEpoch`；两端按 `CloseOwnerStatus.Check()` 验证组合。每次外部查询先执行 `OpFileCloseOwnerStatus` 授权；保留引用的窄清理通道在 session 普通数据准入退休后仍能回答，不能通过全局 `FileSession.Status`、旧路径或仅凭 action ID 重建 owner。会话转为 terminal 后，只有该 file capability 的已确认释放回执仍在期限内，才能回答 `Released=true`；其它状态返回失效。回执与身份核对仍受该引用以及 HTTP registry 的有界清理容量约束。
 

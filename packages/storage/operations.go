@@ -22,6 +22,7 @@ const (
 	OpReplicationSnapshot         Operation = "replication.snapshot"
 	OpReplicationCheckpoint       Operation = "replication.checkpoint"
 	OpFileSessionOpen             Operation = "file.session-open"
+	OpFileBackendIdentity         Operation = "file.backend-identity"
 	OpFileStatus                  Operation = "file.status"
 	OpFileRenew                   Operation = "file.renew"
 	OpFileSessionClose            Operation = "file.session-close"

@@ -112,6 +112,11 @@ func (s *fileSession) AcknowledgeDeleteIntent(ctx context.Context, command stora
 }
 
 func (s *fileSession) OpenAt(ctx context.Context, selection storage.ChildSelection, options storage.OpenAtOptions) (storage.OpenResult, error) {
+	if options.MetadataAccess != 0 {
+		if err := s.CheckOpenMetadataAccess(); err != nil {
+			return storage.OpenResult{}, err
+		}
+	}
 	return sessionCapability(ctx, s, true, func(ctx context.Context, capability httprest.AtomicFileOpenerWithBarrier) (storage.OpenResult, error) {
 		var result storage.OpenResult
 		err := s.confirm(ctx, "open-at", func(ctx context.Context) (*httprest.MutationBarrier, error) {
@@ -137,9 +142,10 @@ func nilReference(reference any) bool {
 	}
 }
 
-func (s *fileSession) closeFailedOpenFile(ctx context.Context, native storage.File) (storage.ReferenceCloseResult, bool, error) {
+func (s *fileSession) closeFailedOpenFile(ctx context.Context, native storage.File, originalErr error) (storage.ReferenceCloseResult, bool, error) {
 	if remote, ok := native.(httprest.FileWithBarrier); ok {
 		result, barrier, err := remote.CloseWithBarrier(ctx)
+		err = errors.Join(originalErr, err)
 		if !result.Released {
 			return result, false, errors.Join(err, result.Check(err))
 		}
@@ -147,12 +153,19 @@ func (s *fileSession) closeFailedOpenFile(ctx context.Context, native storage.Fi
 		return result, settled, err
 	}
 	result, err := native.CloseWithResult(ctx)
+	err = errors.Join(originalErr, err)
+	if result.Released {
+		if lower := lowerCloseSettlement(err); lower != nil {
+			return result, false, errors.Join(lower, result.Check(lower))
+		}
+	}
 	return result, result.Released, errors.Join(err, result.Check(err))
 }
 
-func (s *fileSession) closeFailedOpenReference(ctx context.Context, native storage.NodeReference) (storage.ReferenceCloseResult, bool, error) {
+func (s *fileSession) closeFailedOpenReference(ctx context.Context, native storage.NodeReference, originalErr error) (storage.ReferenceCloseResult, bool, error) {
 	if remote, ok := native.(httprest.NodeReferenceWithBarrier); ok {
 		result, barrier, err := remote.CloseWithBarrier(ctx)
+		err = errors.Join(originalErr, err)
 		if !result.Released {
 			return result, false, errors.Join(err, result.Check(err))
 		}
@@ -160,30 +173,36 @@ func (s *fileSession) closeFailedOpenReference(ctx context.Context, native stora
 		return result, settled, err
 	}
 	result, err := native.CloseWithResult(ctx)
+	err = errors.Join(originalErr, err)
+	if result.Released {
+		if lower := lowerCloseSettlement(err); lower != nil {
+			return result, false, errors.Join(lower, result.Check(lower))
+		}
+	}
 	return result, result.Released, errors.Join(err, result.Check(err))
 }
 
 func (s *fileSession) cleanupFailedOpenFile(native storage.File, failure error) (storage.File, error) {
 	cleanup, done := s.base.fileCleanupContext()
 	defer done()
-	result, settled, closeErr := s.closeFailedOpenFile(cleanup, native)
+	result, settled, closeErr := s.closeFailedOpenFile(cleanup, native, nil)
 	if settled {
 		return nil, errors.Join(failure, closeErr)
 	}
-	return newFailedOpenFile(failure, result, func(ctx context.Context) (storage.ReferenceCloseResult, bool, error) {
-		return s.closeFailedOpenFile(ctx, native)
+	return newFailedOpenFile(native, failure, result, closeErr, func(ctx context.Context, originalErr error) (storage.ReferenceCloseResult, bool, error) {
+		return s.closeFailedOpenFile(ctx, native, originalErr)
 	}), errors.Join(failure, closeErr)
 }
 
 func (s *fileSession) cleanupFailedOpenReference(native storage.NodeReference, failure error) (storage.NodeReference, error) {
 	cleanup, done := s.base.fileCleanupContext()
 	defer done()
-	result, settled, closeErr := s.closeFailedOpenReference(cleanup, native)
+	result, settled, closeErr := s.closeFailedOpenReference(cleanup, native, nil)
 	if settled {
 		return nil, errors.Join(failure, closeErr)
 	}
-	return newFailedOpenReference(failure, result, func(ctx context.Context) (storage.ReferenceCloseResult, bool, error) {
-		return s.closeFailedOpenReference(ctx, native)
+	return newFailedOpenReference(native, failure, result, closeErr, func(ctx context.Context, originalErr error) (storage.ReferenceCloseResult, bool, error) {
+		return s.closeFailedOpenReference(ctx, native, originalErr)
 	}), errors.Join(failure, closeErr)
 }
 

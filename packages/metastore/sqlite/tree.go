@@ -218,46 +218,49 @@ func (s *Store) listChildrenBounded(ctx context.Context, tx *sql.Tx, parent int6
 	return s.listChildrenBoundedChecked(ctx, tx, parent, result, nil)
 }
 
-func (s *Store) listChildrenBoundedChecked(ctx context.Context, tx *sql.Tx, parent int64, result *storage.ListResult, check childReservationCheck) error {
+func (s *Store) listChildrenBoundedChecked(ctx context.Context, tx *sql.Tx, parent int64, result *storage.ListResult, check childReservationCheck) (returned error) {
 	if err := s.validateListedChildren(ctx, tx, parent); err != nil {
 		return err
 	}
 	rows, err := tx.QueryContext(ctx,
-		`SELECT length(CAST(e.name AS BLOB)), `+nodeAttrColumns+` FROM entries e JOIN nodes n ON n.id = e.node
+		`SELECT length(CAST(e.name AS BLOB)),
+		 CASE WHEN typeof(e.name)='blob' AND length(e.name)>0 AND
+		 e.name NOT IN (X'2e', X'2e2e') AND instr(e.name, X'2f')=0 AND instr(e.name, X'00')=0
+		 THEN 1 ELSE 0 END, `+nodeAttrColumns+` FROM entries e JOIN nodes n ON n.id = e.node
 		 WHERE e.volume = ? AND e.parent = ? ORDER BY e.name`,
 		s.volume, parent)
 	if err != nil {
 		return err
 	}
+	defer func() { returned = errors.Join(returned, rows.Close()) }()
 	reserved := []reservedChild{}
 	for rows.Next() {
 		var (
 			nameBytes int64
+			validName int64
 			node      nodeAttrScan
 		)
-		if err := rows.Scan(append([]any{&nameBytes}, node.fields()...)...); err != nil {
-			rows.Close()
+		if err := rows.Scan(append([]any{&nameBytes, &validName}, node.fields()...)...); err != nil {
 			return err
+		}
+		if validName != 1 {
+			return syscall.EIO
 		}
 		value, err := node.node()
 		if err != nil {
-			rows.Close()
 			return err
 		}
 		if err := s.validateLoadedNode(value); err != nil {
-			rows.Close()
 			return err
 		}
 		attr := value.Attr()
 		if check != nil {
 			if err := check(len(reserved), nameBytes, node.metadataBytes, attr); err != nil {
-				rows.Close()
 				return err
 			}
 		}
 		reservation, err := result.Reserve(nameBytes, node.metadataBytes, attr)
 		if err != nil {
-			rows.Close()
 			return err
 		}
 		reserved = append(reserved, reservedChild{
@@ -265,60 +268,56 @@ func (s *Store) listChildrenBoundedChecked(ctx context.Context, tx *sql.Tx, pare
 		})
 	}
 	if err := rows.Err(); err != nil {
-		rows.Close()
 		return err
 	}
 	if err := rows.Close(); err != nil {
 		return err
 	}
 
-	for _, child := range reserved {
-		name, err := s.reservedName(ctx, tx, parent, child)
-		if err != nil {
+	return s.loadReservedChildren(ctx, tx, parent, reserved)
+}
+
+// The payload cursor uses the same row set and snapshot as the completed header
+// pass. Every BLOB it can materialize already has a reservation; a second snapshot
+// would let a concurrent rename or replacement escape that accounting.
+func (s *Store) loadReservedChildren(ctx context.Context, tx *sql.Tx, parent int64, reserved []reservedChild) (returned error) {
+	rows, err := tx.QueryContext(ctx, `SELECT e.node, e.name, n.metadata
+		FROM entries e JOIN nodes n ON n.id=e.node
+		WHERE e.volume=? AND e.parent=? ORDER BY e.name`, s.volume, parent)
+	if err != nil {
+		return err
+	}
+	defer func() { returned = errors.Join(returned, rows.Close()) }()
+	index := 0
+	for rows.Next() {
+		if index >= len(reserved) {
+			return fmt.Errorf("directory %d returned an unreserved child: %w", parent, syscall.EIO)
+		}
+		var node int64
+		var name, metadata []byte
+		if err := rows.Scan(&node, &name, &metadata); err != nil {
 			return err
 		}
-		var metadata []byte
-		if err := tx.QueryRowContext(ctx,
-			`SELECT metadata FROM nodes WHERE volume=? AND id=? AND length(metadata)=?`,
-			s.volume, child.node, child.metadataBytes).Scan(&metadata); err != nil {
-			return err
+		child := reserved[index]
+		if node != child.node || int64(len(name)) != child.nameBytes || int64(len(metadata)) != child.metadataBytes {
+			return fmt.Errorf("directory %d returned a different reserved child at index %d: %w", parent, index, syscall.EIO)
 		}
 		values, err := storage.DecodeMetadata(metadata)
 		if err != nil {
 			return err
 		}
-		if err := child.reservation.Commit(name, values); err != nil {
+		if err := child.reservation.Commit(string(name), values); err != nil {
 			return err
 		}
+		index++
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if index != len(reserved) {
+		return fmt.Errorf("directory %d returned %d reserved children, want %d: %w", parent, index, len(reserved), syscall.EIO)
 	}
 	return nil
-}
-
-func (s *Store) reservedName(ctx context.Context, tx *sql.Tx, parent int64, child reservedChild) (string, error) {
-	var total, matching int64
-	if err := tx.QueryRowContext(ctx, `
-		SELECT count(*), coalesce(sum(
-			parent = ? AND length(CAST(name AS BLOB)) = ? AND typeof(name) = 'blob' AND
-			length(name) > 0 AND name NOT IN (X'2e', X'2e2e') AND
-			instr(name, X'2f') = 0 AND instr(name, X'00') = 0
-		), 0)
-		FROM entries WHERE volume = ? AND node = ?`,
-		parent, child.nameBytes, s.volume, child.node).Scan(&total, &matching); err != nil {
-		return "", err
-	}
-	if total != 1 || matching != 1 {
-		return "", fmt.Errorf(
-			"node %d has %d entries, of which %d match its reserved parent and name: %w",
-			child.node, total, matching, syscall.EIO,
-		)
-	}
-	var name []byte
-	if err := tx.QueryRowContext(ctx,
-		`SELECT name FROM entries WHERE volume = ? AND node = ?`,
-		s.volume, child.node).Scan(&name); err != nil {
-		return "", err
-	}
-	return string(name), nil
 }
 
 func (s *Store) listChildren(ctx context.Context, tx *sql.Tx, parent int64) ([]metastore.Child, error) {

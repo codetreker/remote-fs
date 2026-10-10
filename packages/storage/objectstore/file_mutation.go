@@ -25,6 +25,9 @@ func (f *openFile) MutateFile(ctx context.Context, command storage.FileMutation)
 	if err := command.CheckDataLimit(f.session.options.MaxFileSize); err != nil {
 		return storage.Attr{}, err
 	}
+	if (command.Kind == storage.MutateAttributes || !command.Attr.Empty() || len(command.Metadata) != 0) && f.metadata&storage.WriteMetadata == 0 {
+		return storage.Attr{}, syscall.EBADF
+	}
 	target, err := f.session.referenceActionTarget(ctx, f)
 	if err != nil {
 		return storage.Attr{}, err

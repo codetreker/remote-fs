@@ -6,7 +6,7 @@ Status: proposed
 
 Windows 的 delete-on-close 不是一次在 CLOSE 到达时才临时发起的按名删除。CREATE 已接受关闭删除时，删除授权、目标对象和名字关联必须固定；发起句柄后来显式关闭、连接丢失或宿主终止，都可能触发义务。其它已经允许删除共享的句柄仍可持有原对象，名字必须等最后相关句柄结束才移除。若响应丢失或宿主重启，单靠内存 FileId 既无法判断原义务是否已接受，也无法安全清理；对同名路径再执行删除可能伤害替代物。
 
-本提案落实 [Windows 网络驱动器总方案](2026-09-16-windows-network-drive-support.md)的 7.6，并依赖 [有界 CREATE/CLOSE 提案](2026-09-28-smb-bounded-create-close.md)的 FileId、引用及 cleanup owner。要求来自 [R-FS-6、R-FS-8、R-WIN-7](../../../../docs/spec/requirements.md)。普通 SET_INFO disposition 和显式按名删除属于 [名字修改提案](2026-09-28-smb-guarded-name-mutation.md)。
+本提案落实 [Windows 网络驱动器总方案](2026-09-16-windows-network-drive-support.md)的 7.6，并依赖 [有界 CREATE/CLOSE](../../implemented/feature/2026-09-28-smb-bounded-create-close.md)的 FileId、引用及 cleanup owner。要求来自 [R-FS-6、R-FS-8、R-WIN-7](../../../../docs/spec/requirements.md)。普通 SET_INFO disposition 和显式按名删除属于 [名字修改提案](2026-09-28-smb-guarded-name-mutation.md)。
 
 ## 提案
 

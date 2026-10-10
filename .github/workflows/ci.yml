@@ -200,8 +200,9 @@ jobs:
 
   windows-sspi:
     name: native Windows SSPI tests
-    # This hosted label is Windows Server 2025. It exercises the native SSPI API,
-    # not the Windows 11 redirector or WNet acceptance owned by later work.
+    # This hosted label is Windows Server 2025. It exercises native SSPI and ordinal
+    # name APIs plus portable SMB/wire tests. Windows 11 redirector and WNet
+    # acceptance belongs to later work.
     # https://github.com/actions/runner-images/blob/9d7eec51794bb688d6c7ce00550cda5a134c88a3/README.md#available-images
     runs-on: windows-2025
     timeout-minutes: 10
@@ -216,3 +217,7 @@ jobs:
 
       - name: Vet the native SSPI adapter
         run: go vet ./packages/smb/windows
+
+      - name: Test native Windows names and portable SMB protocol
+        shell: bash
+        run: .github/scripts/assert-every-test-ran.sh -race -count=1 -timeout 10m ./packages/smb ./packages/smb/internal/wire

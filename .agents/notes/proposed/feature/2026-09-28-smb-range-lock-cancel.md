@@ -6,7 +6,7 @@ Status: proposed
 
 Windows 文件句柄可以申请共享或排他的字节范围锁，也可以在等待期间取消请求。授权、实际范围 I/O、取消、关闭和响应丢失可能同时发生；只在 SMB 端点维护一张锁表，会让 Linux、SDK 和另一台 Windows 客户端绕过保护。把取消当成“未授予”又会让已经授予的锁失去本地 owner。一个 SMB LOCK 批次还可能先成功解除旧锁、再在后续获取时失败，不能把整个批次误报为原样未执行。
 
-本提案依赖 [Windows 网络驱动器总提案](2026-09-16-windows-network-drive-support.md)、[CREATE/CLOSE 句柄](2026-09-28-smb-bounded-create-close.md)和[名字修改](2026-09-28-smb-guarded-name-mutation.md)的对象身份、authority incarnation、可恢复动作和句柄退休原则，以及 `R-CC-14`、`R-WIN-7`、`R-FS-8`。本 PR 交付 LOCK、UNLOCK、异步 pending 与 CANCEL，以及同一对象上跨入口强制保护。名字操作的共享模式准入由前序名字修改工作提供；此处连接权威范围排序与已存在的共享 claim，不重新设计 CREATE。
+本提案依赖 [Windows 网络驱动器总提案](2026-09-16-windows-network-drive-support.md)、[CREATE/CLOSE 句柄](../../implemented/feature/2026-09-28-smb-bounded-create-close.md)和[名字修改](2026-09-28-smb-guarded-name-mutation.md)的对象身份、authority incarnation、可恢复动作和句柄退休原则，以及 `R-CC-14`、`R-WIN-7`、`R-FS-8`。本 PR 交付 LOCK、UNLOCK、异步 pending 与 CANCEL，以及同一对象上跨入口强制保护。名字操作的共享模式准入由前序名字修改工作提供；此处连接权威范围排序与已存在的共享 claim，不重新设计 CREATE。
 
 ## 提案
 

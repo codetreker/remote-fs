@@ -37,7 +37,7 @@ func openCloseUnlinkReference(t *testing.T, store *LockingStore, nodeReference b
 		}
 		return opened.Reference.(*retainedNodeReference).file, opened.Reference, id
 	}
-	opened, err := store.OpenAt(t.Context(), selection, storage.OpenAtOptions{
+	opened, err := store.OpenAt(t.Context(), selection, storage.OpenAtOptions{MetadataAccess: storage.ReadMetadata | storage.WriteMetadata,
 		Read: true, Create: true, Exclusive: true, Existing: storage.Keep, Action: fileAction(t),
 		Target: storage.ChildCondition{State: storage.Absent}, Use: use, CloseIntent: intent,
 	})

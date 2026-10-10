@@ -2,7 +2,9 @@ package sqlite
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"math"
@@ -423,6 +425,9 @@ func (f *retainedFile) SetAttr(ctx context.Context, change storage.AttrChange) (
 	if err := change.Check(); err != nil {
 		return metastore.FileState{}, err
 	}
+	if f.metadata&storage.WriteMetadata == 0 {
+		return metastore.FileState{}, syscall.EBADF
+	}
 	var state metastore.FileState
 	err := f.store.mutatePublication(ctx, &volumeIntent{kind: locking.SetAttrMutation, node: f.id, scope: f.scope}, func(tx *sql.Tx) error {
 		if err := f.check(); err != nil {
@@ -608,6 +613,7 @@ func (f *retainedFile) poisonCloseLocked(err error) (storage.ReferenceCloseResul
 }
 
 type fileDomain struct {
+	authority             storage.AuthorityIncarnation
 	config                advisory.Config
 	coordinator           *advisory.Coordinator
 	stores                int
@@ -625,8 +631,13 @@ func (s *Store) attachFileDomain(options Options) error {
 		if err != nil {
 			return err
 		}
+		var nonce [16]byte
+		if _, err := rand.Read(nonce[:]); err != nil {
+			return err
+		}
 		domain = &fileDomain{config: options.Advisory, coordinator: coordinator,
-			maxFiles: options.MaxRetainedFiles, maxDeleteIntents: options.MaxDeleteIntents}
+			authority: storage.AuthorityIncarnation(hex.EncodeToString(nonce[:])),
+			maxFiles:  options.MaxRetainedFiles, maxDeleteIntents: options.MaxDeleteIntents}
 		s.coordinator.domains[s.volume] = domain
 	} else if domain.config != options.Advisory || domain.maxFiles != options.MaxRetainedFiles || domain.maxDeleteIntents != options.MaxDeleteIntents {
 		return fmt.Errorf("shared SQLite volume file limits differ from its active owner: %w", syscall.EINVAL)

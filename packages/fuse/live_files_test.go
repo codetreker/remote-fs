@@ -410,9 +410,20 @@ type observedLifetimeStorage struct {
 	storage.FileStorage
 	hold     string
 	retained storage.File
+	renewal  *lifetimeRenewalGate
 	renewals atomic.Int32
 	closes   atomic.Int32
 }
+
+type lifetimeRenewalGate struct {
+	once     sync.Once
+	released sync.Once
+	entered  chan context.Context
+	release  chan struct{}
+	finished chan error
+}
+
+func (g *lifetimeRenewalGate) unblock() { g.released.Do(func() { close(g.release) }) }
 
 func (s *observedLifetimeStorage) NewFileSession(ctx context.Context, options storage.FileSessionOptions) (storage.FileSession, error) {
 	session, err := s.FileStorage.NewFileSession(ctx, options)
@@ -434,9 +445,28 @@ type observedLifetimeSession struct {
 }
 
 func (s *observedLifetimeSession) Renew(ctx context.Context) (storage.FileSessionStatus, error) {
+	var first, gateErr bool
+	if gate := s.owner.renewal; gate != nil {
+		gate.once.Do(func() {
+			first = true
+			gate.entered <- ctx
+			select {
+			case <-gate.release:
+			case <-ctx.Done():
+				gateErr = true
+			}
+		})
+	}
+	if gateErr {
+		s.owner.renewal.finished <- ctx.Err()
+		return storage.FileSessionStatus{}, ctx.Err()
+	}
 	status, err := s.FileSession.Renew(ctx)
 	if err == nil {
 		s.owner.renewals.Add(1)
+	}
+	if first {
+		s.owner.renewal.finished <- err
 	}
 	return status, err
 }
@@ -449,13 +479,13 @@ func (s *observedLifetimeSession) Close(ctx context.Context) error {
 	return err
 }
 
-func observedLifetimeMount(t *testing.T, url, hold string, lease time.Duration) (*fuse.Mount, string, *observedLifetimeStorage) {
+func observedLifetimeMount(t *testing.T, url, hold string, lease time.Duration, renewal *lifetimeRenewalGate) (*fuse.Mount, string, *observedLifetimeStorage) {
 	t.Helper()
 	remote, err := httprest.Dial(url, &http.Client{Timeout: 5 * time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}
-	observed := &observedLifetimeStorage{FileStorage: remote, hold: hold}
+	observed := &observedLifetimeStorage{FileStorage: remote, hold: hold, renewal: renewal}
 	options := storage.DefaultFileSessionOptions()
 	options.Lease = lease
 	point := t.TempDir()
@@ -480,8 +510,13 @@ func observedLifetimeMount(t *testing.T, url, hold string, lease time.Duration) 
 
 func TestBusyUnmountPreservesRenewalAndAdvisoryContinuity(t *testing.T) {
 	_, url := serveLiveFiles(t, map[string]string{"file": "content"}, 0)
-	const lease = 600 * time.Millisecond
-	mount, point, observed := observedLifetimeMount(t, url, "", lease)
+	// The kernel case observes an actual renewal across EBUSY with a normal
+	// native lease. The confirmed-expiry boundary is tested with virtual time.
+	const lease = 30 * time.Second
+	renewal := &lifetimeRenewalGate{entered: make(chan context.Context, 1),
+		release: make(chan struct{}), finished: make(chan error, 1)}
+	defer renewal.unblock()
+	mount, point, observed := observedLifetimeMount(t, url, "", lease, renewal)
 	remote, err := httprest.Dial(url, &http.Client{Timeout: 5 * time.Second})
 	if err != nil {
 		t.Fatal(err)
@@ -491,6 +526,12 @@ func TestBusyUnmountPreservesRenewalAndAdvisoryContinuity(t *testing.T) {
 	contender := openLiveFile(t, filepath.Join(other, "file"), os.O_RDONLY)
 	inode := liveInode(t, held)
 	checkFlock(t, held, unix.LOCK_EX|unix.LOCK_NB, 0)
+	var renewing context.Context
+	select {
+	case renewing = <-renewal.entered:
+	case <-time.After(lease):
+		t.Fatal("busy mount did not start a renewal")
+	}
 	if err := mount.Unmount(); err == nil {
 		t.Fatal("unmount succeeded while a descriptor keeps the mount busy")
 	}
@@ -499,12 +540,17 @@ func TestBusyUnmountPreservesRenewalAndAdvisoryContinuity(t *testing.T) {
 		t.Fatal("failed unmount retired the file session")
 	default:
 	}
-	timer := time.NewTimer(2 * lease)
-	defer timer.Stop()
+	if err := renewing.Err(); err != nil {
+		t.Fatalf("busy unmount cancelled the in-flight renewal: %v", err)
+	}
+	renewal.unblock()
 	select {
-	case <-timer.C:
-	case <-t.Context().Done():
-		t.Fatal("waiting past the initial file lease")
+	case err := <-renewal.finished:
+		if err != nil {
+			t.Fatalf("renewal after busy unmount: %v", err)
+		}
+	case <-time.After(lease):
+		t.Fatal("busy mount did not complete its renewal")
 	}
 	if observed.renewals.Load() == 0 || observed.closes.Load() != 0 {
 		t.Fatalf("busy mount renewals=%d closes=%d", observed.renewals.Load(), observed.closes.Load())
@@ -532,7 +578,7 @@ func TestBusyUnmountPreservesRenewalAndAdvisoryContinuity(t *testing.T) {
 func TestExternalKernelTeardownRetiresReferencesWithoutRelease(t *testing.T) {
 	const contents = "retained without a kernel handle"
 	backing, url := serveLiveFiles(t, map[string]string{"orphan": contents}, 64<<10)
-	mount, point, observed := observedLifetimeMount(t, url, "orphan", 30*time.Second)
+	mount, point, observed := observedLifetimeMount(t, url, "orphan", 30*time.Second, nil)
 	if observed.retained == nil {
 		t.Fatal("mount session did not retain the unreturned reference")
 	}

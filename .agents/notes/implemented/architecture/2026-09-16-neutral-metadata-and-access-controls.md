@@ -18,7 +18,7 @@ Status: implemented
 
 `BirthTime` 可由调用方显式设置，`ChangeTime` 只由 authority 维护，不进入 `AttrChange`。新节点在创建事务中记录两者；内容、共同属性、metadata 或名字关联的成功修改推进 `ChangeTime`。旧节点和旧日志缺失的时刻保持未知，副本保留 authority 给出的值，不从当前时间或 `ModTime` 推测历史。
 
-平台拥有自己的 namespace。Linux 使用 `posix.permissions.v1` 保存四字节 little-endian `uint32`，只允许 `07777` 范围内的权限与 special bits。存在但畸形的 payload 是错误；缺席时 FUSE 只在展示层采用普通文件 `0644`、目录 `0755`、符号链接 `0777`，不会把默认值写回 authority。Windows 属性可以在后续平台 PR 中使用独立 namespace，不改变 Linux 或 SDK 的语义。
+平台拥有自己的 namespace。Linux 使用 `posix.permissions.v1` 保存四字节 little-endian `uint32`，只允许 `07777` 范围内的权限与 special bits。存在但畸形的 payload 是错误；缺席时 FUSE 只在展示层采用普通文件 `0644`、目录 `0755`、符号链接 `0777`，不会把默认值写回 authority。Windows 的 smb.windows namespace 由[有界 CREATE/CLOSE](../feature/2026-09-28-smb-bounded-create-close.md)使用，不改变 Linux 或 SDK 的语义。
 
 metadata 每节点最多 16 个 namespace，namespace 名最长 128 字节，单值最长 32 KiB，规范编码总长最多 64 KiB，版本 token 最长 64 字节。编码按 key 排序并带长度前缀；解码拒绝未知格式、重复或乱序 key、非法版本和尾随数据。结果及调用方输入都深拷贝可变字节。
 
@@ -26,7 +26,7 @@ metadata 每节点最多 16 个 namespace，namespace 名最长 128 字节，单
 
 ### 使用声明与范围控制保持中立
 
-每个成功打开的 File 注册一份 `UseClaim{Uses, Deny}`。读写打开自动加入 `ReadData` / `WriteData`，调用方不能用空声明绕过已经存在的限制；公开目录读取派生 `ReadEntries`，`DeleteName` 为身份名字操作保留。新旧 claim 双向比较：任一方声明的 Deny 与另一方的 Uses 相交即冲突。实际读取、写入、目录枚举与发布在原生最终顺序重新检查对应 Uses；较早的客户端预检不能代替这一检查。
+每个成功打开的 File 注册一份 `UseClaim{Uses, Deny}`。旧路径读写打开自动加入 `ReadData` / `WriteData`；OpenAt 显式要求 Read/Write 的对应 Use，允许 execute 等非字节权限增加冲突声明，调用方不能用空声明绕过已经存在的限制；公开目录读取派生 `ReadEntries`，`DeleteName` 为身份名字操作保留。新旧 claim 双向比较：任一方声明的 Deny 与另一方的 Uses 相交即冲突。实际读取、写入、目录枚举与发布在原生最终顺序重新检查对应 Uses；较早的客户端预检不能代替这一检查。
 
 公开 replicated `List` / `ListBounded` 在确认本地副本仍可用后回源 authority，使目录枚举与当前 `ReadEntries` 限制共享 native 顺序。路径 Stat 与负查找继续使用副本，保留原来的本地名字查询收益；目录结果不能从副本绕过新建立的 deny。
 

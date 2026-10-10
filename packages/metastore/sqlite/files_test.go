@@ -213,7 +213,7 @@ func TestPendingCloseIntentFinalizationSurvivesFailedExactUseDrop(t *testing.T) 
 		t.Fatal(err)
 	}
 	intentID := storage.DeleteIntentID("44444444444444444444444444444444")
-	opened, err := store.OpenAt(t.Context(), selectChild(storage.ChildName{Parent: directoryTarget(root), RawLeaf: []byte("victim")}), storage.OpenAtOptions{
+	opened, err := store.OpenAt(t.Context(), selectChild(storage.ChildName{Parent: directoryTarget(root), RawLeaf: []byte("victim")}), storage.OpenAtOptions{MetadataAccess: storage.ReadMetadata | storage.WriteMetadata,
 		Read: true, Write: true, Create: true, Exclusive: true, Existing: storage.Keep, Action: fileAction(t),
 		Target:      storage.ChildCondition{State: storage.Absent},
 		Use:         storage.UseClaim{Uses: storage.ReadData | storage.WriteData | storage.DeleteName, Deny: storage.DeleteName},

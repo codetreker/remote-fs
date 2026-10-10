@@ -120,6 +120,8 @@ metadata 每节点最多 16 个 namespace、规范编码总长最多 64 KiB；�
 
 **保留文件接口**：`FileStorage.NewFileSession` 建立有限会话，`OpenFile` 按路径打开，`OpenNode` 按身份打开；`OpenAt` 与 `OpenChildRef` 使用包含父身份、原始叶名和可选 `NamespaceGuards` 的 `ChildSelection` 返回原子捕获的对象引用，`OpenNodeRef` 直接按节点身份选择。`File` 提供当前属性、区间读取、同步补丁、截断、Sync 与 Close；`NodeReference` 提供属性、Scope、State 与 Close，没有字节方法。身份 namespace、条件 mutation、pending deletion 与 session action query 都在相同 authority 顺序中执行。失去名字的对象仍存活并收费，直到引用退役、操作排空和最后释放完成。完整契约见[打开的文件](server/file-handles.md)。
 
+BackendIdentity 绑定持久 Volume、共享 Authority incarnation 与固定 RootNodeID；FileSessionIdentity 把引用所在 session 绑定到同一 descriptor 和其 Status.Epoch。StableReferenceIdentity 在效果前承诺返回引用有不可变 NodeID，OpenMetadataAccess 保证 OpenAt 的 metadata 授予独立于字节权限和 Use。关闭结果分别保留 Released／Determined 与完整链 settlement；已释放但未结算的 adapter 返回中立 CloseSettlementError，续作原关闭尝试并保留原语义错误。这些事实在 wrappers 与 HTTP 中逐层验证，不以 label、路径、取消或 action Completed 推断。
+
 `DirectoryReader.ReadDirNode` 以 DirectoryTarget 的 NodeID 和可选 Scope 返回一次完整、有界的目录捕获，并执行 `ReadEntries` Use 检查；只有 exact scoped read 能继续枚举 detached 空目录，裸 NodeID 与 DirectoryMetadataObserver 都拒绝该目标。`DirectoryMetadataObserver` 在独立授权操作下返回同一捕获的 entries、opaque directory revision 与可选目录自身名字；NamespaceAccess、DirectoryReader 和 DirectoryMetadataObserver 三个 Go capability 可以独立实现。HTTP v5 的预留 DirectoryMetadata bit 只在两个目录 facet 的完整 backing chain 都可用时宣告，避免只支持旧 Namespace 子集的 peer 误通过目录读取 preflight；Namespace bit 仍只表示 LookupAt 与 MutateName。File 和 NodeReference 的 `ReferenceNameObserver` 返回 Root、Linked 或 Detached。可选 NamespaceGuards 在观察的同一权威读取中核对目录 revision、确切名字边和根关系，也可随 `ChildSelection` 在 OpenAt／OpenChildRef 的最终 authority transaction 中约束子项选择；其它 mutation 输入不因此获得 guards。完整契约见[打开的文件](server/file-handles.md#名字与目录观察)。
 
 **强 S/X 控制接口**：显式创建 Session / Owner，解析现有普通文件，取得、续期、解除与核对 S/X 授予。修改只使用调用方给出的有界不可变 proof 集合，普通读取不声称 grant 有效。所有修改，包括匿名调用，都在原生最终转换处遵守占有顺序；重启通过持久最大时长证据与恢复屏障保留已确认保护。身份、动作结果、当前 grant 状态与内容版本分别定义，完整契约见 [文件锁设计](server/file-locks.md)。
@@ -246,7 +248,7 @@ packages/                    可被外部与自身 import
     httprest/                HTTP：URL 与消息的形状、服务端、拨号端
   fuse/                      挂载呈现层：FUSE 与 Linux owner/属性政策
     posix/                   POSIX 权限 metadata codec
-  smb/                       Windows 本机 SMB 3.1.1 endpoint 与 session/tree/export 生命周期
+  smb/                       Windows 本机 SMB 3.1.1、CREATE/CLOSE 与 FileId 生命周期
     windows/                 SSPI authentication 与本机 Windows identity policy
 
 cmd/                         二进制，不被 import

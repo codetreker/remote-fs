@@ -75,7 +75,7 @@ func startConfiguredProtocolServer(t *testing.T, config Config) (*Server, *endpo
 		t.Fatal(err)
 	}
 	backend := &endpointStorage{session: newEndpointFileSession()}
-	if _, err := server.Publish(Share{Name: "data", Volume: "volume", Backend: backend}); err != nil {
+	if _, err := server.Publish(Share{Name: "data", Volume: "volume", BackendVolume: "test-volume", RootNodeID: 1, Backend: backend}); err != nil {
 		t.Fatal(err)
 	}
 	listener, err := net.Listen("tcp4", "127.0.0.1:0")
@@ -440,7 +440,11 @@ func TestAuthenticatedControlTranscriptAndUnsupportedCommands(t *testing.T) {
 		sendFrame(t, connection, packet)
 		response = readFrame(t, connection)
 		header, _ = wire.ParseHeader(response)
-		if header.Status != statusUnsupported || key.Verify(response) != nil {
+		expected := statusUnsupported
+		if command == wire.Create || command == wire.Close {
+			expected = statusInvalid
+		}
+		if header.Status != expected || key.Verify(response) != nil {
 			t.Fatalf("command %d = %+v", command, header)
 		}
 	}

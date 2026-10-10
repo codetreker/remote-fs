@@ -6,6 +6,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/codetreker/remote-fs/packages/locking"
@@ -262,6 +263,79 @@ type handshakeKernel struct {
 }
 
 func (k handshakeKernel) Unmount() error { return k.unmount() }
+
+func TestBusyUnmountPreservesInFlightRenewalUntilConfirmedExpiry(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		confirm bool
+	}{
+		{name: "confirmed renewal", confirm: true},
+		{name: "expired renewal"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				const lease = time.Second
+				start := time.Now()
+				entered := make(chan context.Context, 1)
+				release := make(chan struct{})
+				status := storage.FileSessionStatus{Epoch: "busy-unmount", Revision: 1,
+					ActionEpoch: 1, Remaining: lease, HistoryRemaining: time.Minute}
+				var renewals, closes atomic.Int32
+				session := &sessionLifecycleProbe{
+					renew: func(ctx context.Context) (storage.FileSessionStatus, error) {
+						if renewals.Add(1) == 1 {
+							entered <- ctx
+							select {
+							case <-release:
+							case <-ctx.Done():
+								return storage.FileSessionStatus{}, ctx.Err()
+							}
+						}
+						status.Revision++
+						return status, nil
+					},
+					close: func(context.Context) error { closes.Add(1); return nil },
+				}
+				v := &volume{files: session, status: status, deadline: start.Add(lease),
+					flushTimeout: lease, stop: make(chan struct{}), done: make(chan struct{})}
+				v.renewContext, v.cancelRenew = context.WithCancel(context.Background())
+				go v.maintain()
+				t.Cleanup(func() { _ = v.stopSession() })
+				m := &Mount{volume: v, done: make(chan struct{}),
+					server: handshakeKernel{unmount: func() error { return syscall.EBUSY }}}
+				renewing := <-entered
+				if err := m.Unmount(); !errors.Is(err, syscall.EBUSY) {
+					t.Fatalf("busy unmount: %v", err)
+				}
+				synctest.Wait()
+				if renewing.Err() != nil || closes.Load() != 0 || v.check() != nil {
+					t.Fatalf("busy unmount retired renewal: context=%v closes=%d health=%v",
+						renewing.Err(), closes.Load(), v.check())
+				}
+				if test.confirm {
+					close(release)
+					synctest.Wait()
+					time.Sleep(2 * lease)
+					synctest.Wait()
+					if !time.Now().After(start.Add(lease)) || renewals.Load() < 2 || closes.Load() != 0 || v.check() != nil {
+						t.Fatalf("confirmed renewal did not preserve continuity: renewals=%d closes=%d health=%v",
+							renewals.Load(), closes.Load(), v.check())
+					}
+					if err := v.stopSession(); err != nil || closes.Load() != 1 {
+						t.Fatalf("session retirement: %v closes=%d", err, closes.Load())
+					}
+				} else {
+					<-v.done
+					if time.Now().Before(start.Add(lease)) || !errors.Is(renewing.Err(), context.DeadlineExceeded) ||
+						closes.Load() != 1 || errnoOf(v.check()) != syscall.EIO {
+						t.Fatalf("unconfirmed renewal survived expiry: context=%v closes=%d health=%v",
+							renewing.Err(), closes.Load(), v.check())
+					}
+				}
+			})
+		})
+	}
+}
 
 func TestFailedMountHandshakeDetachesBeforeWaitingForSessionCleanup(t *testing.T) {
 	v, backing := lifecycleVolume(t, func(native storage.FileSession) storage.FileSession { return native })

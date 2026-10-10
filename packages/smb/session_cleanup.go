@@ -101,6 +101,9 @@ func (c *connection) cleanSession(ctx context.Context, s *session, explicit bool
 		}
 		s.mu.Unlock()
 		for _, tree := range trees {
+			c.fenceTree(tree)
+		}
+		for _, tree := range trees {
 			var err error
 			if explicit {
 				err = c.closeTreeAuthorized(ctx, tree)
@@ -187,58 +190,83 @@ func (c *connection) closeTreeAuthorized(ctx context.Context, tree *tree) error 
 	return c.closeTreeContext(ctx, tree)
 }
 
+func (c *connection) fenceTree(tree *tree) <-chan struct{} {
+	tree.stopOnce.Do(func() { close(tree.done) })
+	c.mu.Lock()
+	for _, pending := range c.pending {
+		if pending.treeID == tree.id && pending.sessionID == tree.sessionID && pending.command != wire.Logoff && pending.command != wire.TreeDisconnect {
+			pending.cancel()
+		}
+	}
+	c.mu.Unlock()
+	return tree.fenceFileWork()
+}
+
 func (c *connection) closeTreeContext(ctx context.Context, tree *tree) error {
 	return tree.cleanup.run(ctx, func() error {
+		idle := c.fenceTree(tree)
+		if err := waitFileWork(ctx, idle); err != nil {
+			return err
+		}
+		if tree.kind == controlTree {
+			tree.closeMu.Lock()
+			tree.closed = true
+			tree.closeMu.Unlock()
+			return nil
+		}
+		a := tree.authority
+		if err := a.treeCloseMu.lock(ctx); err != nil {
+			return err
+		}
+		defer a.treeCloseMu.unlock()
 		tree.closeMu.Lock()
 		defer tree.closeMu.Unlock()
 		if tree.closed {
 			return nil
 		}
-		tree.stopOnce.Do(func() { close(tree.done) })
-		c.mu.Lock()
-		for _, pending := range c.pending {
-			if pending.treeID == tree.id && pending.sessionID == tree.sessionID &&
-				pending.command != wire.Logoff && pending.command != wire.TreeDisconnect {
-				pending.cancel()
+		ctx = WithPrincipal(ctx, a.principal)
+		handleErr := tree.closeFileHandles(ctx)
+		if tree.retainedHandles() != 0 {
+			recovered, recoveryErr := a.recoverRetainedOwners(ctx)
+			if !recovered || tree.retainedHandles() != 0 {
+				return errors.Join(handleErr, recoveryErr)
 			}
+			handleErr = errors.Join(handleErr, recoveryErr)
 		}
-		c.mu.Unlock()
-		if tree.kind == controlTree {
-			tree.closed = true
-			return nil
-		}
-
-		authority := tree.authority
-		if err := authority.treeCloseMu.lock(ctx); err != nil {
-			return err
-		}
-		defer authority.treeCloseMu.unlock()
-		ctx = WithPrincipal(ctx, authority.principal)
-		authority.installMu.Lock()
-		authority.mu.Lock()
-		last := authority.refs == 1
+		a.installMu.Lock()
+		a.mu.Lock()
+		last := a.refs == 1
 		if last {
-			authority.stopping = true
+			a.stopping = true
 		}
-		authority.mu.Unlock()
-		authority.installMu.Unlock()
+		a.mu.Unlock()
+		a.installMu.Unlock()
+		var parentErr error
 		if last {
-			if err := authority.close(ctx); err != nil {
-				return err
+			parentErr = a.close(ctx)
+			if !a.isClosed() {
+				return errors.Join(handleErr, parentErr)
 			}
-			if err := authority.wait(ctx); err != nil {
-				return err
+			if err := a.wait(ctx); err != nil {
+				return errors.Join(handleErr, parentErr, err)
 			}
 		}
-		authority.mu.Lock()
-		authority.refs--
-		authority.mu.Unlock()
+		a.mu.Lock()
+		a.refs--
+		a.mu.Unlock()
 		tree.closed = true
 		c.server.mu.Lock()
 		tree.export.refs--
 		tree.export.trees--
 		c.server.mu.Unlock()
-		return nil
+		if a.smbSession != nil {
+			a.smbSession.mu.Lock()
+			if a.smbSession.trees[tree.id] == tree {
+				delete(a.smbSession.trees, tree.id)
+			}
+			a.smbSession.mu.Unlock()
+		}
+		return errors.Join(handleErr, parentErr)
 	})
 }
 
@@ -271,19 +299,21 @@ func (c *connection) closeOrphansLocked(ctx context.Context, s *session, selecte
 		empty := item.authority.refs == 0
 		item.authority.mu.Unlock()
 		if empty {
-			err := item.authority.close(ctx)
-			if err == nil {
-				err = item.authority.wait(ctx)
-			}
-			if err != nil {
-				errs = append(errs, err)
-			} else {
-				item.authority.releaseExport()
-				s.mu.Lock()
-				if s.authorities[item.export] == item.authority {
-					delete(s.authorities, item.export)
+			closeErr := item.authority.close(ctx)
+			if item.authority.isClosed() {
+				if waitErr := item.authority.wait(ctx); waitErr != nil {
+					closeErr = errors.Join(closeErr, waitErr)
+				} else {
+					item.authority.releaseExport()
+					s.mu.Lock()
+					if s.authorities[item.export] == item.authority {
+						delete(s.authorities, item.export)
+					}
+					s.mu.Unlock()
 				}
-				s.mu.Unlock()
+			}
+			if closeErr != nil {
+				errs = append(errs, closeErr)
 			}
 		}
 		item.authority.treeCloseMu.unlock()
@@ -369,6 +399,9 @@ func (c *connection) closeOwnedExport(ctx context.Context, export *Export) error
 		}
 		session.mu.Unlock()
 		for _, tree := range trees {
+			c.fenceTree(tree)
+		}
+		for _, tree := range trees {
 			if err := c.closeTreeContext(ctx, tree); err != nil {
 				errs = append(errs, err)
 			} else {
@@ -411,8 +444,9 @@ func (c *connection) closeExportAuthority(ctx context.Context, s *session, expor
 	if !empty {
 		return ErrBusy
 	}
-	if err := authority.close(ctx); err != nil {
-		return err
+	parentErr := authority.close(ctx)
+	if !authority.isClosed() {
+		return parentErr
 	}
 	if err := authority.wait(ctx); err != nil {
 		return err
@@ -421,13 +455,13 @@ func (c *connection) closeExportAuthority(ctx context.Context, s *session, expor
 	s.mu.Lock()
 	if s.authorities[export] != authority {
 		s.mu.Unlock()
-		return nil
+		return parentErr
 	}
 	if !s.retired || len(s.authorities) > 1 {
 		delete(s.authorities, export)
 		s.mu.Unlock()
 		authority.releaseExport()
-		return nil
+		return parentErr
 	}
 	s.mu.Unlock()
 	if err := s.authMu.lock(ctx); err != nil {
@@ -461,7 +495,7 @@ func (c *connection) closeExportAuthority(ctx context.Context, s *session, expor
 	s.authMu.unlock()
 	authority.releaseExport()
 	c.recordSessionResourcesClosed(s)
-	return nil
+	return parentErr
 }
 
 // Completion only records already-known cleanup. It never retries native work.

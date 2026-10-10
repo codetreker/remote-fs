@@ -62,4 +62,4 @@ SQLite 在删除义务事务与见证提交中保存 owner、序号和每 volume
 
 调用方还可在丢失单个 intent ID 后凭持久 owner 找回未 ACK 的删除义务。每条义务增加 owner 和持久序号，迁移和高水位与见证、容量、完整性检查一起维护；遗失 owner 后不能从未知身份枚举全 volume 义务。ACK 后没有 tombstone，调用方不得复用已确认 ID；序号高水位不会因 ACK 回退。HTTP 回执过期后，已释放引用的清理失败进入有界汇总，只保存累计次数及首个和近期错误样本供 `Handler.Close` 报告，不能从汇总还原已过期动作结果。
 
-本决定接续[持久节点身份与原子文件操作](2026-09-20-durable-identity-and-atomic-file-operations.md)的 durable delete intent、[活跃文件句柄](2026-09-08-live-file-handles.md)的关闭所有权和[业务授权](../feature/2026-09-10-host-provided-authorization.md)的逐请求准入。它不改变对象绑定、原子打开或已接受效果语义。当前结构见[文件句柄设计](../../../../docs/design/server/file-handles.md)，验证边界见[测试策略](../../../../docs/testing.md)；SMB 端点的使用方式由[有界 CREATE/CLOSE 提案](../../proposed/feature/2026-09-28-smb-bounded-create-close.md)说明。
+本决定接续[持久节点身份与原子文件操作](2026-09-20-durable-identity-and-atomic-file-operations.md)的 durable delete intent、[活跃文件句柄](2026-09-08-live-file-handles.md)的关闭所有权和[业务授权](../feature/2026-09-10-host-provided-authorization.md)的逐请求准入。它不改变对象绑定、原子打开或已接受效果语义。当前结构见[文件句柄设计](../../../../docs/design/server/file-handles.md)，验证边界见[测试策略](../../../../docs/testing.md)；SMB 端点的使用方式由[有界 CREATE/CLOSE](../feature/2026-09-28-smb-bounded-create-close.md)说明。

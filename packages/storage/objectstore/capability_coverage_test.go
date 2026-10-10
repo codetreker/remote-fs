@@ -34,7 +34,7 @@ func TestIdentityNamespaceAndReferenceCapabilities(t *testing.T) {
 	if err != nil || lookedUp.ID != created.Attr.ID {
 		t.Fatalf("lookup=%+v error=%v", lookedUp, err)
 	}
-	opened, err := session.(storage.AtomicFileOpener).OpenAt(t.Context(), storage.ChildSelection{Name: fileName}, storage.OpenAtOptions{
+	opened, err := session.(storage.AtomicFileOpener).OpenAt(t.Context(), storage.ChildSelection{Name: fileName}, storage.OpenAtOptions{MetadataAccess: storage.ReadMetadata | storage.WriteMetadata,
 		Read: true, Write: true, Existing: storage.Keep, Action: fileActionFor(t, session),
 		Target: storage.ChildCondition{State: storage.SameNode, NodeID: lookedUp.ID},
 		Use:    storage.UseClaim{Uses: storage.ReadData | storage.WriteData},

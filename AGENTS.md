@@ -94,8 +94,10 @@ existing `checks` status, so `checks` depends on `sqlite-race`, still runs when 
 fails or is skipped, and has a final step that fails unless `sqlite-race` succeeded.
 [The CI isolation decision](.agents/notes/implemented/process/2026-09-29-isolate-sqlite-race-ci.md)
 records the scheduling and required-check link. A focused Windows Server 2025 job runs
-the native SSPI package tests and vet; it validates the Windows API implementation, not
-Windows 11 redirector or WNet behavior.
+the native SSPI package tests and vet, plus the root SMB and wire race suites through
+the strict verdict runner. The root suite compares every UTF-16 code unit and the
+resulting order with the native Windows ordinal name API. Windows 11 redirector and
+WNet behavior require their separate acceptance environment.
 
 `checks` and `mounted` each start the emulator in
 [`deployments/ci/docker-compose.yml`](deployments/ci/docker-compose.yml) before their

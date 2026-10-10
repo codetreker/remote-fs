@@ -162,6 +162,11 @@ func (s *remoteFileSession) OpenAtWithBarrier(ctx context.Context, selection sto
 	if err := s.CheckAtomicFileOpen(); err != nil {
 		return storage.OpenResult{}, nil, err
 	}
+	if options.MetadataAccess != 0 {
+		if err := s.CheckOpenMetadataAccess(); err != nil {
+			return storage.OpenResult{}, nil, err
+		}
+	}
 	if err := selection.Check(); err != nil {
 		return storage.OpenResult{}, nil, err
 	}

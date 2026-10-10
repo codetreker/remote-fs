@@ -6,7 +6,7 @@ Status: proposed
 
 Windows 目录枚举按句柄多次领取有限大小的结果。远端目录在两次请求间可能修改，而且同一 volume 允许 Linux／SDK 创建非法 UTF-8、Windows 不可表示或大小写等价的名字。若每页独立向远端读取，或先过滤坏名字再输出，Windows 程序会把遗漏条目误认为不存在；若返回上一页的缓存并在失联时补空目录，错误会变成真实的删除依据。
 
-本提案是[Windows 网络驱动器总提案](2026-09-16-windows-network-drive-support.md)中 7.5 的独立交付，依赖 [7.3 的有界目录 FileId](2026-09-28-smb-bounded-create-close.md) 和 [7.4 的身份信息投影](2026-09-28-smb-file-data-information.md)。它解决 [R-FS-9、R-WIN-2、R-WIN-3](../../../../docs/spec/requirements.md) 的目录枚举部分。目录变更通知和预热目录缓存的一秒失效由 8.3 负责；本提案不宣称完成它们。
+本提案是[Windows 网络驱动器总提案](2026-09-16-windows-network-drive-support.md)中 7.5 的独立交付，依赖 [7.3 的有界目录 FileId](../../implemented/feature/2026-09-28-smb-bounded-create-close.md) 和 [7.4 的身份信息投影](2026-09-28-smb-file-data-information.md)。它解决 [R-FS-9、R-WIN-2、R-WIN-3](../../../../docs/spec/requirements.md) 的目录枚举部分。目录变更通知和预热目录缓存的一秒失效由 8.3 负责；本提案不宣称完成它们。
 
 ## 提案
 

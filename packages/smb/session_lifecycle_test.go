@@ -484,7 +484,7 @@ func TestVolumeTreeSharesOneAuthoritySessionAndReleasesIt(t *testing.T) {
 		t.Fatal(err)
 	}
 	backend := &endpointStorage{session: newEndpointFileSession()}
-	export, err := server.Publish(Share{Name: "data", Volume: "volume", Backend: backend})
+	export, err := server.Publish(Share{Name: "data", Volume: "volume", BackendVolume: "test-volume", RootNodeID: 1, Backend: backend})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -518,7 +518,7 @@ func TestVolumeTreeSharesOneAuthoritySessionAndReleasesIt(t *testing.T) {
 	if err := export.Unpublish(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	want := []storage.Operation{storage.OpFileSessionOpen, storage.OpFileStatus, storage.OpFileSessionClose}
+	want := []storage.Operation{storage.OpFileSessionOpen, storage.OpFileBackendIdentity, storage.OpFileStatus, storage.OpFileSessionClose}
 	if len(operations) != len(want) {
 		t.Fatalf("authorization operations = %v", operations)
 	}
@@ -593,7 +593,7 @@ func TestLogoffRacingTreeConnectCannotInstallLateAuthority(t *testing.T) {
 		endpointStorage: endpointStorage{session: newEndpointFileSession()},
 		entered:         make(chan struct{}), release: make(chan struct{}),
 	}
-	export, err := server.Publish(Share{Name: "data", Volume: "volume", Backend: backend})
+	export, err := server.Publish(Share{Name: "data", Volume: "volume", BackendVolume: "test-volume", RootNodeID: 1, Backend: backend})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -654,7 +654,7 @@ func TestLogoffWaitsForPreviousSessionFinalization(t *testing.T) {
 	closeEntered, closeRelease := make(chan struct{}), make(chan struct{})
 	backend := &endpointStorage{session: newEndpointFileSession()}
 	backend.session.closeEntered, backend.session.closeRelease = closeEntered, closeRelease
-	export, err := server.Publish(Share{Name: "data", Volume: "volume", Backend: backend})
+	export, err := server.Publish(Share{Name: "data", Volume: "volume", BackendVolume: "test-volume", RootNodeID: 1, Backend: backend})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -720,7 +720,7 @@ func TestShutdownRetainsFailedCleanupAndRetries(t *testing.T) {
 	cause := errors.New("close outcome unknown")
 	backend := &endpointStorage{session: newEndpointFileSession()}
 	backend.session.closeErr = cause
-	export, err := server.Publish(Share{Name: "data", Volume: "volume", Backend: backend})
+	export, err := server.Publish(Share{Name: "data", Volume: "volume", BackendVolume: "test-volume", RootNodeID: 1, Backend: backend})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -751,7 +751,7 @@ func TestShutdownRetainsFailedCleanupAndRetries(t *testing.T) {
 func TestUnpublishRefusesAnIdleLiveTreeWithoutChangingIt(t *testing.T) {
 	server, connection := testConnection(t, DefaultLimits())
 	backend := &endpointStorage{session: newEndpointFileSession()}
-	export, err := server.Publish(Share{Name: "data", Volume: "volume", Backend: backend})
+	export, err := server.Publish(Share{Name: "data", Volume: "volume", BackendVolume: "test-volume", RootNodeID: 1, Backend: backend})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -774,7 +774,7 @@ func TestUnpublishRefusesAnIdleLiveTreeWithoutChangingIt(t *testing.T) {
 
 func TestUnpublishUnusedExportDoesNotJoinUnrelatedConnectionCleanup(t *testing.T) {
 	server, connection := testConnection(t, DefaultLimits())
-	target, err := server.Publish(Share{Name: "target", Volume: "target", Backend: &endpointStorage{}})
+	target, err := server.Publish(Share{Name: "target", Volume: "target", BackendVolume: "test-volume", RootNodeID: 1, Backend: &endpointStorage{}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -790,7 +790,7 @@ func TestUnpublishUnusedExportDoesNotJoinUnrelatedConnectionCleanup(t *testing.T
 	unrelatedBackend := &endpointStorage{session: newEndpointFileSession()}
 	unrelatedBackend.session.closeEntered = closeEntered
 	unrelatedBackend.session.closeRelease = closeRelease
-	unrelated, err := server.Publish(Share{Name: "unrelated", Volume: "unrelated", Backend: unrelatedBackend})
+	unrelated, err := server.Publish(Share{Name: "unrelated", Volume: "unrelated", BackendVolume: "test-volume", RootNodeID: 1, Backend: unrelatedBackend})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -832,7 +832,7 @@ func TestUnpublishUnusedExportDoesNotJoinUnrelatedConnectionCleanup(t *testing.T
 
 func TestUnpublishOwnedExportDoesNotWaitForUnrelatedAuthentication(t *testing.T) {
 	server, connection := testConnection(t, DefaultLimits())
-	export, err := server.Publish(Share{Name: "target", Volume: "target", Backend: &endpointStorage{}})
+	export, err := server.Publish(Share{Name: "target", Volume: "target", BackendVolume: "test-volume", RootNodeID: 1, Backend: &endpointStorage{}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -891,7 +891,7 @@ func TestUnpublishOwnedExportDoesNotWaitForUnrelatedAuthentication(t *testing.T)
 
 func TestUnpublishRetiredOwnerAuthenticationWaitHonorsContext(t *testing.T) {
 	server, connection := testConnection(t, DefaultLimits())
-	export, err := server.Publish(Share{Name: "target", Volume: "target", Backend: &endpointStorage{}})
+	export, err := server.Publish(Share{Name: "target", Volume: "target", BackendVolume: "test-volume", RootNodeID: 1, Backend: &endpointStorage{}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -958,7 +958,7 @@ func TestUnpublishRetryCompletesRetirementAfterNativeCloseDeadline(t *testing.T)
 	limits := DefaultLimits()
 	limits.MaxSessions = 1
 	server, connection := testConnection(t, limits)
-	export, err := server.Publish(Share{Name: "target", Volume: "target", Backend: &endpointStorage{}})
+	export, err := server.Publish(Share{Name: "target", Volume: "target", BackendVolume: "test-volume", RootNodeID: 1, Backend: &endpointStorage{}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1047,11 +1047,11 @@ func TestUnpublishRetryCompletesRetirementAfterNativeCloseDeadline(t *testing.T)
 
 func TestUnpublishRetiredSessionKeepsOtherExportIndependent(t *testing.T) {
 	server, connection := testConnection(t, DefaultLimits())
-	target, err := server.Publish(Share{Name: "target", Volume: "target", Backend: &endpointStorage{}})
+	target, err := server.Publish(Share{Name: "target", Volume: "target", BackendVolume: "test-volume", RootNodeID: 1, Backend: &endpointStorage{}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	remaining, err := server.Publish(Share{Name: "remaining", Volume: "remaining", Backend: &endpointStorage{}})
+	remaining, err := server.Publish(Share{Name: "remaining", Volume: "remaining", BackendVolume: "test-volume", RootNodeID: 1, Backend: &endpointStorage{}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1146,7 +1146,7 @@ func TestCloseExportCleanupSerializationHonorsContext(t *testing.T) {
 
 func TestUnpublishOwnedCleanupWaitHonorsContextAndCanRetry(t *testing.T) {
 	server, connection := testConnection(t, DefaultLimits())
-	export, err := server.Publish(Share{Name: "target", Volume: "target", Backend: &endpointStorage{}})
+	export, err := server.Publish(Share{Name: "target", Volume: "target", BackendVolume: "test-volume", RootNodeID: 1, Backend: &endpointStorage{}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1210,6 +1210,8 @@ func TestAuthorityRenewalFailureFencesAndClosesSession(t *testing.T) {
 			deadline: time.Now().Add(raw.status.Remaining),
 		}
 		s := &session{trees: make(map[uint32]*tree), authorities: map[*Export]*authoritySession{export: authority}}
+		authority.connection, authority.smbSession = connection, s
+		close(authority.ready)
 		registerSession(t, server, connection, s)
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
@@ -1236,7 +1238,7 @@ func TestAuthorityRenewalFailureFencesAndClosesSession(t *testing.T) {
 		raw.mu.Lock()
 		closes := raw.closes
 		raw.mu.Unlock()
-		if !authority.isClosed() || closes != 1 || server.Status().CleanupFailures == 0 || server.Status().FencedAuthorities != 1 {
+		if !authority.isClosed() || closes != 1 || server.Status().CleanupFailures == 0 || server.Status().FencedAuthorities != 0 {
 			t.Fatalf("renewal failure state: closed=%v closes=%d status=%+v", authority.isClosed(), closes, server.Status())
 		}
 	})
