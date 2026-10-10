@@ -113,15 +113,17 @@ recovery record 不是空的哨兵文件。它是带版本和 checksum 的固定
 
 `Put` 对一个 key 的持久化顺序是：
 
-1. 在 `objects/` 根下创建并 `fsync` 一条恢复记录，再 `fsync` 该目录；
+1. 在 `objects/` 创建 `.prep.put-k...`，完整写入并 `fsync` 固定96字节record，再以create-only hardlink发布 `.put-k...`，同步目录、删除preparation并再次同步；
 2. 在目标 shard 里独占创建 staging file，写入 envelope、key 与 payload，并 `fsync` 文件；
 3. 用同一目录内的 `linkat(2)` 把 staging inode 发布到最终名字；目的已存在时返回 `EEXIST`，不会覆盖；
 4. `fsync` shard，删除 staging 名并再次 `fsync` shard；
 5. 删除恢复记录并 `fsync` `objects/` 根。
 
-`Delete` 在 unlink 前同样先持久化恢复记录，unlink 后 `fsync` shard，再删除并同步恢复记录。一个对象已经不存在是成功状态，但已有 shard 仍执行 directory `fsync`，使上一次「unlink 已发生、barrier 失败」的重试可以收敛。打开 store 时逐条恢复 `.put-*` 与 `.delete-*` 记录：未完成的 put 清除 staging，已发布 put 保留 final；delete 确保 final 与 staging 都消失，然后清除记录。delete record 与 staging 同时存在、不同 inode 的 FORMAT/stage 或 publication-probe residue，以及 foreign recovery 内容都是不可能从合法协议产生的状态，必须保留现场并以 `EIO` 停止，不能按最方便的方向猜测恢复。
+`Delete` 在 unlink 前同样经 `.prep.delete-k...` 完整写入／同步和create-only发布取得恢复记录权限，unlink 后 `fsync` shard，再删除并同步恢复记录。一个对象已经不存在是成功状态，但已有 shard 仍执行 directory `fsync`，使上一次「unlink 已发生、barrier 失败」的重试可以收敛。打开 store 时逐条恢复 `.put-*` 与 `.delete-*` 记录：未完成的 put 清除 staging，已发布 put 保留 final；delete 确保 final 与 staging 都消失，然后清除记录。delete record 与 staging 同时存在、不同 inode 的 FORMAT/stage 或 publication-probe residue，以及 foreign recovery 内容都是不可能从合法协议产生的状态，必须保留现场并以 `EIO` 停止，不能按最方便的方向猜测恢复。
 
 一次 shard identity／对象 directory barrier 或恢复状态清理失败之后，进程无法再证明它刚才的磁盘修改处于哪一侧。`localdisk` 保存首个 durability failure，并让成功与 fact-bearing result 最终与 poison 状态线性化；poison 已建立时，较早通过健康检查而仍在等待 key/shard/admission 的调用也不能返回成功、`ENOENT`、`EEXIST`、`EFBIG` 或 `ENOSPC` 等磁盘事实，统一以 `EIO` 失败。context cancellation 的 `EINTR` 保留，不被改写成磁盘结论。它不会在已知不可信的磁盘状态上继续给出看似正常的对象答案。
+
+恢复final的96字节格式不变；只有完整且同步的final名称取得对象清理权限。Open先捕获并验证完整有界集合再修改：final-only单link，final/preparation同inode且恰好双link，配对计一个recovery action；私有single-link的空／部分／撕裂preparation-only在无对应对象stage时可以删除并同步，完整外来身份／key／operation则拒绝。corrupt final、额外link、不同inodepair、超长或错误filesystem保留现场失败。NAME_MAX覆盖最长preparation component；不以宽松final解析兼容半写记录。
 
 ### SQLite 与组合一致性
 

@@ -71,6 +71,8 @@ ROOT/                         0700，归 server 的有效用户所有
     .publish-probe-occupied   create-only 能力探针的恢复文件
     .put-k...                 durable Put recovery record
     .delete-k...              durable Delete recovery record
+    .prep.put-k...            尚未取得恢复权限的 Put preparation
+    .prep.delete-k...         尚未取得恢复权限的 Delete preparation
     00/ ... ff/               按 key 摘要首字节分片
       .store-identity         已发布的 shard identity
       .store-identity.stage   shard identity 的恢复 staging name
@@ -218,7 +220,7 @@ stage   = objects/shard/".stage-"+name
 
 对象写入以 durable recovery record 包围实际目录修改。`.put-k...`／`.delete-k...` 文件名可逆编码 key 与操作；固定 96 字节内容另带版本、store UUID、操作、key 摘要与 checksum。文件名和内容必须逐项一致，另一份 store 的同名记录不能取得恢复权限。`Put` 的顺序是：
 
-1. 在 `objects/` 创建 `.put-...`，同步 marker file，再同步 `objects/`。
+1. 在 `objects/` 独占创建 `.prep.put-...`，完整写入并 `fsync` 固定96字节记录；`linkat` create-only 发布 `.put-...`，同步 `objects/`，删除 preparation 并再次同步。final record 取得恢复权限后才修改对象目录。
 2. 在目标 shard 创建 `.stage-...`，写入 envelope、key 与 payload，`fsync` staging file 后关闭。
 3. 用同一 shard 内的 `linkat` 把 staging inode 发布到 final name；目标已存在时得到 `EEXIST`，不会覆盖。
 4. `fsync` shard，使 final name durable。
@@ -227,7 +229,11 @@ stage   = objects/shard/".stage-"+name
 
 `Delete` 先 durable 地创建 `.delete-...`，验证 final object，删除 final name 并 `fsync` shard，最后删除 marker 并 `fsync objects/`。final name 已不存在时，只要 shard 本身可信，删除仍收敛为成功；已有 shard 仍会被同步，使一次先前在 directory barrier 处失败的删除可以由重试完成。
 
-`Open` 在接受请求前先验证全部已有 shard identity，再扫描有界数量的 recovery records。Put record 使 final object 保留、staging name 被删除；Delete record 使 final 与 staging name 都被删除；对应 shard 随后同步，最后 marker 被删除并同步。未知 entry、超过恢复上限、marker 的名字／内容／key 不一致、缺少它所指向的 shard，都会使打开失败。
+`Delete` 的记录同样先完整写入 `.prep.delete-...` 并同步，再 create-only 发布 `.delete-...`、同步目录与删除 preparation；固定96字节 final格式不变，半写内容不会取得恢复权限。
+
+`Open` 在接受请求前先验证全部 shard identity，捕获有界 recovery actions，并在任何清理前验证完整记录集合。final-only 必须 single-link且内容完整有效；final+preparation 必须同 inode、恰好两个 links。preparation-only 可以是空、部分或撕裂记录，清理前必须通过私有普通文件、owner／mode／filesystem、长度上限及single-link检查，且没有对应对象 staging；完整内部有效但异store／key／operation的preparation仍拒绝。每个final／preparation配对只计一项MaxRecoveryEntries，NAME_MAX包含更长preparation名字。
+
+记录验证通过后同步对象根，删除并同步未取得权限的preparation；有效final在恢复其对象时再核对目标shard。Put final保留已发布对象并删除staging，Delete final删除final／staging，再同步shard并删除／同步record。未知entry、超限、corrupt final、额外hardlink或不同inode配对在清理前保持现场并失败；目标shard缺失在对应final恢复时失败，不能把record当作可清理中断。
 
 shard identity 或对象 publication 已经发生后，任何无法证明 directory barrier、link 结果或 cleanup durability 的错误都会 poison 当前 `localdisk.Objects`。成功与 fact-bearing 结果都在返回前与 poison 状态线性化；poison 一旦先建立，已经通过早期健康检查、正在等待 key/shard/admission 的调用也不能再返回 `ENOENT`、`EEXIST`、`EFBIG`、`ENOSPC` 或成功等磁盘事实，而统一返回 `EIO`。context cancellation 的 `EINTR` 保留为 cancellation，不被改写成磁盘结论。实例保持失败直到关闭并通过下一次 `Open` 的 recovery 得到可证明的磁盘状态。
 
