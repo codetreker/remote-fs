@@ -33,6 +33,7 @@ type referenceActionTarget struct {
 type fileMutationActionInput struct {
 	Target  referenceActionTarget
 	Command storage.FileMutation
+	Effects []storage.ContentMetadataEffect
 }
 
 type pendingUnlinkActionInput struct {
@@ -99,6 +100,7 @@ func canonicalFileActionInput(input any) any {
 		value.Options.Target = canonicalChildCondition(value.Options.Target)
 		value.Options.Initial = canonicalInitialState(value.Options.Initial)
 		value.Options.CloseIntent = canonicalCloseIntent(value.Options.CloseIntent)
+		value.Options.ContentMetadataEffects = storage.CloneContentMetadataEffects(value.Options.ContentMetadataEffects)
 		return value
 	case nodeRefActionInput:
 		if value.Selection != nil {
@@ -137,6 +139,7 @@ func canonicalFileActionInput(input any) any {
 	case storage.FileMutation:
 		return canonicalFileMutation(value)
 	case fileMutationActionInput:
+		value.Effects = storage.CloneContentMetadataEffects(value.Effects)
 		value.Command = canonicalFileMutation(value.Command)
 		return value
 	case pendingUnlinkActionInput:
@@ -153,7 +156,13 @@ func canonicalFileActionInput(input any) any {
 }
 
 func canonicalFileMutation(value storage.FileMutation) storage.FileMutation {
+	value.ContentEffects = append([]uint16(nil), value.ContentEffects...)
+	sort.Slice(value.ContentEffects, func(i, j int) bool { return value.ContentEffects[i] < value.ContentEffects[j] })
 	value.Data = canonicalBytes(value.Data)
+	if value.ExpectedSize != nil {
+		size := *value.ExpectedSize
+		value.ExpectedSize = &size
+	}
 	value.ExpectedMetadata = canonicalMetadataConditions(value.ExpectedMetadata)
 	value.Metadata = canonicalMetadataUpdates(value.Metadata)
 	value.Attr = canonicalAttrChange(value.Attr)

@@ -140,6 +140,9 @@ func validateFileRequest(r fileRequest) error {
 	case storage.OpFileObserveDirectoryMetadata:
 		expected.Directory = r.Directory
 		expected.DirectoryMetadata = r.DirectoryMetadata
+	case storage.OpFileObserveContentMetadata:
+		reference = true
+		expected.ContentEffect = r.ContentEffect
 	case storage.OpFileObserveName:
 		reference = true
 		expected.Guards = r.Guards
@@ -311,6 +314,8 @@ func validateFileResponse(req fileRequest, r fileResponse) error {
 			expected.Attr = r.Attr
 		case storage.OpFileReadDirNode, storage.OpFileObserveDirectoryMetadata:
 			expected.Directory = r.Directory
+		case storage.OpFileObserveContentMetadata:
+			expected.ContentMetadata = r.ContentMetadata
 		case storage.OpFileObserveName:
 			expected.NameObservation = r.NameObservation
 		case storage.OpFileRead:
@@ -445,6 +450,13 @@ func validateFileResponse(req fileRequest, r fileResponse) error {
 	case storage.OpFileMutateName:
 		if req.Name == nil || nameResultNeedsAttr(req.Name.Kind) && r.Attr == nil {
 			return errors.New("name response carries no required attributes")
+		}
+	case storage.OpFileObserveContentMetadata:
+		if r.ContentMetadata == nil {
+			return errors.New("content metadata observation is absent")
+		}
+		if err := r.ContentMetadata.storage().Check(); err != nil {
+			return err
 		}
 	case storage.OpFileObserveName:
 		if r.NameObservation == nil {

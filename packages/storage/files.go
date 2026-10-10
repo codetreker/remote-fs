@@ -105,11 +105,17 @@ type File interface {
 // Opening a retained node cannot carry Create or Exclusive. Validation belongs
 // to FileOpenOptions, which also supplies initial metadata and expected identity.
 type OpenAccess struct {
-	Read      bool
-	Write     bool
-	Create    bool
-	Truncate  bool
-	Exclusive bool
+	ContentMetadataEffects []ContentMetadataEffect `json:",omitempty"`
+	Read                   bool
+	Write                  bool
+	Create                 bool
+	Truncate               bool
+	Exclusive              bool
+}
+
+func (o OpenAccess) Clone() OpenAccess {
+	o.ContentMetadataEffects = CloneContentMetadataEffects(o.ContentMetadataEffects)
+	return o
 }
 
 // FileOpenOptions selects access and atomic creation behavior. ExpectedID zero
@@ -124,6 +130,9 @@ type FileOpenOptions struct {
 
 // Check rejects invalid access, creation and initial metadata before admission.
 func (o FileOpenOptions) Check() error {
+	if len(o.ContentMetadataEffects) != 0 {
+		return syscall.EINVAL
+	}
 	if !o.Read && !o.Write {
 		return fmt.Errorf("file open requires read or write access: %w", syscall.EINVAL)
 	}

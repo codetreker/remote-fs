@@ -178,6 +178,12 @@ func (s InitialState) Check() error {
 }
 
 func (o OpenAtOptions) Check() error {
+	if err := CheckContentMetadataEffects(o.ContentMetadataEffects); err != nil {
+		return err
+	}
+	if len(o.ContentMetadataEffects) != 0 && !o.Write {
+		return syscall.EINVAL
+	}
 	if !o.Read && !o.Write || o.Exclusive && !o.Create || o.Existing < Keep || o.Existing > ReplaceNode {
 		return syscall.EINVAL
 	}
@@ -375,6 +381,21 @@ func (c NameCommand) Check() error {
 }
 
 func (c FileMutation) Check() error {
+	if len(c.ContentEffects) > MaxContentMetadataEffects {
+		return syscall.EFBIG
+	}
+	if len(c.ContentEffects) != 0 {
+		if (c.Kind != MutateWriteAt && c.Kind != MutateAppend) || len(c.Data) == 0 || !c.Attr.Empty() || len(c.Metadata) != 0 {
+			return syscall.EINVAL
+		}
+		seen := make(map[uint16]struct{}, len(c.ContentEffects))
+		for _, index := range c.ContentEffects {
+			if _, ok := seen[index]; ok {
+				return syscall.EINVAL
+			}
+			seen[index] = struct{}{}
+		}
+	}
 	if c.Kind < MutateTruncate || c.Kind > MutateAppend || c.Size < 0 || c.Offset < 0 {
 		return syscall.EINVAL
 	}

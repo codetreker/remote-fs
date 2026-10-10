@@ -208,8 +208,35 @@ func TestSweepRetriesGarbageAfterBackgroundFailure(t *testing.T) {
 	config := testConfig(privateRoot(t))
 	store := open(t, config)
 	t.Cleanup(func() { closeStore(t, store) })
+	awaitSweep := func(after time.Time) objectstore.MaintenanceStatus {
+		t.Helper()
+		deadline := time.NewTimer(5 * time.Second)
+		defer deadline.Stop()
+		for {
+			status := store.MaintenanceStatus()
+			if status.LastSweepTime.After(after) {
+				return status
+			}
+			select {
+			case <-deadline.C:
+				t.Fatal("background maintenance did not complete another attempt")
+			default:
+				time.Sleep(time.Millisecond)
+			}
+		}
+	}
+	startup := awaitSweep(time.Time{})
+	if startup.LastSweepRemoved != 0 || startup.LastSweepError != nil {
+		t.Fatalf("startup maintenance = %+v, want an empty successful sweep", startup)
+	}
 	if err := store.Write(t.Context(), "obsolete", []byte("garbage payload")); err != nil {
 		t.Fatal(err)
+	}
+	// Consume both earlier triggers so no queued empty sweep can overwrite the later
+	// explicit recovery's result in the latest-attempt status.
+	written := awaitSweep(startup.LastSweepTime)
+	if written.LastSweepRemoved != 0 || written.LastSweepError != nil {
+		t.Fatalf("maintenance after Write = %+v, want an empty successful sweep", written)
 	}
 
 	database := rawDatabase(t, filepath.Join(config.Root, databaseName), true)
@@ -237,15 +264,9 @@ func TestSweepRetriesGarbageAfterBackgroundFailure(t *testing.T) {
 	if err := store.Remove(t.Context(), "obsolete"); err != nil {
 		t.Fatal(err)
 	}
-	deadline := time.NewTimer(5 * time.Second)
-	defer deadline.Stop()
-	for store.MaintenanceStatus().LastSweepError == nil {
-		select {
-		case <-deadline.C:
-			t.Fatal("background maintenance did not retain the shard-permission failure")
-		default:
-			time.Sleep(time.Millisecond)
-		}
+	failed := awaitSweep(written.LastSweepTime)
+	if failed.LastSweepRemoved != 0 || !errors.Is(failed.LastSweepError, syscall.EIO) {
+		t.Fatalf("failed maintenance = %+v, want the retained shard-permission failure", failed)
 	}
 	if _, err := os.Stat(object); err != nil {
 		t.Fatalf("failed background maintenance removed the object: %v", err)
@@ -269,7 +290,8 @@ func TestSweepRetriesGarbageAfterBackgroundFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if status.Objects.GarbageCount != 0 || status.Maintenance.LastSweepError != nil ||
+	if !status.Maintenance.LastSweepTime.After(failed.LastSweepTime) ||
+		status.Objects.GarbageCount != 0 || status.Maintenance.LastSweepError != nil ||
 		status.Maintenance.LastSweepRemoved != 1 {
 		t.Fatalf("Status after Sweep = %+v", status)
 	}

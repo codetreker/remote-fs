@@ -13,11 +13,18 @@ import (
 // AccessRequest identifies the host-configured volume and an operation on it.
 // Volume is trusted configuration, not a name selected by the remote request.
 type AccessRequest struct {
-	Volume    string
-	Operation storage.Operation
+	ContentMetadataEffects []storage.ContentMetadataEffect
+	Volume                 string
+	Operation              storage.Operation
 	// Open preserves validated file and node-reference open intent, including
 	// compatibility uses that require read or write authority.
 	Open storage.OpenAccess
+}
+
+func (r AccessRequest) Clone() AccessRequest {
+	r.Open = r.Open.Clone()
+	r.ContentMetadataEffects = storage.CloneContentMetadataEffects(r.ContentMetadataEffects)
+	return r
 }
 
 // Authorizer reads the host's current policy using identity from ctx. It must

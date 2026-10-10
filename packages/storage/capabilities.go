@@ -416,15 +416,16 @@ type InitialState struct {
 }
 
 type OpenAtOptions struct {
-	Read, Write       bool
-	MetadataAccess    MetadataPermissions
-	Create, Exclusive bool
-	Target            ChildCondition
-	Action            FileActionID
-	Use               UseClaim
-	Existing          ExistingEffect
-	Initial           InitialState
-	CloseIntent       *CloseIntent `json:",omitempty"`
+	ContentMetadataEffects []ContentMetadataEffect `json:",omitempty"`
+	Read, Write            bool
+	MetadataAccess         MetadataPermissions
+	Create, Exclusive      bool
+	Target                 ChildCondition
+	Action                 FileActionID
+	Use                    UseClaim
+	Existing               ExistingEffect
+	Initial                InitialState
+	CloseIntent            *CloseIntent `json:",omitempty"`
 }
 
 // A nonnil File transfers cleanup ownership even when OpenAt returns an error.
@@ -544,6 +545,7 @@ const (
 // each payload Version is its expected old token, not the newly assigned token.
 // Empty expected tokens require absence in both maps.
 type FileMutation struct {
+	ContentEffects   []uint16 `json:",omitempty"`
 	Action           FileActionID
 	Offset           int64
 	Data             []byte            `json:",omitempty"`

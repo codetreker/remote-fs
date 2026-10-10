@@ -14,7 +14,7 @@ SMB frame、compound request、authentication token、connection、session、tre
 
 ### 协议安全先于文件命令
 
-本决定交付的本机协议基础成功处理 SMB framing bootstrap、SMB 3.1.1 NEGOTIATE、SESSION_SETUP、ECHO、TREE_CONNECT、TREE_DISCONNECT 与 LOGOFF；它为文件命令保留逐请求安全与 owner 生命周期。CREATE/CLOSE 及文件名字／访问／share 适配由[有界 CREATE/CLOSE](../feature/2026-09-28-smb-bounded-create-close.md)拥有。READ、WRITE、FLUSH、LOCK、IOCTL、QUERY_DIRECTORY、CHANGE_NOTIFY、QUERY_INFO、SET_INFO 与 oplock work 仍不进入 backing，并返回 `STATUS_NOT_SUPPORTED`。CANCEL 的动作语义不在本决定内；CANCEL、未知 command 与畸形 request fail closed，终止连接而不执行受控效果。
+本决定交付的本机协议基础成功处理 SMB framing bootstrap、SMB 3.1.1 NEGOTIATE、SESSION_SETUP、ECHO、TREE_CONNECT、TREE_DISCONNECT 与 LOGOFF；它为文件命令保留逐请求安全与 owner 生命周期。CREATE/CLOSE 及文件名字／访问／share 适配由[有界 CREATE/CLOSE](../feature/2026-09-28-smb-bounded-create-close.md)拥有。READ／WRITE／FLUSH 由[文件内容访问](../feature/2026-09-28-smb-file-data-io.md)接续；LOCK、IOCTL、QUERY_DIRECTORY、CHANGE_NOTIFY、QUERY_INFO、SET_INFO 与 oplock work 仍不进入 backing，并返回 `STATUS_NOT_SUPPORTED`。CANCEL 的动作语义不在本决定内；CANCEL、未知 command 与畸形 request fail closed，终止连接而不执行受控效果。
 
 Direct TCP payload 在分配前受 byte bound 限制。SMB2 header、compound offset/alignment、command count、negotiate context、UTF-16 和变长字段使用严格 decoder；解析结果借用一份被请求生命周期持有的 bounded frame。compound request 保留每个 command 的原始 bytes、MessageId、SessionId、TreeId 与 related 关系，协议层不把后续文件命令压成一个无上下文 callback。
 
@@ -50,7 +50,7 @@ authentication exchange 有独立 expiry watcher。新的 reauthentication gener
 
 本决定交付 Windows client 所需的 secure bounded SMB endpoint/session foundation，并只部分满足 R-WIN-1、R-WIN-9 与 R-WIN-10。它不交付可浏览或可读写 share，不声明 Windows network-drive support 已完成。
 
-Windows name/metadata projection、authoritative resolver、CREATE/CLOSE、share-mode admission 与 FileId cleanup 由[有界 CREATE/CLOSE](../feature/2026-09-28-smb-bounded-create-close.md)接续。READ/WRITE/FLUSH、QUERY_INFO、directory enumeration 和 delete-on-close 属于各自文件能力。SUPERSEDE、disposition、rename、current-name traversal、CHANGE_NOTIFY、overflow/rescan、cache invalidation 与 byte-range LOCK/CANCEL 属于独立 mutation/concurrency 工作。WNet mapping、Windows VM lifecycle、真实 redirector 的身份／缓存／故障验收不由本决定完成。
+Windows name/metadata projection、authoritative resolver、CREATE/CLOSE、share-mode admission 与 FileId cleanup 由[有界 CREATE/CLOSE](../feature/2026-09-28-smb-bounded-create-close.md)接续。READ/WRITE/FLUSH 的[文件内容能力](../feature/2026-09-28-smb-file-data-io.md)已独立交付；QUERY_INFO、directory enumeration 和 delete-on-close 属于各自后续能力。SUPERSEDE、disposition、rename、current-name traversal、CHANGE_NOTIFY、overflow/rescan、cache invalidation 与 byte-range LOCK/CANCEL 属于独立 mutation/concurrency 工作。WNet mapping、Windows VM lifecycle、真实 redirector 的身份／缓存／故障验收不由本决定完成。
 
 平台中立约束保持不变：SMB status、Windows name comparer、create disposition、本地主体和协议 handle 不进入 storage/HTTP schema；tree 保留 FileStorage 与 FileSession 的扩展位置，FileId 绑定 retained File/NodeReference，不能由路径、connection、SessionId、TreeId 或 NodeID 直接充当。directory revision 仍只可比等，不是 notification cursor；当前端点不建立 watcher 或 TTL cache。
 

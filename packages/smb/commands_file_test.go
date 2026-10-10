@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
+	"reflect"
 	"syscall"
 	"testing"
 
@@ -212,7 +214,7 @@ func TestCreateAllocationHintPreservesOrdinaryOpenIntent(t *testing.T) {
 	}
 	request.Contexts = []wire.CreateContext{{Name: []byte("AlSi"), Data: []byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}}}
 	hinted, err := classifyCreate(request)
-	if err != nil || hinted != ordinary {
+	if err != nil || !reflect.DeepEqual(hinted, ordinary) {
 		t.Fatalf("allocation hint changed ordinary open: %+v, %v", hinted, err)
 	}
 }
@@ -278,5 +280,31 @@ func TestCreateDirectoryAttributesFollowOptionsAndRetainOnlySettableFlags(t *tes
 		if err != nil || intent.directory != test.directory || intent.attributes != test.retained {
 			t.Fatalf("attributes=%x options=%x intent=%+v err=%v", test.attributes, test.options, intent, err)
 		}
+	}
+}
+
+func TestOpenAuthorizationSeparatesInitialMetadataFromSealedEffects(t *testing.T) {
+	for _, reset := range []bool{false, true} {
+		t.Run(fmt.Sprintf("reset-%v", reset), func(t *testing.T) {
+			var checked []authz.AccessRequest
+			c := &connection{server: &Server{config: Config{Authorize: authz.AuthorizerFunc(func(_ context.Context, request authz.AccessRequest) error {
+				checked = append(checked, request.Clone())
+				if request.Operation == storage.OpFileSetMetadata && len(request.ContentMetadataEffects) == 0 {
+					return authz.ErrDenied
+				}
+				return nil
+			})}}}
+			initial := storage.InitialState{}
+			if reset {
+				initial.OnReset.Metadata = map[string][]byte{windowsMetadataKey: []byte("arbitrary")}
+			} else {
+				initial.OnCreate.Metadata = map[string][]byte{windowsMetadataKey: []byte("arbitrary")}
+			}
+			intent := openIntent{write: true, contentEffects: windowsContentEffects()}
+			err := c.authorizeOpen(t.Context(), &tree{export: &Export{share: Share{Volume: "v"}}}, storage.OpFileOpenAt, intent, initial)
+			if !errors.Is(err, authz.ErrDenied) || len(checked) != 2 || checked[1].Operation != storage.OpFileSetMetadata || len(checked[1].ContentMetadataEffects) != 0 {
+				t.Fatalf("unrestricted initial metadata used sealed authorization: requests=%+v err=%v", checked, err)
+			}
+		})
 	}
 }

@@ -160,6 +160,8 @@ schema v9 用例从真实 v8 记录前滚，核对原 intent ID 作为 owner、�
 
 [limited 包装用例](../packages/storage/limited/recoverable_close_test.go)、[locked 包装用例](../packages/storage/locked/recoverable_close_test.go)和[replicated 包装用例](../packages/storage/replicated/recoverable_close_test.go)核对 CloseRecovery capability preflight、原 action/generation、`Determined` 与 `Released`、原错误和 barrier 逐层保真；下层不支持时，capability 检查显式拒绝；要求该能力的入口须在打开效果前执行预检。replica 在 barrier 等待失败后保留已确认释放事实，同 ID 只继续等待 barrier，不重做 native close。副本包装测试还覆盖内部清理在确定未释放后的下一 generation、外部从原引用状态接管内部 Unknown、wrapper 本地关闭额度满时 Ready=false，以及未执行旧 ID 的有界证明账本：仅绑定查询得到 Retired 或 parent authority 已释放且 barrier 结算才回收，旧 ID 后续以失效失败而不重新转发。证明账本满时其它可成功关闭的引用仍能关闭；遇到新的旧 epoch ID 在效果前被拒绝则原 ID 保留待存证明、以 `EAGAIN` 续查，直到旧证明有绑定 Retired 证据后才能同 generation 换 ID。
 
+Handler.Close 的 cleanup-attempt 回归在首轮已经排空后、第二次显式调用前核对 retained EIO 与仍有 session；后续调用才可取得成功或 ENOTEMPTY，原 completed attempt 的 error 不随它改变。它验证一次 Close 只发起／加入一次 cleanup，Stop 保持非阻塞并只启动首轮；不依靠 race 调度使 duplicate stop 恰好未发生。
+
 ### 无名字对象的用量与恢复
 
 [retained quota 用例](../packages/storage/limited/files_test.go)用两个打开引用保留已 unlink 的对象，断言字节继续计入 Used，后续增长也被计费，第一次 Close 不释放第二个引用仍需要的字节。最后一次有效释放按对象当前大小结算一次，重复 Close 不重复返还；失败 cleanup、取消创建请求后到期、startup 与 Recount 都核对真实 retained 用量。Recount 与最终 cleanup 交错时必须重取一致用量，不能用只遍历可见树的方法漏掉 detached 文件。
@@ -327,7 +329,7 @@ Pending 用例先占满 authority 的申请队列，随后确认 HTTP control ad
 
 ## SMB endpoint、认证与生命周期
 
-SMB 的协议 primitive 与 endpoint lifecycle 分层验证。`packages/smb/internal/wire` 直接覆盖 SMB2 header、Direct TCP payload、compound alignment、UTF-16、negotiate context、SESSION_SETUP、TREE_CONNECT 与 CREATE/CLOSE shape；畸形 offset、CREATE context 的 Next 越界／重叠、重复或互斥 context、混合 related compound、超量 command/context、半个 all-ones FileId 和截断 body 必须在消费受控状态前失败。`packages/smb/internal/signing` 使用 CMAC 标准向量核对 SP800-108 key derivation、SHA-512 preauthentication transcript、packet sign/verify，以及 signer destroy 与并发 sign 的互斥。
+SMB 的协议 primitive 与 endpoint lifecycle 分层验证。`packages/smb/internal/wire` 直接覆盖 SMB2 header、Direct TCP payload、compound alignment、UTF-16、negotiate context、SESSION_SETUP、TREE_CONNECT、CREATE/CLOSE 与 READ/WRITE/FLUSH shape；畸形 offset、CREATE context 的 Next 越界／重叠、重复或互斥 context、混合 related compound、超量 command/context、半个 all-ones FileId 和截断 body 必须在消费受控状态前失败。`packages/smb/internal/signing` 使用 CMAC 标准向量核对 SP800-108 key derivation、SHA-512 preauthentication transcript、packet sign/verify，以及 signer destroy 与并发 sign 的互斥。
 
 `packages/smb` 的真实 TCP transcript 从 NEGOTIATE、两轮 SESSION_SETUP、ECHO 到 volume TREE_CONNECT／TREE_DISCONNECT／LOGOFF，逐帧验证签名和状态。协商只接受 SMB 3.1.1、SHA-512 与 AES-CMAC；client 未发送 signing-capabilities context 时 response 不虚构该 context，显式发送时只回显实际选择。unsigned session request 的拒绝保持 unsigned；带 signed flag 的坏 MAC 和已建立 session 的 malformed reauthentication 得到 signed denial，旧 session 仍可继续使用。sessionless ECHO 在 authentication 前后均不借用另一 session 的 signer。错误 session/tree、unsupported flag 与已识别但未实现的 file/directory command 都在 backing 之前拒绝；后者的用例同时核对 `STATUS_NOT_SUPPORTED` 与 backend data call 为零。CANCEL、未知 command 和畸形 request 的 fail-closed 用例断言连接终止且没有受控效果，不要求一个协议不定义的响应。
 
@@ -355,6 +357,22 @@ identity 契约两端验证 backend 的持久 Volume／共享 Authority／RootNo
 
 retirement 用受控并发使 TREE_DISCONNECT/LOGOFF/断线/stop 与 CREATE/CLOSE 交错，确认 tree fence 先于新准入、已接纳工作排空、该 tree 的 handles 先于共享 authority ref 释放。CREATE 的迟到成功结果在发布前重新核对 raw Status 与本地 context/fence/session/deadline/预留槽；取消、退休、失效 session 或丢失槽位不能安装 Live，已获引用继续 cleanup-owned。退出一个 tree 不关闭其它 tree 使用的 FileSession；清理失败保留计数、export 和当前尝试，新 context 能续作同一 owner。直接 backend 与真实 HTTP adapter 分别验证这些事实。
 
+### 文件内容、固定效果与未知结果
+
+READ 用例以一次 FileRead 的 Data／Attr 核对 ID、kind、Size、allocation 和 captured EOF，正短读不补读；合法零结果与 MinimumCount 的状态、非法零读、跨 revision 不相容事实分别验证。WRITE 直接及真实 HTTP 用例覆盖 WRITE-only／append-only 的公开 metadata EBADF、普通范围／增长、authority 原子 append、空 WRITE 无内容／EOF／ARCHIVE／时间改变，以及 READONLY 在观察后翻转和当前 metadata policy 撤销的零效果拒绝。固定 SMW payload 与 tokens 在内容 publication 内同时提交，不能把两次 setter 当作原子证明。
+
+native／HTTP 的 confirmed EDQUOT 用例核对 STATUS_QUOTA_EXCEEDED、bound NotExecuted，以及内容／ARCHIVE／时间／日志均无效果；joined EIO＋EDQUOT 保持未知 I/O 状态，不冒充 quota refusal。SMB 与 HTTP enrollment 的限定 descriptor 与 initial metadata 普通授权分别调用，restricted effect policy 不能省略普通 metadata 许可；CREATE／reset 拒绝不得留下名字、内容或属性效果。
+
+wire 向量覆盖 READ／WRITE StructureSize 49、FLUSH 24、WRITE DataOffset≤256 与当前 command extent；空 Data 不需112下界但仍不可越界，非空需≥112且不增加未规定对齐。Channel NONE 垃圾字段及 reserved 被忽略；READ compression 普通返回。WRITE_THROUGH-only INVALID_PARAMETER、UNBUFFERED／配对 NOT_SUPPORTED、RDMA／未知 flags 和非法 offset 都核对效果前拒绝。64 KiB、边界上一字节与最大 I/O credits 按 requested Length，READ 的完整最大响应在 backing 前预留。
+
+ContentMetadata contract tests 覆盖16项／32 KiB单值／64 KiB总量、重复 namespace、mask／prefix、absence与present empty、未知版本、descriptor深复制及同动作变化。每个 ContentEffects index 必须绑定原 namespace 与显式 ExpectedMetadata，遗漏／任意 payload／属性混合／空数据效果在 publication 前失败。OpenAt、限定观察、mutation／typed replay 的真实 OpFileSetMetadata 授权与公开 MetadataAccess 分离；direct、HTTP、locked、limited 与 replica 验证同一能力链。
+
+file_io_gate tests 受控排列 running／queued／cancel／CLOSE／tree／parent：fence 后新请求失败，queued项无效果，running先排空，post-query在排空后；不同FileId仍并行。write_owner tests 核对 Completed 必须原 typed replay、bound NotExecuted 条件重试最多两次、unbound／Unknown／Retired不 remint、original action／Data／token不变。真实HTTP丢回复后，unknown owner仍计费，sibling READ／Renew／Status／Close进展；data pending满额仍保留cleanup及最大Data恢复lane，close proof不能依赖先证明execution。真实 signed related CREATE→WRITE→FLUSH→CLOSE transcript 核对原 frame 不变、逐响应签名、final callback 排空 owner，以及 CLOSE post-query 的最终 EOF／ARCHIVE。
+
+FLUSH 用原 exact File.Sync；Sync DTO拒绝Action，不进入session pending journal，未知confirmation不堵无关句柄。HTTP SyncWithBarrier与replica用例核对post-Sync确切barrier未完成时不成功，重作Sync不写内容。write_diagnostics tests 覆盖response final前不可ack、typed generation/stale/missing/duplicates全批拒绝、原failure facts深复制与饱和预留。payload仅在exact引用或完整父no-future及全链settlement证明后释放；ExecutionUnknown与发送未确认保留至宿主明确接管诊断，停止未完成责任保持stopping/error。
+
+真实 SMB→replica→HTTP→native 关闭用例在原 Unknown WRITE 后暂停 SSE 的 close barrier：下层 native 已 Released、HTTP 可撤下本层 copy，SMB 原 owner 仍保留 Data／charge 且不能 acknowledgment。恢复同一 barrier 并沿原 close attempt 结算后才释放 bytes，终态 ExecutionUnknown 仍保留；不能以本层释放冒充完整链确认。
+
 `packages/smb/windows` 的平台无关测试核对 canonical SID／logon-session、同 SID 不同登录会话的拒绝、anonymous／Guest／service account 拒绝、context cancellation 和 secret-free `SECURITY_STATUS`。SMB session 用例另验证 `AuthorizeIdentity` 在 signer/principal 安装前执行，明确拒绝与无法决定分别映射为 access denied 和 I/O failure，并且失败的 reauthentication 不改变旧身份或 expiry。`windows-2025` CI job 在 Windows Server 2025 runner 上以 race detector 执行 native SSPI Negotiate exchange，核对 current token 的 SID、`TOKEN_STATISTICS.AuthenticationId`、session key 与 security-context expiry；取消用例核对 exchange 关闭且不能复用。注入失败的 ownership 用例分别核对 credential、context、token 与 buffer cleanup 会尝试全部独立 owner、保留失败项并在后续 Close 重试。该 runner 验证 Windows API 与 SSPI ownership，不是 R-INT-8 所要求的 Windows 11 24H2 redirector/WNet 环境；其它平台仍须明确返回不支持，不能用假的身份通过。
 
 `windows-sspi` job 还通过严格 no-skip wrapper 执行 portable endpoint/wire suite，其中 root SMB 包的 Windows 构建包含 native UTF-16 比较测试：
@@ -366,7 +384,7 @@ retirement 用受控并发使 TREE_DISCONNECT/LOGOFF/断线/stop 与 CREATE/CLOS
 
 交叉编译只验证可构建；native 比较的实际 verdict 必须来自 Windows runner。Linux package-local 测试与必要 race 验证分别覆盖 SMB、storage identity/open、SQLite/objectstore、HTTP 和 wrappers；其它包 test binary 的执行不计入它们的 production coverage。
 
-这些用例证明端点的协议、安全、CREATE/CLOSE、共享准入与清理路径。原生 unit/order 与 SSPI 测试证明所调用 Windows API 的行为；它们不构成 Windows 11 redirector、WNet 映射、数据 I/O、目录浏览、通知、缓存一致性或最终 network-drive 资格证据。完整结论由相应真实 Windows 入口验收给出。
+这些用例证明端点的协议、安全、CREATE/CLOSE、READ/WRITE/FLUSH、共享准入与清理路径。原生 unit/order 与 SSPI 测试证明所调用 Windows API 的行为；它们不构成 Windows 11 redirector、WNet 映射、Windows redirector 数据 I/O、目录浏览、通知、缓存一致性或最终 network-drive 资格证据。完整结论由相应真实 Windows 入口验收给出。
 
 ## 测真实入口
 
@@ -454,6 +472,10 @@ SQLite 的包内直接用例按各模块持有的边界核对结果：
 ### 本地持久对象存储
 
 [shard 描述符用例](../packages/storage/objectstore/localdisk/objects_test.go)在真实私有对象目录中分别驱动 Get、GetBounded 与 Delete：占住唯一 active 名额，确认 shard 已打开且调用到达饱和的提升等待分支后取消，重复操作结束时按 device／inode 识别的 `/proc/self/fd` 目标 shard 描述符数恢复基线。单纯取消保持 EINTR，waiting／active、byte 预留与 key／shard 协调资源释放，归还名额后正常操作仍可完成；另在打开 shard 后注入健康失败，核对 EIO 与 FD 基线。[既有对象用例](../packages/storage/objectstore/localdisk/localdisk_test.go)继续核对缺席、打开及身份校验失败的错误语义；缺席判断仍位于 admission 与健康检查之后。
+
+[recovery publication 用例](../packages/storage/objectstore/localdisk/recovery_publication_test.go)在Put／Delete的preparation创建、完整写入、file sync、create-only final link、目录sync与cleanup各边界用子进程SIGKILL中断，重开不得把半写preparation当final权限；原已确认payload仍可读，final96字节格式及corruption拒绝不变。preparation-only空／部分／撕裂、foreign完整记录、hardlinkalias、不同inodepair、对象stage、超限及配对精确计一项分别有recovery tests。真实binary local-store重启用例验证恢复后serving与旧描述符退役。
+
+localstore background-failure测试先等启动及Write的空清扫触发都完成，再制造shard权限失败并观察本次error；恢复权限后显式Sweep核对移除对象与最近attempt状态。用例区分已经排空的早期空trigger与失败后的重试，保留最近一次维护结果的真实语义。
 
 `packages/storage/objectstore/localdisk` 与 `packages/storage/localstore` 在测试专用的真实本地目录里运行，验证的不只是 `Objects` 契约，还包括磁盘格式与 reopen 行为：
 

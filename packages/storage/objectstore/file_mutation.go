@@ -28,11 +28,15 @@ func (f *openFile) MutateFile(ctx context.Context, command storage.FileMutation)
 	if (command.Kind == storage.MutateAttributes || !command.Attr.Empty() || len(command.Metadata) != 0) && f.metadata&storage.WriteMetadata == 0 {
 		return storage.Attr{}, syscall.EBADF
 	}
+	if err := storage.CheckContentMutation(command, f.contentEffects); err != nil {
+		return storage.Attr{}, err
+	}
+	command = canonicalFileMutation(command)
 	target, err := f.session.referenceActionTarget(ctx, f)
 	if err != nil {
 		return storage.Attr{}, err
 	}
-	input := fileMutationActionInput{Target: target, Command: command}
+	input := fileMutationActionInput{Target: target, Command: command, Effects: storage.CloneContentMetadataEffects(f.contentEffects)}
 	return runFileAction(ctx, f.session, command.Action, storage.OpFileMutate, input,
 		func(attr storage.Attr) storage.Attr { return attr.Clone() },
 		func(attr storage.Attr) bool { return attr.ID != 0 },
@@ -40,6 +44,9 @@ func (f *openFile) MutateFile(ctx context.Context, command storage.FileMutation)
 }
 
 func (f *openFile) mutateFile(ctx context.Context, command storage.FileMutation) (storage.Attr, error) {
+	if len(command.ContentEffects) != 0 {
+		ctx = metastore.WithReferenceSession(ctx, f.session.locks)
+	}
 	switch command.Kind {
 	case storage.MutateTruncate:
 		ctx = metastore.WithFileAccess(ctx, metastore.FileAccess{Uses: storage.WriteData, Truncate: true, Size: command.Size})

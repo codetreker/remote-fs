@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -1334,7 +1335,7 @@ func TestIdentityAuthorizationCoversCompositeEffectsAndCompatibilityClaims(t *te
 		Use:      storage.UseClaim{Uses: storage.ReadData | storage.WriteData | storage.DeleteName},
 	}
 	err := handler.authorizeFile(t.Context(), fileRequest{Op: storage.OpFileOpenAt, OpenAt: openAtOptionsOf(open)})
-	if !errors.Is(err, authz.ErrDenied) || len(requests) != 2 || requests[0].Operation != storage.OpFileOpenAt || requests[0].Open != (storage.OpenAccess{Read: true, Write: true, Create: true}) || requests[1].Operation != storage.OpVolumeRemove {
+	if !errors.Is(err, authz.ErrDenied) || len(requests) != 2 || requests[0].Operation != storage.OpFileOpenAt || !reflect.DeepEqual(requests[0].Open, storage.OpenAccess{Read: true, Write: true, Create: true}) || requests[1].Operation != storage.OpVolumeRemove {
 		t.Fatalf("replace authorization=%+v err=%v", requests, err)
 	}
 
@@ -1347,7 +1348,7 @@ func TestIdentityAuthorizationCoversCompositeEffectsAndCompatibilityClaims(t *te
 	if err := handler.authorizeFile(t.Context(), fileRequest{Op: storage.OpFileOpenNodeRef, NodeRef: nodeRefOptionsOf(options)}); err != nil {
 		t.Fatal(err)
 	}
-	if len(requests) != 1 || requests[0].Open != (storage.OpenAccess{Read: true, Write: true}) {
+	if len(requests) != 1 || !reflect.DeepEqual(requests[0].Open, storage.OpenAccess{Read: true, Write: true}) {
 		t.Fatalf("compatibility claims were not authorized as open access: %+v", requests)
 	}
 }

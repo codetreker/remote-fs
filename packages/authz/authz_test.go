@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"testing"
 
 	"github.com/codetreker/remote-fs/packages/authz"
@@ -22,7 +23,7 @@ func TestAuthorizerFuncPreservesHostContextIntentAndError(t *testing.T) {
 	calls := 0
 	policy := authz.AuthorizerFunc(func(got context.Context, copied authz.AccessRequest) error {
 		calls++
-		if got != ctx || got.Value(identityKey{}) != "host-owned-identity" || copied != request {
+		if got != ctx || got.Value(identityKey{}) != "host-owned-identity" || !reflect.DeepEqual(copied, request) {
 			t.Fatalf("adapter changed host context or intent: %+v", copied)
 		}
 		copied.Volume = "different"
@@ -49,5 +50,16 @@ func TestDeniedMarkerSurvivesHostErrorWrappingAndJoining(t *testing.T) {
 	}
 	if errors.Is(errors.New("access denied"), authz.ErrDenied) {
 		t.Fatal("matching text invented an explicit policy decision")
+	}
+}
+
+func TestAccessRequestCloneOwnsSealedMetadataEffects(t *testing.T) {
+	effect := storage.ContentMetadataEffect{Namespace: "test.flags", PayloadBytes: 1, AbsentPayload: []byte{0}, ClearMask: []byte{1}, SetMask: []byte{2}}
+	request := authz.AccessRequest{Open: storage.OpenAccess{Write: true, ContentMetadataEffects: []storage.ContentMetadataEffect{effect}}, ContentMetadataEffects: []storage.ContentMetadataEffect{effect}}
+	cloned := request.Clone()
+	cloned.Open.ContentMetadataEffects[0].SetMask[0] = 0xff
+	cloned.ContentMetadataEffects[0].AbsentPayload[0] = 0xff
+	if request.Open.ContentMetadataEffects[0].SetMask[0] != 2 || request.ContentMetadataEffects[0].AbsentPayload[0] != 0 {
+		t.Fatal("policy copy changed sealed metadata effect")
 	}
 }

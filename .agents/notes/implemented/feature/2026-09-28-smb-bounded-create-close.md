@@ -19,7 +19,7 @@ SMB 负责 Windows 名字比较、标志解释、wire 编码、本机 FileId、�
 | 内容 | 范围与延期代价 | 保留的结构 |
 |---|---|---|
 | CREATE/CLOSE、身份、真实错误、容量与清理所有权 | 本次保证；延期会重写效果与退休路径 | 引用和 owner 在效果前登记，未知结果固定原动作 |
-| READ/WRITE/FLUSH、信息与目录枚举 | 后续命令使用已有对象能力，增加命令与结果预算 | File 与 NodeReference 不互相冒充，访问授予与 Use 分开保存 |
+| READ/WRITE/FLUSH、信息与目录枚举 | [内容访问](2026-09-28-smb-file-data-io.md)使用已有对象能力；信息与目录新增独立结果投影 | File 与 NodeReference 不互相冒充，访问授予与 Use 分开保存 |
 | delete-on-close、SUPERSEDE、rename/disposition | 增加持久义务和 guarded 名字／原位重置动作；请求明确拒绝 | FileId 不以路径为身份，不把关闭等同于删除动作 |
 | 范围锁、CANCEL、通知／leases／缓存 | 增加中立 owner、async 请求与变更源；请求不取得成功路径 | 不授予 oplock，不把 SMB replay 当成中立动作重投 |
 | WNet 与原生 Windows 资格 | 需要系统 redirector、445、登录会话与缓存证据 | 本机协议验证不宣称 network-drive 发布资格 |
@@ -128,4 +128,4 @@ CREATE/CLOSE 有可独立审查的签名、名字选择、访问、共享、身�
 
 每级完整目录观察使深路径和大目录冷打开昂贵；MaxDirectoryBytes 耗尽明确失败。优化只能采用 revision 耦合的权威索引或可证明失效的观察缓存。action history 有限，窗口之外的未知动作可能无法在原 Windows 调用中结清；有界诊断不能冒充应用成功。不能提供身份、allocation、稳定引用或可恢复关闭的第三方链拒绝 tree；HTTP server 下尚有异步 settlement 的组合不宣告 CloseRecovery。
 
-本决定不交付文件数据、目录浏览、名字修改、范围锁、通知、WNet 或原生发布资格。它们由[文件 I/O 与信息](../../proposed/feature/2026-09-28-smb-file-data-information.md)、[目录枚举](../../proposed/feature/2026-09-28-smb-directory-enumeration.md)、[关闭删除义务](../../proposed/feature/2026-09-28-smb-close-delete-obligation.md)及整体 Windows 提案中的独立工作承担。实际结构见[SMB 端点设计](../../../../docs/design/client/smb-endpoint.md)，错误与竞争路径验证见[测试策略](../../../../docs/testing.md)。
+本决定不交付文件数据、目录浏览、名字修改、范围锁、通知、WNet 或原生发布资格。内容路径由[文件内容访问](2026-09-28-smb-file-data-io.md)接续，其余由[文件与 volume 信息](../../proposed/feature/2026-09-28-smb-file-data-information.md)、[目录枚举](../../proposed/feature/2026-09-28-smb-directory-enumeration.md)、[关闭删除义务](../../proposed/feature/2026-09-28-smb-close-delete-obligation.md)及整体 Windows 提案中的独立工作承担。实际结构见[SMB 端点设计](../../../../docs/design/client/smb-endpoint.md)，错误与竞争路径验证见[测试策略](../../../../docs/testing.md)。

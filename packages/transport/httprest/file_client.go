@@ -18,8 +18,9 @@ type fileScopeKey struct{}
 type fileReadOnlyKey struct{}
 type fileRequestAdmissionKey struct{}
 type fileRequestAdmission struct {
-	storage *Storage
-	control bool
+	recovery bool
+	storage  *Storage
+	control  bool
 }
 
 func fileReadOnly(op storage.Operation) bool {
@@ -27,7 +28,7 @@ func fileReadOnly(op storage.Operation) bool {
 		return true
 	}
 	switch op {
-	case storage.OpFileBackendIdentity, storage.OpFileRead, storage.OpFileStat, storage.OpFileStatNode, storage.OpFileLookupAt, storage.OpFileReadDirNode, storage.OpFileObserveDirectoryMetadata, storage.OpFileObserveName, storage.OpFileQueryAction, storage.OpFileCloseOwnerStatus, storage.OpFileQueryDeleteIntent, storage.OpFileListDeleteIntents, storage.OpFileState, storage.OpFileScope, storage.OpFileRangeGetConflict, storage.OpFileRangeQuery, storage.OpFileStatus:
+	case storage.OpFileBackendIdentity, storage.OpFileRead, storage.OpFileStat, storage.OpFileStatNode, storage.OpFileLookupAt, storage.OpFileReadDirNode, storage.OpFileObserveDirectoryMetadata, storage.OpFileObserveName, storage.OpFileObserveContentMetadata, storage.OpFileQueryAction, storage.OpFileCloseOwnerStatus, storage.OpFileQueryDeleteIntent, storage.OpFileListDeleteIntents, storage.OpFileState, storage.OpFileScope, storage.OpFileRangeGetConflict, storage.OpFileRangeQuery, storage.OpFileStatus:
 		return true
 	}
 	return false
@@ -37,7 +38,7 @@ func requestInterruptible(ctx context.Context, r Request) bool {
 		return true
 	}
 	read, _ := ctx.Value(fileReadOnlyKey{}).(bool)
-	return (r.Op == OpFile || r.Op == OpFileControl) && read
+	return (r.Op == OpFile || r.Op == OpFileControl || r.Op == OpFileRecovery) && read
 }
 
 func fileScopeEnabled(ctx context.Context) bool { v, _ := ctx.Value(fileScopeKey{}).(bool); return v }
@@ -48,6 +49,8 @@ type remoteFileSession struct {
 	mu                   sync.Mutex
 	closeCallMu          sync.Mutex
 	reconcileMu          sync.Mutex
+	explicitWrites       map[string]*explicitFileWrite
+	recoveryAdmission    *bodyAdmission
 	epoch                uint64
 	failed               error
 	closed               bool
@@ -64,6 +67,7 @@ type remoteFileSession struct {
 	closeActionLimit     int
 	closeHistory         time.Duration
 	inflight             int
+	cleanupInflight      int
 	pendingLimit         int
 	capabilities         fileCapabilities
 	identity             storage.FileSessionIdentityResult
@@ -97,6 +101,7 @@ type remoteFile struct {
 	closeScope           locking.MutationScope
 	closeScopeSet        bool
 	capabilities         fileCapabilities
+	contentEffects       []storage.ContentMetadataEffect
 }
 
 type remoteClosePendingProof struct {
@@ -152,7 +157,19 @@ func (s *Storage) fileCall(ctx context.Context, req fileRequest) (fileResponse, 
 		return fileResponse{}, syscall.EFBIG
 	}
 	op := OpFile
-	if fileControl(req.Op) {
+	recovery, _ := ctx.Value(fileRecoveryKey{}).(bool)
+	if recovery {
+		if !isExplicitFileWrite(req) || len(req.Mutation.Data) > MaxFileRecoveryDataBytes {
+			return fileResponse{}, syscall.EINVAL
+		}
+		release, err := s.fileRecovery.acquire(ctx, retainedResponseMultiplier*min(s.maxBodyBytes, MaxFileRecoveryBytes))
+		if err != nil {
+			return fileResponse{}, err
+		}
+		defer release()
+		ctx = context.WithValue(ctx, fileRequestAdmissionKey{}, fileRequestAdmission{storage: s, recovery: true})
+		op = OpFileRecovery
+	} else if fileControl(req.Op) {
 		op = OpFileControl
 	} else if admission, _ := ctx.Value(fileRequestAdmissionKey{}).(fileRequestAdmission); admission.storage != s || admission.control {
 		release, err := s.fileRequests.acquire(ctx, retainedResponseMultiplier*s.maxBodyBytes)
@@ -170,11 +187,15 @@ func (s *Storage) fileCall(ctx context.Context, req fileRequest) (fileResponse, 
 	envelope := req
 	envelope.Path = []byte{}
 	envelope.Data = []byte{}
+
 	fixed, err := json.Marshal(envelope)
 	if err != nil {
 		return fileResponse{}, unreachable(Request{Op: OpFile}, err)
 	}
 	limit := s.maxBodyBytes
+	if op == OpFileRecovery {
+		limit = min(limit, MaxFileRecoveryBytes)
+	}
 	if op == OpFileControl {
 		limit = min(limit, MaxFileControlBytes)
 	}
@@ -270,8 +291,13 @@ func (s *remoteFileSession) call(ctx context.Context, req fileRequest) (fileResp
 			req.ResultBytes = min(req.ResultBytes, outer)
 		}
 	}
-	if err := s.resolvePending(ctx); err != nil {
-		return fileResponse{}, err
+	if isExplicitFileWrite(req) {
+		return s.callExplicitWrite(ctx, req)
+	}
+	if req.Op != storage.OpFileSync {
+		if err := s.resolvePending(ctx); err != nil {
+			return fileResponse{}, err
+		}
 	}
 	control := fileControl(req.Op)
 	admission := s.storage.fileRequests
@@ -324,7 +350,16 @@ func (s *remoteFileSession) call(ctx context.Context, req fileRequest) (fileResp
 		if limit <= 0 {
 			limit = storage.DefaultFileSessionOptions().MaxLockActions
 		}
-		if len(s.pending)+s.inflight >= limit {
+		count := s.dataPendingLocked() + len(s.explicitWrites) + s.inflight
+		cleanup := cleanupFileAction(req.Op)
+		if cleanup {
+			limit = s.closeActionLimit
+			if limit <= 0 {
+				limit = storage.DefaultFileSessionOptions().MaxCloseActions
+			}
+			count = s.cleanupPendingLocked() + s.cleanupInflight
+		}
+		if count >= limit {
 			s.mu.Unlock()
 			return fileResponse{}, syscall.EAGAIN
 		}
@@ -335,14 +370,22 @@ func (s *remoteFileSession) call(ctx context.Context, req fileRequest) (fileResp
 				return fileResponse{}, err
 			}
 		}
-		s.inflight++
+		if cleanup {
+			s.cleanupInflight++
+		} else {
+			s.inflight++
+		}
 		reserved = true
 	}
 	s.mu.Unlock()
 	if reserved {
 		defer func() {
 			s.mu.Lock()
-			s.inflight--
+			if cleanupFileAction(req.Op) {
+				s.cleanupInflight--
+			} else {
+				s.inflight--
+			}
 			s.mu.Unlock()
 		}()
 	}
@@ -505,7 +548,9 @@ func (s *remoteFileSession) resolvePending(ctx context.Context) error {
 	}
 	keys := make([]string, 0, len(s.pending))
 	for key := range s.pending {
-		keys = append(keys, key)
+		if !isExplicitFileWrite(s.pending[key].request) {
+			keys = append(keys, key)
+		}
 	}
 	s.mu.Unlock()
 	sort.Strings(keys)
@@ -806,6 +851,7 @@ func (s *remoteFileSession) closeWithResultAndBarrier(ctx context.Context) (stor
 		}
 	}
 	if r.CloseResult != nil && r.CloseResult.Released {
+
 		e = closeReplayResultError(r.CloseResult, wasReleased, previousErr, e)
 		s.mu.Lock()
 		s.closed = true
@@ -814,6 +860,9 @@ func (s *remoteFileSession) closeWithResultAndBarrier(ctx context.Context) (stor
 		s.closeErr = e
 		s.closeBarrierPending = r.CloseResult.BarrierPending
 		s.mu.Unlock()
+		if !r.CloseResult.BarrierPending {
+			s.detachExplicitWrites("")
+		}
 		return r.CloseResult.storage(), r.Barrier, e
 	}
 	if r.CloseResult != nil {
@@ -933,8 +982,12 @@ func (f *remoteFile) setAttrWithBarrier(ctx context.Context, c storage.AttrChang
 	return a, r.Barrier, e
 }
 func (f *remoteFile) Sync(ctx context.Context) error {
-	_, e := f.call(ctx, fileRequest{Op: storage.OpFileSync})
-	return e
+	_, err := f.SyncWithBarrier(ctx)
+	return err
+}
+func (f *remoteFile) SyncWithBarrier(ctx context.Context) (*MutationBarrier, error) {
+	response, err := f.call(ctx, fileRequest{Op: storage.OpFileSync})
+	return response.Barrier, err
 }
 func (f *remoteFile) Close(ctx context.Context) error {
 	_, err := f.CloseWithResult(ctx)
@@ -1141,6 +1194,7 @@ func (f *remoteFile) closeWithActionAndBarrier(ctx context.Context, attempt stor
 		return response.CloseResult.storage(), response.Barrier, err
 	}
 	if response.CloseResult.Released {
+
 		err = closeReplayResultError(response.CloseResult, wasReleased, previousErr, err)
 		f.mu.Lock()
 		f.closed = true
@@ -1148,6 +1202,9 @@ func (f *remoteFile) closeWithActionAndBarrier(ctx context.Context, attempt stor
 		f.closeErr = err
 		f.closeBarrierPending = response.CloseResult.BarrierPending
 		f.mu.Unlock()
+		if !response.CloseResult.BarrierPending {
+			f.session.detachExplicitWrites(f.id)
+		}
 	} else if response.CloseResult.Determined {
 		f.mu.Lock()
 		f.closeDeterminedFalse = true
@@ -1315,6 +1372,9 @@ func (f *remoteFile) closeWithResultAndBarrier(ctx context.Context) (storage.Ref
 		f.closeErr = e
 		f.closeBarrierPending = r.CloseResult.BarrierPending
 		f.mu.Unlock()
+		if !r.CloseResult.BarrierPending {
+			f.session.detachExplicitWrites(f.id)
+		}
 		return r.CloseResult.storage(), r.Barrier, e
 	}
 	if r.CloseResult != nil {
