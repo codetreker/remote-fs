@@ -31,6 +31,7 @@ type Handler struct {
 	storage             *locked.Storage
 	locks               locking.Service
 	lockControls        *bodyAdmission
+	fileRecovery        *bodyAdmission
 	log                 metastore.Log
 	limits              Limits
 	maxBodyBytes        int64
@@ -116,6 +117,7 @@ func NewHandlerWithOptions(s storage.Storage, log metastore.Log, options Handler
 		storage:             paired,
 		locks:               paired.LockService(),
 		lockControls:        configuredLockControlAdmission(settled.maxConcurrentLockControls, settled.maxWaitingLockControls),
+		fileRecovery:        newBodyAdmission(options.Files.settled().MaxSessions, retainedResponseMultiplier*int64(options.Files.settled().MaxSessions)*min(settled.maxBodyBytes, MaxFileRecoveryBytes), 0),
 		log:                 log,
 		limits:              settled.replication,
 		maxBodyBytes:        settled.maxBodyBytes,
@@ -190,7 +192,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.writeFault(w, statusForParseError(err), err)
 		return
 	}
-	if req.Op == OpFile || req.Op == OpFileControl {
+	if req.Op == OpFile || req.Op == OpFileControl || req.Op == OpFileRecovery {
 		h.serveFile(w, r)
 		return
 	}

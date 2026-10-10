@@ -31,6 +31,7 @@ type Storage struct {
 	maxFrameBytes int64
 	responses     *bodyAdmission
 	fileRequests  *bodyAdmission
+	fileRecovery  *bodyAdmission
 	lockControls  *bodyAdmission
 	scope         *locking.MutationScope
 
@@ -118,6 +119,7 @@ func DialWithOptions(baseURL string, httpClient *http.Client, options DialOption
 			settled.MaxWaitingResponses,
 		),
 		fileRequests: newBodyAdmission(settled.MaxConcurrentResponses, settled.MaxInFlightResponseBytes, settled.MaxWaitingResponses),
+		fileRecovery: newBodyAdmission(settled.MaxConcurrentLockControls, retainedResponseMultiplier*int64(settled.MaxConcurrentLockControls)*min(settled.MaxBodyBytes, MaxFileRecoveryBytes), 0),
 		silence:      settled.Silence,
 		lockControls: configuredLockControlAdmission(settled.MaxConcurrentLockControls, settled.MaxWaitingLockControls),
 	}, nil
@@ -370,6 +372,9 @@ func (s *Storage) callWithin(ctx context.Context, req Request, content []byte, s
 	if req.Op == OpWrite {
 		limit = s.maxWriteBytes
 	}
+	if req.Op == OpFileRecovery {
+		limit = min(limit, MaxFileRecoveryBytes)
+	}
 	if req.Op == OpFileControl {
 		limit = min(limit, MaxFileControlBytes)
 	}
@@ -381,6 +386,11 @@ func (s *Storage) callWithin(ctx context.Context, req Request, content []byte, s
 		return nil, unreachable(req, tooLarge)
 	}
 	admission, reservation := s.responses, retainedResponseMultiplier*s.maxBodyBytes
+	if req.Op == OpFileRecovery {
+		admission = s.fileRecovery
+		reservation = retainedResponseMultiplier * min(s.maxBodyBytes, MaxFileRecoveryBytes)
+		successLimit = min(successLimit, MaxFileRecoveryBytes)
+	}
 	if req.Op == OpFileControl {
 		admission = s.lockControls
 		reservation = retainedResponseMultiplier * MaxFileControlBytes
@@ -388,7 +398,7 @@ func (s *Storage) callWithin(ctx context.Context, req Request, content []byte, s
 	}
 	release := func() {}
 	preAdmitted, _ := ctx.Value(fileRequestAdmissionKey{}).(fileRequestAdmission)
-	if preAdmitted.storage != s || !preAdmitted.control || req.Op != OpFileControl {
+	if !(preAdmitted.storage == s && (preAdmitted.control && req.Op == OpFileControl || preAdmitted.recovery && req.Op == OpFileRecovery)) {
 		var err error
 		release, err = admission.acquire(ctx, reservation)
 		if err != nil {
@@ -420,7 +430,7 @@ func (s *Storage) callWithin(ctx context.Context, req Request, content []byte, s
 	if content != nil {
 		httpReq.Header.Set("Content-Type", req.ContentType())
 	}
-	if isVolumeMutation(req.Op) || (req.Op == OpFile || req.Op == OpFileControl) && fileScopeEnabled(ctx) {
+	if isVolumeMutation(req.Op) || (req.Op == OpFile || req.Op == OpFileControl || req.Op == OpFileRecovery) && fileScopeEnabled(ctx) {
 		scope := locking.ScopeFromContext(ctx)
 		if !locking.HasScope(ctx) && s.scope != nil {
 			scope = *s.scope
@@ -464,6 +474,9 @@ func (s *Storage) callWithin(ctx context.Context, req Request, content []byte, s
 		return &retainedBody{content: body, done: release}, nil
 	case StatusStorageError:
 		errorLimit := s.maxBodyBytes
+		if req.Op == OpFileRecovery {
+			errorLimit = min(errorLimit, MaxFileRecoveryBytes)
+		}
 		if req.Op == OpFileControl {
 			errorLimit = min(errorLimit, MaxFileControlBytes)
 		}
@@ -517,7 +530,7 @@ func (s *Storage) storageError(req Request, body []byte) error {
 	if hasCode != hasRecorded || hasCapability && hasCode {
 		return unreachable(req, errors.New("response combines unrelated error families"))
 	}
-	if hasFileResult && (resp.FileResult == nil || req.Op != OpFile && req.Op != OpFileControl) {
+	if hasFileResult && (resp.FileResult == nil || req.Op != OpFile && req.Op != OpFileControl && req.Op != OpFileRecovery) {
 		return unreachable(req, errors.New("invalid partial file result"))
 	}
 	if hasCloseProof {

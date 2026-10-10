@@ -15,6 +15,7 @@ type AccessRequest struct {
     Volume    string
     Operation storage.Operation
     Open      storage.OpenAccess
+    ContentMetadataEffects []storage.ContentMetadataEffect
 }
 ```
 
@@ -59,6 +60,7 @@ storage.Operation 是覆盖路径、文件会话、复制和锁控制的 transpo
 | `file.read-dir-node` | `/v5/file`，`file.read-dir-node` | 按目录身份执行应用枚举并检查 `ReadEntries` |
 | `file.observe-directory-metadata` | `/v5/file`，同名动作 | 取得完整目录 entries、revision 与可选目录当前名字 |
 | `file.observe-name` | `/v5/file`，`file.observe-name` | 取得一个保留引用的 Root／Linked／Detached 当前绑定 |
+| `file.observe-content-metadata` | `/v5/file`，同名动作 | 只观察可写 exact reference 已 enrollment 的 namespace；AccessRequest 携带所选固定效果 |
 | `file.mutate-name` | `/v5/file`，`file.mutate-name` | 按父身份创建、删除或改名子项 |
 | `file.open-node-ref` | `/v5/file`，`file.open-node-ref` | 按 NodeID 打开 metadata-only 引用 |
 | `file.open-child-ref` | `/v5/file`，`file.open-child-ref` | 按父身份打开或创建节点引用 |
@@ -85,7 +87,7 @@ storage.Operation 是覆盖路径、文件会话、复制和锁控制的 transpo
 | `file.range-drop` | `/v5/file-control`，`file.range-drop` | 清理 owner 在指定 domain 的状态 |
 | `file.set-pending-unlink` | `/v5/file-control`，同名动作 | 原子建立节点 pending deletion |
 | `file.clear-pending-unlink` | `/v5/file-control`，同名动作 | 按 generation 清除当前 pending 状态 |
-| `file.mutate` | `/v5/file`，`file.mutate` | 按 size/metadata 条件修改引用 |
+| `file.mutate` | `/v5/file` 或受限 `/v5/file-recovery`，`file.mutate` | 按 size/metadata 条件修改引用；recovery 路由仍使用原实际操作及派生效果授权 |
 | `file.close` | `/v5/file-control`，`file.close` | 关闭一个保留文件引用 |
 | `file.close-owner-status` | `/v5/file-control`，`file.close-owner-status` | 只查询请求绑定的确切 File／NodeReference 关闭 owner 状态；每次外部查询重新授权 |
 | `lock.session-enrollment` | `/v5/session-enrollment` | 申请强占有会话 enrollment ticket |
@@ -108,6 +110,8 @@ storage.Operation 是覆盖路径、文件会话、复制和锁控制的 transpo
 `FileOpenOptions` 嵌入共享的 `storage.OpenAccess`；file.open／file.open-node 继续把这五项意图放入 `AccessRequest.Open`。OpenAt、OpenNodeRef 与 OpenChildRef 也携带由 metadata 权限、Use 与打开效果导出的 OpenAccess；Use 是冲突声明，不独自授予 byte 或 metadata 方法。OpenAt 的 metadata 权限由显式 MetadataAccess 指定，不从字节 Read/Write 推导。OpenAt/OpenChildRef 的顶层 child/guards 在进入策略前完成结构和 guard 上限校验，server 再把它们组装为 `ChildSelection`；guards 是 authority 核对的名字证据，不增加授权 Operation，也不作为策略资源。一个复杂动作按固定顺序产生基础 Operation 及它实际包含的 remove、set-attr、set-metadata 或 set-pending 等补充 Operation；每项分别调用同一 Authorizer，任一拒绝都发生在 native action 前。NodeID、Scope、metadata token、namespace guard、action ID、delete-intent owner、cursor 和 ID 不作为业务身份。带 Create 的打开即使最终选择已有对象，也报告创建意图。
 
 `volume.write` 可以创建缺失文件，单独拒绝 volume.create 不能禁止创建。应用枚举、完整目录 metadata 与 reference current-name 分别授权；允许 `file.read-dir-node` 不授予另两项，DirectoryMetadataObserver 也不从 `ReadEntries` 或 `ReadMetadata` 推导权限。metadata、range apply 与 range drop 同样分别授权；查询、取消或已有 owner 不能绕过本次策略。range mode 不代替内容读写权限，后续数据访问仍检查 file.read / file.write。FUSE 的 flock/POSIX 解释不进入 AccessRequest。
+
+OpenAt 的 ContentMetadataEffects 随实际 OpenAccess 交给策略，enrollment 另核对 OpFileSetMetadata 与 OpFileObserveContentMetadata。ReferenceContentMetadata 的 effect index 只选择原引用已深复制的 descriptor；新观察与每次非空 MutateWriteAt／MutateAppend 的 typed replay 都以当前策略核对真实效果。派生更新的 AccessRequest.ContentMetadataEffects 包含所选 namespace、格式和固定 masks；Metadata=nil 不省略 OpFileSetMetadata，打开批准不构成终身授权。限定 descriptor 的 OpFileSetMetadata 不替代 initial metadata 或公开 metadata 写权所需的普通 OpFileSetMetadata；去重同时核对 operation、Open 与 descriptor，不能合并不同语义。公开 Stat、SetAttr、SetMetadata 的 MetadataAccess 仍独立，固定效果不扩大它们的权限。
 
 ## 三、请求、capability 与关闭
 

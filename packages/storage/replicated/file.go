@@ -71,7 +71,11 @@ func (f *retainedFile) SetAttr(ctx context.Context, change storage.AttrChange) (
 
 func (f *retainedFile) Sync(ctx context.Context) error {
 	_, err := fileCall(ctx, f.session, true, func(ctx context.Context) (struct{}, error) {
-		return struct{}{}, f.remote.Sync(ctx)
+		remote, err := optional[httprest.FileSyncWithBarrier](f.remote)
+		if err != nil {
+			return struct{}{}, err
+		}
+		return struct{}{}, f.session.confirm(ctx, "sync-file", remote.SyncWithBarrier)
 	})
 	return err
 }

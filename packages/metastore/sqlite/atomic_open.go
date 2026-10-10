@@ -29,7 +29,7 @@ func (s *Store) OpenAt(ctx context.Context, selection storage.ChildSelection, op
 	selection = selection.Clone()
 	file, state, outcome, err := s.openAtomicChild(ctx, selection, storage.NodeRegular, options.Read, options.Write,
 		options.MetadataAccess, options.Create, options.Exclusive, options.Target,
-		options.Use, options.Existing, options.Initial, options.CloseIntent)
+		options.Use, options.Existing, options.Initial, options.CloseIntent, options.ContentMetadataEffects)
 	if file == nil {
 		return metastore.OpenResult{}, err
 	}
@@ -39,8 +39,15 @@ func (s *Store) OpenAt(ctx context.Context, selection storage.ChildSelection, op
 func (s *Store) openAtomicChild(ctx context.Context, selection storage.ChildSelection, kind storage.NodeKind, read, write bool,
 	metadata storage.MetadataPermissions, create, exclusive bool, target storage.ChildCondition,
 	use storage.UseClaim, existing storage.ExistingEffect,
-	initial storage.InitialState, closeIntent *storage.CloseIntent,
+	initial storage.InitialState, closeIntent *storage.CloseIntent, effects []storage.ContentMetadataEffect,
 ) (*retainedFile, metastore.FileState, storage.OpenOutcome, error) {
+	if err := storage.CheckContentMetadataEffects(effects); err != nil {
+		return nil, metastore.FileState{}, 0, err
+	}
+	if len(effects) != 0 && (kind != storage.NodeRegular || !write) {
+		return nil, metastore.FileState{}, 0, syscall.EINVAL
+	}
+	effects = storage.CloneContentMetadataEffects(effects)
 	scope, err := newReferenceScope()
 	if err != nil {
 		return nil, metastore.FileState{}, 0, err
@@ -56,7 +63,7 @@ func (s *Store) openAtomicChild(ctx context.Context, selection storage.ChildSele
 		return nil, metastore.FileState{}, 0, syscall.EAGAIN
 	}
 	file := &retainedFile{store: s, scope: scope, session: metastore.ReferenceSession(ctx), use: use,
-		read: read, write: write, metadata: metadata, active: true}
+		read: read, write: write, metadata: metadata, contentEffects: effects, active: true}
 	if err := s.inspect(ctx, func(tx *sql.Tx) error {
 		_, _, err := s.directoryTarget(ctx, tx, selection.Name.Parent, 0)
 		return err

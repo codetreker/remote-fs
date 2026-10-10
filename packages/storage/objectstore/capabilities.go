@@ -84,6 +84,12 @@ func (fs *fileSession) OpenAt(ctx context.Context, selection storage.ChildSelect
 		return storage.OpenResult{}, err
 	}
 	selection = selection.Clone()
+	options.ContentMetadataEffects = storage.CloneContentMetadataEffects(options.ContentMetadataEffects)
+	if len(options.ContentMetadataEffects) != 0 {
+		if err := fs.CheckOpenContentMetadata(); err != nil {
+			return storage.OpenResult{}, err
+		}
+	}
 	input := openAtActionInput{Selection: selection, Options: options}
 	return runFileAction(ctx, fs, options.Action, storage.OpFileOpenAt, input, cloneOpenResult,
 		func(result storage.OpenResult) bool {
@@ -107,12 +113,13 @@ func (fs *fileSession) openAt(ctx context.Context, selection storage.ChildSelect
 		return opened, fs.finishOpen(nil, err)
 	}
 	file := &openFile{
-		session:  fs,
-		native:   result.File,
-		uses:     referenceUses{nodeID: uint64(result.State.ID)},
-		options:  storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: options.Read, Write: options.Write}},
-		metadata: options.MetadataAccess,
-		active:   true,
+		contentEffects: storage.CloneContentMetadataEffects(options.ContentMetadataEffects),
+		session:        fs,
+		native:         result.File,
+		uses:           referenceUses{nodeID: uint64(result.State.ID)},
+		options:        storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: options.Read, Write: options.Write}},
+		metadata:       options.MetadataAccess,
+		active:         true,
 	}
 	opened.File = file
 	err = fs.finishOpen(file, err)

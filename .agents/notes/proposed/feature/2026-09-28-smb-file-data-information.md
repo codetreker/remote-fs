@@ -6,7 +6,7 @@ Status: proposed
 
 Windows 程序需要通过已经打开的对象查询或修改文件信息，并取得真实的 volume 身份、时间与容量。打开后的路径可能改名、删除或被替换；按旧路径重查会把属性操作转给新对象。未知时间、分配量及 geometry 不能由当前时间、固定 cluster 或缓存数字猜测。EOF 与 ARCHIVE 必须同动作改变，属性／时间组合不能拆成部分成功。
 
-本提案保留[Windows 总提案](2026-09-16-windows-network-drive-support.md)中 7.4 的文件／volume 信息决定，按两个独立目的交付：**7.4b 文件信息**，**7.4c volume 信息**。[7.4a 文件内容访问](2026-09-28-smb-file-data-io.md)独立拥有 READ／WRITE／FLUSH、byte-only 派生效果、逐句柄准入与 action owner。这里保留信息类、EOF、geometry 的详细设计；各段开工前再将对应目的定稿成自己的独立提案。
+本提案保留[Windows 总提案](2026-09-16-windows-network-drive-support.md)中 7.4 的文件／volume 信息决定，按两个独立目的交付：**7.4b 文件信息**，**7.4c volume 信息**。已落地的[7.4a 文件内容访问](../../implemented/feature/2026-09-28-smb-file-data-io.md)独立拥有 READ／WRITE／FLUSH、byte-only 派生效果、逐句柄准入与 action owner。这里保留信息类、EOF、geometry 的详细设计；各段开工前再将对应目的定稿成自己的独立提案。
 
 需求依据为 [R-FS-6 至 R-FS-9、R-WIN-2、R-WIN-4、R-WIN-5、R-WS-5](../../../../docs/spec/requirements.md)。它们只承担相应信息能力，不宣布完整 Windows drive 已完成。
 
@@ -40,7 +40,7 @@ Windows 程序需要通过已经打开的对象查询或修改文件信息，并
 
 7.4b 使用 7.4a 逐句柄 gate 和 immutable owner，确保查询／修改与同句柄 CLOSE 顺序一致。普通文件基本信息依实际 metadata access 调 Stat；没有 byte-read 的 metadata-only FileId 可使用 NodeReference，但不会因此获得字节方法。当前名字类不能回显 CREATE 时保存的旧名字，归后续受 guard 名字工作。
 
-EOF 需要 FILE_WRITE_DATA，通过同一个 `ConditionalFileMutation.MutateFile(MutateTruncate)` 提交长度与已 enrollment 的固定 ARCHIVE 效果；READONLY 的 namespace 观察、显式 ExpectedMetadata 条件、当前附加授权、action digest、bound NotExecuted 与恢复规则归[7.4a](2026-09-28-smb-file-data-io.md)。把派生效果适用 kind 扩展到 Truncate 是 7.4b 的必要接入，不能用 Truncate 后 SetMetadata 两步模拟。
+EOF 需要 FILE_WRITE_DATA，通过同一个 `ConditionalFileMutation.MutateFile(MutateTruncate)` 提交长度与已 enrollment 的固定 ARCHIVE 效果；READONLY 的 namespace 观察、显式 ExpectedMetadata 条件、当前附加授权、action digest、bound NotExecuted 与恢复规则归[7.4a](../../implemented/feature/2026-09-28-smb-file-data-io.md)。把派生效果适用 kind 扩展到 Truncate 是 7.4b 的必要接入，不能用 Truncate 后 SetMetadata 两步模拟。
 
 显式 Basic 属性／时间修改需要 FILE_WRITE_ATTRIBUTES 和相应 MetadataAccess，由 `MutateAttributes` 一次提交任意允许的 metadata／Attr 与条件。目录和 metadata-only FileId 使用现有 `NodeReference.(ConditionalFileMutation)` 的 MutateAttributes；WriteAt／Truncate 对这类引用仍是 EBADF。每次 SET_INFO 核对当前业务授权、exact scope 与条件；不能调用两个 setter 拼出部分效果。
 
@@ -103,7 +103,7 @@ SET_INFO 使用 7.4a 同 action owner 与 typed replay。Completed receipt 不�
 
 **完整 7.4 一个 PR。** 数据、文件信息和 volume geometry 同时审查会交叠不同权限与故障证明。选择三个目的，内容访问先落实关闭排序与动作确认；7.4b/c 复用这些机制并独立增加类表／presentation。
 
-直接 WriteAt 后补 ARCHIVE 的原备选及拒绝理由，由独立[7.4a 提案](2026-09-28-smb-file-data-io.md)拥有。
+直接 WriteAt 后补 ARCHIVE 的原备选及拒绝理由，由独立[7.4a 决定](../../implemented/feature/2026-09-28-smb-file-data-io.md)拥有。
 
 ## 验收标准
 

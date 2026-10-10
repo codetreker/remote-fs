@@ -36,7 +36,7 @@ Windows 应用／Explorer ── Windows 文件 API ── SMB redirector
 
 中立契约只承载对象身份、名字观察、用途／共享拒绝集合、范围、metadata namespace、动作结果和固定错误。Windows comparer、disposition、NTSTATUS、本机 SID 或 WNet 身份都停留在本机 codec／宿主；authority 根据宿主提供的远端业务身份逐操作授权。本机 SID 加登录会话 LUID 只准入 loopback SMB 会话，不构成远端业务身份。
 
-已交付的 endpoint 结构详见[客户端 SMB 设计](../../../../docs/design/client/smb-endpoint.md)。基础决定由 [安全且有界的 SMB 端点](../../implemented/architecture/2026-09-21-secure-bounded-smb-endpoint.md)、[中立 metadata 与访问控制](../../implemented/architecture/2026-09-16-neutral-metadata-and-access-controls.md)、[持久对象身份与原子文件动作](../../implemented/architecture/2026-09-20-durable-identity-and-atomic-file-operations.md)、[权威名字观察](../../implemented/architecture/2026-09-20-bounded-authoritative-name-observations.md)、[权威子项选择](../../implemented/architecture/2026-09-22-guard-authoritative-child-selection.md)、[可恢复关闭](../../implemented/architecture/2026-09-23-recoverable-close-ownership.md)和[虚拟分配账](../../implemented/architecture/2026-09-23-virtual-allocation-ledger.md)拥有。本文只说明它们如何组合成完整 Windows 入口；不把已经存在的 endpoint 内部实现重写一遍。当前文件、目录、名字命令仍明确不支持，WNet 映射和 Windows 11 redirector 的完整验收尚未交付。
+已交付的 endpoint 结构详见[客户端 SMB 设计](../../../../docs/design/client/smb-endpoint.md)。基础决定由 [安全且有界的 SMB 端点](../../implemented/architecture/2026-09-21-secure-bounded-smb-endpoint.md)、[中立 metadata 与访问控制](../../implemented/architecture/2026-09-16-neutral-metadata-and-access-controls.md)、[持久对象身份与原子文件动作](../../implemented/architecture/2026-09-20-durable-identity-and-atomic-file-operations.md)、[权威名字观察](../../implemented/architecture/2026-09-20-bounded-authoritative-name-observations.md)、[权威子项选择](../../implemented/architecture/2026-09-22-guard-authoritative-child-selection.md)、[可恢复关闭](../../implemented/architecture/2026-09-23-recoverable-close-ownership.md)和[虚拟分配账](../../implemented/architecture/2026-09-23-virtual-allocation-ledger.md)拥有。本文只说明它们如何组合成完整 Windows 入口；不把已经存在的 endpoint 内部实现重写一遍。当前文件内容访问已交付；文件信息、目录与名字修改仍明确不支持，WNet 映射和 Windows 11 redirector 的完整验收尚未交付。
 
 ### 运行时状态与所有权
 
@@ -83,7 +83,7 @@ CREATE 与 CLOSE 建立后续操作依赖的 FileId：五种非 supersede dispos
 
 ### FileId 数据、目录与名字效果
 
-[7.4a 文件内容访问](2026-09-28-smb-file-data-io.md)使用身份稳定的 File.ReadAt，成功字节与 Attr 来自同一 revision；WRITE／append 经条件动作，同次提交内容、Windows ARCHIVE 和时间，最终效果点核对 READONLY 的 metadata token。byte-only 引用在 OpenAt enrollment 固定的通用 metadata 效果，并逐操作授权，不增加公开 metadata 权限。逐句柄 FIFO 与 CLOSE 排空、原动作 typed replay、FLUSH 的真实 barrier 与有界失败事实均由该提案拥有。
+已落地的[7.4a 文件内容访问](../../implemented/feature/2026-09-28-smb-file-data-io.md)使用身份稳定的 File.ReadAt，成功字节与 Attr 来自同一 revision；WRITE／append 经条件动作，同次提交内容、Windows ARCHIVE 和时间，最终效果点核对 READONLY 的 metadata token。byte-only 引用在 OpenAt enrollment 固定的通用 metadata 效果，并逐操作授权，不增加公开 metadata 权限。逐句柄 FIFO 与 CLOSE 排空、原动作 typed replay、FLUSH 的真实 barrier 与有界失败事实均由该决定拥有。
 
 7.4b 文件信息复用这一 gate／owner，为 EOF 增加同动作长度／ARCHIVE 效果；目录或 metadata-only FileId 的属性／时间组合更新使用现有 NodeReference 的 MutateAttributes，不获得字节写入／截断。7.4c volume 信息只有在权威 Attr、Space 与可信 VolumePresentation 足够时才能成功，不能强加 4096 几何；Used>Total 或不可表达只使对应容量查询失败，tree 继续读与释放。两段的类表、时间、allocation、身份／geometry 与备选理由归[文件与 volume 信息提案](2026-09-28-smb-file-data-information.md)，各目的开工前独立定稿。
 
@@ -133,12 +133,12 @@ rename、move、replace、unlink 与普通 disposition 在最终 authority 事�
 
 ### 分段交付与证明门
 
-[Issue #30](https://github.com/codetreker/remote-fs/issues/30)按单一交付目的拆分实现 PR；7.4 分为内容访问、文件信息、volume 信息，内容访问已有独立提案，信息两段在各自开工前定稿。表中顺序按技术依赖排列，因此 9 号映射／夹具在 8.3 缓存工作前交付；这份总提案持有整体拓扑、跨任务不变量、最终 WN 矩阵和放弃的架构路线，不替代分项提案的具体接口、文件布局、算法及段内测试。每段实际落地时同 PR 更新 `docs/design/`、implemented Agent Note、代码和覆盖该段错误路径的测试；后段不能把前段未确认结果掩盖为成功。
+[Issue #30](https://github.com/codetreker/remote-fs/issues/30)按单一交付目的拆分实现 PR；7.4 分为内容访问、文件信息、volume 信息，内容访问已有独立 implemented note，信息两段在各自开工前定稿。表中顺序按技术依赖排列，因此 9 号映射／夹具在 8.3 缓存工作前交付；这份总提案持有整体拓扑、跨任务不变量、最终 WN 矩阵和放弃的架构路线，不替代分项提案的具体接口、文件布局、算法及段内测试。每段实际落地时同 PR 更新 `docs/design/`、implemented Agent Note、代码和覆盖该段错误路径的测试；后段不能把前段未确认结果掩盖为成功。
 
 | 段与拥有提案 | 依赖与本段结果 | 下一段取得的保证 |
 |---|---|---|
 | [7.3b 有界 CREATE/CLOSE](../../implemented/feature/2026-09-28-smb-bounded-create-close.md) | 已落地；依赖中立可恢复关闭，五种非 supersede 打开、typed FileId、权威 guarded 选择、共享准入、身份／metadata／settlement 投影与端点清理 owner。 | 句柄容量先于效果预留；响应丢失、tree 退休和 barrier 由稳定 owner 持有；确认 `Released=false` 且 `Determined=true` 后才开始新 close 尝试；7.4 可按原对象 I/O。 |
-| [7.4a 文件内容访问](2026-09-28-smb-file-data-io.md) | 使用 7.3 FileId；READ/WRITE/FLUSH、byte-only 固定派生效果、逐句柄 gate、同 action 确认与关闭排空。 | 内容与 ARCHIVE 同步提交；原对象读写、真实失败与有界 owner。 |
+| [7.4a 文件内容访问](../../implemented/feature/2026-09-28-smb-file-data-io.md) | 已落地；使用 7.3 FileId；READ/WRITE/FLUSH、byte-only 固定派生效果、逐句柄 gate、同 action 确认与关闭排空。 | 内容与 ARCHIVE 同步提交；原对象读写、真实失败与有界 owner。 |
 | [7.4b 文件信息](2026-09-28-smb-file-data-information.md) | 使用 7.4a gate／owner；五种文件查询、Basic 属性／时间、条件 EOF。 | 同对象字段与时间不伪造，长度与 ARCHIVE 同动作，7.5 取得信息 codec。 |
 | [7.4c volume 信息](2026-09-28-smb-file-data-information.md) | 独立可信 identity／presentation／geometry 与五种 volume 查询。 | 容量／allocation 精确表达；无法证明时对应查询失败。 |
 | [7.5 目录枚举](2026-09-28-smb-directory-enumeration.md) | 使用目录引用和信息 codec；完整有界捕获、全量 Windows 名字验证、冻结 cursor 分页。 | 单次枚举不混 revision、不漏坏名字；后续名字修改仍须独立 guards。 |

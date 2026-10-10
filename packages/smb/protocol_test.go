@@ -441,7 +441,7 @@ func TestAuthenticatedControlTranscriptAndUnsupportedCommands(t *testing.T) {
 		response = readFrame(t, connection)
 		header, _ = wire.ParseHeader(response)
 		expected := statusUnsupported
-		if command == wire.Create || command == wire.Close {
+		if command == wire.Create || command == wire.Close || command == wire.Read || command == wire.Write || command == wire.Flush {
 			expected = statusInvalid
 		}
 		if header.Status != expected || key.Verify(response) != nil {
@@ -775,6 +775,7 @@ func TestNegotiatedRequestBoundsAreEnforcedBeforeDispatch(t *testing.T) {
 func TestRequestLimitRejectsMaxPlusOneAndRecovers(t *testing.T) {
 	limits := DefaultLimits()
 	limits.MaxRequests = 1
+	limits.MaxHandleIORequests = 1
 	limits.MaxCompound = 1
 	entered := make(chan struct{})
 	release := make(chan struct{})
@@ -838,6 +839,7 @@ func TestRequestLimitRejectsMaxPlusOneAndRecovers(t *testing.T) {
 func TestRequestLimitPreservesRelatedCompoundResponses(t *testing.T) {
 	limits := DefaultLimits()
 	limits.MaxRequests = 2
+	limits.MaxHandleIORequests = 2
 	limits.MaxCompound = 2
 	entered := make(chan struct{})
 	release := make(chan struct{})

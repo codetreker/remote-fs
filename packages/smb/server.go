@@ -16,6 +16,7 @@ import (
 )
 
 type Server struct {
+	writes       writeLedger
 	handleMu     sync.Mutex
 	handleOwners map[*fileHandle]struct{}
 	config       Config
@@ -39,15 +40,16 @@ type Server struct {
 }
 
 type Export struct {
-	server    *Server
-	share     Share
-	key       string
-	refs      int
-	trees     int
-	active    int
-	stopping  bool
-	published bool
-	cleanupMu cleanupGate
+	ioGeneration uint64 // Protected by the server's write ledger.
+	server       *Server
+	share        Share
+	key          string
+	refs         int
+	trees        int
+	active       int
+	stopping     bool
+	published    bool
+	cleanupMu    cleanupGate
 }
 
 func interfaceNil(value any) bool {
@@ -317,6 +319,9 @@ func (s *Server) retryCleanup(ctx context.Context) error {
 			}
 			s.mu.Unlock()
 		}
+		if err := s.writes.pendingError(nil); err != nil {
+			errs = append(errs, err)
+		}
 		return errors.Join(errs...)
 	})
 }
@@ -341,6 +346,9 @@ func (e *Export) close(ctx context.Context) error {
 		s.mu.Unlock()
 		if busy && len(errs) == 0 {
 			errs = append(errs, ErrBusy)
+		}
+		if err := s.writes.pendingError(e); err != nil {
+			errs = append(errs, err)
 		}
 		return errors.Join(errs...)
 	})
@@ -385,5 +393,6 @@ func (s *Server) Status() Status {
 	for _, connection := range connections {
 		connection.addStatus(&out)
 	}
+	s.writes.addStatus(&out)
 	return out
 }

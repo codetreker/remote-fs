@@ -29,6 +29,7 @@ type retainedFile struct {
 	session          *advisory.Session
 	use              storage.UseClaim
 	metadata         storage.MetadataPermissions
+	contentEffects   []storage.ContentMetadataEffect
 	closeIntent      storage.DeleteIntentID
 	store            *Store
 	id               int64

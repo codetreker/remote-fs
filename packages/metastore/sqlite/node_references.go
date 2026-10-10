@@ -27,7 +27,7 @@ func (s *Store) OpenChildRef(ctx context.Context, selection storage.ChildSelecti
 	selection = selection.Clone()
 	file, state, outcome, err := s.openAtomicChild(ctx, selection, options.Kind, false, false, options.MetadataAccess,
 		options.Create, options.Exclusive, options.Target, options.Use, storage.Keep,
-		options.InitialState, options.CloseIntent)
+		options.InitialState, options.CloseIntent, nil)
 	if file == nil {
 		return metastore.NodeOpenResult{}, err
 	}

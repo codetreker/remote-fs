@@ -105,8 +105,9 @@ func (a *authoritySession) recoverRetainedOwners(ctx context.Context) (bool, err
 			h.pendingOpen = nil
 			h.released = true
 			h.terminal = true
+			ioErr := retirePendingFileIO(h, true, true)
 			t.releaseFileHandle(h)
-			return nil
+			return ioErr
 		})
 		if err != nil {
 			errs = append(errs, err)

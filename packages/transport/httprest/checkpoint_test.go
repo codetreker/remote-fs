@@ -110,7 +110,7 @@ func TestCheckpointAuthorizesItsOperationBeforeReadingTheLog(t *testing.T) {
 				if log.calls != 0 {
 					t.Fatal("log access preceded authorization")
 				}
-				if ctx.Value(authorizationHostKey{}) != "host-identity" || request != (authz.AccessRequest{Volume: "trusted-volume", Operation: storage.OpReplicationCheckpoint}) {
+				if ctx.Value(authorizationHostKey{}) != "host-identity" || !reflect.DeepEqual(request, authz.AccessRequest{Volume: "trusted-volume", Operation: storage.OpReplicationCheckpoint}) {
 					t.Fatalf("authorization context/request = %+v", request)
 				}
 				return cause

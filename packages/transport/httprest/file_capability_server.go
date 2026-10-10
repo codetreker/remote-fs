@@ -3,6 +3,7 @@ package httprest
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"reflect"
@@ -14,6 +15,13 @@ import (
 
 func capabilitiesOf(value any) (*fileCapabilities, error) {
 	caps := &fileCapabilities{}
+	if capability, ok := value.(storage.ReferenceContentMetadata); ok {
+		if err := capability.CheckContentMetadata(); err == nil {
+			caps.ContentMetadata = true
+		} else if storage.ErrnoOf(err) != syscall.EOPNOTSUPP {
+			return caps, err
+		}
+	}
 	var failure error
 	check := func(target *bool, call func() error) {
 		err := call()
@@ -73,6 +81,9 @@ func sessionCapabilitiesOf(value storage.FileSession) (*fileCapabilities, error)
 		} else if storage.ErrnoOf(checkErr) != syscall.EOPNOTSUPP {
 			err = errors.Join(err, checkErr)
 		}
+	}
+	if c, ok := value.(storage.OpenContentMetadata); ok {
+		check(&caps.OpenContentMetadata, c.CheckOpenContentMetadata)
 	}
 	if c, ok := value.(storage.FileSessionIdentity); ok {
 		check(&caps.SessionIdentity, c.CheckFileSessionIdentity)
@@ -186,6 +197,17 @@ func (h *Handler) openReference(ctx context.Context, session *servedFileSession,
 	case storage.OpFileOpenNode:
 		reference, err = session.native.OpenNode(ctx, request.Node, request.Open)
 	case storage.OpFileOpenAt:
+		if len(request.OpenAt.ContentMetadataEffects) != 0 {
+			provider, ok := session.native.(storage.OpenContentMetadata)
+			if !ok {
+				err = syscall.EOPNOTSUPP
+				break
+			}
+			if err = provider.CheckOpenContentMetadata(); err != nil {
+				break
+			}
+			entry.contentEffects = contentMetadataEffectsStorage(request.OpenAt.ContentMetadataEffects)
+		}
 		if request.OpenAt.MetadataAccess != 0 {
 			metadata, ok := session.native.(storage.OpenMetadataAccess)
 			if !ok {
@@ -488,6 +510,37 @@ func (h *Handler) performSessionCapability(ctx context.Context, session storage.
 func performReferenceCapability(ctx context.Context, file retainedReference, req fileRequest) (fileResponse, error) {
 	response := fileResponse{}
 	switch req.Op {
+	case storage.OpFileObserveContentMetadata:
+		capability, ok := file.(storage.ReferenceContentMetadata)
+		if !ok {
+			return response, syscall.EOPNOTSUPP
+		}
+		if err := capability.CheckContentMetadata(); err != nil {
+			return response, err
+		}
+		value, err := capability.ObserveContentMetadata(ctx, req.ContentEffect)
+		if err != nil {
+			return response, err
+		}
+		if err := value.Check(); err != nil {
+			return response, err
+		}
+		node, err := storage.ReferenceNodeID(file)
+		if err != nil {
+			return response, err
+		}
+		if value.NodeID != node {
+			return response, syscall.EIO
+		}
+		response.ContentMetadata = contentMetadataObservationOf(value)
+		encoded, err := json.Marshal(response)
+		if err != nil {
+			return fileResponse{}, err
+		}
+		if int64(len(encoded))+32 > req.ResultBytes {
+			return fileResponse{}, syscall.EFBIG
+		}
+		return response, nil
 	case storage.OpFileObserveName:
 		return observeReferenceName(ctx, file, req)
 	case storage.OpFileState:

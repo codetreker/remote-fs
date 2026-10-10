@@ -273,7 +273,7 @@ func TestStreamAuthorizationPrecedesControlledAdmission(t *testing.T) {
 func streamAuthorizationCheckAccess(t *testing.T, ctx context.Context, access authz.AccessRequest, op Op) {
 	t.Helper()
 	want := authz.AccessRequest{Volume: streamAuthorizationVolume, Operation: streamAuthorizationOperation(op)}
-	if access != want || ctx.Value(streamAuthorizationIdentityKey{}) != "original-identity-and-trace" {
+	if !reflect.DeepEqual(access, want) || ctx.Value(streamAuthorizationIdentityKey{}) != "original-identity-and-trace" {
 		t.Errorf("authorization lost operation or context: access=%+v identity=%v", access, ctx.Value(streamAuthorizationIdentityKey{}))
 	}
 }

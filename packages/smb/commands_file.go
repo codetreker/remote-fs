@@ -42,6 +42,7 @@ type openIntent struct {
 	metadataOnly                   bool
 	metadata                       storage.MetadataPermissions
 	attributes                     uint32
+	contentEffects                 []storage.ContentMetadataEffect
 }
 
 func normalizeAccess(access uint32) (uint32, error) {
@@ -150,14 +151,24 @@ func classifyCreate(request wire.CreateRequest) (openIntent, error) {
 }
 
 func (c *connection) authorizeOpen(ctx context.Context, t *tree, operation storage.Operation, intent openIntent, initial storage.InitialState) error {
-	authorize := func(operation storage.Operation, access storage.OpenAccess) error {
-		return c.server.config.Authorize.Authorize(ctx, authz.AccessRequest{Volume: t.export.share.Volume, Operation: operation, Open: access})
+	authorize := func(operation storage.Operation, access storage.OpenAccess, effects []storage.ContentMetadataEffect) error {
+		request := authz.AccessRequest{Volume: t.export.share.Volume, Operation: operation, Open: access,
+			ContentMetadataEffects: storage.CloneContentMetadataEffects(effects)}
+		return c.server.config.Authorize.Authorize(ctx, request.Clone())
 	}
-	if err := authorize(operation, storage.OpenAccess{Read: intent.read || intent.access&accessExecute != 0 || intent.metadata&storage.ReadMetadata != 0, Write: intent.write || intent.metadata&storage.WriteMetadata != 0, Create: intent.create, Exclusive: intent.exclusive, Truncate: intent.reset}); err != nil {
+	if err := authorize(operation, storage.OpenAccess{Read: intent.read || intent.access&accessExecute != 0 || intent.metadata&storage.ReadMetadata != 0, Write: intent.write || intent.metadata&storage.WriteMetadata != 0, Create: intent.create, Exclusive: intent.exclusive, Truncate: intent.reset, ContentMetadataEffects: storage.CloneContentMetadataEffects(intent.contentEffects)}, nil); err != nil {
 		return err
 	}
 	if len(initial.OnCreate.Metadata)+len(initial.OnReset.Metadata) != 0 {
-		if err := authorize(storage.OpFileSetMetadata, storage.OpenAccess{}); err != nil {
+		if err := authorize(storage.OpFileSetMetadata, storage.OpenAccess{}, nil); err != nil {
+			return err
+		}
+	}
+	if len(intent.contentEffects) != 0 {
+		if err := authorize(storage.OpFileObserveContentMetadata, storage.OpenAccess{}, intent.contentEffects); err != nil {
+			return err
+		}
+		if err := authorize(storage.OpFileSetMetadata, storage.OpenAccess{}, intent.contentEffects); err != nil {
 			return err
 		}
 	}
@@ -261,6 +272,9 @@ func (c *connection) createFile(ctx context.Context, s *session, t *tree, reques
 			}
 		}
 	}
+	if !isDirectory && !intent.metadataOnly && intent.write {
+		intent.contentEffects = windowsContentEffects()
+	}
 	var operation storage.Operation
 	if isDirectory || intent.metadataOnly {
 		operation = storage.OpFileOpenChildRef
@@ -289,6 +303,7 @@ func (c *connection) createFile(ctx context.Context, s *session, t *tree, reques
 		return nil, createStatusError(err), wire.FileID{}
 	}
 	handle.action, handle.access = action, intent.access
+	handle.contentEffects = storage.CloneContentMetadataEffects(intent.contentEffects)
 	handle.recordOpenDiagnostic()
 	var attr storage.Attr
 	var outcome storage.OpenOutcome
@@ -316,7 +331,7 @@ func (c *connection) createFile(ctx context.Context, s *session, t *tree, reques
 		}
 	} else {
 		options := storage.OpenAtOptions{Read: intent.read, Write: intent.write, MetadataAccess: intent.metadata, Create: intent.create, Exclusive: intent.exclusive,
-			Target: resolved.Condition, Action: action, Use: intent.use, Existing: storage.Keep, Initial: initial}
+			Target: resolved.Condition, Action: action, Use: intent.use, Existing: storage.Keep, Initial: initial, ContentMetadataEffects: storage.CloneContentMetadataEffects(intent.contentEffects)}
 		if intent.reset {
 			options.Existing = storage.ResetContent
 		}
@@ -352,6 +367,24 @@ func (c *connection) createFile(ctx context.Context, s *session, t *tree, reques
 	if state.Epoch != t.authority.identity.SessionEpoch || state.Remaining <= 0 || state.Retired || state.Fenced {
 		return nil, c.finishFailedOpen(ctx, t, handle, syscall.ESTALE), wire.FileID{}
 	}
+	if handle.file != nil {
+		mutation, ok := handle.file.(storage.ConditionalFileMutation)
+		if !ok {
+			return nil, c.finishFailedOpen(ctx, t, handle, syscall.EOPNOTSUPP), wire.FileID{}
+		}
+		if err := mutation.CheckConditionalFileMutation(); err != nil {
+			return nil, c.finishFailedOpen(ctx, t, handle, err), wire.FileID{}
+		}
+		if len(intent.contentEffects) != 0 {
+			content, ok := handle.file.(storage.ReferenceContentMetadata)
+			if !ok {
+				return nil, c.finishFailedOpen(ctx, t, handle, syscall.EOPNOTSUPP), wire.FileID{}
+			}
+			if err := content.CheckContentMetadata(); err != nil {
+				return nil, c.finishFailedOpen(ctx, t, handle, err), wire.FileID{}
+			}
+		}
+	}
 	if err := handle.bindReference(ctx, t, attr, intent.use); err != nil {
 		return nil, c.finishFailedOpen(ctx, t, handle, err), wire.FileID{}
 	}
@@ -379,6 +412,13 @@ func validCreateOutcome(disposition uint32, outcome storage.OpenOutcome) bool {
 }
 
 func checkCreateCapabilities(session storage.FileSession) error {
+	content, ok := session.(storage.OpenContentMetadata)
+	if !ok {
+		return syscall.EOPNOTSUPP
+	}
+	if err := content.CheckOpenContentMetadata(); err != nil {
+		return err
+	}
 	identity, ok := session.(storage.FileSessionIdentity)
 	if !ok {
 		return syscall.EOPNOTSUPP

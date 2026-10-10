@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"math"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -53,6 +54,15 @@ type fileHandle struct {
 	closeLifetime   contextLock
 	terminalErr     error
 	terminal        bool
+	ioMu            sync.Mutex
+	ioSequence      uint64
+	ioQueue         []*fileIOTicket
+	ioRunning       *fileIOTicket
+	ioIdle          chan struct{}
+	ioFenced        bool
+	contentEffects  []storage.ContentMetadataEffect
+	pendingWrite    *writeOwner
+	pendingFlush    *flushOwner
 }
 
 func (t *tree) beginFileWork(s *session) bool {
@@ -76,17 +86,24 @@ func (t *tree) beginFileWork(s *session) bool {
 
 func (t *tree) endFileWork() {
 	t.fileMu.Lock()
+	t.endFileWorkLocked()
+	t.fileMu.Unlock()
+}
+
+func (t *tree) endFileWorkLocked() {
 	t.fileActive--
 	if t.fileActive == 0 {
 		close(t.fileIdle)
 		t.fileIdle = nil
 	}
-	t.fileMu.Unlock()
 }
 
 func (t *tree) fenceFileWork() <-chan struct{} {
 	t.fileMu.Lock()
 	t.fileStopping = true
+	for _, handle := range t.handles {
+		t.fenceHandleFileIOLocked(handle)
+	}
 	idle := t.fileIdle
 	t.fileMu.Unlock()
 	return idle
@@ -143,7 +160,8 @@ func (t *tree) reserveFileHandle(s *session, limit int) (*fileHandle, error) {
 		server := t.export.server
 		server.handleMu.Lock()
 		limits := server.config.Limits
-		if len(server.handleOwners) >= min(limits.MaxHandles, limits.MaxUnresolvedOwners, limits.MaxDiagnosticBytes/diagnosticOwnerBytes) {
+		if len(server.handleOwners) >= min(limits.MaxHandles, limits.MaxUnresolvedOwners) ||
+			len(server.handleOwners)+server.writes.usedDiagnosticSlots() >= limits.MaxDiagnosticBytes/diagnosticOwnerBytes {
 			server.handleMu.Unlock()
 			return nil, syscall.EMFILE
 		}
@@ -231,6 +249,17 @@ func (t *tree) closeFileHandle(ctx context.Context, handle *fileHandle) (closeEr
 		return err
 	}
 	defer handle.closeLifetime.unlock()
+	if err := waitFileWork(ctx, t.fenceHandleFileIO(handle)); err != nil {
+		return err
+	}
+	return t.closeFileHandleLocked(ctx, handle)
+}
+
+func (t *tree) closeFileHandleLocked(ctx context.Context, handle *fileHandle) (closeErr error) {
+	return t.closeFileHandlePrepared(ctx, handle, settlePendingFileIO(ctx, handle))
+}
+
+func (t *tree) closeFileHandlePrepared(ctx context.Context, handle *fileHandle, pendingIOErr error) (closeErr error) {
 	if handle.terminal {
 		return handle.terminalErr
 	}
@@ -240,7 +269,7 @@ func (t *tree) closeFileHandle(ctx context.Context, handle *fileHandle) (closeEr
 		if !handle.released {
 			handle.state.Store(uint32(handleCleanupOnly))
 		}
-		var pendingErr error
+		pendingErr := pendingIOErr
 		if handle.pendingOpen != nil {
 			noReference, recoverErr := handle.pendingOpen(ctx)
 			if noReference {
@@ -250,7 +279,7 @@ func (t *tree) closeFileHandle(ctx context.Context, handle *fileHandle) (closeEr
 			if handle.file == nil && handle.node == nil {
 				return recoverErr
 			}
-			pendingErr = recoverErr
+			pendingErr = errors.Join(pendingErr, recoverErr)
 			handle.pendingOpen = nil
 		}
 		actions, err := handle.closeActions()
@@ -411,7 +440,7 @@ func (t *tree) acceptCloseResult(handle *fileHandle, result storage.ReferenceClo
 			return closeErr
 		}
 		t.releaseFileHandle(handle)
-		return errors.Join(closeErr, handle.semanticErr)
+		return errors.Join(closeErr, handle.semanticErr, retirePendingFileIO(handle, true, true))
 	}
 	if handle.released {
 		return errors.Join(closeErr, syscall.EIO)

@@ -9,6 +9,11 @@ import (
 const OpFile Op = "file"
 const OpFileControl Op = "file-control"
 
+// OpFileRecovery gives exact bounded content-action retries an independent lane.
+const OpFileRecovery Op = "file-recovery"
+const MaxFileRecoveryBytes int64 = 12 << 20
+const MaxFileRecoveryDataBytes = 8 << 20
+
 // MaxFileControlBytes bounds complete neutral control commands and receipts.
 const MaxFileControlBytes int64 = 256 << 10
 
@@ -54,6 +59,7 @@ type fileRequest struct {
 	Payload           metadataPayload                 `json:"payload"`
 	Pending           *pendingUnlinkCommand           `json:"pending,omitempty"`
 	ClearPending      *clearPendingUnlinkCommand      `json:"clearPending,omitempty"`
+	ContentEffect     uint16                          `json:"contentEffect,omitempty"`
 	Mutation          *fileMutationOptions            `json:"mutation,omitempty"`
 	FileAction        storage.FileActionID            `json:"fileAction"`
 	DeleteIntent      storage.DeleteIntentID          `json:"deleteIntent"`
@@ -96,32 +102,33 @@ func (r fileRequest) MarshalJSON() ([]byte, error) {
 }
 
 type fileResponse struct {
-	Node             uint64                     `json:"node,omitempty"`
-	Session          string                     `json:"session,omitempty"`
-	File             string                     `json:"file,omitempty"`
-	Retry            bool                       `json:"retry,omitempty"`
-	Epoch            uint64                     `json:"epoch"`
-	Status           *storage.FileSessionStatus `json:"status,omitempty"`
-	Attr             *Attr                      `json:"attr,omitempty"`
-	Data             []byte                     `json:"data"`
-	Conflict         *storage.RangeConflict     `json:"conflict,omitempty"`
-	Attempt          *storage.RangeAttempt      `json:"attempt,omitempty"`
-	Barrier          *MutationBarrier           `json:"barrier,omitempty"`
-	Capabilities     *fileCapabilities          `json:"capabilities,omitempty"`
-	BackendIdentity  *backendIdentity           `json:"backendIdentity,omitempty"`
-	SessionIdentity  *fileSessionIdentity       `json:"sessionIdentity,omitempty"`
-	Scope            *storage.UseScope          `json:"scope,omitempty"`
-	Owner            storage.UseOwner           `json:"owner,omitempty"`
-	Metadata         *OpaquePayload             `json:"metadata,omitempty"`
-	Outcome          storage.OpenOutcome        `json:"outcome,omitempty"`
-	State            *referenceState            `json:"state,omitempty"`
-	ActionReceipt    *storage.FileActionReceipt `json:"actionReceipt,omitempty"`
-	DeleteStatus     *deleteIntentStatus        `json:"deleteStatus,omitempty"`
-	DeletePage       *deleteIntentPage          `json:"deletePage,omitempty"`
-	CloseResult      *referenceCloseResult      `json:"closeResult,omitempty"`
-	CloseOwnerStatus *closeOwnerStatusResult    `json:"closeOwnerStatus,omitempty"`
-	Directory        *observedDirectory         `json:"directory,omitempty"`
-	NameObservation  *nameObservation           `json:"nameObservation,omitempty"`
+	Node             uint64                      `json:"node,omitempty"`
+	Session          string                      `json:"session,omitempty"`
+	File             string                      `json:"file,omitempty"`
+	Retry            bool                        `json:"retry,omitempty"`
+	Epoch            uint64                      `json:"epoch"`
+	Status           *storage.FileSessionStatus  `json:"status,omitempty"`
+	Attr             *Attr                       `json:"attr,omitempty"`
+	Data             []byte                      `json:"data"`
+	Conflict         *storage.RangeConflict      `json:"conflict,omitempty"`
+	Attempt          *storage.RangeAttempt       `json:"attempt,omitempty"`
+	Barrier          *MutationBarrier            `json:"barrier,omitempty"`
+	Capabilities     *fileCapabilities           `json:"capabilities,omitempty"`
+	BackendIdentity  *backendIdentity            `json:"backendIdentity,omitempty"`
+	SessionIdentity  *fileSessionIdentity        `json:"sessionIdentity,omitempty"`
+	Scope            *storage.UseScope           `json:"scope,omitempty"`
+	Owner            storage.UseOwner            `json:"owner,omitempty"`
+	Metadata         *OpaquePayload              `json:"metadata,omitempty"`
+	Outcome          storage.OpenOutcome         `json:"outcome,omitempty"`
+	State            *referenceState             `json:"state,omitempty"`
+	ActionReceipt    *storage.FileActionReceipt  `json:"actionReceipt,omitempty"`
+	DeleteStatus     *deleteIntentStatus         `json:"deleteStatus,omitempty"`
+	DeletePage       *deleteIntentPage           `json:"deletePage,omitempty"`
+	CloseResult      *referenceCloseResult       `json:"closeResult,omitempty"`
+	CloseOwnerStatus *closeOwnerStatusResult     `json:"closeOwnerStatus,omitempty"`
+	Directory        *observedDirectory          `json:"directory,omitempty"`
+	ContentMetadata  *contentMetadataObservation `json:"contentMetadata,omitempty"`
+	NameObservation  *nameObservation            `json:"nameObservation,omitempty"`
 }
 
 func fileMutation(op storage.Operation) bool {
@@ -136,7 +143,7 @@ func fileActionRequired(op storage.Operation) bool {
 	switch op {
 	case storage.OpFileOpen, storage.OpFileOpenNode, storage.OpFileOpenAt, storage.OpFileOpenNodeRef, storage.OpFileOpenChildRef,
 		storage.OpFileSetNodeAttr, storage.OpFileMutateName, storage.OpFileWrite, storage.OpFileTruncate, storage.OpFileSetAttr,
-		storage.OpFileSync, storage.OpFileSetNodeMetadata, storage.OpFileSetMetadata, storage.OpFileSetPendingUnlink,
+		storage.OpFileSetNodeMetadata, storage.OpFileSetMetadata, storage.OpFileSetPendingUnlink,
 		storage.OpFileClearPendingUnlink, storage.OpFileMutate, storage.OpFileClose, storage.OpFileSessionClose, storage.OpFileAcknowledgeDeleteIntent,
 		storage.OpFileNewUseOwner, storage.OpFileRetireUseOwner, storage.OpFileRangeDrop:
 		return true
@@ -178,6 +185,12 @@ func semanticFileAction(request fileRequest) storage.LockRequestID {
 	return ""
 }
 
+// FileSyncWithBarrier carries the backing confirmation point for replication.
+type FileSyncWithBarrier interface {
+	storage.File
+	SyncWithBarrier(context.Context) (*MutationBarrier, error)
+}
+
 // FileWithBarrier exposes authority progress without requiring a directory entry
 // for detached files. A nil barrier means the volume has no change log.
 type FileWithBarrier interface {
@@ -198,22 +211,24 @@ type FileSessionWithBarrier interface {
 }
 
 type fileCapabilities struct {
-	SessionIdentity   bool `json:"sessionIdentity"`
-	StableIdentity    bool `json:"stableIdentity"`
-	OpenMetadata      bool `json:"openMetadata"`
-	Allocation        bool `json:"allocation"`
-	DirectoryMetadata bool `json:"directoryMetadata"`
-	ReferenceName     bool `json:"referenceName"`
-	AtomicOpen        bool `json:"atomicOpen"`
-	Namespace         bool `json:"namespace"`
-	References        bool `json:"references"`
-	Actions           bool `json:"actions"`
-	Metadata          bool `json:"metadata"`
-	Owners            bool `json:"owners"`
-	Ranges            bool `json:"ranges"`
-	State             bool `json:"state"`
-	Scope             bool `json:"scope"`
-	Delete            bool `json:"delete"`
-	Conditional       bool `json:"conditional"`
-	CloseRecovery     bool `json:"closeRecovery"`
+	ContentMetadata     bool `json:"contentMetadata"`
+	OpenContentMetadata bool `json:"openContentMetadata"`
+	SessionIdentity     bool `json:"sessionIdentity"`
+	StableIdentity      bool `json:"stableIdentity"`
+	OpenMetadata        bool `json:"openMetadata"`
+	Allocation          bool `json:"allocation"`
+	DirectoryMetadata   bool `json:"directoryMetadata"`
+	ReferenceName       bool `json:"referenceName"`
+	AtomicOpen          bool `json:"atomicOpen"`
+	Namespace           bool `json:"namespace"`
+	References          bool `json:"references"`
+	Actions             bool `json:"actions"`
+	Metadata            bool `json:"metadata"`
+	Owners              bool `json:"owners"`
+	Ranges              bool `json:"ranges"`
+	State               bool `json:"state"`
+	Scope               bool `json:"scope"`
+	Delete              bool `json:"delete"`
+	Conditional         bool `json:"conditional"`
+	CloseRecovery       bool `json:"closeRecovery"`
 }

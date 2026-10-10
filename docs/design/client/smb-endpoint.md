@@ -2,7 +2,7 @@
 
 `packages/smb` 是 Windows client 进程内的本机呈现层。Windows 系统 SMB client 通过 loopback TCP 连接它；端点把认证后的 share 连接绑定到调用方提供的 `storage.FileStorage`。SMB 只存在于 client 与同机操作系统之间，client 到远端 authority 的边界仍是平台中立的 storage／HTTP 契约。
 
-端点支持 SMB 3.1.1 协商、认证、消息签名、share 连接、CREATE/CLOSE 与会话清理。五种非 supersede disposition 建立稳定 FileId 和权威 share claim；其余文件、目录、名字和锁命令返回明确的不支持结果。该命令集合不构成可浏览或可读写的 Windows network drive。
+端点支持 SMB 3.1.1 协商、认证、消息签名、share 连接、CREATE/CLOSE、regular-file READ／flags=0 WRITE／FLUSH 与会话清理。五种非 supersede disposition 建立稳定 FileId 和权威 share claim；文件信息、目录、名字和锁命令返回明确的不支持结果。该命令集合不构成完整 Windows network drive。
 
 ## 一、嵌入与发布
 
@@ -50,15 +50,17 @@ authentication exchange 受 `HandshakeTimeout` 约束，完成后的 identity �
 
 | 文件 | 责任 |
 |---|---|
-| `internal/wire/files.go`、`create_contexts.go` | CREATE/CLOSE 的固定体、偏移、名字、contexts 与 FileId，响应结构 |
+| `internal/wire/files.go`、`create_contexts.go`、`file_io.go` | CREATE/CLOSE 与 READ/WRITE/FLUSH 的固定体、偏移、contexts、FileId 及响应结构 |
 | `names.go`、`name_compare_*.go` | 可表示名字、保留名、UTF-16 code-unit 等价与排序 |
 | `namespace.go` | 完整权威 sibling 观察、pinned root、revision/edge ancestry guards |
 | `tree_capabilities.go`、`authority_session.go` | backend/session identity、完整能力预检、共享 FileSession 与续期 |
-| `commands_file.go`、`windows_metadata.go` | CREATE 意图、访问／share／disposition、Windows metadata 与原子结果投影 |
+| `commands_file.go`、`windows_metadata.go`、`content_metadata.go` | CREATE 意图、访问／share／disposition、Windows metadata 与固定派生效果 |
+| `commands_file_io.go`、`file_io_gate.go` | 文件内容命令、逐句柄 FIFO、授权／身份复核与关闭排空 |
+| `write_owner.go`、`flush_owner.go`、`write_diagnostics.go` | immutable WRITE／FLUSH confirmation、同动作恢复、有界失败事实与宿主责任转移 |
 | `file_handles.go`、`commands_close.go`、`authority_recovery.go`、`handle_diagnostics.go` | typed owner、准入／容量、恢复、关闭尝试与结算 |
 | `session_cleanup.go`、`connection.go`、`server.go` | tree/session/export 退休、compound 执行与 signer 所有权 |
 
-每个 authority session 保存不可变 `FileSessionIdentityResult{Backend, SessionEpoch}`。Backend 的 Volume、Authority 与 RootNodeID 全部必须和经验证 backend 相同，Volume／Root 还须匹配宿主 pin，SessionEpoch 必须等于其 Status.Epoch。Share.Volume 只用于业务授权。新的 tree 在公布成功前完成 AtomicFileOpener、NodeReferences、DirectoryMetadataObserver、StableReferenceIdentity、OpenMetadataAccess、FileActions、AllocationReporting 与 RecoverableReferenceClose 的完整链检查；wrapper 缺失能力时明确拒绝。身份与中立能力的定义见[文件句柄设计](../server/file-handles.md#一身份与会话)。
+每个 authority session 保存不可变 `FileSessionIdentityResult{Backend, SessionEpoch}`。Backend 的 Volume、Authority 与 RootNodeID 全部必须和经验证 backend 相同，Volume／Root 还须匹配宿主 pin，SessionEpoch 必须等于其 Status.Epoch。Share.Volume 只用于业务授权。新的 tree 在公布成功前完成 AtomicFileOpener、NodeReferences、DirectoryMetadataObserver、StableReferenceIdentity、OpenMetadataAccess、OpenContentMetadata、FileActions、AllocationReporting 与 RecoverableReferenceClose 的完整链检查；wrapper 缺失能力时明确拒绝。身份与中立能力的定义见[文件句柄设计](../server/file-handles.md#一身份与会话)。
 
 ### 名字选择
 
@@ -82,9 +84,23 @@ CREATE contexts 有严格数量、alignment、Next 范围、重复与 payload �
 
 动作保存原 action ID、方法、selection 与 options。引用身份、Outcome、已知 allocation 的精确字节值、共同时间和 Windows 属性从同次原子结果验证；不要求 4096 字节粒度，也不推断尚未取得的 volume geometry。Created 必须有 BirthTime/ChangeTime，Reset 必须有 ChangeTime；既有对象缺失的可选时间以 unknown 零值表达。ReferenceNodeID 必须等于 Attr.ID，不用后续 Stat 拼出成功响应。error 与非 nil 引用同时返回时，预留 owner 立即接管；无引用的未知结果保留同 ID、同输入恢复入口。只有绑定原动作的 NotExecuted 证明允许丢弃未执行意图或重新观察。内部恢复续查和 replay 使用原授权后的不可变意图，不重新执行 endpoint 当前策略检查；远端 HTTP 公共 RPC 继续各自授权。公布 FileId 前在本地锁外读取新的 raw Status，核对固定 session epoch 和 liveness；随后在 authority install、tree admission 与所属 session 锁内核对 context、tree/authority stopping、session retirement、本地确认期限和原预留槽，原子安装 Live。失败保留已获引用与 owner，不回滚已完成效果。Windows 应用收到 NTSTATUS，内部动作 ID 留在有界宿主诊断中。
 
+### 文件内容与引用准入
+
+READ／WRITE／FLUSH 经原签名 frame 分派，related FileId 在 frame-local context 中解析，原字节不改。每次请求核对 exact typed FileId、tree／session／authority descriptor、regular File 与实际访问权，先授权再入队，取得 turn 后在 backing dispatch 前重新授权。READ 用 OpFileRead，所有 WRITE 用 OpFileWrite，非空派生效果另用 OpFileSetMetadata，限定观察用 OpFileObserveContentMetadata，FLUSH 用 OpFileSync；拒绝不能把先前 Unknown 改成 NotExecuted。
+
+逐句柄 FIFO 与 running pointer 由 file_io_gate.go 管理。MaxHandleIORequests 默认 32，不能超过 MaxRequests；queued 项保留原 frame 费用，取得 turn 前不复制写内容。短锁按 authority installation、tree fileMu、session mu、handle ioMu 顺序取得，放锁后才授权／调用 backing。不同 FileId 并行；同一对象的最终内容顺序归 authority。
+
+READ 一次 ReadAt 返回 Data／Attr，验证 NodeID、kind、size、allocation 与捕获 EOF；成功零字节及不足 MinimumCount 为 END_OF_FILE，正请求在 captured EOF 前非法零读为 I/O 错误。短读不补读拼接。WRITE flags=0 支持普通范围及 append-only 权限的 MutateAppend；-1 选 authority EOF，其它高位 offset 拒绝。WRITE_THROUGH-only INVALID_PARAMETER，UNBUFFERED 与配对 NOT_SUPPORTED，效果前失败。空 WRITE 用零效果显式 MutateWriteAt，无 ARCHIVE／时间／内容变化。
+
+WRITE owner 在 dispatch 前预留原 Data、action／token／effect、完整 response 与诊断预算。MaxWriteOwners 默认 128，MaxRetainedWriteBytes 默认 32 MiB，global 与每 export 都计费。非空 WRITE 用 smb.windows 的八字节 sealed descriptor，最终 token CAS 与内容／ARCHIVE／时间同事务；READONLY、非法格式或 CAS 冲突不放行。Unknown 结束 active turn，但保留原 immutable owner，后续只原 action Query／typed replay；Completed receipt 不提供 typed Attr／barrier，bound NotExecuted 条件冲突才允许最多两次新条件尝试。
+
+CREATE 的 initial metadata 普通授权与固定 descriptor enrollment 分别核对：普通 OpFileSetMetadata 的 ContentMetadataEffects 为空，限制于派生效果的许可不允许创建或设置 HIDDEN／SYSTEM 等任意 initial attributes。直接 SMB 与远端 HTTP 保留同一区分，不能将两项按 operation 名称合并。
+
+FLUSH owner 无 Data，用原 File.Sync 作有限 confirmation；失败与丢响应不建立 HTTP action pending，不重写任何内容。CLOSE 先 fence 新 I/O、移除 queued、排空 running，再有界结算 write／flush owner；Unknown 可继续 exact close 取得 no-future-publication 与 settlement 证明。post-query Attr 在 drain 后捕获。
+
 ## 五、容量与 FileId owner
 
-Limits 分别限制 export、connection、session、tree、pending request、compound/context、frame/I/O/token、完整目录观察、handle、未结清 owner 与诊断字节。所有值显式选择，零值不表示无界。MaxIOBytes 同时成为协商公布的 transact/read/write 上限；协商后完整 request 受 I/O 加固定 envelope 约束，control command 另受 68 KiB 上限且只消耗一个 credit，数据 command 的 credit charge 覆盖每个 64 KiB payload 单元。FileSessionOptions 另限制原生引用、owner、range、等待与动作历史。
+Limits 分别限制 export、connection、session、tree、pending request、compound/context、frame/I/O/token、完整目录观察、handle、未结清 owner 与诊断字节。所有值显式选择，零值不表示无界。MaxIOBytes 同时成为协商公布的 transact/read/write 上限；协商后完整 request 受 I/O 加固定 envelope 约束，control command 另受 68 KiB 上限且只消耗一个 credit，READ/WRITE 的 credit charge 为 max(1,ceil(requested Length/65536))，不把 header／compound padding 算作 payload；READ 在 backing 前预留 requested Length 的完整响应。FileSessionOptions 另限制原生引用、owner、range、等待与动作历史。
 
 CREATE 在对象效果前预留 response frame 空间、FileId 与 owner。server 全局 owner registry 包含 reserved/opening、live、cleanup-only、barrier-only；其上限为 min(MaxHandles, MaxUnresolvedOwners, MaxDiagnosticBytes/256)，每份可能未结清的 owner 在效果前预留固定 256 字节诊断槽。原生／HTTP 的 close receipt 历史继续按自身期限计费；端点回收一个 FileId 不使该容量提前可复用。容量不足在创建／清空前失败。
 
@@ -114,10 +130,18 @@ Export.Unpublish 对 live tree 或正在取得 export 的 connect/request 返回
 
 Server.Shutdown 永久停止 listener 与新工作，等待 connection 退出，清理 tree/handles/FileSession，移除确认静止并结清的 export；失败项保留供重试。调用方 backend 始终由调用方拥有。Status 报告 serving/stopping/stopped、export、live/cleanup-only connection、session、identity-expired session、tree、pending request、fenced authority、cleanup failure，以及 Handles、OpeningHandles、CleanupOnlyHandles、BarrierOnlyHandles。Server.HandleOwners() 受预留条数／字节预算约束，只暴露 opaque FileId/session/tree/NodeID、open action、close attempt、owner 状态和 LastStatus uint32，不保存 SID、密钥、路径、内容或原始 backend 错误。协议表项退役不能替代 native 释放与 settlement。
 
+### 内容失败事实与宿主责任
+
+write_diagnostics.go 在 dispatch 前预留 WRITE／FLUSH 失败事实。Status 的 WriteOwners、UnknownWrites、PendingFlushes、RetainedWriteBytes 与 copied WriteFailures 区分仍持有内容、已终结资源及原 execution unknown；ResponseSent 只表示本机发送完成，不确认 Windows 应用消费。SMB 原 payload 只在 exact reference／完整父 session no-future-publication 与包含 replica 的完整链 settlement 正面证明后释放。HTTP 可在本层下游证明成立后先 fence 并撤下自己的 pending copy，不能因此撤销外层 SMB charge。失败事实不因 FileId 删除或断线消失。
+
+WriteFailure 保存 typed WriteOwnerID 的随机 incarnation／单调 generation、export／FileId generation、NodeID、action、operation、byte count／digest、execution、FLUSH durability、ResponseFinal、Terminal、PayloadReleased、ReferenceReleased、ChainSettled 与固定 error category，不保存 Data。Server.AcknowledgeWriteFailures 全批验证 final terminal settled IDs 后才移除记录；宿主必须先保存并接管继续报告事实，ack 不改变 Unknown、不确认执行、不重发内容。未确认资源或尚未交出失败事实时 Shutdown／Unpublish 返回错误并保留 stopping；责任完成后后续停止可成功。
+
 ## 七、命令与需求边界
 
-可成功的命令为 NEGOTIATE、SESSION_SETUP、ECHO、TREE_CONNECT、TREE_DISCONNECT、LOGOFF、CREATE 与 CLOSE。FLUSH、READ、WRITE、LOCK、IOCTL、QUERY_DIRECTORY、CHANGE_NOTIFY、QUERY_INFO、SET_INFO 和 OPLOCK_BREAK 不执行 backing 操作并返回 STATUS_NOT_SUPPORTED。CANCEL 的 async 语义未建立，CANCEL、无法识别或畸形 command fail closed，终止连接而不执行受控效果。
+可成功的命令为 NEGOTIATE、SESSION_SETUP、ECHO、TREE_CONNECT、TREE_DISCONNECT、LOGOFF、CREATE、CLOSE，以及 regular-file READ、flags=0 WRITE 和 FLUSH。LOCK、IOCTL、QUERY_DIRECTORY、CHANGE_NOTIFY、QUERY_INFO、SET_INFO 和 OPLOCK_BREAK 不执行 backing 操作并返回 STATUS_NOT_SUPPORTED。CANCEL 的 async 语义未建立，CANCEL、无法识别或畸形 command fail closed，终止连接而不执行受控效果。
 
 对象不存在、撞名、类型不符只有在权威条件已确定时映射相应文件错误；typed share 冲突映射 STATUS_SHARING_VIOLATION，不能被一般 EAGAIN 资源错误遮蔽。容量耗尽映射 STATUS_INSUFFICIENT_RESOURCES。无法证明的引用身份、allocation、时间、动作或 settlement 返回 I/O 错误，不能报告成功、缺席或旧值。
 
-这套结构对应 R-FS-5 至 R-FS-9 的打开／引用部分，R-CC-14／R-WIN-6 的共享准入，R-INT-1 至 R-INT-3 的嵌入和资源，以及 R-ERR-1、R-ERR-2、R-WIN-9 的真实错误与安全准入。范围锁、文件数据与信息、目录枚举、持久关闭删除、名字修改、通知／缓存、WNet 和完整 Windows 资格仍由独立能力实现。取舍与依赖见[有界 CREATE/CLOSE](../../../.agents/notes/implemented/feature/2026-09-28-smb-bounded-create-close.md)。
+文件 I/O 已确认的 EDQUOT 映射 STATUS_QUOTA_EXCEEDED，与底层 ENOSPC 区分；含 EIO 的未知结果优先保持 STATUS_IO_DEVICE_ERROR，不能凭 joined quota errno 宣称明确未执行。
+
+这套结构对应 R-FS-5 至 R-FS-9 的打开／引用部分，R-CC-14／R-WIN-6 的共享准入，R-INT-1 至 R-INT-3 的嵌入和资源，以及 R-ERR-1、R-ERR-2、R-WIN-9 的真实错误与安全准入。范围锁、文件信息、目录枚举、持久关闭删除、名字修改、通知／缓存、WNet 和完整 Windows 资格仍由独立能力实现。取舍与依赖见[有界 CREATE/CLOSE](../../../.agents/notes/implemented/feature/2026-09-28-smb-bounded-create-close.md)与[文件内容访问](../../../.agents/notes/implemented/feature/2026-09-28-smb-file-data-io.md)。

@@ -81,6 +81,7 @@ func (e *closeErrors) Error() string {
 func (e *closeErrors) Unwrap() []error { return e.samples }
 
 type servedFileSession struct {
+	recoveryAdmission   *bodyAdmission
 	dataActions         int
 	cleanupActions      int
 	cleanupReserved     int
@@ -111,6 +112,7 @@ type servedFileSession struct {
 
 type servedFile struct {
 	native          retainedReference
+	contentEffects  []storage.ContentMetadataEffect
 	pending         time.Time
 	closing         bool
 	replaying       int
@@ -578,8 +580,16 @@ func (r *fileRegistry) terminalizeSession(id string, session *servedFileSession,
 
 func (h *Handler) serveFile(w http.ResponseWriter, r *http.Request) {
 	control := r.URL.Path == Prefix+string(OpFileControl)
+	recovery := r.URL.Path == Prefix+string(OpFileRecovery)
+	writeResponse := func(status int, body any) {
+		if recovery {
+			h.writeBoundedFileResponse(w, status, body, min(h.maxBodyBytes, MaxFileRecoveryBytes))
+			return
+		}
+		h.writeFileResponse(w, status, body, control)
+	}
 	writeFault := func(status int, err error) {
-		h.writeFileResponse(w, status, ErrorResponse{Message: err.Error()}, control)
+		writeResponse(status, ErrorResponse{Message: err.Error()})
 	}
 	writeError := func(err error) {
 		var barrierFailure *fileBarrierError
@@ -589,14 +599,14 @@ func (h *Handler) serveFile(w http.ResponseWriter, r *http.Request) {
 		}
 		var recorded *recordedFileError
 		if errors.As(err, &recorded) {
-			h.writeFileResponse(w, StatusStorageError, fileErrorResponse(err, true), control)
+			writeResponse(StatusStorageError, fileErrorResponse(err, true))
 			return
 		}
 		if response, ok := authorizationResponse(err); ok {
-			h.writeFileResponse(w, StatusStorageError, response, control)
+			writeResponse(StatusStorageError, response)
 			return
 		}
-		h.writeFileResponse(w, StatusStorageError, fileErrorResponse(err, false), control)
+		writeResponse(StatusStorageError, fileErrorResponse(err, false))
 	}
 	if h.stopped() {
 		writeError(syscall.EIO)
@@ -608,7 +618,18 @@ func (h *Handler) serveFile(w http.ResponseWriter, r *http.Request) {
 	}
 	var body []byte
 	var err error
-	if control {
+	if recovery {
+		release, e := h.fileRecovery.acquire(r.Context(), retainedResponseMultiplier*min(h.maxBodyBytes, MaxFileRecoveryBytes))
+		if e != nil {
+			writeError(e)
+			return
+		}
+		defer release()
+		body, err = readAtMost(r.Body, min(h.maxBodyBytes, MaxFileRecoveryBytes))
+		if err == nil && r.ContentLength >= 0 && int64(len(body)) != r.ContentLength {
+			err = errors.New("file recovery body did not arrive whole")
+		}
+	} else if control {
 		release, e := h.lockControls.acquire(r.Context(), retainedResponseMultiplier*MaxFileControlBytes)
 		if e != nil {
 			writeError(e)
@@ -645,7 +666,7 @@ func (h *Handler) serveFile(w http.ResponseWriter, r *http.Request) {
 		writeFault(http.StatusBadRequest, err)
 		return
 	}
-	if fileControl(req.Op) != control {
+	if recovery && (!isExplicitFileWrite(req) || len(req.Mutation.Data) > MaxFileRecoveryDataBytes) || !recovery && fileControl(req.Op) != control {
 		writeFault(http.StatusBadRequest, errors.New("file operation uses the wrong admission endpoint"))
 		return
 	}
@@ -697,6 +718,27 @@ func (h *Handler) serveFile(w http.ResponseWriter, r *http.Request) {
 		writeError(err)
 		return
 	}
+	if recovery {
+		h.files.mu.Lock()
+		session := h.files.sessions[req.Session]
+		h.files.mu.Unlock()
+		if session == nil {
+			writeError(syscall.ESTALE)
+			return
+		}
+		session.mu.Lock()
+		if session.recoveryAdmission == nil {
+			session.recoveryAdmission = newBodyAdmission(1, retainedResponseMultiplier*min(h.maxBodyBytes, MaxFileRecoveryBytes), 0)
+		}
+		lane := session.recoveryAdmission
+		session.mu.Unlock()
+		release, e := lane.acquire(r.Context(), retainedResponseMultiplier*min(h.maxBodyBytes, MaxFileRecoveryBytes))
+		if e != nil {
+			writeError(e)
+			return
+		}
+		defer release()
+	}
 	if fileAttrResult(req.Op) {
 		r = r.WithContext(storage.WithBoundedAttrResult(r.Context(), req.ResultBytes, h.attrResultBudget(req)))
 	}
@@ -711,30 +753,30 @@ func (h *Handler) serveFile(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		var closeProof *storage.CloseActionNotExecutedError
 		if errors.As(err, &closeProof) {
-			h.writeFileResponse(w, StatusStorageError, ErrorResponse{Errno: "ESTALE", Message: closeProof.Error(), CloseNotExecutedEpoch: closeProof.CurrentEpoch}, control)
+			writeResponse(StatusStorageError, ErrorResponse{Errno: "ESTALE", Message: closeProof.Error(), CloseNotExecutedEpoch: closeProof.CurrentEpoch})
 			return
 		}
 		if response.Attempt != nil {
-			h.writeFileResponse(w, StatusStorageError, ErrorResponse{Errno: storage.ErrnoNameOf(err), Message: err.Error(), CapabilityCode: capabilityErrorCode(err), Attempt: response.Attempt}, control)
+			writeResponse(StatusStorageError, ErrorResponse{Errno: storage.ErrnoNameOf(err), Message: err.Error(), CapabilityCode: capabilityErrorCode(err), Attempt: response.Attempt})
 			return
 		}
 		var recorded *recordedFileError
 		if errors.As(err, &recorded) {
 			body := fileErrorResponse(err, true)
 			body.FileResult = partialFileResult(req, response)
-			h.writeFileResponse(w, StatusStorageError, body, control)
+			writeResponse(StatusStorageError, body)
 			return
 		}
 		if result := partialFileResult(req, response); result != nil {
 			body := fileErrorResponse(err, false)
 			body.FileResult = result
-			h.writeFileResponse(w, StatusStorageError, body, control)
+			writeResponse(StatusStorageError, body)
 			return
 		}
 		writeError(err)
 		return
 	}
-	h.writeFileResponse(w, http.StatusOK, response, control)
+	writeResponse(http.StatusOK, response)
 }
 
 func partialFileResult(request fileRequest, response fileResponse) *fileResponse {
@@ -1652,7 +1694,7 @@ func (h *Handler) performFile(ctx context.Context, s *servedFileSession, req fil
 				return response, syscall.EBADF
 			}
 			err = data.Sync(ctx)
-		case storage.OpFileObserveName, storage.OpFileState, storage.OpFileScope, storage.OpFileSetMetadata, storage.OpFileSetPendingUnlink, storage.OpFileClearPendingUnlink, storage.OpFileMutate:
+		case storage.OpFileObserveName, storage.OpFileObserveContentMetadata, storage.OpFileState, storage.OpFileScope, storage.OpFileSetMetadata, storage.OpFileSetPendingUnlink, storage.OpFileClearPendingUnlink, storage.OpFileMutate:
 			response, err = performReferenceCapability(ctx, file.native, req)
 		case storage.OpFileClose:
 			if !req.CloseImplicit && !s.recoverable {
@@ -1737,7 +1779,13 @@ func (h *Handler) writeFileResponse(w http.ResponseWriter, status int, body any,
 		h.writeJSON(w, status, body)
 		return
 	}
-	limit := min(h.maxBodyBytes, MaxFileControlBytes)
+	h.writeBoundedFileResponse(w, status, body, min(h.maxBodyBytes, MaxFileControlBytes))
+}
+func (h *Handler) writeBoundedFileResponse(w http.ResponseWriter, status int, body any, limit int64) {
+	if response, ok := body.(fileResponse); ok && response.Data == nil {
+		response.Data = []byte{}
+		body = response
+	}
 	var encoded []byte
 	var err error
 	if failure, ok := body.(ErrorResponse); ok {
@@ -1747,7 +1795,7 @@ func (h *Handler) writeFileResponse(w http.ResponseWriter, status int, body any,
 	}
 	if err != nil || int64(len(encoded)) > limit {
 		status = http.StatusInternalServerError
-		encoded = []byte(`{"message":"file control response exceeds its protocol bound"}`)
+		encoded = []byte(`{"message":"file response exceeds its protocol bound"}`)
 	}
 	w.Header().Set("Content-Type", contentJSON)
 	w.Header().Set("Content-Length", strconv.Itoa(len(encoded)))

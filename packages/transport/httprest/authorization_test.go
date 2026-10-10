@@ -150,7 +150,7 @@ func TestVolumeAuthorizationMapsEveryOperationBeforeBackendAndBarrier(t *testing
 			if len(backend.calls) != 0 || log.barriers != 0 {
 				t.Fatal("refusal touched backend or log barrier")
 			}
-			if len(requests) != 1 || requests[0] != (authz.AccessRequest{Volume: "trusted-volume", Operation: semantic}) {
+			if len(requests) != 1 || !reflect.DeepEqual(requests[0], authz.AccessRequest{Volume: "trusted-volume", Operation: semantic}) {
 				t.Fatalf("semantic request=%+v", requests)
 			}
 			denied = false
@@ -236,7 +236,7 @@ func TestAuthorizationOptionsRequireAnExplicitUsablePair(t *testing.T) {
 	if err := h.authorize(t.Context(), request); err != nil {
 		t.Fatal(err)
 	}
-	if observed.Volume != " " || observed.Open != request.Open || request.Volume != "request-selected-volume" {
+	if observed.Volume != " " || !reflect.DeepEqual(observed.Open, request.Open) || request.Volume != "request-selected-volume" {
 		t.Fatalf("trusted opaque volume or intent copy changed: %+v / %+v", observed, request)
 	}
 }

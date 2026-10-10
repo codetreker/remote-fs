@@ -104,6 +104,15 @@ func (c *connection) dispatch(ctx context.Context, request, original wire.Reques
 	case wire.Create:
 		body, status, _ := c.createFile(ctx, s, tree, request)
 		return body, status, signer
+	case wire.Read:
+		body, status := c.readFile(ctx, s, tree, request)
+		return body, status, signer
+	case wire.Write:
+		body, status := c.writeFile(ctx, s, tree, request)
+		return body, status, signer
+	case wire.Flush:
+		body, status := c.flushFile(ctx, s, tree, request)
+		return body, status, signer
 	case wire.Close:
 		inherited, _ := ctx.Value(relatedFileKey{}).(wire.FileID)
 		body, status := c.closeFile(ctx, s, tree, request, inherited)

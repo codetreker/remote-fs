@@ -117,6 +117,15 @@ func (f *file) SetAttr(ctx context.Context, change storage.AttrChange) (storage.
 	})
 }
 
+func (f *file) Sync(ctx context.Context) error {
+	f.storage.gate.RLock()
+	defer f.storage.gate.RUnlock()
+	if err := f.storage.healthy(); err != nil {
+		return err
+	}
+	return f.storage.publicationError(f.File.Sync(ctx))
+}
+
 func (f *file) Close(ctx context.Context) error {
 	_, err := f.CloseWithResult(ctx)
 	return err
