@@ -168,6 +168,8 @@ handler 在读取 body 前取得 request operation 与 byte admission。`Write` 
 
 HTTP handler 只接受实现 `storage.BoundedStorage` 的 volume。constructor 在服务请求前调用 `CheckBounded`；任一依赖无法在实际产生结果时接受预算，启动就直接失败。`ReadBounded` 在完整 payload 分配前知道 byte bound，超限以 `EFBIG` 失败。`ListBounded` 与 identity-bound directory observation 按顺序把 entry 加入调用方的 `ListResult`；`ListResult` 用 HTTP 表示的精确逐条 charge 计数，并在保留那条超限 entry 之前以 `EIO` 失败。requested current-name 使用相同 response limit 的 prefix reservation。backend 不得先建立完整的超限 `[]byte`、`[]Entry` 或名字 payload 中间结果。
 
+SQLite 的共同 child 捕获 helper 在同一 read transaction 内使用三次查询，并保留已启用文件能力的 commit/Use 顺序；父目标与 guards 预检另行执行。这三次查询为关系验证、scalar header／lengths 及全部 ListReservation、有序 name／metadata payload cursor。payload 逐项匹配预留 node、数量和 exact lengths 后提交；任何不符使整份结果失败。payload 查询在全部 reservations 完成后才开始，不按 child 发起独立 payload 查询。
+
 `Read` 与 `List` 的 wire format 仍是一份 non-streaming response，在发出前保留一份配置内的完整结果。每个非流式操作在调用 storage 前都取得 response operation 与 byte admission；`Read` 与 `List` 按 `4 * MaxBodyBytes` 预留，覆盖 storage entries、wire conversion、encoded body 与它们同时存在的保守峰值，其余固定结果操作按 `MaxBodyBytes` 预留，使得同时产生的最大错误 JSON 也在 aggregate 上限内。response 等待者已满时，`Stat`、`Write`、`Create` 等操作也会在到达 storage 前以 `EAGAIN` 失败；`Write` 与 `SetAttr` 还不会读取 request body。context cancellation 会退出等待并释放计数。
 
 启用业务授权时，stream 入口的 callback 与拒绝响应也取得通用 response admission；允许后释放，再取得 Log、订阅与 snapshot 资源，长连接不持续占用该名额。未配置 hook 的 stream 不增加这项占用。授权和生命周期顺序见[业务授权](authorization.md)。
