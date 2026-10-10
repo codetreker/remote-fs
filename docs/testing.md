@@ -160,6 +160,8 @@ schema v9 用例从真实 v8 记录前滚，核对原 intent ID 作为 owner、�
 
 [limited 包装用例](../packages/storage/limited/recoverable_close_test.go)、[locked 包装用例](../packages/storage/locked/recoverable_close_test.go)和[replicated 包装用例](../packages/storage/replicated/recoverable_close_test.go)核对 CloseRecovery capability preflight、原 action/generation、`Determined` 与 `Released`、原错误和 barrier 逐层保真；下层不支持时，capability 检查显式拒绝；要求该能力的入口须在打开效果前执行预检。replica 在 barrier 等待失败后保留已确认释放事实，同 ID 只继续等待 barrier，不重做 native close。副本包装测试还覆盖内部清理在确定未释放后的下一 generation、外部从原引用状态接管内部 Unknown、wrapper 本地关闭额度满时 Ready=false，以及未执行旧 ID 的有界证明账本：仅绑定查询得到 Retired 或 parent authority 已释放且 barrier 结算才回收，旧 ID 后续以失效失败而不重新转发。证明账本满时其它可成功关闭的引用仍能关闭；遇到新的旧 epoch ID 在效果前被拒绝则原 ID 保留待存证明、以 `EAGAIN` 续查，直到旧证明有绑定 Retired 证据后才能同 generation 换 ID。
 
+Handler.Close 的 cleanup-attempt 回归在首轮已经排空后、第二次显式调用前核对 retained EIO 与仍有 session；后续调用才可取得成功或 ENOTEMPTY，原 completed attempt 的 error 不随它改变。它验证一次 Close 只发起／加入一次 cleanup，Stop 保持非阻塞并只启动首轮；不依靠 race 调度使 duplicate stop 恰好未发生。
+
 ### 无名字对象的用量与恢复
 
 [retained quota 用例](../packages/storage/limited/files_test.go)用两个打开引用保留已 unlink 的对象，断言字节继续计入 Used，后续增长也被计费，第一次 Close 不释放第二个引用仍需要的字节。最后一次有效释放按对象当前大小结算一次，重复 Close 不重复返还；失败 cleanup、取消创建请求后到期、startup 与 Recount 都核对真实 retained 用量。Recount 与最终 cleanup 交错时必须重取一致用量，不能用只遍历可见树的方法漏掉 detached 文件。

@@ -34,11 +34,17 @@ type fileRegistry struct {
 	running        bool
 	wake           chan struct{}
 	done           chan struct{}
+	attempt        *fileCleanupAttempt
 	err            error
 	terminalErr    closeErrorSummary
 }
 
 const maxRetainedCloseErrors = 16
+
+type fileCleanupAttempt struct {
+	done chan struct{}
+	err  error
+}
 
 // Close errors can precede Handler.Close by arbitrarily many retired sessions.
 // Keep the first failure and a bounded sample of later failures while counting
@@ -215,6 +221,7 @@ func (s *servedFileSession) pruneCloseIDsLocked(httpEpoch, nativeEpoch uint64) {
 func (r *fileRegistry) startLocked() {
 	if !r.running {
 		r.done = make(chan struct{})
+		r.attempt = &fileCleanupAttempt{done: r.done}
 		if r.closed {
 			r.err = r.terminalErr.result()
 		}
@@ -223,17 +230,17 @@ func (r *fileRegistry) startLocked() {
 	}
 }
 
-func (r *fileRegistry) stop() <-chan struct{} {
+func (r *fileRegistry) stop() *fileCleanupAttempt {
 	r.mu.Lock()
 	r.closed = true
 	r.startLocked()
-	done := r.done
+	attempt := r.attempt
 	r.mu.Unlock()
 	select {
 	case r.wake <- struct{}{}:
 	default:
 	}
-	return done
+	return attempt
 }
 
 // Close retires and drains sessions created by this handler. The volume
@@ -242,13 +249,13 @@ func (r *fileRegistry) stop() <-chan struct{} {
 func (h *Handler) Close(ctx context.Context) error {
 	h.files.closeMu.Lock()
 	defer h.files.closeMu.Unlock()
-	h.Stop()
-	done := h.files.stop()
+	attempt, initiated := h.beginStop()
+	if !initiated {
+		attempt = h.files.stop()
+	}
 	select {
-	case <-done:
-		h.files.mu.Lock()
-		defer h.files.mu.Unlock()
-		return h.files.err
+	case <-attempt.done:
+		return attempt.err
 	case <-ctx.Done():
 		return ctx.Err()
 	}
@@ -257,11 +264,12 @@ func (h *Handler) Close(ctx context.Context) error {
 func (r *fileRegistry) run() {
 	timer := time.NewTicker(100 * time.Millisecond)
 	defer timer.Stop()
-	done := r.done
+	attempt := r.attempt
 	defer func() {
 		r.mu.Lock()
+		attempt.err = r.err
 		r.running = false
-		close(done)
+		close(attempt.done)
 		r.mu.Unlock()
 	}()
 	for {

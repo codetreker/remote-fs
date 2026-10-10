@@ -26,6 +26,8 @@ HTTP 的 `file.close` 与 `file.session-close` 携带 transport 动作 ID 和 ge
 
 PendingAck 回收遇到在途回执时退役会话并安排续作；native session 已释放但 HTTP 回执仍需续核对时，`closeReconciling` 保存首次 native 释放事实和原语义错误，保留清理循环；后续轮次只续核对 HTTP 回执，不重复 native session 关闭或累计同一清理错误。待核对回执能够按其原事实转入 terminal 历史后，`Handler.Close` 才完成；超时保留同一清理 owner。已释放而 mutation barrier 未确认时，同一动作只继续 barrier，不再 native close；重投响应再次丢失也保留先前 `Released=true` 与原语义错误，barrier 可从 pending 单调结算。第一次会话关闭确定未释放、后来由新 ID 完成时，历史期内每次尝试各自保留结果。`file.close-owner-status` 的外部请求每次单独按 `OpFileCloseOwnerStatus` 授权，并绑定确切 file capability；活跃或退休但仍保留的引用把 native `CloseOwnerStatus` 原样穿过 HTTP。会话已经终结时，只有仍在回执期限内、绑定该 file capability 且确认 `Released=true` 的关闭动作可以回答已释放状态，不能借此恢复其它引用或推断未确认释放。HTTP client 和 limited、locked、replicated 等第一方包装层逐层传递 typed 结果、显式动作身份、未执行证明与原错误，不从错误类型或取消猜测释放。
 
+HTTP handler 的停止通知与显式排空共享同一 cleanup attempt；Stop 非阻塞启动首轮，发起停止的 Close 等待该轮，下一次显式 Close 才开始或加入重试。attempt 保存不可变完成 error，首轮 EIO 不会因快速后续 ENOTEMPTY／成功而被覆盖；timeout 仍保留原 registry owner。这不改变引用 action、generation 或回执历史。
+
 ### 退休后的窄清理准入
 
 advisory session 退休或租期结束后，普通数据、owner、锁历史与 `FileSession.Status` 继续拒绝。`WithCloseAdmission` 只对已持有确切引用的清理路径提供会继续前进的 close epoch，并在同一临界区核对新 close action 与回执准入；`CloseOwnerStatus` 也从这条窄通道取得 epoch。内部 `CloseWithResult` 可据该 epoch 为尚未释放的原引用生成清理尝试，确定未释放后按下一 generation 继续；外部持有同一引用的调用方能从状态中接管其 Pending／Unknown 尝试，或在 `Ready=true` 时使用当前 epoch 和下一 generation。旧 epoch ID 即使回执已到期也不能重绑为新的关闭效果。此通道不能重新开放字节、名字、范围锁或普通 action history。

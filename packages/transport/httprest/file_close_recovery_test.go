@@ -732,3 +732,48 @@ func TestHTTPHandlerCloseRetriesRetainedOwnershipAndKeepsTerminalFailure(t *test
 		})
 	}
 }
+
+func TestHTTPHandlerCloseKeepsItsCleanupAttemptAfterFirstDrainCompletes(t *testing.T) {
+	_, native := memoryfixture.New(t, "handler-close-attempt", 1<<20, locking.DefaultOptions())
+	backend := &failedFirstSessionCloseBackend{Storage: native, terminalError: syscall.ENOTEMPTY}
+	handler, err := NewHandler(backend, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := handler.files.enroll(t.Context(), storage.DefaultFileSessionOptions()); err != nil {
+		t.Fatal(err)
+	}
+	first, initiated := handler.beginStop()
+	if !initiated || first == nil {
+		t.Fatal("first shutdown did not own its cleanup attempt")
+	}
+	select {
+	case <-first.done:
+	case <-time.After(time.Second):
+		t.Fatal("first drain blocked")
+	}
+	if !errors.Is(first.err, syscall.EIO) || backend.calls.Load() != 1 {
+		t.Fatalf("first drain=%v calls=%d", first.err, backend.calls.Load())
+	}
+	handler.files.mu.Lock()
+	retained := len(handler.files.sessions)
+	handler.files.mu.Unlock()
+	if retained != 1 {
+		t.Fatalf("first attempt lost retained session=%d", retained)
+	}
+	if err := handler.Close(t.Context()); !errors.Is(err, syscall.ENOTEMPTY) {
+		t.Fatalf("explicit retry=%v", err)
+	}
+	if !errors.Is(first.err, syscall.EIO) || errors.Is(first.err, syscall.ENOTEMPTY) {
+		t.Fatalf("completed first attempt changed=%v", first.err)
+	}
+	if calls := backend.calls.Load(); calls != 2 {
+		t.Fatalf("retry calls=%d", calls)
+	}
+	if err := handler.Close(t.Context()); !errors.Is(err, syscall.ENOTEMPTY) {
+		t.Fatalf("terminal result=%v", err)
+	}
+	if !errors.Is(first.err, syscall.EIO) {
+		t.Fatalf("later completion replaced first result=%v", first.err)
+	}
+}

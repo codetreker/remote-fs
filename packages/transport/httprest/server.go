@@ -154,16 +154,20 @@ func NewHandlerWithOptions(s storage.Storage, log metastore.Log, options Handler
 // Register it with http.Server.RegisterOnShutdown so streams do not keep HTTP
 // shutdown waiting for connections to become idle. Close waits for session
 // cleanup; the backend remains owned by the caller.
-func (h *Handler) Stop() {
+func (h *Handler) Stop() { h.beginStop() }
+
+func (h *Handler) beginStop() (attempt *fileCleanupAttempt, initiated bool) {
 	h.stopsOnce.Do(func() {
 		close(h.stopping)
 		if h.cancelLifetime != nil {
 			h.cancelLifetime(errHandlerStopped)
 		}
 		if h.files != nil {
-			h.files.stop()
+			attempt = h.files.stop()
 		}
+		initiated = true
 	})
+	return attempt, initiated
 }
 
 // stopped reports whether Stop has been called.
