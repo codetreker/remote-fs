@@ -41,6 +41,7 @@ type openIntent struct {
 	use                            storage.UseClaim
 	metadataOnly                   bool
 	metadata                       storage.MetadataPermissions
+	attributes                     uint32
 }
 
 func normalizeAccess(access uint32) (uint32, error) {
@@ -75,9 +76,14 @@ func classifyCreate(request wire.CreateRequest) (openIntent, error) {
 	if request.Options&(createDeleteOnClose|createOpenByFileID) != 0 || request.Options&^(createDirectory|createNonDirectory|createSyncAlert|createSyncNonAlert) != 0 {
 		return intent, syscall.EOPNOTSUPP
 	}
-	if request.OplockLevel != 0 && request.OplockLevel != 1 && request.OplockLevel != 8 && request.OplockLevel != 9 && request.OplockLevel != 0xff || request.Impersonation > 3 || !validDOSAttributes(request.Attributes) {
+	if request.OplockLevel != 0 && request.OplockLevel != 1 && request.OplockLevel != 8 && request.OplockLevel != 9 && request.OplockLevel != 0xff || request.Impersonation > 3 {
 		return intent, syscall.EOPNOTSUPP
 	}
+	attributes, err := normalizeCreateAttributes(request.Attributes)
+	if err != nil {
+		return intent, err
+	}
+	intent.attributes = attributes
 	if err := validateCreateContexts(request); err != nil {
 		return intent, err
 	}
@@ -222,7 +228,7 @@ func (c *connection) createFile(ctx context.Context, s *session, t *tree, reques
 	}
 	initial := storage.InitialState{}
 	if intent.create {
-		attributes := parsed.Attributes &^ dosNormal
+		attributes := intent.attributes
 		if !isDirectory {
 			attributes |= dosArchive
 		}
@@ -244,11 +250,11 @@ func (c *connection) createFile(ctx context.Context, s *session, t *tree, reques
 			return nil, createStatusError(syscall.EACCES), wire.FileID{}
 		}
 		if intent.reset {
-			if attributes&(dosHidden|dosSystem)&^parsed.Attributes != 0 {
+			if attributes&(dosHidden|dosSystem)&^intent.attributes != 0 {
 				releaseReservation()
 				return nil, createStatusError(syscall.EACCES), wire.FileID{}
 			}
-			initial.OnReset.Metadata, err = withWindowsMetadata(nil, windowsMetadata{Attributes: (parsed.Attributes | dosArchive) &^ dosNormal})
+			initial.OnReset.Metadata, err = withWindowsMetadata(nil, windowsMetadata{Attributes: intent.attributes | dosArchive})
 			if err != nil {
 				releaseReservation()
 				return nil, createStatusError(err), wire.FileID{}

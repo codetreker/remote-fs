@@ -56,7 +56,7 @@ FileId 由不可复用 session 实例与单调序号组成，两个 64-bit 部�
 
 Windows 名字比较按 UTF-16 code unit、不作 normalization。Windows 使用显式长度的 CompareStringOrdinal；其它平台使用规范的 973 项 BMP 大写映射，未列项保持原值，代理项不映射。比较表的来源、摘要与规范算法保存在源码中；Go EqualFold/ToUpper 不能替代这项关系。
 
-每一级先核对固定 root，再取得完整、有界、权威 directory metadata。所有 sibling 都检查可表示性与 case 唯一性；一个非法名字或两个等价名字使整次观察失败，不能在过滤或精确命中后忽略。无关的合法符号链接不使目录失败；选中的叶项或中间路径若是符号链接则拒绝。结果携带每级 directory revision、精确 raw edge 与父节点身份；最终 OpenAt/OpenChildRef 同次重验 guards、目标及 metadata 条件。
+每一级先核对固定 root，再用请求中已验证的 principal 和可信 Share.Volume 授权 OpFileObserveDirectoryMetadata，允许后才取得完整、有界、权威 directory metadata。该名字观察不请求 replication.snapshot 权限；拒绝在 observer 调用和 CREATE 效果前结束。所有 sibling 都检查可表示性与 case 唯一性；一个非法名字或两个等价名字使整次观察失败，不能在过滤或精确命中后忽略。无关的合法符号链接不使目录失败；选中的叶项或中间路径若是符号链接则拒绝。结果携带每级 directory revision、精确 raw edge 与父节点身份；最终 OpenAt/OpenChildRef 同次重验 guards、目标及 metadata 条件。
 
 空名字只指 share root，每次 Stat 必须匹配已核对的 pin，随后以同一 session 的 OpenNodeRef 和 SameNode 条件打开现存目录。OPEN/OPEN_IF 不创建根；CREATE 报已存在，overwrite、非目录与截断在效果前拒绝。普通 OPEN 保持内容；CREATE 要求缺席；OPEN_IF 保持已有对象或创建；OVERWRITE 只清空已有普通文件；OVERWRITE_IF 清空已有普通文件或创建。清空、请求属性集合加 ARCHIVE 和 metadata predicate 属于同一次 guarded authority 动作；若已有 HIDDEN/SYSTEM 位，overwrite 请求必须包含对应位，否则在清空前拒绝。READONLY 只拒绝 DataFile 的字节写／append 打开；对已有只读文件的 DELETE-only FILE_OPEN 可以取得 NodeReference，打开不执行删除。
 
@@ -77,6 +77,8 @@ Generic rights 按规范完整展开成具体权限，未实现权限和 MAXIMUM
 | SYNCHRONIZE／支持的控制权限 | 不增加 Use | 不增加数据或 metadata 方法 |
 
 只有 data／execute／write／append／DELETE 权限让 Windows 打开参与 sharing。Use 非零时，缺少 SHARE_READ 设置 Deny.ReadData|ReadEntries，缺少 SHARE_WRITE 设置 Deny.WriteData，缺少 SHARE_DELETE 设置 Deny.DeleteName；Use=0 的 metadata/control-only 打开忽略 ShareAccess，Deny=0。因而任一 Windows 打开不参与时都不形成双向 sharing conflict；参与的 claim 在同一 authority NodeID 上双向比较，冲突在创建／清空与保留引用前失败。OpenAt 的 Read/Write 只来自实际字节权限，MetadataAccess 显式独立。execute+write 因此声明 ReadData|WriteData，却只授予字节写；attribute-only、DELETE-only、execute-only 使用 NodeReference。清空内容必须有字节写权。
+
+CREATE 的属性输入允许已支持的可设置位与结构性 DIRECTORY，规范化时去除 DIRECTORY 和 NORMAL；NORMAL 与其它位组合时忽略。对象种类由 CreateOptions 和权威解析结果决定，DIRECTORY 属性不独立选择目录，也不生成属性／options mismatch 拒绝。持久 smb.windows payload 只保存可设置位，响应 DIRECTORY 从捕获的 kind 派生；未知属性位仍在效果前拒绝。
 
 接受目录／非目录选项和互斥的同步 alert/nonalert 选项；同步选项需要 SYNCHRONIZE。SUPERSEDE、delete-on-close、reparse、ADS 及其它未实现效果在 backend 前拒绝。CREATE/CLOSE 的协议 reserved 字段按标准忽略，不把它们作为新的功能开关。
 

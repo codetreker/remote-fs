@@ -559,14 +559,20 @@ type createSessionContract interface {
 
 type createResultProbe struct {
 	createSessionContract
-	change      func(*storage.OpenResult)
-	afterOpen   func()
-	beforeOpen  func()
-	returnError error
-	loseFirst   bool
-	calls       []storage.OpenAtOptions
-	selections  []storage.ChildSelection
-	last        storage.File
+	change       func(*storage.OpenResult)
+	afterOpen    func()
+	beforeOpen   func()
+	returnError  error
+	loseFirst    bool
+	calls        []storage.OpenAtOptions
+	selections   []storage.ChildSelection
+	last         storage.File
+	observations int
+}
+
+func (p *createResultProbe) ObserveDirectoryMetadata(ctx context.Context, target storage.DirectoryTarget, options storage.DirectoryMetadataOptions, result *storage.ListResult) (storage.DirectoryMetadataObservation, error) {
+	p.observations++
+	return p.createSessionContract.ObserveDirectoryMetadata(ctx, target, options, result)
 }
 
 func (p *createResultProbe) OpenAt(ctx context.Context, selection storage.ChildSelection, options storage.OpenAtOptions) (storage.OpenResult, error) {
@@ -1180,6 +1186,144 @@ func TestCreateGenericAllRejectsUnsupportedRightsBeforeEffectsDirectAndHTTP(t *t
 			}
 			if _, err := fixture.volume.Stat(t.Context(), "missing"); !errors.Is(err, syscall.ENOENT) {
 				t.Fatalf("unsupported rights created name: %v", err)
+			}
+		})
+	}
+}
+
+func TestCreateDirectoryObservationAuthorizationUsesSemanticOperationDirectAndHTTP(t *testing.T) {
+	for _, transport := range []string{"direct", "http"} {
+		t.Run(transport, func(t *testing.T) {
+			factory := newRealSMBFixture
+			if transport == "http" {
+				factory = newHTTPSMBFixture
+			}
+			fixture := factory(t)
+			probe := &createResultProbe{createSessionContract: fixture.raw.(createSessionContract)}
+			fixture.tree.authority.raw = probe
+			var authorized []storage.Operation
+			fixture.server.config.Authorize = authz.AuthorizerFunc(func(_ context.Context, request authz.AccessRequest) error {
+				authorized = append(authorized, request.Operation)
+				if request.Operation == storage.OpFileObserveDirectoryMetadata {
+					return authz.ErrDenied
+				}
+				return nil
+			})
+			_, status, id := fixture.connection.createFile(t.Context(), fixture.session, fixture.tree, createRequestForTest("observation-denied", 2, accessReadData))
+			if status != statusDenied || id != (wire.FileID{}) || probe.observations != 0 || len(probe.calls) != 0 {
+				t.Fatalf("denied observe: status=%#x id=%x observations=%d opens=%d", status, id, probe.observations, len(probe.calls))
+			}
+			if _, err := fixture.volume.Stat(t.Context(), "observation-denied"); !errors.Is(err, syscall.ENOENT) {
+				t.Fatalf("denied observation created node: %v", err)
+			}
+			fixture.tree.fileMu.Lock()
+			retained := len(fixture.tree.handles)
+			fixture.tree.fileMu.Unlock()
+			if retained != 0 {
+				t.Fatalf("denied observe retained %d owners", retained)
+			}
+			for _, operation := range authorized {
+				if operation == storage.OpReplicationSnapshot {
+					t.Fatal("CREATE authorized replication instead of directory observation")
+				}
+			}
+			authorized = nil
+			fixture.server.config.Authorize = authz.AuthorizerFunc(func(_ context.Context, request authz.AccessRequest) error {
+				authorized = append(authorized, request.Operation)
+				switch request.Operation {
+				case storage.OpVolumeStat, storage.OpFileObserveDirectoryMetadata, storage.OpFileOpenAt, storage.OpFileSetMetadata, storage.OpFileClose:
+					return nil
+				default:
+					return authz.ErrDenied
+				}
+			})
+			_, status, id = fixture.connection.createFile(t.Context(), fixture.session, fixture.tree, createRequestForTest("observation-allowed", 2, accessReadData))
+			if status != statusOK || probe.observations != 1 || len(probe.calls) != 1 {
+				t.Fatalf("allowed observe: status=%#x observations=%d opens=%d operations=%v", status, probe.observations, len(probe.calls), authorized)
+			}
+			closeFixtureHandle(t, fixture, id)
+			for _, operation := range authorized {
+				if operation == storage.OpReplicationSnapshot {
+					t.Fatal("CREATE requested replication permission")
+				}
+			}
+		})
+	}
+}
+
+func TestCreateDirectoryRequestAttributesDirectAndHTTP(t *testing.T) {
+	for _, transport := range []string{"direct", "http"} {
+		t.Run(transport, func(t *testing.T) {
+			factory := newRealSMBFixture
+			if transport == "http" {
+				factory = newHTTPSMBFixture
+			}
+			fixture := factory(t)
+			makeRequest := func(name string, disposition, attributes, options uint32) wire.Request {
+				request := createRequestForTest(name, disposition, accessReadAttr)
+				binary.LittleEndian.PutUint32(request.Body[28:], attributes)
+				binary.LittleEndian.PutUint32(request.Body[40:], options)
+				return request
+			}
+			for _, test := range []struct {
+				name                    string
+				disposition, attributes uint32
+			}{
+				{"directory-create", 2, dosDirectory}, {"directory-open-if", 3, dosDirectory | dosHidden}, {"directory-normal", 2, dosDirectory | dosNormal | dosHidden},
+			} {
+				body, status, id := fixture.connection.createFile(t.Context(), fixture.session, fixture.tree, makeRequest(test.name, test.disposition, test.attributes, createDirectory))
+				retained := test.attributes &^ (dosDirectory | dosNormal)
+				if status != statusOK || binary.LittleEndian.Uint32(body[56:]) != dosDirectory|retained {
+					t.Fatalf("directory create %s status=%#x body=%v", test.name, status, body)
+				}
+				handle := fixture.tree.findFileHandle(id)
+				attr, err := handle.node.Stat(t.Context())
+				metadata, metadataErr := decodeWindowsMetadata(attr.Metadata)
+				if err != nil || metadataErr != nil || attr.Kind != storage.NodeDirectory || metadata.Attributes != retained {
+					t.Fatalf("directory metadata %s attr=%+v metadata=%+v err=%v/%v", test.name, attr, metadata, err, metadataErr)
+				}
+				closeFixtureHandle(t, fixture, id)
+				for _, disposition := range []uint32{1, 3} {
+					body, status, id = fixture.connection.createFile(t.Context(), fixture.session, fixture.tree, makeRequest(test.name, disposition, dosDirectory|dosNormal, createDirectory))
+					if status != statusOK || binary.LittleEndian.Uint32(body[4:]) != uint32(storage.Opened) || binary.LittleEndian.Uint32(body[56:]) != dosDirectory|retained {
+						t.Fatalf("directory open %s disposition=%d status=%#x body=%v", test.name, disposition, status, body)
+					}
+					closeFixtureHandle(t, fixture, id)
+				}
+			}
+			for _, disposition := range []uint32{1, 3} {
+				body, status, id := fixture.connection.createFile(t.Context(), fixture.session, fixture.tree, makeRequest("", disposition, dosDirectory|dosNormal|dosHidden, createDirectory))
+				if status != statusOK || binary.LittleEndian.Uint32(body[56:]) != dosDirectory {
+					t.Fatalf("root directory attributes disposition=%d status=%#x body=%v", disposition, status, body)
+				}
+				closeFixtureHandle(t, fixture, id)
+			}
+			body, status, id := fixture.connection.createFile(t.Context(), fixture.session, fixture.tree, makeRequest("regular-with-directory-attr", 2, dosDirectory|dosNormal|dosHidden, createNonDirectory))
+			if status != statusOK || binary.LittleEndian.Uint32(body[56:]) != dosHidden|dosArchive {
+				t.Fatalf("structural request changed selected regular kind status=%#x body=%v", status, body)
+			}
+			regular, err := fixture.tree.findFileHandle(id).node.Stat(t.Context())
+			metadata, metadataErr := decodeWindowsMetadata(regular.Metadata)
+			if err != nil || metadataErr != nil || regular.Kind != storage.NodeRegular || metadata.Attributes != dosHidden|dosArchive {
+				t.Fatalf("regular structural attrs persisted: attr=%+v metadata=%+v err=%v/%v", regular, metadata, err, metadataErr)
+			}
+			closeFixtureHandle(t, fixture, id)
+			before, err := fixture.volume.Stat(t.Context(), "regular-with-directory-attr")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, status, _ := fixture.connection.createFile(t.Context(), fixture.session, fixture.tree, makeRequest("regular-with-directory-attr", 1, dosDirectory, createDirectory)); status != statusNotADirectory {
+				t.Fatalf("existing regular directory-option mismatch status=%#x", status)
+			}
+			after, err := fixture.volume.Stat(t.Context(), "regular-with-directory-attr")
+			if err != nil || !reflect.DeepEqual(before, after) {
+				t.Fatalf("kind mismatch changed node: before=%+v after=%+v err=%v", before, after, err)
+			}
+			if _, status, _ := fixture.connection.createFile(t.Context(), fixture.session, fixture.tree, makeRequest("unsupported-directory-attributes", 2, dosDirectory|dosReparsePoint, createDirectory)); status != statusUnsupported {
+				t.Fatalf("unsupported structural attributes status=%#x", status)
+			}
+			if _, err := fixture.volume.Stat(t.Context(), "unsupported-directory-attributes"); !errors.Is(err, syscall.ENOENT) {
+				t.Fatalf("unsupported attributes created node: %v", err)
 			}
 		})
 	}

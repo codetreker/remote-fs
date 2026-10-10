@@ -162,7 +162,7 @@ func resolveNameWithComparer(ctx context.Context, backend storage.FileStorage, s
 		if err != nil {
 			return resolvedCreateName{}, err
 		}
-		if err := authorize(ctx, storage.OpReplicationSnapshot); err != nil {
+		if err := authorize(ctx, storage.OpFileObserveDirectoryMetadata); err != nil {
 			return resolvedCreateName{}, namespaceFailure(err)
 		}
 		options := storage.DirectoryMetadataOptions{Guards: cloneNamespaceGuards(guards)}

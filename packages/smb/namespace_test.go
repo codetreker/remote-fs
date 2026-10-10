@@ -184,7 +184,7 @@ func TestSMBNamespacePreservesRawIdentityGuardsAndAuthorization(t *testing.T) {
 	if err != nil || result.Root || result.RootID != 1 || result.Selection.Name.Parent.NodeID != 2 || string(result.Selection.Name.RawLeaf) != "Actual" || !reflect.DeepEqual(result.Condition, storage.ChildCondition{State: storage.SameNode, NodeID: 3, ExpectedMetadata: map[string][]byte{windowsMetadataKey: nil}}) || result.Attr == nil || result.Attr.ID != 3 {
 		t.Fatalf("resolution: %+v %v", result, err)
 	}
-	if !reflect.DeepEqual(operations, []storage.Operation{storage.OpVolumeStat, storage.OpReplicationSnapshot, storage.OpReplicationSnapshot}) {
+	if !reflect.DeepEqual(operations, []storage.Operation{storage.OpVolumeStat, storage.OpFileObserveDirectoryMetadata, storage.OpFileObserveDirectoryMetadata}) {
 		t.Fatalf("wrong permissions: %v", operations)
 	}
 	if backend.calls != 1 || backend.contextValue != "principal" || len(session.calls) != 2 {
@@ -255,7 +255,7 @@ func TestSMBNamespacePreservesFailuresWithoutAbsenceOrRetry(t *testing.T) {
 	if _, err := resolveTestName(t.Context(), backend, session, "x", DefaultLimits(), allowNamespace); !errors.Is(err, syscall.ENOENT) || storage.ErrnoOf(err) != syscall.EIO || len(session.calls) != 0 {
 		t.Fatalf("root ENOENT: %v", err)
 	}
-	for _, denied := range []storage.Operation{storage.OpVolumeStat, storage.OpReplicationSnapshot} {
+	for _, denied := range []storage.Operation{storage.OpVolumeStat, storage.OpFileObserveDirectoryMetadata} {
 		backend, session := namespaceFixture()
 		_, err := resolveTestName(t.Context(), backend, session, "Folder", DefaultLimits(), func(_ context.Context, op storage.Operation) error {
 			if op == denied {
@@ -291,6 +291,51 @@ func TestSMBNamespacePreservesFailuresWithoutAbsenceOrRetry(t *testing.T) {
 	session.before = func(*namespaceTestSession, storage.DirectoryTarget) { cancel() }
 	if result, err := resolveTestName(ctx, backend, session, "Folder", DefaultLimits(), allowNamespace); !errors.Is(err, context.Canceled) || !reflect.DeepEqual(result, resolvedCreateName{}) || len(session.calls) != 1 {
 		t.Fatalf("canceled observation supplied a selection: %+v %v", result, err)
+	}
+}
+
+func TestSMBNamespaceAuthorizesDirectoryMetadataOperation(t *testing.T) {
+	for _, test := range []struct {
+		name         string
+		denied       storage.Operation
+		wantErr      error
+		observations int
+	}{
+		{"denied observation", storage.OpFileObserveDirectoryMetadata, authz.ErrDenied, 0},
+		{"denied replication snapshot", storage.OpReplicationSnapshot, nil, 2},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			backend, session := namespaceFixture()
+			var operations []storage.Operation
+			server := &Server{config: Config{Limits: DefaultLimits(), Authorize: authz.AuthorizerFunc(func(ctx context.Context, request authz.AccessRequest) error {
+				if request.Volume != "trusted-volume" || ctx.Value(namespaceTestKey{}) != "principal" {
+					t.Fatalf("directory authorization lost volume or principal: %+v", request)
+				}
+				operations = append(operations, request.Operation)
+				if request.Operation == test.denied {
+					return authz.ErrDenied
+				}
+				return nil
+			})}}
+			export := &Export{server: server, share: Share{Volume: "trusted-volume", Backend: backend}}
+			tree := &tree{export: export, authority: &authoritySession{raw: session, identity: storage.FileSessionIdentityResult{Backend: storage.BackendIdentityResult{RootNodeID: 1}}}}
+			ctx := context.WithValue(t.Context(), namespaceTestKey{}, "principal")
+			resolved, err := resolveCreateName(ctx, tree, `folder\Actual`)
+			if !errors.Is(err, test.wantErr) || len(session.calls) != test.observations {
+				t.Fatalf("wrong semantic authorization: result=%+v err=%v observations=%d operations=%v", resolved, err, len(session.calls), operations)
+			}
+			if test.wantErr != nil && (!reflect.DeepEqual(resolved, resolvedCreateName{}) || session.loads != 0 || namespaceStatus(err) != statusDenied) {
+				t.Fatalf("denied observation returned controlled metadata: %+v %v loads=%d", resolved, err, session.loads)
+			}
+			if test.wantErr == nil && (resolved.Condition.NodeID != 3 || string(resolved.Selection.Name.RawLeaf) != "Actual") {
+				t.Fatalf("replication denial prevented authorized file observation: %+v %v", resolved, err)
+			}
+			for _, operation := range operations {
+				if operation == storage.OpReplicationSnapshot {
+					t.Fatalf("directory observation checked unrelated replication permission: %v", operations)
+				}
+			}
+		})
 	}
 }
 

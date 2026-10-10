@@ -64,7 +64,7 @@ authentication exchange 受 `HandshakeTimeout` 约束，完成后的 identity �
 
 SMB 名字是严格 UTF-16，转换为可逆 raw leaf；NUL、孤立 surrogate、ADS、保留设备名、非法组件与尾部点／空白拒绝，不做 Unicode normalization。Windows 使用 CompareStringOrdinal 的显式长度、case-insensitive 比较；其它平台按规范的 BMP 大写表映射 UTF-16 code unit，代理项和未列项保持原值。比较不能使用 Go EqualFold 或 ToUpper。
 
-每级父目录使用完整、有界的 DirectoryMetadataObserver 捕获。所有 sibling 的名字都先核对可表示性与大小写唯一性；坏名字或等价重名使整次按名选择失败，不能省略或猜测。无关的合法符号链接保留在完整观察中；选中的叶或中间 component 为符号链接时拒绝。根 Stat 每次都必须匹配固定 RootNodeID。选择保存父 NodeID、精确 raw edge 与各级 directory revision，最终以带 NamespaceGuards 的 ChildSelection 交给 authority；取消、观察不完整或祖先身份重复使选择失败。
+每级父目录在 DirectoryMetadataObserver 调用前以已验证 principal 和可信 Share.Volume 授权 OpFileObserveDirectoryMetadata，然后取得完整、有界捕获；名字观察不要求 replication.snapshot。拒绝时不调用 observer，也不产生打开效果。所有 sibling 的名字都先核对可表示性与大小写唯一性；坏名字或等价重名使整次按名选择失败，不能省略或猜测。无关的合法符号链接保留在完整观察中；选中的叶或中间 component 为符号链接时拒绝。根 Stat 每次都必须匹配固定 RootNodeID。选择保存父 NodeID、精确 raw edge 与各级 directory revision，最终以带 NamespaceGuards 的 ChildSelection 交给 authority；取消、观察不完整或祖先身份重复使选择失败。
 
 ### 打开意图与返回事实
 
@@ -75,6 +75,8 @@ FILE_OPEN 要求已有目标，FILE_CREATE 要求缺席，FILE_OPEN_IF 保持已
 Generic rights 按规范完整展开，MAXIMUM_ALLOWED 和未支持权限拒绝。GENERIC_ALL 展开为 FILE_ALL_ACCESS（0x001f01ff），包含未交付的 DELETE_CHILD、WRITE_DAC 和 WRITE_OWNER，因此返回 STATUS_NOT_SUPPORTED；不能删掉这些权限后部分授予。READ_DATA 授予字节读，WRITE_DATA/APPEND_DATA 授予字节写；EXECUTE 声明 ReadData share Use，却不授予字节读。目录 LIST_DIRECTORY/TRAVERSE 声明 ReadEntries，ADD_FILE/ADD_SUBDIRECTORY 声明 WriteData；目录引用没有字节方法。DELETE 声明 DeleteName，打开不删除。READ_ATTRIBUTES/READ_EA、WRITE_ATTRIBUTES/WRITE_EA 分别授予独立 ReadMetadata、WriteMetadata，不参加 data/write/delete share 分类。
 
 data／execute／write／append／DELETE 权限参与 sharing；Use 非零时，缺少 SHARE_READ 设置 Deny.ReadData|ReadEntries，缺少 SHARE_WRITE 设置 Deny.WriteData，缺少 SHARE_DELETE 设置 Deny.DeleteName。metadata/control-only 的 Use=0 时忽略 ShareAccess，Deny=0，不能形成双向 Windows sharing conflict；authority 在实际 NodeID 上双向比较参与者的 Uses/Deny。OpenAt Read/Write 只由字节权限决定，MetadataAccess 显式独立。execute+write 的 Use 因而同时含 ReadData|WriteData，但没有字节读。支持目录／非目录与互斥同步选项；同步选项要求 SYNCHRONIZE。
+
+CREATE 属性先接受支持的可设置位与 DIRECTORY，再去除 DIRECTORY/NORMAL，作为规范打开意图的属性集合。NORMAL 与其它位组合时忽略；DIRECTORY 不独立决定 kind，实际种类由目录／非目录 CreateOptions 和解析目标决定，不因属性与 options 不同而额外拒绝。DIRECTORY+FILE_DIRECTORY_FILE 可创建／打开目录，DIRECTORY+FILE_NON_DIRECTORY_FILE 仍按普通文件种类处理；响应结构位从捕获的 kind 派生，不写入 smb.windows。已有目标与目录／非目录 option 的类型冲突仍拒绝，未支持属性位仍在效果前拒绝，持久 metadata 编码保持严格。
 
 CREATE contexts 有严格数量、alignment、Next 范围、重复与 payload 检查。well-formed DHnQ、DH2Q、RqLs、AlSi 与协议 reserved GUID 仅解析并忽略，response 始终 oplock NONE、无 context，不建立 durable/persistent/lease 状态。畸形 recognized context 或互斥 durable 请求是 invalid parameter；well-formed reconnect、MxAc、QFid、以及 ExtA/SecD/TWrp、app-instance、virtual-disk 与未知 context 在效果前明确不支持。协议 reserved CREATE/CLOSE 字段按标准忽略。
 

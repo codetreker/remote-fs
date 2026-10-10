@@ -263,3 +263,20 @@ func TestCreateGenericAccessPreservesEveryMappedRight(t *testing.T) {
 		}
 	}
 }
+
+func TestCreateDirectoryAttributesFollowOptionsAndRetainOnlySettableFlags(t *testing.T) {
+	for _, test := range []struct {
+		attributes, options uint32
+		directory           bool
+		retained            uint32
+	}{
+		{dosDirectory, createDirectory, true, 0}, {dosDirectory | dosHidden, createDirectory, true, dosHidden},
+		{dosNormal | dosDirectory | dosHidden, createDirectory, true, dosHidden},
+		{dosDirectory, 0, false, 0}, {dosDirectory | dosHidden, createNonDirectory, false, dosHidden},
+	} {
+		intent, err := classifyCreate(wire.CreateRequest{Disposition: 2, DesiredAccess: accessReadAttr, Attributes: test.attributes, Options: test.options})
+		if err != nil || intent.directory != test.directory || intent.attributes != test.retained {
+			t.Fatalf("attributes=%x options=%x intent=%+v err=%v", test.attributes, test.options, intent, err)
+		}
+	}
+}

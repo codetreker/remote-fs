@@ -261,3 +261,26 @@ func TestWindowsMetadataProjectsOnlyKnownKindAndDOSFacts(t *testing.T) {
 		t.Fatalf("absent namespace projection = %x, %v", got, err)
 	}
 }
+
+func TestCreateAttributesSeparateRequestFlagsFromPersistedMetadata(t *testing.T) {
+	for _, test := range []struct{ request, want uint32 }{
+		{0, 0}, {dosNormal, 0}, {dosDirectory, 0}, {dosDirectory | dosNormal, 0},
+		{dosHidden | dosNormal, dosHidden}, {dosDirectory | dosHidden | dosSystem | dosNormal, dosHidden | dosSystem},
+		{dosReadOnly | dosArchive, dosReadOnly | dosArchive},
+	} {
+		got, err := normalizeCreateAttributes(test.request)
+		if err != nil || got != test.want || !validDOSAttributes(got) {
+			t.Fatalf("request=%x normalized=%x want=%x err=%v", test.request, got, test.want, err)
+		}
+	}
+	for _, attributes := range []uint32{dosReparsePoint, 0x8, 0x100, dosDirectory | 0x800} {
+		if _, err := normalizeCreateAttributes(attributes); !errors.Is(err, syscall.EOPNOTSUPP) {
+			t.Fatalf("unsupported CREATE attributes=%x err=%v", attributes, err)
+		}
+	}
+	for _, attributes := range []uint32{dosDirectory, dosDirectory | dosHidden, dosNormal | dosHidden} {
+		if _, err := encodeWindowsMetadata(windowsMetadata{Attributes: attributes}); !errors.Is(err, syscall.EINVAL) {
+			t.Fatalf("request flags leaked into persisted attributes=%x err=%v", attributes, err)
+		}
+	}
+}

@@ -29,6 +29,18 @@ type windowsMetadata struct {
 	Attributes uint32
 }
 
+// CREATE attributes can contain structural DIRECTORY and an ignored NORMAL.
+// The authority-selected kind supplies DIRECTORY in the response; only the
+// settable attributes are retained in the Windows metadata namespace.
+// https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-fsa/498a5eeb-afc9-445f-99ed-a7e4b73c648b
+// https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-fscc/ca28ec38-f155-4768-81d6-4bfeb8586fc9
+func normalizeCreateAttributes(attributes uint32) (uint32, error) {
+	if attributes&^(dosSettableAttributes|dosDirectory) != 0 {
+		return 0, syscall.EOPNOTSUPP
+	}
+	return attributes &^ (dosNormal | dosDirectory), nil
+}
+
 func validDOSAttributes(attributes uint32) bool {
 	return attributes&^dosSettableAttributes == 0 && (attributes&dosNormal == 0 || attributes == dosNormal)
 }
