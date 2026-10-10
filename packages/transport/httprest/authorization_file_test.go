@@ -160,6 +160,7 @@ func TestEveryFileOperationAuthorizesBeforeCapabilityLookup(t *testing.T) {
 		{Op: storage.OpFileSetMetadata, Namespace: "client.v1", Payload: metadataPayload("value")},
 		{Op: storage.OpFileSync},
 		{Op: storage.OpFileScope},
+		{Op: storage.OpFileCloseOwnerStatus},
 		{Op: storage.OpFileObserveName},
 		{Op: storage.OpFileNewUseOwner, Node: 71, Scope: &storage.UseScope{Token: strings.Repeat("c", 64)}, OwnerOptions: storage.OwnerOptions{Lifetime: storage.OwnerExplicit}},
 		{Op: storage.OpFileRetireUseOwner, Owner: 13},
@@ -179,8 +180,11 @@ func TestEveryFileOperationAuthorizesBeforeCapabilityLookup(t *testing.T) {
 			if fileActionRequired(req.Op) {
 				req.Action = action
 			}
+			if req.Op == storage.OpFileClose || req.Op == storage.OpFileSessionClose {
+				req.CloseGeneration = 1
+			}
 			switch req.Op {
-			case storage.OpFileStat, storage.OpFileRead, storage.OpFileWrite, storage.OpFileTruncate, storage.OpFileSetAttr, storage.OpFileSetMetadata, storage.OpFileSync, storage.OpFileAck, storage.OpFileClose, storage.OpFileScope, storage.OpFileObserveName:
+			case storage.OpFileStat, storage.OpFileRead, storage.OpFileWrite, storage.OpFileTruncate, storage.OpFileSetAttr, storage.OpFileSetMetadata, storage.OpFileSync, storage.OpFileAck, storage.OpFileClose, storage.OpFileScope, storage.OpFileCloseOwnerStatus, storage.OpFileObserveName:
 				req.File = strings.Repeat("b", 64)
 			}
 			fileAuthorizationDenied(t, fileAuthorizationRequest(t, h, req), "EACCES", "access denied")
@@ -313,8 +317,8 @@ func TestDeniedFileActionsDoNotMutateOrExposeRetainedReceipts(t *testing.T) {
 		{Op: storage.OpFileAck, Session: session.Session, File: opened.File},
 		{Op: storage.OpFileRenew, Session: session.Session},
 		{Op: storage.OpFileStatus, Session: session.Session},
-		{Op: storage.OpFileClose, Session: session.Session, File: opened.File, Action: closeAction},
-		{Op: storage.OpFileSessionClose, Session: session.Session, Action: closeAction},
+		{Op: storage.OpFileClose, Session: session.Session, File: opened.File, Action: closeAction, CloseGeneration: 1},
+		{Op: storage.OpFileSessionClose, Session: session.Session, Action: closeAction, CloseGeneration: 1},
 	} {
 		fileAuthorizationDenied(t, fileAuthorizationRequest(t, h, denied), "EACCES", "access denied")
 	}
@@ -464,7 +468,7 @@ func TestDeniedFileCloseStillAllowsInternalLeaseCleanup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	fileAuthorizationDenied(t, fileAuthorizationRequest(t, h, fileRequest{Op: storage.OpFileClose, Session: session.Session, File: opened.File, Action: closeAction}), "EACCES", "access denied")
+	fileAuthorizationDenied(t, fileAuthorizationRequest(t, h, fileRequest{Op: storage.OpFileClose, Session: session.Session, File: opened.File, Action: closeAction, CloseGeneration: 1}), "EACCES", "access denied")
 	if used, err := backend.Usage(t.Context()); err != nil || used != 8 {
 		t.Fatalf("denied close released retained bytes: %d, %v", used, err)
 	}
@@ -487,4 +491,55 @@ func TestDeniedFileCloseStillAllowsInternalLeaseCleanup(t *testing.T) {
 	if len(policy.requests) != 1 || policy.requests[0].Operation != storage.OpFileClose {
 		t.Fatalf("internal cleanup asked for caller authorization: %+v", policy.requests)
 	}
+}
+
+func TestRevokedAuthorizationDeniesExternalCloseAndQuery(t *testing.T) {
+	policy := &fileAuthorizationPolicy{}
+	_, native := memoryfixture.New(t, "revoked-close-continuation", 1<<20, locking.DefaultOptions())
+	backend := &failedFirstCloseBackend{Storage: native}
+	if err := backend.Create(t.Context(), "file"); err != nil {
+		t.Fatal(err)
+	}
+	options := DefaultHandlerOptions()
+	options.Authorizer = policy
+	options.Volume = "trusted-volume"
+	handler, err := NewHandlerWithOptions(backend, nil, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := handler.Close(context.Background()); err != nil {
+			t.Error(err)
+		}
+	})
+	enrolled := fileAuthorizationSuccess(t, handler, fileRequest{Op: storage.OpFileSessionOpen, Options: storage.DefaultFileSessionOptions()})
+	openID, err := storage.NewLockRequestID(enrolled.Epoch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	opened := fileAuthorizationSuccess(t, handler, fileRequest{Op: storage.OpFileOpen, Session: enrolled.Session, Action: openID, Path: []byte("file"), Open: storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true}}})
+	firstID, err := storage.NewLockRequestID(enrolled.Epoch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := fileRequest{Op: storage.OpFileClose, Session: enrolled.Session, File: opened.File, Action: firstID, CloseGeneration: 1}
+	if answer := fileAuthorizationRequest(t, handler, first); answer.Code != StatusStorageError {
+		t.Fatalf("first close returned %d: %s", answer.Code, answer.Body.String())
+	}
+	policy.reset(authz.ErrDenied)
+	secondID, err := storage.NewLockRequestID(enrolled.Epoch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second := fileRequest{Op: storage.OpFileClose, Session: enrolled.Session, File: opened.File, Action: secondID, CloseGeneration: 2}
+	fileAuthorizationDenied(t, fileAuthorizationRequest(t, handler, first), "EACCES", "access denied")
+	fileAuthorizationDenied(t, fileAuthorizationRequest(t, handler, second), "EACCES", "access denied")
+	query := fileRequest{Op: storage.OpFileQueryAction, Session: enrolled.Session, File: opened.File, FileAction: storage.FileActionID(secondID), CloseGeneration: 2}
+	fileAuthorizationDenied(t, fileAuthorizationRequest(t, handler, query), "EACCES", "access denied")
+	wrong := second
+	wrong.File = strings.Repeat("f", 64)
+	fileAuthorizationDenied(t, fileAuthorizationRequest(t, handler, wrong), "EACCES", "access denied")
+	query.File = wrong.File
+	fileAuthorizationDenied(t, fileAuthorizationRequest(t, handler, query), "EACCES", "access denied")
+	fileAuthorizationDenied(t, fileAuthorizationRequest(t, handler, fileRequest{Op: storage.OpFileOpen, Session: enrolled.Session, Action: openID, Path: []byte("file"), Open: storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true}}}), "EACCES", "access denied")
 }

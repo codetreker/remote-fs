@@ -52,6 +52,10 @@ func (*nodeAuthorityWithoutName) CloseWithBarrier(context.Context) (storage.Refe
 	return storage.ReferenceCloseResult{}, nil, syscall.EIO
 }
 
+func (r *nodeAuthorityWithoutName) CloseWithActionAndBarrier(ctx context.Context, _ storage.CloseAttempt) (storage.ReferenceCloseResult, *httprest.MutationBarrier, error) {
+	return r.CloseWithBarrier(ctx)
+}
+
 type nameObserverContextKey struct{}
 
 type substitutedDirectoryAuthority struct {

@@ -37,12 +37,12 @@ func TestHTTPExplicitSessionCloseRetainsEarlierActionResults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	firstRequest := fileRequest{Op: storage.OpFileSessionClose, Session: enrollment.Session, Action: firstID}
+	firstRequest := fileRequest{Op: storage.OpFileSessionClose, Session: enrollment.Session, Action: firstID, CloseGeneration: 1}
 	first, firstErr := handler.fileCall(t.Context(), firstRequest, [32]byte{1})
 	if first.CloseResult == nil || first.CloseResult.Released || !errors.Is(firstErr, syscall.EIO) {
 		t.Fatalf("first close=%+v err=%v", first.CloseResult, firstErr)
 	}
-	secondRequest := fileRequest{Op: storage.OpFileSessionClose, Session: enrollment.Session, Action: secondID}
+	secondRequest := fileRequest{Op: storage.OpFileSessionClose, Session: enrollment.Session, Action: secondID, CloseGeneration: 2}
 	second, secondErr := handler.fileCall(t.Context(), secondRequest, [32]byte{2})
 	if second.CloseResult == nil || !second.CloseResult.Released || !errors.Is(secondErr, syscall.ENOTEMPTY) {
 		t.Fatalf("second close=%+v err=%v", second.CloseResult, secondErr)
@@ -54,7 +54,7 @@ func TestHTTPExplicitSessionCloseRetainsEarlierActionResults(t *testing.T) {
 		errno    error
 		outcome  storage.FileActionOutcome
 	}{
-		{firstRequest, [32]byte{1}, false, syscall.EIO, storage.FileActionUnknown},
+		{firstRequest, [32]byte{1}, false, syscall.EIO, storage.FileActionCompleted},
 		{secondRequest, [32]byte{2}, true, syscall.ENOTEMPTY, storage.FileActionCompleted},
 	} {
 		replayed, replayErr := handler.fileCall(t.Context(), test.request, test.digest)

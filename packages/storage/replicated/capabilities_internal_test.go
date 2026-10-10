@@ -126,6 +126,10 @@ func (r *barrierReferenceStub) CloseWithBarrier(context.Context) (storage.Refere
 	return storage.ReferenceCloseResult{Released: r.closeErr == nil}, barrier, r.closeErr
 }
 
+func (r *barrierReferenceStub) CloseWithActionAndBarrier(ctx context.Context, _ storage.CloseAttempt) (storage.ReferenceCloseResult, *httprest.MutationBarrier, error) {
+	return r.CloseWithBarrier(ctx)
+}
+
 func TestReleasedNodeReferenceCloseRetriesBarrierConfirmation(t *testing.T) {
 	session := retainedTestSession(t, nil)
 	remote := &barrierReferenceStub{barrier: &httprest.MutationBarrier{Incarnation: "log", Position: 1}}

@@ -1048,7 +1048,7 @@ func TestRetainedReadRetriesCollectedRevisionAndRejectsMissingCurrentObject(t *t
 }
 
 func TestRetainedSessionCloseCanRetryKnownAccountingRefusal(t *testing.T) {
-	volume, _ := fileVolume(t, memory.New(), 4096, nil)
+	volume, meta := fileVolume(t, memory.New(), 4096, nil)
 	failure := errors.New("known cleanup refusal")
 	var refuse atomic.Bool
 	refuse.Store(true)
@@ -1062,7 +1062,14 @@ func TestRetainedSessionCloseCanRetryKnownAccountingRefusal(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	f := openFileFor(t, session, "f", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, Write: true, Create: true}})
+	f := openFileFor(t, session, "f", storage.FileOpenOptions{
+		OpenAccess: storage.OpenAccess{Read: true, Write: true, Create: true},
+		Use:        storage.UseClaim{Uses: storage.ReadData | storage.WriteData, Deny: storage.ReadData},
+	})
+	attr, err := f.Stat(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
 	if _, err := f.WriteAt(t.Context(), 0, []byte("charge")); err != nil {
 		t.Fatal(err)
 	}
@@ -1072,8 +1079,8 @@ func TestRetainedSessionCloseCanRetryKnownAccountingRefusal(t *testing.T) {
 	if err := volume.Close(); !errors.Is(err, failure) {
 		t.Fatalf("first close=%v", err)
 	}
-	if result, err := session.CloseWithResult(t.Context()); result.Released || !errors.Is(err, failure) {
-		t.Fatalf("failed close retained ownership=%+v %v", result, err)
+	if competing, err := meta.OpenNode(t.Context(), attr.ID, storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true}}); competing != nil || !errors.Is(err, storage.ErrUseConflict) {
+		t.Fatalf("failed close dropped the original share claim: reference=%v error=%v", competing, err)
 	}
 	refuse.Store(false)
 	if err := volume.Close(); err != nil {
@@ -1081,6 +1088,22 @@ func TestRetainedSessionCloseCanRetryKnownAccountingRefusal(t *testing.T) {
 	}
 	if result, err := session.CloseWithResult(context.Background()); !result.Released || err != nil {
 		t.Fatalf("settled close=%+v %v", result, err)
+	}
+}
+
+func TestReleasedReferenceFreesLiveFileCapacityBeforeReceiptExpiry(t *testing.T) {
+	volume, _ := fileVolume(t, memory.New(), 4096, nil)
+	options := storage.DefaultFileSessionOptions()
+	options.MaxFiles = 1
+	options.MaxCloseActions = 5
+	session := fileSessionFor(t, volume, options)
+	for i := 0; i < 2; i++ {
+		file := openFileFor(t, session, "f", storage.FileOpenOptions{
+			OpenAccess: storage.OpenAccess{Read: true, Create: true},
+		})
+		if result, err := file.CloseWithResult(t.Context()); err != nil || !result.Released {
+			t.Fatalf("close %d = %+v, %v", i, result, err)
+		}
 	}
 }
 

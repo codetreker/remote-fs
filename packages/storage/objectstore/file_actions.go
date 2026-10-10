@@ -347,6 +347,12 @@ func runFileAction[T any](
 			fs.actions = make(map[storage.FileActionID]*fileAction)
 		}
 		fs.pruneFileActionsLocked(time.Now())
+		fs.pruneCloseHistoryLocked(time.Now())
+		if fs.closeActions[id] != nil {
+			fs.mu.Unlock()
+			var zero T
+			return zero, syscall.EINVAL
+		}
 		if retained := fs.actions[id]; retained != nil {
 			if retained.operation != operation || retained.digest != digest {
 				fs.mu.Unlock()
@@ -391,6 +397,12 @@ func runFileAction[T any](
 
 		fs.mu.Lock()
 		fs.pruneFileActionsLocked(time.Now())
+		fs.pruneCloseHistoryLocked(time.Now())
+		if fs.closeActions[id] != nil {
+			fs.mu.Unlock()
+			var zero T
+			return zero, syscall.EINVAL
+		}
 		if fs.actions[id] != nil {
 			fs.mu.Unlock()
 			continue
@@ -441,6 +453,12 @@ func (fs *fileSession) QueryFileAction(ctx context.Context, id storage.FileActio
 	defer done()
 	fs.mu.Lock()
 	fs.pruneFileActionsLocked(time.Now())
+	fs.pruneCloseHistoryLocked(time.Now())
+	if closeAction := fs.closeActions[id]; closeAction != nil {
+		receipt := storage.FileActionReceipt{Action: id, Operation: storage.OpFileClose, Outcome: closeAction.outcome}
+		fs.mu.Unlock()
+		return receipt, nil
+	}
 	action := fs.actions[id]
 	if action != nil {
 		receipt := storage.FileActionReceipt{Action: id, Operation: action.operation, Outcome: action.outcome}

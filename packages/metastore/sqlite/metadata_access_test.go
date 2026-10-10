@@ -83,7 +83,7 @@ func TestInitialMetadataAssignsNativeVersionsAndOwnsPayloads(t *testing.T) {
 	}
 }
 
-func TestRetiredFileKeepsUseClaimUntilExplicitDrop(t *testing.T) {
+func TestRetiredFileKeepsUseClaimUntilClose(t *testing.T) {
 	store, file := openPublicationFile(t)
 	if err := store.CheckUseOwners(); err != nil {
 		t.Fatal(err)
@@ -104,9 +104,6 @@ func TestRetiredFileKeepsUseClaimUntilExplicitDrop(t *testing.T) {
 	if err := file.Order(t.Context(), func() error { called = true; return nil }); err != nil || !called {
 		t.Fatalf("ordered transition = called %v, err %v", called, err)
 	}
-	if err := file.DropUse(t.Context()); !errors.Is(err, syscall.EBUSY) {
-		t.Fatalf("active reference dropped its use claim: %v", err)
-	}
 	if _, err := file.Node(metastore.WithFileAccess(t.Context(), metastore.FileAccess{Uses: storage.ReadData, Offset: 0, Length: 1})); err != nil {
 		t.Fatalf("scoped read access: %v", err)
 	}
@@ -126,7 +123,7 @@ func TestRetiredFileKeepsUseClaimUntilExplicitDrop(t *testing.T) {
 	if competing, err := store.OpenFile(t.Context(), "file", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true}}); competing != nil || !errors.Is(err, storage.ErrUseConflict) {
 		t.Fatalf("retired reference released use before drain: file=%v err=%v", competing, err)
 	}
-	if err := opened.DropUse(t.Context()); err != nil {
+	if err := opened.Close(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 	competing, err := store.OpenFile(t.Context(), "file", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true}})
@@ -134,9 +131,6 @@ func TestRetiredFileKeepsUseClaimUntilExplicitDrop(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := competing.Close(t.Context()); err != nil {
-		t.Fatal(err)
-	}
-	if err := opened.Close(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 }

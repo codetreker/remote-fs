@@ -86,6 +86,7 @@ storage.Operation 是覆盖路径、文件会话、复制和锁控制的 transpo
 | `file.clear-pending-unlink` | `/v5/file-control`，同名动作 | 按 generation 清除当前 pending 状态 |
 | `file.mutate` | `/v5/file`，`file.mutate` | 按 size/metadata 条件修改引用 |
 | `file.close` | `/v5/file-control`，`file.close` | 关闭一个保留文件引用 |
+| `file.close-owner-status` | `/v5/file-control`，`file.close-owner-status` | 只查询请求绑定的确切 File／NodeReference 关闭 owner 状态；每次外部查询重新授权 |
 | `lock.session-enrollment` | `/v5/session-enrollment` | 申请强占有会话 enrollment ticket |
 | `lock.session-open` | `/v5/session-open` | 使用 ticket 建立强占有会话 |
 | `lock.session-close` | `/v5/session-close` | 关闭强占有会话 |

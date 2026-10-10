@@ -637,7 +637,7 @@ func (s *Store) markNodeDeleteIntents(ctx context.Context, tx *sql.Tx, node int6
 	return err
 }
 
-func (s *Store) finalizePendingUnlinkLocked(ctx context.Context, id int64) error {
+func (s *Store) finalizePendingUnlinkLocked(ctx context.Context, id int64, closing *retainedFile) error {
 	if s.coordinator.pins[retainedNode{s.volume, id}] > 1 {
 		return syscall.EBUSY
 	}
@@ -653,7 +653,7 @@ func (s *Store) finalizePendingUnlinkLocked(ctx context.Context, id int64) error
 		return nil
 	}
 	ctx = pendingUnlinkCleanupContext(ctx, storage.PublicationAccountingFrom(ctx))
-	intent := &volumeIntent{kind: locking.RemoveMutation, node: id, cleanup: state.State.Detached}
+	intent := &volumeIntent{kind: locking.RemoveMutation, node: id, cleanup: state.State.Detached, closing: closing}
 	err := s.mutateTransactionLocked(ctx, ctx, intent, func(tx *sql.Tx) error {
 		if !state.State.Detached {
 			if state.State.ID == s.root {
@@ -748,7 +748,7 @@ func (s *Store) RetryPendingUnlinks(ctx context.Context, limit int) error {
 			failures = append(failures, err)
 			continue
 		}
-		if err := s.finalizePendingUnlinkLocked(ctx, id); err != nil {
+		if err := s.finalizePendingUnlinkLocked(ctx, id, nil); err != nil {
 			failures = append(failures, err)
 		}
 	}

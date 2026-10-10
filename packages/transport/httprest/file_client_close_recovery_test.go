@@ -133,3 +133,89 @@ func TestHTTPLostCloseResponsePreservesPendingRelease(t *testing.T) {
 		}
 	}
 }
+
+func TestHTTPExplicitCloseReplayLossPreservesConfirmedRelease(t *testing.T) {
+	meta, backend := memoryfixture.New(t, "explicit-close-replay-loss", 1<<20, locking.DefaultOptions())
+	if err := backend.Create(t.Context(), "file"); err != nil {
+		t.Fatal(err)
+	}
+	log := &retryBarrierLog{Log: meta}
+	handler, err := NewHandler(backend, log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(handler)
+	t.Cleanup(func() {
+		server.Close()
+		if err := handler.Close(context.Background()); err != nil {
+			t.Error(err)
+		}
+	})
+	client, err := Dial(server.URL, server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := client.NewFileSession(t.Context(), storage.DefaultFileSessionOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	opened, err := session.OpenFile(t.Context(), "file", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	file := opened.(*remoteFile)
+	owner, err := file.CloseOwnerStatus(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := storage.NewFileActionID(owner.CurrentEpoch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	attempt := storage.CloseAttempt{Action: id, Generation: owner.NextGeneration}
+	log.failures = log.calls.Load() + 1
+	first, barrier, firstErr := file.CloseWithActionAndBarrier(t.Context(), attempt)
+	var pending *CloseBarrierPendingError
+	if !first.Released || !first.Determined || barrier != nil || !errors.As(firstErr, &pending) {
+		t.Fatalf("first close did not preserve pending release: result=%+v barrier=%+v err=%v", first, barrier, firstErr)
+	}
+	original := client.http.Transport
+	var mu sync.Mutex
+	dropped := false
+	client.http.Transport = fileRoundTripFunc(func(request *http.Request) (*http.Response, error) {
+		body, bodyErr := request.GetBody()
+		if bodyErr != nil {
+			return nil, bodyErr
+		}
+		var command struct {
+			Op storage.Operation `json:"op"`
+		}
+		decodeErr := json.NewDecoder(body).Decode(&command)
+		_ = body.Close()
+		if decodeErr != nil {
+			return nil, decodeErr
+		}
+		response, callErr := original.RoundTrip(request)
+		if callErr != nil || command.Op != storage.OpFileClose {
+			return response, callErr
+		}
+		mu.Lock()
+		lose := !dropped
+		dropped = true
+		mu.Unlock()
+		if !lose {
+			return response, nil
+		}
+		_, _ = io.Copy(io.Discard, response.Body)
+		_ = response.Body.Close()
+		return nil, errors.New("lost explicit close replay")
+	})
+	second, barrier, secondErr := file.CloseWithActionAndBarrier(t.Context(), attempt)
+	if !second.Released || !second.Determined || barrier != nil || !errors.Is(secondErr, syscall.EIO) || !errors.As(secondErr, &pending) {
+		t.Fatalf("lost replay revoked confirmed release: result=%+v barrier=%+v err=%v", second, barrier, secondErr)
+	}
+	settled, barrier, settleErr := file.CloseWithActionAndBarrier(t.Context(), attempt)
+	if !settled.Released || !settled.Determined || barrier == nil || settleErr != nil {
+		t.Fatalf("same-ID barrier did not settle: result=%+v barrier=%+v err=%v", settled, barrier, settleErr)
+	}
+}

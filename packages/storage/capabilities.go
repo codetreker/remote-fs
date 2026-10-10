@@ -51,15 +51,88 @@ type NodeReference interface {
 	CloseWithResult(context.Context) (ReferenceCloseResult, error)
 }
 
-// ReferenceCloseResult reports whether the caller still owns a reference after
-// close returns. A semantic deletion error can coexist with a released reference.
-type ReferenceCloseResult struct{ Released bool }
+// ReferenceCloseResult reports the physical release fact. Determined false with
+// Released false means the result is unknown; it cannot authorize a new attempt.
+// A semantic deletion error can coexist with a released reference.
+type ReferenceCloseResult struct {
+	Released   bool
+	Determined bool
+}
 
 func (r ReferenceCloseResult) Check(err error) error {
 	if !r.Released && err == nil {
 		return errors.New("close retained ownership without an error: invalid result")
 	}
 	return nil
+}
+
+// ReferenceCloseActions lets the caller recover one exact close attempt. A
+// determined unreleased result permits a later attempt with a new action ID;
+// an undetermined result permits only replay of the original ID.
+type ReferenceCloseActions interface {
+	CloseWithAction(context.Context, CloseAttempt) (ReferenceCloseResult, error)
+	QueryCloseAttempt(context.Context, CloseAttempt) (FileActionReceipt, error)
+	CloseOwnerStatus(context.Context) (CloseOwnerStatus, error)
+}
+
+// CloseOwnerStatus is scoped to one exact retained reference. Current is the
+// admitted attempt that must be adopted while its result is pending or unknown.
+// Ready says the owner has a reserved receipt slot for a new action at
+// NextGeneration/CurrentEpoch. When false, the caller preserves the owner and
+// queries or waits for history.
+type CloseOwnerStatus struct {
+	Released       bool
+	Ready          bool
+	Current        *CloseAttempt
+	CurrentOutcome FileActionOutcome
+	NextGeneration uint64
+	CurrentEpoch   uint64
+}
+
+func (s CloseOwnerStatus) Check() error {
+	if s.NextGeneration == 0 || s.CurrentEpoch == 0 || s.Released && s.Ready {
+		return syscall.EINVAL
+	}
+	if s.Current == nil {
+		if s.CurrentOutcome != 0 {
+			return syscall.EINVAL
+		}
+		return nil
+	}
+	if s.Ready || s.Released || s.Current.Generation != s.NextGeneration ||
+		(s.CurrentOutcome != FileActionPending && s.CurrentOutcome != FileActionUnknown) {
+		return syscall.EINVAL
+	}
+	return s.Current.Check()
+}
+
+// CloseAttempt identifies one reference-bound close generation and action.
+// Generations start at one and advance only after a determined unreleased result.
+type CloseAttempt struct {
+	Action     FileActionID
+	Generation uint64
+}
+
+// CloseActionNotExecutedError proves that a new explicit close attempt missed
+// the native action epoch before admission or any reference effect.
+type CloseActionNotExecutedError struct{ CurrentEpoch uint64 }
+
+func (e *CloseActionNotExecutedError) Error() string {
+	return "close action was not admitted in the current epoch"
+}
+func (e *CloseActionNotExecutedError) Unwrap() error { return syscall.ESTALE }
+
+func (a CloseAttempt) Check() error {
+	if a.Generation == 0 {
+		return syscall.EINVAL
+	}
+	return a.Action.Check()
+}
+
+// RecoverableReferenceClose confirms that a session reserves action history
+// for every retained reference before an effectful open.
+type RecoverableReferenceClose interface {
+	CheckRecoverableReferenceClose() error
 }
 
 // NodeReferences opens retained identities directly or as an exact child of a

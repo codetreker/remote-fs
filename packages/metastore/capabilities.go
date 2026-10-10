@@ -33,7 +33,6 @@ type NodeReference interface {
 	Node(context.Context) (FileState, error)
 	SetAttr(context.Context, storage.AttrChange) (FileState, error)
 	Retire(context.Context) error
-	DropUse(context.Context) error
 	Close(context.Context) error
 	CloseWithResult(context.Context) (storage.ReferenceCloseResult, error)
 }

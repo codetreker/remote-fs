@@ -159,6 +159,7 @@ type volumeIntent struct {
 	nodes   []int64
 	scope   storage.UseScope
 	cleanup bool
+	closing *retainedFile
 }
 
 type volumePublication struct {
@@ -279,7 +280,16 @@ func (s *Store) finishVolumePublication(ctx context.Context, tx *sql.Tx, publica
 			if node.ID == 0 {
 				continue
 			}
-			if err := s.fileDomain.coordinator.CheckUse(ctx, uint64(node.ID), publication.intent.scope, storage.DeleteName); err != nil {
+			var err error
+			if closing := publication.intent.closing; closing != nil {
+				if closing.store != s || closing.id != node.ID {
+					return storage.ErrInvalidScope
+				}
+				err = s.fileDomain.coordinator.CheckCloseUnlink(ctx, uint64(node.ID), closing.scope, closing.use)
+			} else {
+				err = s.fileDomain.coordinator.CheckUse(ctx, uint64(node.ID), publication.intent.scope, storage.DeleteName)
+			}
+			if err != nil {
 				return err
 			}
 		}
