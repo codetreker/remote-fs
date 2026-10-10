@@ -83,7 +83,9 @@ CREATE 与 CLOSE 建立后续操作依赖的 FileId：五种非 supersede dispos
 
 ### FileId 数据、目录与名字效果
 
-文件 READ 使用身份稳定的 `File.ReadAt`，成功字节与属性来自同一 revision；WRITE、EOF 和属性／时间修改经过 authority 的条件动作，同次提交内容／长度与 Windows `ARCHIVE`，最终效果点核对 `READONLY` metadata token。目录或 metadata-only FileId 的属性／时间组合更新使用现有 `NodeReference.(ConditionalFileMutation).MutateFile(MutateAttributes)`；字节写入／截断仍不属于此引用，不能调用两次 setter 拼出部分效果。FLUSH 确认后端 durability barrier；CLOSE 不延后写回。Windows 属性解释只在本地 codec；其它入口不解释这些位。allocation 在 CREATE/CLOSE 中按权威字节数报告；文件／volume 信息类只有在权威 Attr、Space 与经中立 `VolumePresentation` 证明的身份／几何足够时才能成功，不能强加内置 volume 的 4096 粒度。配额下调导致 `Used > Total` 或容量结构无法准确表示时，仅受影响的容量 `QUERY_INFO` 明确失败；tree 继续允许读取、释放引用与回收空间，不对整个 share 设置故障 fence。信息类 allowlist、`MinimumCount`、输出预算、时间零值及 `NodeReference` 的条件属性动作归[文件 I/O 与信息提案](2026-09-28-smb-file-data-information.md)。
+[7.4a 文件内容访问](2026-09-28-smb-file-data-io.md)使用身份稳定的 File.ReadAt，成功字节与 Attr 来自同一 revision；WRITE／append 经条件动作，同次提交内容、Windows ARCHIVE 和时间，最终效果点核对 READONLY 的 metadata token。byte-only 引用在 OpenAt enrollment 固定的通用 metadata 效果，并逐操作授权，不增加公开 metadata 权限。逐句柄 FIFO 与 CLOSE 排空、原动作 typed replay、FLUSH 的真实 barrier 与有界失败事实均由该提案拥有。
+
+7.4b 文件信息复用这一 gate／owner，为 EOF 增加同动作长度／ARCHIVE 效果；目录或 metadata-only FileId 的属性／时间组合更新使用现有 NodeReference 的 MutateAttributes，不获得字节写入／截断。7.4c volume 信息只有在权威 Attr、Space 与可信 VolumePresentation 足够时才能成功，不能强加 4096 几何；Used>Total 或不可表达只使对应容量查询失败，tree 继续读与释放。两段的类表、时间、allocation、身份／geometry 与备选理由归[文件与 volume 信息提案](2026-09-28-smb-file-data-information.md)，各目的开工前独立定稿。
 
 应用可见 QUERY_DIRECTORY 通过目录 FileId 的活 scope 取得一次完整有界 `DirectoryReader.ReadDirNodeBounded` 捕获，先验证**所有**名字与属性，再从冻结的同一 revision 分页；坏条目不能被 pattern 过滤掉。普通续页不冒充实时观察；restart/reopen 重取，FileIndex 只在本句柄当前捕获有效。捕获、cursor、flags、buffer 与预算由[目录枚举提案](2026-09-28-smb-directory-enumeration.md)拥有。目录路径遍历的 `DirectoryMetadataObserver` 与应用目录捕获是不同能力；后者不能替代前者的最终 mutation guards。
 
@@ -131,12 +133,14 @@ rename、move、replace、unlink 与普通 disposition 在最终 authority 事�
 
 ### 分段交付与证明门
 
-[Issue #30](https://github.com/codetreker/remote-fs/issues/30)的剩余工作分成九个**各有独立提案文件**的实现 PR；表中顺序按技术依赖排列，因此 9 号映射／夹具在 8.3 缓存工作前交付；这份总提案持有整体拓扑、跨任务不变量、最终 WN 矩阵和放弃的架构路线，不替代分项提案的具体接口、文件布局、算法及段内测试。每段实际落地时同 PR 更新 `docs/design/`、implemented Agent Note、代码和覆盖该段错误路径的测试；后段不能把前段未确认结果掩盖为成功。
+[Issue #30](https://github.com/codetreker/remote-fs/issues/30)按单一交付目的拆分实现 PR；7.4 分为内容访问、文件信息、volume 信息，内容访问已有独立提案，信息两段在各自开工前定稿。表中顺序按技术依赖排列，因此 9 号映射／夹具在 8.3 缓存工作前交付；这份总提案持有整体拓扑、跨任务不变量、最终 WN 矩阵和放弃的架构路线，不替代分项提案的具体接口、文件布局、算法及段内测试。每段实际落地时同 PR 更新 `docs/design/`、implemented Agent Note、代码和覆盖该段错误路径的测试；后段不能把前段未确认结果掩盖为成功。
 
 | 段与拥有提案 | 依赖与本段结果 | 下一段取得的保证 |
 |---|---|---|
 | [7.3b 有界 CREATE/CLOSE](../../implemented/feature/2026-09-28-smb-bounded-create-close.md) | 已落地；依赖中立可恢复关闭，五种非 supersede 打开、typed FileId、权威 guarded 选择、共享准入、身份／metadata／settlement 投影与端点清理 owner。 | 句柄容量先于效果预留；响应丢失、tree 退休和 barrier 由稳定 owner 持有；确认 `Released=false` 且 `Determined=true` 后才开始新 close 尝试；7.4 可按原对象 I/O。 |
-| [7.4 文件 I/O 与信息](2026-09-28-smb-file-data-information.md) | 使用 7.3 FileId；READ/WRITE/FLUSH/EOF、条件内容／属性动作、目录引用已有 `ConditionalFileMutation.MutateFile(MutateAttributes)` 的条件属性动作和可证明的文件／volume 信息。 | 写入与 `ARCHIVE` 同步提交；身份与 allocation/geometry 信息不伪造；7.5 可投影完整目录条目。 |
+| [7.4a 文件内容访问](2026-09-28-smb-file-data-io.md) | 使用 7.3 FileId；READ/WRITE/FLUSH、byte-only 固定派生效果、逐句柄 gate、同 action 确认与关闭排空。 | 内容与 ARCHIVE 同步提交；原对象读写、真实失败与有界 owner。 |
+| [7.4b 文件信息](2026-09-28-smb-file-data-information.md) | 使用 7.4a gate／owner；五种文件查询、Basic 属性／时间、条件 EOF。 | 同对象字段与时间不伪造，长度与 ARCHIVE 同动作，7.5 取得信息 codec。 |
+| [7.4c volume 信息](2026-09-28-smb-file-data-information.md) | 独立可信 identity／presentation／geometry 与五种 volume 查询。 | 容量／allocation 精确表达；无法证明时对应查询失败。 |
 | [7.5 目录枚举](2026-09-28-smb-directory-enumeration.md) | 使用目录引用和信息 codec；完整有界捕获、全量 Windows 名字验证、冻结 cursor 分页。 | 单次枚举不混 revision、不漏坏名字；后续名字修改仍须独立 guards。 |
 | [7.6 关闭删除义务](2026-09-28-smb-close-delete-obligation.md) | 使用原子打开／close owner；宿主持久 per-volume owner、`CloseIntent`、armed→pending→终态、分页恢复与 ACK。 | 义务在发起句柄消失后仍可由 authority 完成，8.1 的普通 disposition 不会撤销它。 |
 | [8.1 受 guard 的名字修改](2026-09-28-smb-guarded-name-mutation.md) | 使用完整目录观察和 7.6 pending；双侧 ancestry guard 的 rename／replace／unlink、普通 disposition、原对象身份稳定的原位 supersede。 | 旧引用与新路径不混，名字效果可按原 action 结算；8.2/8.3 获得身份与关联事件。 |

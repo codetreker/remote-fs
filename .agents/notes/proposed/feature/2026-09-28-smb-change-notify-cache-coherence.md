@@ -6,7 +6,7 @@ Status: proposed
 
 远端 authority 的一次成功修改可以由另一台 Windows、Linux 或 SDK 客户端发起，而已连接的 Windows redirector 可能保留文件内容、信息、目录及正负查找结果。SMB 端点即使每次收到请求都回源，也无法纠正根本没有到达端点的缓存命中。普通目录订阅又只覆盖名字，已打开但失去最后名字的对象仍可被旧引用修改。变更流断线、历史裁剪或分页恢复时，静默继续报告旧事实会造成错误成功；简单刷新目录也可能跳过扫描期间的并发改动。
 
-本提案细化 [Windows 网络驱动器总提案](2026-09-16-windows-network-drive-support.md) 的 8.3，依赖[文件数据与信息](2026-09-28-smb-file-data-information.md)、[目录枚举](2026-09-28-smb-directory-enumeration.md)、[名字修改](2026-09-28-smb-guarded-name-mutation.md)与[范围控制](2026-09-28-smb-range-lock-cancel.md)中的对象身份与作用域。[PR 9 原生 WNet 与故障 fixture](2026-09-28-smb-native-wnet-fixture.md)须先交付，8.3 才能在真实 redirector 上验证缓存机制。它实现 `R-CON-1` 至 `R-CON-4`、`R-WIN-3` 与 `R-WIN-8` 的变更传播和恢复机制；能否对每类私有缓存执行充分失效由 8.3 的聚焦原生门验证，最终支持资格仍由 PR 10 判定。
+本提案细化 [Windows 网络驱动器总提案](2026-09-16-windows-network-drive-support.md) 的 8.3，依赖[文件内容访问](2026-09-28-smb-file-data-io.md)、[文件与 volume 信息](2026-09-28-smb-file-data-information.md)、[目录枚举](2026-09-28-smb-directory-enumeration.md)、[名字修改](2026-09-28-smb-guarded-name-mutation.md)与[范围控制](2026-09-28-smb-range-lock-cancel.md)中的对象身份与作用域。[PR 9 原生 WNet 与故障 fixture](2026-09-28-smb-native-wnet-fixture.md)须先交付，8.3 才能在真实 redirector 上验证缓存机制。它实现 `R-CON-1` 至 `R-CON-4`、`R-WIN-3` 与 `R-WIN-8` 的变更传播和恢复机制；能否对每类私有缓存执行充分失效由 8.3 的聚焦原生门验证，最终支持资格仍由 PR 10 判定。
 
 ## 提案
 
