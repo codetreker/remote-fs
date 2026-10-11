@@ -19,7 +19,11 @@ func httpContentEffect() storage.ContentMetadataEffect {
 }
 func httpContentOpen(t *testing.T, client *Storage, backend storage.Storage) (*remoteFileSession, *remoteFile) {
 	t.Helper()
-	if err := backend.Write(t.Context(), "content", []byte("old")); err != nil {
+	return httpContentOpenNamed(t, client, backend, "content")
+}
+func httpContentOpenNamed(t *testing.T, client *Storage, backend storage.Storage, name string) (*remoteFileSession, *remoteFile) {
+	t.Helper()
+	if err := backend.Write(t.Context(), name, []byte("old")); err != nil {
 		t.Fatal(err)
 	}
 	root, err := backend.Stat(t.Context(), "")
@@ -37,7 +41,7 @@ func httpContentOpen(t *testing.T, client *Storage, backend storage.Storage) (*r
 		}
 	})
 	options := storage.OpenAtOptions{Read: true, Write: true, Target: storage.ChildCondition{State: storage.Any}, Existing: storage.Keep, Use: storage.UseClaim{Uses: storage.ReadData | storage.WriteData}, Action: httpFileAction(t, session), ContentMetadataEffects: []storage.ContentMetadataEffect{httpContentEffect()}}
-	opened, err := session.OpenAt(t.Context(), storage.ChildSelection{Name: storage.ChildName{Parent: storage.DirectoryTarget{NodeID: root.ID}, RawLeaf: []byte("content")}}, options)
+	opened, err := session.OpenAt(t.Context(), storage.ChildSelection{Name: storage.ChildName{Parent: storage.DirectoryTarget{NodeID: root.ID}, RawLeaf: []byte(name)}}, options)
 	if err != nil {
 		t.Fatal(err)
 	}

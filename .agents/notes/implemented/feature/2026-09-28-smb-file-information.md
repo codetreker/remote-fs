@@ -80,6 +80,12 @@ allocation setter、EA／streams／compression／reparse、position／mode sette
 
 **持久化另一份128-bit 身份 map。** 现有不可复用 uint64NodeID 可以无损编码到128bit，同 volume 内没有 hash 碰撞；新增 map 会引入 schema、迁移与回收职责。保持 volume serial 与对象 ID 的组合，独立检查 volume 投影碰撞。
 
+### 测试资源归属
+
+HTTP 文件信息、metadata观察与恢复矩阵共用各自顶层的真实 authority准备，每项新建对象、HTTPpair、session、journal和fault状态，不继承别项的action或dirty内容。纯错误传递fixture只返回原注入错误，storage与十二个lockservice方法都没有健康fallback；健康publication／lock用例仍需真实native后端。fixture准备与测试判据的取舍由[测试工作量决定](../testing/2026-09-09-scale-test-work-to-its-assertions.md)记录。CI watchdog、strict无skip检查、函数coverage和protectedcheck均保持原标准。
+
+command-only SMB share矩阵没有后台续期任务，每次新打开之前通过真实FileSession.Renew与authority.acceptStatus刷新admission epoch。lease和actionhistory分别保留原期限；用长lease不能使已经退役的action epoch重新有效。短 history 回归验证过期 epoch 拒绝与真实续期后的 CREATE，share 矩阵独立验证原 sharing 约束。
+
 ## 后果
 
 五个文件查询覆盖所需权限与真实事实；scalar 和限定 namespace 观察增加中立契约，却保持公开 metadata 读权与字节方法分离。HTTP、native 与 wrappers 必须检查整条能力链并验证 exact 身份，不能由可选方法存在直接宣布支持。

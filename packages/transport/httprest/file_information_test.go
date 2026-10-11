@@ -10,7 +10,9 @@ import (
 	"testing"
 
 	"github.com/codetreker/remote-fs/packages/authz"
+	"github.com/codetreker/remote-fs/packages/locking"
 	"github.com/codetreker/remote-fs/packages/storage"
+	"github.com/codetreker/remote-fs/packages/storage/lockcontract/memoryfixture"
 )
 
 func httpInformationSession(t *testing.T, client *Storage) *remoteFileSession {
@@ -30,11 +32,15 @@ func httpInformationSession(t *testing.T, client *Storage) *remoteFileSession {
 
 func httpInformationFile(t *testing.T, session *remoteFileSession, root, node uint64, scopes []storage.MetadataObservationScope) storage.File {
 	t.Helper()
+	return httpInformationFileNamed(t, session, root, node, scopes, "file")
+}
+func httpInformationFileNamed(t *testing.T, session *remoteFileSession, root, node uint64, scopes []storage.MetadataObservationScope, name string) storage.File {
+	t.Helper()
 	options := storage.OpenAtOptions{Write: true, Target: storage.ChildCondition{State: storage.SameNode, NodeID: node}, Existing: storage.Keep, Use: storage.UseClaim{Uses: storage.WriteData}, Action: httpFileAction(t, session), MetadataObservations: scopes}
 	if len(scopes) != 0 {
 		options.MetadataAccess = storage.WriteMetadata
 	}
-	opened, err := session.OpenAt(t.Context(), storage.ChildSelection{Name: storage.ChildName{Parent: storage.DirectoryTarget{NodeID: root}, RawLeaf: []byte("file")}}, options)
+	opened, err := session.OpenAt(t.Context(), storage.ChildSelection{Name: storage.ChildName{Parent: storage.DirectoryTarget{NodeID: root}, RawLeaf: []byte(name)}}, options)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -99,19 +105,21 @@ func TestHTTPFileInformationUsesFreshExactReferenceWithoutStatGrant(t *testing.T
 }
 
 func TestHTTPNodeInformationWorksForMetadataOnlyFileAndDirectory(t *testing.T) {
+	_, backend := memoryfixture.New(t, "node-information-http", 1<<20, locking.DefaultOptions())
 	for _, kind := range []storage.NodeKind{storage.NodeRegular, storage.NodeDirectory} {
 		t.Run(map[storage.NodeKind]string{storage.NodeRegular: "file", storage.NodeDirectory: "directory"}[kind], func(t *testing.T) {
-			client, _, backend := retainedHTTPFixture(t, DefaultFileLimits())
+			client, _ := retainedHTTPPair(t, DefaultFileLimits(), backend)
+			name := map[storage.NodeKind]string{storage.NodeRegular: "file", storage.NodeDirectory: "directory"}[kind]
 			var err error
 			if kind == storage.NodeRegular {
-				err = backend.Write(t.Context(), "node", []byte("body"))
+				err = backend.Write(t.Context(), name, []byte("body"))
 			} else {
-				err = backend.Mkdir(t.Context(), "node")
+				err = backend.Mkdir(t.Context(), name)
 			}
 			if err != nil {
 				t.Fatal(err)
 			}
-			attr, err := backend.Stat(t.Context(), "node")
+			attr, err := backend.Stat(t.Context(), name)
 			if err != nil {
 				t.Fatal(err)
 			}

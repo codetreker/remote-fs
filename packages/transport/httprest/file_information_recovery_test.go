@@ -72,10 +72,11 @@ func loseInformationMutation(t *testing.T, client *Storage, action storage.FileA
 }
 
 func TestHTTPInformationRecoveryKeepsOriginalResultBound(t *testing.T) {
+	_, backend := memoryfixture.New(t, "information-bound-http", 1<<20, locking.DefaultOptions())
 	for _, kind := range []string{"basic file", "basic node", "EOF"} {
 		t.Run(kind, func(t *testing.T) {
-			client, _, backend := retainedHTTPFixture(t, DefaultFileLimits())
-			session, file := httpContentOpen(t, client, backend)
+			client, _ := retainedHTTPPair(t, DefaultFileLimits(), backend)
+			session, file := httpContentOpenNamed(t, client, backend, strings.ReplaceAll(kind, " ", "_"))
 			var mutate func(context.Context, storage.FileMutation) (storage.Attr, *MutationBarrier, error)
 			var command storage.FileMutation
 			referenceID := file.id
@@ -133,24 +134,25 @@ func TestHTTPInformationRecoveryKeepsOriginalResultBound(t *testing.T) {
 }
 
 func TestHTTPBasicRecoveryPreservesTypedResultAndFrozenIntent(t *testing.T) {
+	meta, backend := memoryfixture.New(t, "basic-http-recovery", 1<<20, locking.DefaultOptions())
 	for _, kind := range []string{"byte file", "metadata file", "directory"} {
 		t.Run(kind, func(t *testing.T) {
-			meta, backend := memoryfixture.New(t, "basic-http-recovery", 1<<20, locking.DefaultOptions())
 			client := checkpointClient(t, authorizationHandler(t, backend, meta, nil))
+			name := strings.ReplaceAll(kind, " ", "_")
 			nodeKind := storage.NodeRegular
 			if kind == "directory" {
 				nodeKind = storage.NodeDirectory
-				if err := backend.Mkdir(t.Context(), "file"); err != nil {
+				if err := backend.Mkdir(t.Context(), name); err != nil {
 					t.Fatal(err)
 				}
-			} else if err := backend.Write(t.Context(), "file", []byte("content")); err != nil {
+			} else if err := backend.Write(t.Context(), name, []byte("content")); err != nil {
 				t.Fatal(err)
 			}
 			root, err := backend.Stat(t.Context(), "")
 			if err != nil {
 				t.Fatal(err)
 			}
-			node, err := backend.Stat(t.Context(), "file")
+			node, err := backend.Stat(t.Context(), name)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -160,7 +162,7 @@ func TestHTTPBasicRecoveryPreservesTypedResultAndFrozenIntent(t *testing.T) {
 				MutateFileWithBarrier(context.Context, storage.FileMutation) (storage.Attr, *MutationBarrier, error)
 			}
 			if kind == "byte file" {
-				reference = httpInformationFile(t, session, root.ID, node.ID, []storage.MetadataObservationScope{{Namespace: "basic.flags", MaxPayloadBytes: 2}}).(*remoteFile)
+				reference = httpInformationFileNamed(t, session, root.ID, node.ID, []storage.MetadataObservationScope{{Namespace: "basic.flags", MaxPayloadBytes: 2}}, name).(*remoteFile)
 			} else {
 				opened, err := session.OpenNodeRef(t.Context(), node.ID, storage.NodeRefOptions{Kind: nodeKind, Target: storage.ChildCondition{State: storage.SameNode, NodeID: node.ID}, Action: httpFileAction(t, session), MetadataAccess: storage.WriteMetadata, MetadataObservations: []storage.MetadataObservationScope{{Namespace: "basic.flags", MaxPayloadBytes: 2}}})
 				if err != nil {
@@ -190,7 +192,7 @@ func TestHTTPBasicRecoveryPreservesTypedResultAndFrozenIntent(t *testing.T) {
 				t.Fatalf("changed action intent=%v", err)
 			}
 			later := originalTime.Add(time.Hour)
-			if err := backend.SetAttr(t.Context(), "file", storage.AttrChange{ModTime: &later}); err != nil {
+			if err := backend.SetAttr(t.Context(), name, storage.AttrChange{ModTime: &later}); err != nil {
 				t.Fatal(err)
 			}
 			result, barrier, err := reference.MutateFileWithBarrier(t.Context(), originalCommand)
@@ -200,7 +202,7 @@ func TestHTTPBasicRecoveryPreservesTypedResultAndFrozenIntent(t *testing.T) {
 			if !bytes.Equal(result.Metadata["basic.flags"].Data, []byte{1, 2}) || capture.calls != 2 || !capture.recovery {
 				t.Fatalf("metadata replay=%+v calls=%d recovery=%v", result.Metadata, capture.calls, capture.recovery)
 			}
-			fresh, err := backend.Stat(t.Context(), "file")
+			fresh, err := backend.Stat(t.Context(), name)
 			if err != nil || !fresh.ModTime.Equal(later) || !bytes.Equal(fresh.Metadata["basic.flags"].Version, result.Metadata["basic.flags"].Version) {
 				t.Fatalf("replay repeated effects: current=%+v err=%v", fresh, err)
 			}
@@ -265,11 +267,12 @@ func TestHTTPEOFRecoveryKeepsAtomicEffectsAndDoesNotBlockOtherActions(t *testing
 }
 
 func TestHTTPInformationMutationCancelledCloseRetainsPendingIntent(t *testing.T) {
+	_, backend := memoryfixture.New(t, "information-cancel-http", 1<<20, locking.DefaultOptions())
 	for _, kind := range []storage.FileMutationKind{storage.MutateAttributes, storage.MutateTruncate} {
 		name := map[storage.FileMutationKind]string{storage.MutateAttributes: "basic", storage.MutateTruncate: "EOF"}[kind]
 		t.Run(name, func(t *testing.T) {
-			client, _, backend := retainedHTTPFixture(t, DefaultFileLimits())
-			session, file := httpContentOpen(t, client, backend)
+			client, _ := retainedHTTPPair(t, DefaultFileLimits(), backend)
+			session, file := httpContentOpenNamed(t, client, backend, name)
 			var command storage.FileMutation
 			var closeCall func(context.Context) (storage.ReferenceCloseResult, error)
 			var mutate func(context.Context, storage.FileMutation) (storage.Attr, error)
