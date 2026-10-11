@@ -82,3 +82,9 @@ const (
 const OpFileObserveContentMetadata Operation = "file.observe-content-metadata"
 
 const OpFileObserveDirectoryMetadata Operation = "file.observe-directory-metadata"
+
+const (
+	OpFileInformation     Operation = "file.information"
+	OpFileObserveMetadata Operation = "file.observe-metadata"
+	OpFileVolumeGeometry  Operation = "file.volume-geometry"
+)

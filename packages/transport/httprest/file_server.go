@@ -117,16 +117,17 @@ type servedFileSession struct {
 }
 
 type servedFile struct {
-	native          retainedReference
-	contentEffects  []storage.ContentMetadataEffect
-	pending         time.Time
-	closing         bool
-	replaying       int
-	closeReserve    int
-	closeAction     storage.LockRequestID
-	closeGeneration uint64
-	closeDetermined bool
-	closeImplicit   bool
+	native               retainedReference
+	contentEffects       []storage.ContentMetadataEffect
+	metadataObservations []storage.MetadataObservationScope
+	pending              time.Time
+	closing              bool
+	replaying            int
+	closeReserve         int
+	closeAction          storage.LockRequestID
+	closeGeneration      uint64
+	closeDetermined      bool
+	closeImplicit        bool
 }
 
 type closeIDUse struct {
@@ -1564,6 +1565,8 @@ func (h *Handler) performFile(ctx context.Context, s *servedFileSession, req fil
 	response := fileResponse{}
 	var err error
 	switch req.Op {
+	case storage.OpFileVolumeGeometry:
+		return performVolumeGeometry(ctx, s.native)
 	case storage.OpFileStatus, storage.OpFileRenew:
 		start := time.Now()
 		var status storage.FileSessionStatus
@@ -1702,7 +1705,12 @@ func (h *Handler) performFile(ctx context.Context, s *servedFileSession, req fil
 				return response, syscall.EBADF
 			}
 			err = data.Sync(ctx)
-		case storage.OpFileObserveName, storage.OpFileObserveContentMetadata, storage.OpFileState, storage.OpFileScope, storage.OpFileSetMetadata, storage.OpFileSetPendingUnlink, storage.OpFileClearPendingUnlink, storage.OpFileMutate:
+		case storage.OpFileObserveMetadata:
+			if int(req.MetadataObservation) >= len(file.metadataObservations) {
+				return response, syscall.EINVAL
+			}
+			response, err = performMetadataObservation(ctx, file.native, req, file.metadataObservations[req.MetadataObservation])
+		case storage.OpFileInformation, storage.OpFileObserveName, storage.OpFileObserveContentMetadata, storage.OpFileState, storage.OpFileScope, storage.OpFileSetMetadata, storage.OpFileSetPendingUnlink, storage.OpFileClearPendingUnlink, storage.OpFileMutate:
 			response, err = performReferenceCapability(ctx, file.native, req)
 		case storage.OpFileClose:
 			if !req.CloseImplicit && !s.recoverable {

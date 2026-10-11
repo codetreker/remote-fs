@@ -13,6 +13,7 @@ import (
 // AccessRequest identifies the host-configured volume and an operation on it.
 // Volume is trusted configuration, not a name selected by the remote request.
 type AccessRequest struct {
+	MetadataObservations   []storage.MetadataObservationScope
 	ContentMetadataEffects []storage.ContentMetadataEffect
 	Volume                 string
 	Operation              storage.Operation
@@ -22,6 +23,7 @@ type AccessRequest struct {
 }
 
 func (r AccessRequest) Clone() AccessRequest {
+	r.MetadataObservations = storage.CloneMetadataObservationScopes(r.MetadataObservations)
 	r.Open = r.Open.Clone()
 	r.ContentMetadataEffects = storage.CloneContentMetadataEffects(r.ContentMetadataEffects)
 	return r

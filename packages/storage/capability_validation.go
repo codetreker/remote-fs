@@ -178,6 +178,12 @@ func (s InitialState) Check() error {
 }
 
 func (o OpenAtOptions) Check() error {
+	if err := CheckMetadataObservationScopes(o.MetadataObservations); err != nil {
+		return err
+	}
+	if len(o.MetadataObservations) != 0 && o.MetadataAccess&WriteMetadata == 0 {
+		return syscall.EINVAL
+	}
 	if err := CheckContentMetadataEffects(o.ContentMetadataEffects); err != nil {
 		return err
 	}
@@ -228,6 +234,12 @@ func (o OpenAtOptions) Check() error {
 }
 
 func (o NodeRefOptions) Check() error {
+	if err := CheckMetadataObservationScopes(o.MetadataObservations); err != nil {
+		return err
+	}
+	if len(o.MetadataObservations) != 0 && o.MetadataAccess&WriteMetadata == 0 {
+		return syscall.EINVAL
+	}
 	if err := o.Kind.Check(); err != nil {
 		return err
 	}
@@ -385,7 +397,8 @@ func (c FileMutation) Check() error {
 		return syscall.EFBIG
 	}
 	if len(c.ContentEffects) != 0 {
-		if (c.Kind != MutateWriteAt && c.Kind != MutateAppend) || len(c.Data) == 0 || !c.Attr.Empty() || len(c.Metadata) != 0 {
+		if (c.Kind != MutateWriteAt && c.Kind != MutateAppend && c.Kind != MutateTruncate) ||
+			(c.Kind != MutateTruncate && len(c.Data) == 0) || !c.Attr.Empty() || len(c.Metadata) != 0 {
 			return syscall.EINVAL
 		}
 		seen := make(map[uint16]struct{}, len(c.ContentEffects))

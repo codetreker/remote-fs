@@ -15,7 +15,7 @@ func (h *Handler) authorizeFile(ctx context.Context, request fileRequest) error 
 	}
 	appendOperation := func(operation storage.Operation) {
 		for _, access := range accesses {
-			if access.Operation == operation && len(access.ContentMetadataEffects) == 0 && reflect.DeepEqual(access.Open, storage.OpenAccess{}) {
+			if access.Operation == operation && len(access.MetadataObservations) == 0 && len(access.ContentMetadataEffects) == 0 && reflect.DeepEqual(access.Open, storage.OpenAccess{}) {
 				return
 			}
 		}
@@ -27,7 +27,12 @@ func (h *Handler) authorizeFile(ctx context.Context, request fileRequest) error 
 		accesses[0].Open = request.Open.OpenAccess
 	case storage.OpFileOpenAt:
 		options := request.OpenAt.storage()
-		accesses[0].Open = storage.OpenAccess{Read: options.Read, Write: options.Write, Create: options.Create, Exclusive: options.Exclusive, Truncate: options.Existing == storage.ResetContent, ContentMetadataEffects: storage.CloneContentMetadataEffects(options.ContentMetadataEffects)}
+		accesses[0].Open = storage.OpenAccess{Read: options.Read, Write: options.Write, Create: options.Create, Exclusive: options.Exclusive, Truncate: options.Existing == storage.ResetContent, MetadataObservations: storage.CloneMetadataObservationScopes(options.MetadataObservations), ContentMetadataEffects: storage.CloneContentMetadataEffects(options.ContentMetadataEffects)}
+		if len(options.MetadataObservations) != 0 {
+			accesses = append(accesses,
+				authz.AccessRequest{Operation: storage.OpFileSetMetadata, MetadataObservations: storage.CloneMetadataObservationScopes(options.MetadataObservations)},
+				authz.AccessRequest{Operation: storage.OpFileObserveMetadata, MetadataObservations: storage.CloneMetadataObservationScopes(options.MetadataObservations)})
+		}
 		if len(options.ContentMetadataEffects) != 0 {
 			accesses = append(accesses,
 				authz.AccessRequest{Operation: storage.OpFileSetMetadata, ContentMetadataEffects: storage.CloneContentMetadataEffects(options.ContentMetadataEffects)},
@@ -55,10 +60,14 @@ func (h *Handler) authorizeFile(ctx context.Context, request fileRequest) error 
 	case storage.OpFileOpenNodeRef, storage.OpFileOpenChildRef:
 		options := request.NodeRef.storage()
 		accesses[0].Open = storage.OpenAccess{
-			Read:      options.MetadataAccess&storage.ReadMetadata != 0 || options.Use.Uses&(storage.ReadData|storage.ReadEntries) != 0,
-			Write:     options.MetadataAccess&storage.WriteMetadata != 0 || options.Use.Uses&storage.WriteData != 0,
-			Create:    options.Create,
-			Exclusive: options.Exclusive,
+			Read:                 options.MetadataAccess&storage.ReadMetadata != 0 || options.Use.Uses&(storage.ReadData|storage.ReadEntries) != 0,
+			Write:                options.MetadataAccess&storage.WriteMetadata != 0 || options.Use.Uses&storage.WriteData != 0,
+			Create:               options.Create,
+			Exclusive:            options.Exclusive,
+			MetadataObservations: storage.CloneMetadataObservationScopes(options.MetadataObservations),
+		}
+		if len(options.MetadataObservations) != 0 {
+			accesses = append(accesses, authz.AccessRequest{Operation: storage.OpFileSetMetadata, MetadataObservations: storage.CloneMetadataObservationScopes(options.MetadataObservations)}, authz.AccessRequest{Operation: storage.OpFileObserveMetadata, MetadataObservations: storage.CloneMetadataObservationScopes(options.MetadataObservations)})
 		}
 		if len(options.InitialState.OnCreate.Metadata) != 0 {
 			appendOperation(storage.OpFileSetMetadata)
@@ -104,6 +113,13 @@ func (h *Handler) authorizeFile(ctx context.Context, request fileRequest) error 
 		}
 	}
 
+	observations, err := h.fileMetadataObservation(request)
+	if err != nil {
+		return err
+	}
+	if len(observations) != 0 {
+		accesses[0].MetadataObservations = observations
+	}
 	effects, err := h.fileContentEffects(request)
 	if err != nil {
 		return err

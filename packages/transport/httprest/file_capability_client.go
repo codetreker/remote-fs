@@ -162,6 +162,11 @@ func (s *remoteFileSession) OpenAtWithBarrier(ctx context.Context, selection sto
 	if err := s.CheckAtomicFileOpen(); err != nil {
 		return storage.OpenResult{}, nil, err
 	}
+	if len(options.MetadataObservations) != 0 {
+		if err := s.CheckOpenMetadataObservation(); err != nil {
+			return storage.OpenResult{}, nil, err
+		}
+	}
 	if len(options.ContentMetadataEffects) != 0 {
 		if err := s.CheckOpenContentMetadata(); err != nil {
 			return storage.OpenResult{}, nil, err
@@ -178,10 +183,12 @@ func (s *remoteFileSession) OpenAtWithBarrier(ctx context.Context, selection sto
 	if err := options.Check(); err != nil {
 		return storage.OpenResult{}, nil, err
 	}
+	options.MetadataObservations = storage.CloneMetadataObservationScopes(options.MetadataObservations)
 	options.ContentMetadataEffects = storage.CloneContentMetadataEffects(options.ContentMetadataEffects)
 	child, guards := childSelectionWire(selection)
 	reference, response, err := s.openCapability(ctx, fileRequest{Op: storage.OpFileOpenAt, Child: child, Guards: guards, OpenAt: openAtOptionsOf(options)})
 	if reference != nil {
+		reference.metadataObservations = storage.CloneMetadataObservationScopes(options.MetadataObservations)
 		reference.contentEffects = storage.CloneContentMetadataEffects(options.ContentMetadataEffects)
 	}
 	result := openResultOf(reference, response)
@@ -266,12 +273,18 @@ func (s *remoteFileSession) openNodeReference(ctx context.Context, req fileReque
 	if err := validateCapabilityArguments(req); err != nil {
 		return storage.NodeOpenResult{}, nil, err
 	}
+	if len(req.NodeRef.MetadataObservations) != 0 {
+		if err := s.CheckOpenMetadataObservation(); err != nil {
+			return storage.NodeOpenResult{}, nil, err
+		}
+	}
 	reference, response, err := s.openCapability(ctx, req)
 	if err == nil && reference != nil && (!reference.capabilities.Scope || !reference.capabilities.State) {
 		err = unreachable(Request{Op: OpFile}, errors.New("node reference omitted mandatory scope or state capability"))
 	}
 	result := storage.NodeOpenResult{Outcome: response.Outcome}
 	if reference != nil {
+		reference.metadataObservations = metadataObservationScopesStorage(req.NodeRef.MetadataObservations)
 		result.Reference = &remoteNodeReference{file: reference}
 	}
 	if response.Attr != nil {
@@ -564,7 +577,7 @@ func (f *remoteFile) mutateFileWithBarrier(ctx context.Context, mutation storage
 	if err := mutation.CheckDataLimit(f.session.storage.maxWriteBytes); err != nil {
 		return storage.Attr{}, nil, err
 	}
-	if mutation.Action != "" && len(mutation.Data) <= MaxFileRecoveryDataBytes && (mutation.Kind == storage.MutateWriteAt || mutation.Kind == storage.MutateAppend) {
+	if mutation.Action != "" && len(mutation.Data) <= MaxFileRecoveryDataBytes && (mutation.Kind == storage.MutateWriteAt || mutation.Kind == storage.MutateAppend || mutation.Kind == storage.MutateTruncate || mutation.Kind == storage.MutateAttributes) {
 		admitted, release, _, err := f.session.admitExplicitWrite(ctx, f.id, mutation.Action)
 		if err != nil {
 			return storage.Attr{}, nil, err

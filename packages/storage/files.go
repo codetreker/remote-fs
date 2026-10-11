@@ -105,7 +105,8 @@ type File interface {
 // Opening a retained node cannot carry Create or Exclusive. Validation belongs
 // to FileOpenOptions, which also supplies initial metadata and expected identity.
 type OpenAccess struct {
-	ContentMetadataEffects []ContentMetadataEffect `json:",omitempty"`
+	MetadataObservations   []MetadataObservationScope `json:",omitempty"`
+	ContentMetadataEffects []ContentMetadataEffect    `json:",omitempty"`
 	Read                   bool
 	Write                  bool
 	Create                 bool
@@ -114,6 +115,7 @@ type OpenAccess struct {
 }
 
 func (o OpenAccess) Clone() OpenAccess {
+	o.MetadataObservations = CloneMetadataObservationScopes(o.MetadataObservations)
 	o.ContentMetadataEffects = CloneContentMetadataEffects(o.ContentMetadataEffects)
 	return o
 }
@@ -130,7 +132,7 @@ type FileOpenOptions struct {
 
 // Check rejects invalid access, creation and initial metadata before admission.
 func (o FileOpenOptions) Check() error {
-	if len(o.ContentMetadataEffects) != 0 {
+	if len(o.ContentMetadataEffects) != 0 || len(o.MetadataObservations) != 0 {
 		return syscall.EINVAL
 	}
 	if !o.Read && !o.Write {

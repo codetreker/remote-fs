@@ -101,6 +101,7 @@ func canonicalFileActionInput(input any) any {
 		value.Options.Initial = canonicalInitialState(value.Options.Initial)
 		value.Options.CloseIntent = canonicalCloseIntent(value.Options.CloseIntent)
 		value.Options.ContentMetadataEffects = storage.CloneContentMetadataEffects(value.Options.ContentMetadataEffects)
+		value.Options.MetadataObservations = storage.CloneMetadataObservationScopes(value.Options.MetadataObservations)
 		return value
 	case nodeRefActionInput:
 		if value.Selection != nil {
@@ -110,6 +111,7 @@ func canonicalFileActionInput(input any) any {
 		value.Options.Target = canonicalChildCondition(value.Options.Target)
 		value.Options.InitialState = canonicalInitialState(value.Options.InitialState)
 		value.Options.CloseIntent = canonicalCloseIntent(value.Options.CloseIntent)
+		value.Options.MetadataObservations = storage.CloneMetadataObservationScopes(value.Options.MetadataObservations)
 		return value
 	case storage.NameCommand:
 		value.Name = canonicalChildName(value.Name)

@@ -25,44 +25,46 @@ const (
 )
 
 type fileHandle struct {
-	state           atomic.Uint32
-	lastStatus      atomic.Uint32
-	treeID          uint32
-	sessionID       uint64
-	ownerSession    *session
-	identity        storage.FileSessionIdentityResult
-	nodeID          uint64
-	diagnostic      atomic.Pointer[HandleOwnerStatus]
-	capacity        *Server
-	use             storage.UseClaim
-	attempt         *storage.CloseAttempt
-	attemptAdmitted bool
-	remintEpoch     uint64
-	priorAttempt    *storage.CloseAttempt
-	released        bool
-	published       bool
-	semanticErr     error
-	id              wire.FileID
-	file            storage.File
-	node            storage.NodeReference
-	pendingOpen     func(context.Context) (bool, error)
-	access          uint32
-	action          storage.FileActionID
-	closing         bool
-	requestCloseMu  contextLock
-	cleanup         cleanupGate
-	closeLifetime   contextLock
-	terminalErr     error
-	terminal        bool
-	ioMu            sync.Mutex
-	ioSequence      uint64
-	ioQueue         []*fileIOTicket
-	ioRunning       *fileIOTicket
-	ioIdle          chan struct{}
-	ioFenced        bool
-	contentEffects  []storage.ContentMetadataEffect
-	pendingWrite    *writeOwner
-	pendingFlush    *flushOwner
+	state                atomic.Uint32
+	lastStatus           atomic.Uint32
+	treeID               uint32
+	sessionID            uint64
+	ownerSession         *session
+	identity             storage.FileSessionIdentityResult
+	nodeID               uint64
+	nodeKind             storage.NodeKind
+	diagnostic           atomic.Pointer[HandleOwnerStatus]
+	capacity             *Server
+	use                  storage.UseClaim
+	attempt              *storage.CloseAttempt
+	attemptAdmitted      bool
+	remintEpoch          uint64
+	priorAttempt         *storage.CloseAttempt
+	released             bool
+	published            bool
+	semanticErr          error
+	id                   wire.FileID
+	file                 storage.File
+	node                 storage.NodeReference
+	pendingOpen          func(context.Context) (bool, error)
+	access               uint32
+	action               storage.FileActionID
+	closing              bool
+	requestCloseMu       contextLock
+	cleanup              cleanupGate
+	closeLifetime        contextLock
+	terminalErr          error
+	terminal             bool
+	ioMu                 sync.Mutex
+	ioSequence           uint64
+	ioQueue              []*fileIOTicket
+	ioRunning            *fileIOTicket
+	ioIdle               chan struct{}
+	ioFenced             bool
+	contentEffects       []storage.ContentMetadataEffect
+	metadataObservations []storage.MetadataObservationScope
+	pendingWrite         *mutationOwner
+	pendingFlush         *flushOwner
 }
 
 func (t *tree) beginFileWork(s *session) bool {
@@ -225,11 +227,18 @@ func (h *fileHandle) bindReference(ctx context.Context, t *tree, attr storage.At
 	if t.fileStopping || h.ownerSession.retired || a.stopping || a.closed || !time.Now().Before(a.deadline) || t.handles[h.id] != h {
 		return syscall.ESTALE
 	}
-	h.nodeID, h.use = attr.ID, use
+	h.nodeID, h.nodeKind, h.use = attr.ID, attr.Kind, use
 	h.diagnostic.Store(&HandleOwnerStatus{FileID: h.id, TreeID: h.treeID, SessionID: h.sessionID, NodeID: h.nodeID, OpenAction: h.action})
 	h.published = true
 	h.state.Store(uint32(handleLive))
 	return nil
+}
+
+func (h *fileHandle) reference() any {
+	if h.node != nil {
+		return h.node
+	}
+	return h.file
 }
 
 func (h *fileHandle) closeActions() (storage.ReferenceCloseActions, error) {

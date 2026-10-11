@@ -12,14 +12,16 @@ import (
 )
 
 type nodeReference struct {
-	session    *fileSession
-	native     metastore.NodeReference
-	uses       referenceUses
-	active     bool
-	operations sync.WaitGroup
-	retireMu   sync.Mutex
-	retired    bool
-	closing    referenceCloseState
+	metadata             storage.MetadataPermissions
+	metadataObservations []storage.MetadataObservationScope
+	session              *fileSession
+	native               metastore.NodeReference
+	uses                 referenceUses
+	active               bool
+	operations           sync.WaitGroup
+	retireMu             sync.Mutex
+	retired              bool
+	closing              referenceCloseState
 }
 
 func (r *nodeReference) begin(ctx context.Context) (context.Context, func(), error) {

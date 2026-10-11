@@ -27,6 +27,11 @@ func (s *fileSession) CheckAllocationReporting() error {
 }
 
 func (s *fileSession) OpenAt(ctx context.Context, selection storage.ChildSelection, options storage.OpenAtOptions) (storage.OpenResult, error) {
+	if err := s.checkMetadataObservationEnrollment(options.MetadataAccess, options.MetadataObservations); err != nil {
+		return storage.OpenResult{}, err
+	}
+	scopes := storage.CloneMetadataObservationScopes(options.MetadataObservations)
+	options.MetadataObservations = storage.CloneMetadataObservationScopes(scopes)
 	if err := storage.CheckContentMetadataEffects(options.ContentMetadataEffects); err != nil {
 		return storage.OpenResult{}, err
 	}
@@ -49,6 +54,9 @@ func (s *fileSession) OpenAt(ctx context.Context, selection storage.ChildSelecti
 		return backing.OpenAt(ctx, selection, options)
 	})
 	result.File = wrapFile(s.storage, result.File)
+	if file, ok := result.File.(*file); ok {
+		file.metadataObservations = scopes
+	}
 	return result, err
 }
 
@@ -177,6 +185,11 @@ func (s *fileSession) AcknowledgeDeleteIntent(ctx context.Context, command stora
 }
 
 func (s *fileSession) OpenNodeRef(ctx context.Context, id uint64, options storage.NodeRefOptions) (storage.NodeOpenResult, error) {
+	if err := s.checkMetadataObservationEnrollment(options.MetadataAccess, options.MetadataObservations); err != nil {
+		return storage.NodeOpenResult{}, err
+	}
+	scopes := storage.CloneMetadataObservationScopes(options.MetadataObservations)
+	options.MetadataObservations = storage.CloneMetadataObservationScopes(scopes)
 	backing, err := capability(s.FileSession, storage.NodeReferences.CheckNodeReferences)
 	if err != nil {
 		return storage.NodeOpenResult{}, err
@@ -185,10 +198,18 @@ func (s *fileSession) OpenNodeRef(ctx context.Context, id uint64, options storag
 		return backing.OpenNodeRef(ctx, id, options)
 	})
 	result.Reference = wrapNodeReference(s.storage, result.Reference)
+	if reference, ok := result.Reference.(*nodeReference); ok {
+		reference.metadataObservations = scopes
+	}
 	return result, err
 }
 
 func (s *fileSession) OpenChildRef(ctx context.Context, selection storage.ChildSelection, options storage.NodeRefOptions) (storage.NodeOpenResult, error) {
+	if err := s.checkMetadataObservationEnrollment(options.MetadataAccess, options.MetadataObservations); err != nil {
+		return storage.NodeOpenResult{}, err
+	}
+	scopes := storage.CloneMetadataObservationScopes(options.MetadataObservations)
+	options.MetadataObservations = storage.CloneMetadataObservationScopes(scopes)
 	backing, err := capability(s.FileSession, storage.NodeReferences.CheckNodeReferences)
 	if err != nil {
 		return storage.NodeOpenResult{}, err
@@ -197,6 +218,9 @@ func (s *fileSession) OpenChildRef(ctx context.Context, selection storage.ChildS
 		return backing.OpenChildRef(ctx, selection, options)
 	})
 	result.Reference = wrapNodeReference(s.storage, result.Reference)
+	if reference, ok := result.Reference.(*nodeReference); ok {
+		reference.metadataObservations = scopes
+	}
 	return result, err
 }
 
@@ -282,8 +306,9 @@ func (s *fileSession) Drop(ctx context.Context, owner storage.UseOwner, domain s
 }
 
 type referenceCapabilities struct {
-	backing any
-	storage *Storage
+	backing              any
+	storage              *Storage
+	metadataObservations []storage.MetadataObservationScope
 }
 
 func (r *referenceCapabilities) CloseWithAction(ctx context.Context, attempt storage.CloseAttempt) (storage.ReferenceCloseResult, error) {

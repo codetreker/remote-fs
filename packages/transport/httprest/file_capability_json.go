@@ -72,7 +72,7 @@ func validateCapabilityArguments(req fileRequest) error {
 			return err
 		}
 		return req.DirectoryMetadata.storage().Check()
-	case storage.OpFileObserveContentMetadata:
+	case storage.OpFileInformation, storage.OpFileVolumeGeometry, storage.OpFileObserveMetadata, storage.OpFileObserveContentMetadata:
 		return nil
 	case storage.OpFileObserveName:
 		return req.Guards.storage().Check()

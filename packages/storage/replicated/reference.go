@@ -15,6 +15,7 @@ type nodeReference struct {
 	session *fileSession
 	remote  httprest.NodeReferenceWithBarrier
 	retainedClose
+	metadataObservations []storage.MetadataObservationScope
 }
 
 func referenceCall[C, R any](ctx context.Context, session *fileSession, remote any, call func(context.Context, C) (R, error)) (R, error) {

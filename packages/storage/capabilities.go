@@ -416,7 +416,8 @@ type InitialState struct {
 }
 
 type OpenAtOptions struct {
-	ContentMetadataEffects []ContentMetadataEffect `json:",omitempty"`
+	MetadataObservations   []MetadataObservationScope `json:",omitempty"`
+	ContentMetadataEffects []ContentMetadataEffect    `json:",omitempty"`
 	Read, Write            bool
 	MetadataAccess         MetadataPermissions
 	Create, Exclusive      bool
@@ -445,14 +446,15 @@ const (
 )
 
 type NodeRefOptions struct {
-	Kind              NodeKind
-	Target            ChildCondition
-	Action            FileActionID
-	Use               UseClaim
-	MetadataAccess    MetadataPermissions
-	Create, Exclusive bool
-	InitialState      InitialState
-	CloseIntent       *CloseIntent `json:",omitempty"`
+	MetadataObservations []MetadataObservationScope `json:",omitempty"`
+	Kind                 NodeKind
+	Target               ChildCondition
+	Action               FileActionID
+	Use                  UseClaim
+	MetadataAccess       MetadataPermissions
+	Create, Exclusive    bool
+	InitialState         InitialState
+	CloseIntent          *CloseIntent `json:",omitempty"`
 }
 
 // A nonnil Reference transfers cleanup ownership on success and error.

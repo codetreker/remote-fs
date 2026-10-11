@@ -27,7 +27,7 @@ func (s *Store) OpenChildRef(ctx context.Context, selection storage.ChildSelecti
 	selection = selection.Clone()
 	file, state, outcome, err := s.openAtomicChild(ctx, selection, options.Kind, false, false, options.MetadataAccess,
 		options.Create, options.Exclusive, options.Target, options.Use, storage.Keep,
-		options.InitialState, options.CloseIntent, nil)
+		options.InitialState, options.CloseIntent, nil, options.MetadataObservations)
 	if file == nil {
 		return metastore.NodeOpenResult{}, err
 	}
@@ -44,6 +44,7 @@ func (s *Store) OpenNodeRef(ctx context.Context, id uint64, options storage.Node
 	if id > math.MaxInt64 {
 		return metastore.NodeOpenResult{}, syscall.ESTALE
 	}
+	observations := storage.CloneMetadataObservationScopes(options.MetadataObservations)
 	scope, err := newReferenceScope()
 	if err != nil {
 		return metastore.NodeOpenResult{}, err
@@ -59,7 +60,7 @@ func (s *Store) OpenNodeRef(ctx context.Context, id uint64, options storage.Node
 		return metastore.NodeOpenResult{}, syscall.EAGAIN
 	}
 	file := &retainedFile{store: s, id: int64(id), scope: scope, session: metastore.ReferenceSession(ctx),
-		use: options.Use, metadata: options.MetadataAccess, active: true}
+		use: options.Use, metadata: options.MetadataAccess, metadataObservations: observations, active: true}
 	var state metastore.FileState
 	claimed := false
 	open := func(tx *sql.Tx) error {

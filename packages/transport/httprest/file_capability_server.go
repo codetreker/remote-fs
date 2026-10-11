@@ -31,6 +31,18 @@ func capabilitiesOf(value any) (*fileCapabilities, error) {
 			failure = errors.Join(failure, err)
 		}
 	}
+	if capability, ok := value.(storage.ReferenceInformationAccess); ok {
+		check(&caps.Information, func() error {
+			if err := capability.CheckReferenceInformation(); err != nil {
+				return err
+			}
+			_, err := storage.ReferenceNodeID(value)
+			return err
+		})
+	}
+	if capability, ok := value.(storage.ReferenceMetadataObserver); ok {
+		check(&caps.MetadataObservation, capability.CheckMetadataObservation)
+	}
 	if capability, ok := value.(storage.ReferenceNameObserver); ok {
 		check(&caps.ReferenceName, func() error {
 			if err := capability.CheckReferenceNameObservation(); err != nil {
@@ -81,6 +93,15 @@ func sessionCapabilitiesOf(value storage.FileSession) (*fileCapabilities, error)
 		} else if storage.ErrnoOf(checkErr) != syscall.EOPNOTSUPP {
 			err = errors.Join(err, checkErr)
 		}
+	}
+	if c, ok := value.(storage.OpenReferenceInformation); ok {
+		check(&caps.OpenInformation, c.CheckOpenReferenceInformation)
+	}
+	if c, ok := value.(storage.OpenMetadataObservation); ok {
+		check(&caps.OpenMetadataObservation, c.CheckOpenMetadataObservation)
+	}
+	if c, ok := value.(storage.VolumeGeometryAccess); ok {
+		check(&caps.Geometry, c.CheckVolumeGeometry)
 	}
 	if c, ok := value.(storage.OpenContentMetadata); ok {
 		check(&caps.OpenContentMetadata, c.CheckOpenContentMetadata)
@@ -197,6 +218,17 @@ func (h *Handler) openReference(ctx context.Context, session *servedFileSession,
 	case storage.OpFileOpenNode:
 		reference, err = session.native.OpenNode(ctx, request.Node, request.Open)
 	case storage.OpFileOpenAt:
+		if len(request.OpenAt.MetadataObservations) != 0 {
+			provider, ok := session.native.(storage.OpenMetadataObservation)
+			if !ok {
+				err = syscall.EOPNOTSUPP
+				break
+			}
+			if err = provider.CheckOpenMetadataObservation(); err != nil {
+				break
+			}
+			entry.metadataObservations = metadataObservationScopesStorage(request.OpenAt.MetadataObservations)
+		}
 		if len(request.OpenAt.ContentMetadataEffects) != 0 {
 			provider, ok := session.native.(storage.OpenContentMetadata)
 			if !ok {
@@ -233,6 +265,17 @@ func (h *Handler) openReference(ctx context.Context, session *servedFileSession,
 			}
 		}
 	case storage.OpFileOpenNodeRef, storage.OpFileOpenChildRef:
+		if len(request.NodeRef.MetadataObservations) != 0 {
+			provider, ok := session.native.(storage.OpenMetadataObservation)
+			if !ok {
+				err = syscall.EOPNOTSUPP
+				break
+			}
+			if err = provider.CheckOpenMetadataObservation(); err != nil {
+				break
+			}
+			entry.metadataObservations = metadataObservationScopesStorage(request.NodeRef.MetadataObservations)
+		}
 		provider, ok := session.native.(storage.NodeReferences)
 		if !ok {
 			err = syscall.EOPNOTSUPP
@@ -286,7 +329,7 @@ func (h *Handler) openReference(ctx context.Context, session *servedFileSession,
 	}
 	identityInvalid := false
 	stableOpen := session.stableIdentity && (request.Op == storage.OpFileOpenAt || request.Op == storage.OpFileOpenNodeRef || request.Op == storage.OpFileOpenChildRef)
-	if response.Capabilities.ReferenceName || stableOpen {
+	if response.Capabilities.ReferenceName || response.Capabilities.Information || stableOpen {
 		node, identityErr := storage.ReferenceNodeID(reference)
 		if identityErr != nil {
 			identityInvalid = true
@@ -510,6 +553,8 @@ func (h *Handler) performSessionCapability(ctx context.Context, session storage.
 func performReferenceCapability(ctx context.Context, file retainedReference, req fileRequest) (fileResponse, error) {
 	response := fileResponse{}
 	switch req.Op {
+	case storage.OpFileInformation:
+		return performReferenceInformation(ctx, file)
 	case storage.OpFileObserveContentMetadata:
 		capability, ok := file.(storage.ReferenceContentMetadata)
 		if !ok {

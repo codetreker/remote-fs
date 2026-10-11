@@ -112,6 +112,11 @@ func (s *fileSession) AcknowledgeDeleteIntent(ctx context.Context, command stora
 }
 
 func (s *fileSession) OpenAt(ctx context.Context, selection storage.ChildSelection, options storage.OpenAtOptions) (storage.OpenResult, error) {
+	if err := s.checkMetadataObservationEnrollment(options.MetadataAccess, options.MetadataObservations); err != nil {
+		return storage.OpenResult{}, err
+	}
+	scopes := storage.CloneMetadataObservationScopes(options.MetadataObservations)
+	options.MetadataObservations = storage.CloneMetadataObservationScopes(scopes)
 	if err := storage.CheckContentMetadataEffects(options.ContentMetadataEffects); err != nil {
 		return storage.OpenResult{}, err
 	}
@@ -134,7 +139,11 @@ func (s *fileSession) OpenAt(ctx context.Context, selection storage.ChildSelecti
 			result, barrier, err = capability.OpenAtWithBarrier(ctx, selection, options)
 			return barrier, err
 		})
-		return s.wrapOpenResult(result, err)
+		result, err = s.wrapOpenResult(result, err)
+		if file, ok := result.File.(*retainedFile); ok {
+			file.metadataObservations = scopes
+		}
+		return result, err
 	})
 }
 
@@ -301,18 +310,36 @@ func (s *fileSession) MutateName(ctx context.Context, command storage.NameComman
 }
 
 func (s *fileSession) OpenNodeRef(ctx context.Context, id uint64, options storage.NodeRefOptions) (storage.NodeOpenResult, error) {
+	if err := s.checkMetadataObservationEnrollment(options.MetadataAccess, options.MetadataObservations); err != nil {
+		return storage.NodeOpenResult{}, err
+	}
+	scopes := storage.CloneMetadataObservationScopes(options.MetadataObservations)
+	options.MetadataObservations = storage.CloneMetadataObservationScopes(scopes)
 	return sessionCapability(ctx, s, true, func(ctx context.Context, capability httprest.NodeReferencesWithBarrier) (storage.NodeOpenResult, error) {
-		return s.openReference(ctx, func(ctx context.Context) (storage.NodeOpenResult, *httprest.MutationBarrier, error) {
+		result, err := s.openReference(ctx, func(ctx context.Context) (storage.NodeOpenResult, *httprest.MutationBarrier, error) {
 			return capability.OpenNodeRefWithBarrier(ctx, id, options)
 		})
+		if reference, ok := result.Reference.(*nodeReference); ok {
+			reference.metadataObservations = scopes
+		}
+		return result, err
 	})
 }
 
 func (s *fileSession) OpenChildRef(ctx context.Context, selection storage.ChildSelection, options storage.NodeRefOptions) (storage.NodeOpenResult, error) {
+	if err := s.checkMetadataObservationEnrollment(options.MetadataAccess, options.MetadataObservations); err != nil {
+		return storage.NodeOpenResult{}, err
+	}
+	scopes := storage.CloneMetadataObservationScopes(options.MetadataObservations)
+	options.MetadataObservations = storage.CloneMetadataObservationScopes(scopes)
 	return sessionCapability(ctx, s, true, func(ctx context.Context, capability httprest.NodeReferencesWithBarrier) (storage.NodeOpenResult, error) {
-		return s.openReference(ctx, func(ctx context.Context) (storage.NodeOpenResult, *httprest.MutationBarrier, error) {
+		result, err := s.openReference(ctx, func(ctx context.Context) (storage.NodeOpenResult, *httprest.MutationBarrier, error) {
 			return capability.OpenChildRefWithBarrier(ctx, selection, options)
 		})
+		if reference, ok := result.Reference.(*nodeReference); ok {
+			reference.metadataObservations = scopes
+		}
+		return result, err
 	})
 }
 

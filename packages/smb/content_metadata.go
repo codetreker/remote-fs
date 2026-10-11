@@ -27,7 +27,7 @@ func (c *connection) observeWriteMetadata(ctx context.Context, s *session, t *tr
 	if err := c.authorizeFileIO(ctx, s, t, h, storage.OpFileObserveContentMetadata, h.contentEffects); err != nil {
 		return nil, err
 	}
-	observer, ok := h.file.(storage.ReferenceContentMetadata)
+	observer, ok := h.reference().(storage.ReferenceContentMetadata)
 	if !ok {
 		return nil, syscall.EOPNOTSUPP
 	}
@@ -70,7 +70,7 @@ func (c *connection) authorizeFileIO(ctx context.Context, s *session, t *tree, h
 	if err := c.server.config.Authorize.Authorize(call, request.Clone()); err != nil {
 		return err
 	}
-	if operation == storage.OpFileWrite && len(effects) != 0 {
+	if (operation == storage.OpFileWrite || operation == storage.OpFileTruncate) && len(effects) != 0 {
 		request.Operation = storage.OpFileSetMetadata
 		request.ContentMetadataEffects = storage.CloneContentMetadataEffects(effects)
 		if err := c.server.config.Authorize.Authorize(call, request.Clone()); err != nil {

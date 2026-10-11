@@ -123,7 +123,7 @@ func ResolveContentMetadataEffects(effects []ContentMetadataEffect, indices []ui
 }
 
 // CheckContentMutation requires an explicit condition even for an absent namespace.
-// Effects cannot be used as arbitrary metadata writes or as empty data operations.
+// Effects cannot be used as arbitrary metadata writes or as empty byte writes.
 func CheckContentMutation(command FileMutation, effects []ContentMetadataEffect) error {
 	if err := command.Check(); err != nil {
 		return err

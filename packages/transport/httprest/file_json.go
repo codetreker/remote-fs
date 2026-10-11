@@ -66,7 +66,7 @@ func validateFileRequest(r fileRequest) error {
 	}
 	reference := false
 	switch r.Op {
-	case storage.OpFileBackendIdentity:
+	case storage.OpFileBackendIdentity, storage.OpFileVolumeGeometry:
 	case storage.OpFileSessionOpen:
 		expected.Options = r.Options
 	case storage.OpFileStatus, storage.OpFileRenew, opFileSessionReleaseResult:
@@ -102,7 +102,7 @@ func validateFileRequest(r fileRequest) error {
 	case storage.OpFileSetNodeAttr:
 		expected.Node = r.Node
 		expected.Change = r.Change
-	case storage.OpFileStat, storage.OpFileSync, storage.OpFileAck, storage.OpFileState, storage.OpFileScope, storage.OpFileCloseOwnerStatus:
+	case storage.OpFileInformation, storage.OpFileStat, storage.OpFileSync, storage.OpFileAck, storage.OpFileState, storage.OpFileScope, storage.OpFileCloseOwnerStatus:
 		reference = true
 	case storage.OpFileClose:
 		reference = true
@@ -140,6 +140,9 @@ func validateFileRequest(r fileRequest) error {
 	case storage.OpFileObserveDirectoryMetadata:
 		expected.Directory = r.Directory
 		expected.DirectoryMetadata = r.DirectoryMetadata
+	case storage.OpFileObserveMetadata:
+		reference = true
+		expected.MetadataObservation = r.MetadataObservation
 	case storage.OpFileObserveContentMetadata:
 		reference = true
 		expected.ContentEffect = r.ContentEffect
@@ -284,6 +287,12 @@ func validateFileResponse(req fileRequest, r fileResponse) error {
 		expected.Retry = true
 	} else {
 		switch req.Op {
+		case storage.OpFileVolumeGeometry:
+			expected.Geometry = r.Geometry
+		case storage.OpFileInformation:
+			expected.Information = r.Information
+		case storage.OpFileObserveMetadata:
+			expected.ObservedMetadata = r.ObservedMetadata
 		case storage.OpFileBackendIdentity:
 			expected.BackendIdentity = r.BackendIdentity
 		case storage.OpFileSessionOpen:
@@ -415,13 +424,13 @@ func validateFileResponse(req fileRequest, r fileResponse) error {
 		if !validFileCapability(r.File) || r.Capabilities == nil {
 			return errors.New("file open response carries no reference capability")
 		}
-		if r.Capabilities.ReferenceName != (r.Node != 0) {
+		if (r.Capabilities.ReferenceName || r.Capabilities.Information) != (r.Node != 0) {
 			return errors.New("file open identity does not match name observation capability")
 		}
-		if req.Op == storage.OpFileOpenNode && r.Capabilities.ReferenceName && r.Node != req.Node {
+		if req.Op == storage.OpFileOpenNode && (r.Capabilities.ReferenceName || r.Capabilities.Information) && r.Node != req.Node {
 			return errors.New("identity open substituted its target")
 		}
-		if req.Op == storage.OpFileOpen && r.Capabilities.ReferenceName && req.Open.ExpectedID != 0 && r.Node != req.Open.ExpectedID {
+		if req.Op == storage.OpFileOpen && (r.Capabilities.ReferenceName || r.Capabilities.Information) && req.Open.ExpectedID != 0 && r.Node != req.Open.ExpectedID {
 			return errors.New("path open substituted its expected identity")
 		}
 	case storage.OpFileOpenAt, storage.OpFileOpenNodeRef, storage.OpFileOpenChildRef:
@@ -450,6 +459,27 @@ func validateFileResponse(req fileRequest, r fileResponse) error {
 	case storage.OpFileMutateName:
 		if req.Name == nil || nameResultNeedsAttr(req.Name.Kind) && r.Attr == nil {
 			return errors.New("name response carries no required attributes")
+		}
+	case storage.OpFileInformation:
+		if r.Information == nil {
+			return errors.New("reference information is absent")
+		}
+		if err := r.Information.storage().Check(r.Information.NodeID); err != nil {
+			return err
+		}
+	case storage.OpFileVolumeGeometry:
+		if r.Geometry == nil {
+			return errors.New("volume geometry is absent")
+		}
+		if err := r.Geometry.storage().Check(); err != nil {
+			return err
+		}
+	case storage.OpFileObserveMetadata:
+		if r.ObservedMetadata == nil {
+			return errors.New("metadata observation is absent")
+		}
+		if err := r.ObservedMetadata.storage().Check(); err != nil {
+			return err
 		}
 	case storage.OpFileObserveContentMetadata:
 		if r.ContentMetadata == nil {

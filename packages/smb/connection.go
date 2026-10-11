@@ -484,6 +484,10 @@ func requiredCredits(request wire.Request) int {
 		if parsed, err := request.Read(); err == nil {
 			return max(1, int((uint64(parsed.Length)+65535)/65536))
 		}
+	case wire.QueryInfo:
+		if parsed, err := request.QueryInfo(); err == nil {
+			return max(1, int((max(uint64(parsed.InputBufferLength), uint64(parsed.OutputBufferLength))+65535)/65536))
+		}
 	case wire.Write:
 		if parsed, err := request.Write(); err == nil {
 			return max(1, int((uint64(parsed.Length)+65535)/65536))
@@ -581,6 +585,13 @@ func responseBudget(request wire.Request) int {
 		}
 		return 128
 	case wire.Write:
+		return 80
+	case wire.QueryInfo:
+		if parsed, err := request.QueryInfo(); err == nil {
+			return max(80, (72+int(parsed.OutputBufferLength)+7)&^7)
+		}
+		return 80
+	case wire.SetInfo:
 		return 80
 	case wire.Flush:
 		return 72

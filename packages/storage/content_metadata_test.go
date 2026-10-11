@@ -96,7 +96,7 @@ func TestContentMetadataCloneObservationAndTransformation(t *testing.T) {
 	}
 }
 
-func TestContentMutationRequiresEnrolledNonemptyDataAndExplicitAbsence(t *testing.T) {
+func TestContentMutationRequiresEnrolledContentEffectAndExplicitAbsence(t *testing.T) {
 	id, err := storage.NewFileActionID(1)
 	if err != nil {
 		t.Fatal(err)
@@ -105,6 +105,13 @@ func TestContentMutationRequiresEnrolledNonemptyDataAndExplicitAbsence(t *testin
 	effects := []storage.ContentMetadataEffect{contentEffect()}
 	if err := storage.CheckContentMutation(command, effects); err != nil {
 		t.Fatal(err)
+	}
+	for _, size := range []int64{0, 1, 1 << 20} {
+		truncate := storage.FileMutation{Action: id, Kind: storage.MutateTruncate, Size: size,
+			ContentEffects: []uint16{0}, ExpectedMetadata: map[string][]byte{"test.flags": nil}}
+		if err := storage.CheckContentMutation(truncate, effects); err != nil {
+			t.Fatalf("sealed truncate to %d: %v", size, err)
+		}
 	}
 	for _, bad := range []storage.FileMutation{
 		{Action: id, Kind: storage.MutateWriteAt, Data: []byte{1}, ContentEffects: []uint16{0}},

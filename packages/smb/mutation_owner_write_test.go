@@ -37,7 +37,7 @@ func ioOwnerFixture(t *testing.T) (*Server, *tree, *fileHandle, *ioOwnerFile, *i
 	server := &Server{config: Config{Limits: DefaultLimits(), Authorize: authz.AuthorizerFunc(func(context.Context, authz.AccessRequest) error { return nil })}}
 	session := &ioOwnerSession{endpointFileSession: newEndpointFileSession()}
 	file := &ioOwnerFile{}
-	h := &fileHandle{file: file, nodeID: 41}
+	h := &fileHandle{file: file, nodeID: 41, nodeKind: storage.NodeRegular}
 	export := &Export{server: server, share: Share{Volume: "v"}}
 	tree := &tree{export: export, authority: &authoritySession{raw: session}}
 	action, err := storage.NewFileActionID(1)
@@ -60,7 +60,7 @@ func ioOwnerAttr(t *testing.T) storage.Attr {
 
 func TestWriteOwnerCompletedReceiptRequiresSameTypedReplay(t *testing.T) {
 	server, tree, h, file, session, command, effects := ioOwnerFixture(t)
-	original := cloneWriteCommand(command)
+	original := cloneMutationCommand(command)
 	calls := 0
 	file.mutate = func(got storage.FileMutation) (storage.Attr, error) {
 		calls++
@@ -76,13 +76,13 @@ func TestWriteOwnerCompletedReceiptRequiresSameTypedReplay(t *testing.T) {
 	session.query = func(id storage.FileActionID) (storage.FileActionReceipt, error) {
 		return storage.FileActionReceipt{Action: id, Operation: storage.OpFileMutate, Outcome: storage.FileActionCompleted}, nil
 	}
-	owner, err := server.reserveWriteOwner(tree, h, 1, command, effects)
+	owner, err := server.reserveMutationOwner(tree, h, 1, command, effects)
 	if err != nil {
 		t.Fatal(err)
 	}
 	command.Data[0] = 'x'
 	effects[0].SetMask[4] = 0
-	attr, err := owner.execute(t.Context(), func(context.Context) error { return nil }, nil, nil)
+	attr, err := owner.executeMutation(t.Context(), func(context.Context) error { return nil }, nil, nil)
 	if err != nil || attr.ID != 41 || calls != 2 || owner.pending() {
 		t.Fatalf("replay result: %+v %v calls=%d", attr, err, calls)
 	}
@@ -101,13 +101,13 @@ func TestWriteOwnerUnknownRetainsPayloadUntilCompleteProof(t *testing.T) {
 			session.query = func(id storage.FileActionID) (storage.FileActionReceipt, error) {
 				return storage.FileActionReceipt{Action: id, Outcome: outcome}, nil
 			}
-			owner, err := server.reserveWriteOwner(tree, h, 1, command, effects)
+			owner, err := server.reserveMutationOwner(tree, h, 1, command, effects)
 			if err != nil {
 				t.Fatal(err)
 			}
-			_, err = owner.execute(t.Context(), func(context.Context) error { return nil }, func(context.Context) (map[string][]byte, error) {
+			_, err = owner.executeMutation(t.Context(), func(context.Context) error { return nil }, func(context.Context) (storage.FileMutation, error) {
 				t.Fatal("unbound receipt reminted action")
-				return nil, nil
+				return storage.FileMutation{}, nil
 			}, func() uint64 { return 1 })
 			if !errors.Is(err, syscall.EIO) || !owner.pending() || calls != 1 {
 				t.Fatalf("unknown result: %v pending=%v calls=%d", err, owner.pending(), calls)
@@ -154,13 +154,15 @@ func TestWriteOwnerConditionRetriesRequireBoundRefusalAndRemainLimited(t *testin
 	session.query = func(id storage.FileActionID) (storage.FileActionReceipt, error) {
 		return storage.FileActionReceipt{Action: id, Operation: storage.OpFileMutate, Outcome: storage.FileActionNotExecuted}, nil
 	}
-	owner, err := server.reserveWriteOwner(tree, h, 1, command, effects)
+	owner, err := server.reserveMutationOwner(tree, h, 1, command, effects)
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = owner.execute(t.Context(), func(context.Context) error { return nil }, func(context.Context) (map[string][]byte, error) {
+	_, err = owner.executeMutation(t.Context(), func(context.Context) error { return nil }, func(context.Context) (storage.FileMutation, error) {
 		observations++
-		return map[string][]byte{windowsMetadataKey: []byte("new")}, nil
+		retry := cloneMutationCommand(command)
+		retry.ExpectedMetadata = map[string][]byte{windowsMetadataKey: []byte("new")}
+		return retry, nil
 	}, func() uint64 { return 1 })
 	if !errors.Is(err, storage.ErrConditionConflict) || calls != 3 || len(ids) != 3 || observations != 2 || owner.pending() {
 		t.Fatalf("retry result: %v calls=%d ids=%d obs=%d", err, calls, len(ids), observations)
@@ -189,11 +191,11 @@ func TestWriteOwnerCompletedReceiptCannotHideTypedErrorOrMalformedResult(t *test
 			session.query = func(id storage.FileActionID) (storage.FileActionReceipt, error) {
 				return storage.FileActionReceipt{Action: id, Operation: storage.OpFileMutate, Outcome: storage.FileActionCompleted}, nil
 			}
-			owner, err := server.reserveWriteOwner(tree, h, 1, command, effects)
+			owner, err := server.reserveMutationOwner(tree, h, 1, command, effects)
 			if err != nil {
 				t.Fatal(err)
 			}
-			_, err = owner.execute(t.Context(), func(context.Context) error { return nil }, nil, nil)
+			_, err = owner.executeMutation(t.Context(), func(context.Context) error { return nil }, nil, nil)
 			if !errors.Is(err, syscall.EIO) || !owner.pending() || calls != 2 || server.Status().RetainedWriteBytes == 0 {
 				t.Fatalf("completed result accepted: %v calls=%d", err, calls)
 			}
@@ -212,7 +214,7 @@ func TestWriteOwnerRecoveryRechecksAuthorityBeforeQueryOrReplay(t *testing.T) {
 		queries++
 		return storage.FileActionReceipt{Action: id, Outcome: storage.FileActionUnknown}, nil
 	}
-	owner, err := server.reserveWriteOwner(tree, h, 1, command, effects)
+	owner, err := server.reserveMutationOwner(tree, h, 1, command, effects)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -223,7 +225,7 @@ func TestWriteOwnerRecoveryRechecksAuthorityBeforeQueryOrReplay(t *testing.T) {
 		}
 		return nil
 	}
-	_, _ = owner.execute(t.Context(), authorize, nil, nil)
+	_, _ = owner.executeMutation(t.Context(), authorize, nil, nil)
 	allowed = false
 	_, err = owner.reconcile(t.Context())
 	if !errors.Is(err, syscall.EIO) || !errors.Is(err, authz.ErrDenied) || mutations != 1 || queries != 1 || !owner.pending() {
@@ -237,11 +239,11 @@ func TestWriteOwnerPreDispatchRefusalHasNoMutationAndCanTransferFacts(t *testing
 		t.Fatal("denied mutation executed")
 		return storage.Attr{}, nil
 	}
-	owner, err := server.reserveWriteOwner(tree, h, 1, command, effects)
+	owner, err := server.reserveMutationOwner(tree, h, 1, command, effects)
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = owner.execute(t.Context(), func(context.Context) error { return authz.ErrDenied }, nil, nil)
+	_, err = owner.executeMutation(t.Context(), func(context.Context) error { return authz.ErrDenied }, nil, nil)
 	if !errors.Is(err, authz.ErrDenied) || owner.pending() {
 		t.Fatalf("denied admission: %v", err)
 	}

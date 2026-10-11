@@ -84,7 +84,12 @@ func (fs *fileSession) OpenAt(ctx context.Context, selection storage.ChildSelect
 		return storage.OpenResult{}, err
 	}
 	selection = selection.Clone()
-	options.ContentMetadataEffects = storage.CloneContentMetadataEffects(options.ContentMetadataEffects)
+	options = canonicalFileActionInput(openAtActionInput{Options: options}).(openAtActionInput).Options
+	if len(options.MetadataObservations) != 0 {
+		if err := fs.CheckOpenMetadataObservation(); err != nil {
+			return storage.OpenResult{}, err
+		}
+	}
 	if len(options.ContentMetadataEffects) != 0 {
 		if err := fs.CheckOpenContentMetadata(); err != nil {
 			return storage.OpenResult{}, err
@@ -113,13 +118,14 @@ func (fs *fileSession) openAt(ctx context.Context, selection storage.ChildSelect
 		return opened, fs.finishOpen(nil, err)
 	}
 	file := &openFile{
-		contentEffects: storage.CloneContentMetadataEffects(options.ContentMetadataEffects),
-		session:        fs,
-		native:         result.File,
-		uses:           referenceUses{nodeID: uint64(result.State.ID)},
-		options:        storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: options.Read, Write: options.Write}},
-		metadata:       options.MetadataAccess,
-		active:         true,
+		contentEffects:       storage.CloneContentMetadataEffects(options.ContentMetadataEffects),
+		metadataObservations: storage.CloneMetadataObservationScopes(options.MetadataObservations),
+		session:              fs,
+		native:               result.File,
+		uses:                 referenceUses{nodeID: uint64(result.State.ID)},
+		options:              storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: options.Read, Write: options.Write}},
+		metadata:             options.MetadataAccess,
+		active:               true,
 	}
 	opened.File = file
 	err = fs.finishOpen(file, err)
@@ -133,13 +139,19 @@ func (fs *fileSession) OpenNodeRef(ctx context.Context, id uint64, options stora
 	if err := options.Check(); err != nil {
 		return storage.NodeOpenResult{}, err
 	}
+	options = canonicalFileActionInput(nodeRefActionInput{Options: options}).(nodeRefActionInput).Options
+	if len(options.MetadataObservations) != 0 {
+		if err := fs.CheckOpenMetadataObservation(); err != nil {
+			return storage.NodeOpenResult{}, err
+		}
+	}
 	input := nodeRefActionInput{Node: id, Options: options}
 	return runFileAction(ctx, fs, options.Action, storage.OpFileOpenNodeRef, input, cloneNodeOpenResult,
 		func(result storage.NodeOpenResult) bool {
 			return result.Reference != nil || result.Attr.ID != 0 || result.Outcome != 0
 		},
 		func() (storage.NodeOpenResult, error) {
-			return fs.openNodeReference(ctx, func(ctx context.Context) (metastore.NodeOpenResult, error) {
+			return fs.openNodeReference(ctx, options, func(ctx context.Context) (metastore.NodeOpenResult, error) {
 				return fs.native.(metastore.NodeReferences).OpenNodeRef(ctx, id, options)
 			})
 		})
@@ -156,19 +168,25 @@ func (fs *fileSession) OpenChildRef(ctx context.Context, selection storage.Child
 		return storage.NodeOpenResult{}, err
 	}
 	selection = selection.Clone()
+	options = canonicalFileActionInput(nodeRefActionInput{Options: options}).(nodeRefActionInput).Options
+	if len(options.MetadataObservations) != 0 {
+		if err := fs.CheckOpenMetadataObservation(); err != nil {
+			return storage.NodeOpenResult{}, err
+		}
+	}
 	input := nodeRefActionInput{Selection: &selection, Options: options}
 	return runFileAction(ctx, fs, options.Action, storage.OpFileOpenChildRef, input, cloneNodeOpenResult,
 		func(result storage.NodeOpenResult) bool {
 			return result.Reference != nil || result.Attr.ID != 0 || result.Outcome != 0
 		},
 		func() (storage.NodeOpenResult, error) {
-			return fs.openNodeReference(ctx, func(ctx context.Context) (metastore.NodeOpenResult, error) {
+			return fs.openNodeReference(ctx, options, func(ctx context.Context) (metastore.NodeOpenResult, error) {
 				return fs.native.(metastore.NodeReferences).OpenChildRef(ctx, selection, options)
 			})
 		})
 }
 
-func (fs *fileSession) openNodeReference(ctx context.Context, open func(context.Context) (metastore.NodeOpenResult, error)) (storage.NodeOpenResult, error) {
+func (fs *fileSession) openNodeReference(ctx context.Context, options storage.NodeRefOptions, open func(context.Context) (metastore.NodeOpenResult, error)) (storage.NodeOpenResult, error) {
 	ctx, cancel := fs.operationContext(ctx)
 	defer cancel()
 	ctx = metastore.WithFilePublicationGuard(ctx, fs.publicationAllowed)
@@ -182,7 +200,7 @@ func (fs *fileSession) openNodeReference(ctx context.Context, open func(context.
 	if result.Reference == nil {
 		return opened, fs.finishOpen(nil, err)
 	}
-	reference := &nodeReference{session: fs, native: result.Reference, uses: referenceUses{nodeID: uint64(result.State.ID)}, active: true,
+	reference := &nodeReference{metadata: options.MetadataAccess, metadataObservations: storage.CloneMetadataObservationScopes(options.MetadataObservations), session: fs, native: result.Reference, uses: referenceUses{nodeID: uint64(result.State.ID)}, active: true,
 		closing: referenceCloseState{next: 1}}
 	opened.Reference = reference
 	err = fs.finishOpen(reference, err)

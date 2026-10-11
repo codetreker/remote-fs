@@ -143,7 +143,6 @@ func TestContentMetadataCASAndRejectedRequestsLeaveContentTimesAndLogUntouched(t
 		{"arbitrary metadata", func(c *storage.FileMutation) {
 			c.Metadata = map[string]storage.OpaquePayload{"test.other": {Data: []byte("bad")}}
 		}, syscall.EINVAL},
-		{"truncate effect", func(c *storage.FileMutation) { c.Kind, c.Size, c.Data = storage.MutateTruncate, 0, nil }, syscall.EINVAL},
 	}
 	for _, test := range invalid {
 		t.Run(test.name, func(t *testing.T) {
