@@ -14,13 +14,13 @@ SMB 3.1.1 的 regular-file READ、flags=0 WRITE 和 FLUSH 使用[有界 CREATE/C
 
 ### 平台解释与中立固定效果
 
-OpenAtOptions.ContentMetadataEffects 将固定 namespace 转换密封在 exact writable File 上；OpenContentMetadata 检查整个链，ReferenceContentMetadata 只观察已 enrollment 的一个 namespace，返回 NodeID 与明确存在／缺席的 OpaquePayload。descriptor 包括 Namespace、PayloadBytes、PresentPrefix、AbsentPayload、ClearMask、SetMask；最多 16 项、单 payload 32 KiB、合计 64 KiB。prefix 对应 masks 为零；不存在值使用已批准模板，存在空值不冒充缺席。旧 FileOpenOptions 不接受该 enrollment。
+OpenAtOptions.ContentMetadataEffects 将固定 namespace 转换密封在 exact writable File 上；OpenContentMetadata 检查整个链；既有 ReferenceMetadataAccess.ObserveMetadata 以明确 ContentEffect purpose 只观察原引用已封存的一个效果 namespace，返回 NodeID 与明确存在／缺席的 OpaquePayload。descriptor 包括 Namespace、PayloadBytes、PresentPrefix、AbsentPayload、ClearMask、SetMask；最多 16 项、单 payload 32 KiB、合计 64 KiB。prefix 对应 masks 为零；不存在值使用已批准模板，存在空值不冒充缺席。旧 FileOpenOptions 不接受该 enrollment。
 
 SMB 密封 smb.windows 的八字节 SMW version-1 payload，固定清除 NORMAL、设置 ARCHIVE，保留 READONLY/HIDDEN/SYSTEM 与其它 namespace。Windows 解码和 READONLY 判定留在 SMB；authority 只验证通用格式、条件与固定转换，不执行平台 hook，不需要 host 注册平台策略。
 
 FileMutation.ContentEffects 用于非空 WriteAt／Append；[文件信息](2026-09-28-smb-file-information.md)在同一路径支持 Truncate，Attr 与任意 Metadata 为空，每个所选 namespace 必须有显式 ExpectedMetadata entry；空 token 表示确认缺席，遗漏 entry 非法。native 最终 publication 同时核对 exact scope、数据 Use、metadata token、descriptor 格式和内容 revision，以 (old &^ ClearMask) | SetMask 计算结果，与内容、时间、日志一次提交。原 OpenAt descriptor、mutation target／command／enrolled vector 进入 action digest，每处 slice／map 深复制。
 
-enrollment、限定观察与每次 mutation／typed replay 都经当前实际业务授权；AccessRequest 携带准确 descriptor，Metadata=nil 不能绕过 OpFileSetMetadata。OpenAt 批准不构成终身授权。公开 Stat、SetAttr、SetMetadata 和任意属性修改继续独立受 MetadataAccess 约束，byte-only 与 append-only 句柄不能借派生效果扩权。
+enrollment、条件观察与每次 mutation／typed replay 都经当前实际业务授权；AccessRequest 携带准确 descriptor，Metadata=nil 不能绕过 OpFileSetMetadata。OpenAt 批准不构成终身授权。公开 Stat、SetAttr、SetMetadata 和任意属性修改继续独立受 MetadataAccess 约束，byte-only 与 append-only 句柄不能借派生效果扩权。
 
 ### 协议与读取／写入
 

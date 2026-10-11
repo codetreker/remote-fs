@@ -23,6 +23,9 @@ type allocationSessionStub struct {
 }
 
 func (s allocationSessionStub) CheckAllocationReporting() error { return s.err }
+func (s allocationSessionStub) AllocationUnitBytes(context.Context) (uint64, error) {
+	return 4096, s.err
+}
 
 func TestAllocationReportingFollowsRemoteSession(t *testing.T) {
 	if err := (&fileSession{remote: &rangeSessionStub{}}).CheckAllocationReporting(); !errors.Is(err, syscall.EOPNOTSUPP) {
@@ -202,6 +205,9 @@ func (s *referenceCapabilityStub) Scope(context.Context) (storage.UseScope, erro
 	return storage.UseScope{Token: "scope"}, s.failure
 }
 func (s *referenceCapabilityStub) CheckMetadataAccess() error { return s.checkErr }
+func (s *referenceCapabilityStub) ObserveMetadata(context.Context, storage.MetadataObservationRequest) (storage.MetadataObservation, error) {
+	return storage.MetadataObservation{}, s.failure
+}
 func (s *referenceCapabilityStub) SetMetadata(context.Context, string, []byte, []byte) (storage.OpaquePayload, error) {
 	return storage.OpaquePayload{Version: []byte{1}, Data: []byte("value")}, s.failure
 }
@@ -384,7 +390,7 @@ func TestAtomicOpenRetainsAReferenceWhenFailureCleanupIsUnknown(t *testing.T) {
 			return failed.(storage.ReferenceStateAccess).CheckReferenceState()
 		},
 		"state": func() error {
-			_, err := failed.(storage.ReferenceStateAccess).State(t.Context())
+			_, err := failed.(storage.ReferenceStateAccess).State(t.Context(), storage.StateFull)
 			return err
 		},
 	} {
@@ -443,7 +449,7 @@ func TestNodeOpenRetainsAReferenceWhenFailureCleanupIsUnknown(t *testing.T) {
 		"scope check": failed.CheckScopedReference,
 		"scope":       func() error { _, err := failed.Scope(t.Context()); return err },
 		"state check": failed.CheckReferenceState,
-		"state":       func() error { _, err := failed.State(t.Context()); return err },
+		"state":       func() error { _, err := failed.State(t.Context(), storage.StateFull); return err },
 	} {
 		if err := call(); !errors.Is(err, openFailure) {
 			t.Fatalf("failed node-open %s=%v", name, err)

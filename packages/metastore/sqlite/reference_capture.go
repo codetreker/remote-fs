@@ -9,7 +9,7 @@ import (
 	"github.com/codetreker/remote-fs/packages/storage"
 )
 
-func (s *Store) captureNamespace(ctx context.Context, tx *sql.Tx, id int64, namespace string) (storage.NodeKind, storage.ContentMetadataObservation, error) {
+func (s *Store) captureNamespace(ctx context.Context, tx *sql.Tx, id int64, namespace string) (storage.NodeKind, storage.MetadataObservation, error) {
 	var kind, metadataBytes int64
 	var encoded []byte
 	err := tx.QueryRowContext(ctx, `SELECT
@@ -18,25 +18,25 @@ func (s *Store) captureNamespace(ctx context.Context, tx *sql.Tx, id int64, name
 		CASE WHEN typeof(metadata)='blob' AND length(metadata)<=? THEN metadata END
 		FROM nodes WHERE volume=? AND id=?`, storage.MaxMetadataBytes, s.volume, id).Scan(&kind, &metadataBytes, &encoded)
 	if errors.Is(err, sql.ErrNoRows) {
-		return 0, storage.ContentMetadataObservation{}, syscall.ESTALE
+		return 0, storage.MetadataObservation{}, syscall.ESTALE
 	}
 	if err != nil {
-		return 0, storage.ContentMetadataObservation{}, err
+		return 0, storage.MetadataObservation{}, err
 	}
 	if kind < int64(storage.NodeRegular) || kind > int64(storage.NodeSymlink) || metadataBytes < 0 ||
 		metadataBytes > storage.MaxMetadataBytes || int64(len(encoded)) != metadataBytes {
-		return 0, storage.ContentMetadataObservation{}, syscall.EIO
+		return 0, storage.MetadataObservation{}, syscall.EIO
 	}
 	metadata, err := storage.DecodeMetadata(encoded)
 	if err != nil {
-		return 0, storage.ContentMetadataObservation{}, err
+		return 0, storage.MetadataObservation{}, err
 	}
-	observed := storage.ContentMetadataObservation{NodeID: uint64(id)}
+	observed := storage.MetadataObservation{NodeID: uint64(id)}
 	if value, ok := metadata[namespace]; ok {
 		observed.Value = &value
 	}
 	if err := checkContentMetadataValue(observed.Value); err != nil {
-		return 0, storage.ContentMetadataObservation{}, err
+		return 0, storage.MetadataObservation{}, err
 	}
 	return storage.NodeKind(kind), observed, nil
 }

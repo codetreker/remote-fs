@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
-	"errors"
 	"math"
 	"syscall"
 	"time"
@@ -16,18 +15,24 @@ import (
 
 const statusInfoLengthMismatch uint32 = 0xc0000004
 
-func windowsMetadataObservations() []storage.MetadataObservationScope {
-	return []storage.MetadataObservationScope{{Namespace: windowsMetadataKey, MaxPayloadBytes: 8}}
-}
-
-func (c *connection) authorizeReference(ctx context.Context, s *session, t *tree, h *fileHandle, operation storage.Operation, scopes []storage.MetadataObservationScope) error {
+func (c *connection) authorizeReference(ctx context.Context, s *session, t *tree, h *fileHandle, operation storage.Operation, observation *storage.MetadataObservationRequest) error {
 	if err := checkFileIOIdentity(ctx, s, t, h); err != nil {
 		return err
 	}
 	s.identityMu.RLock()
 	principal := s.principal
 	s.identityMu.RUnlock()
-	request := authz.AccessRequest{Volume: t.export.share.Volume, Operation: operation, MetadataObservations: storage.CloneMetadataObservationScopes(scopes)}
+	request := authz.AccessRequest{Volume: t.export.share.Volume, Operation: operation, MetadataObservation: observation}
+	if operation == storage.OpFileState {
+		request.StateProjection = storage.StateScalars
+	}
+	if observation != nil && observation.Purpose == storage.MetadataObservationContentEffect {
+		selected, err := storage.ResolveContentMetadataEffects(h.contentEffects, []uint16{observation.EffectIndex})
+		if err != nil {
+			return err
+		}
+		request.ContentMetadataEffects = selected
+	}
 	if err := c.server.config.Authorize.Authorize(WithPrincipal(ctx, principal), request.Clone()); err != nil {
 		return err
 	}
@@ -95,7 +100,7 @@ func (c *connection) queryFileInfo(ctx context.Context, s *session, t *tree, req
 	if err != nil {
 		return nil, ioStatusError(err)
 	}
-	operation, rights := storage.OpFileInformation, uint32(0)
+	operation, rights := storage.OpFileState, uint32(0)
 	if parsed.FileInfoClass == wire.FileBasicInformation || parsed.FileInfoClass == wire.FileNetworkOpenInformation {
 		operation, rights = storage.OpFileStat, accessReadAttr
 	}
@@ -134,33 +139,33 @@ func (c *connection) queryFileInfo(ctx context.Context, s *session, t *tree, req
 			data = wire.FileNetworkOpenInformationBody(wire.FileNetworkOpenInfo{FileBasicInfo: basic, AllocationSize: attr.AllocationSize, EndOfFile: eof})
 		}
 	} else {
-		information, ok := h.reference().(storage.ReferenceInformationAccess)
+		information, ok := h.reference().(storage.ReferenceStateAccess)
 		if !ok {
 			return nil, statusUnsupported
 		}
-		if err = information.CheckReferenceInformation(); err != nil {
+		if err = information.CheckReferenceState(); err != nil {
 			return nil, ioStatusError(err)
 		}
-		result, err := information.Information(ctx)
+		result, err := information.State(ctx, storage.StateScalars)
 		if err != nil {
 			return nil, ioStatusError(err)
 		}
-		if err = result.Check(h.nodeID); err != nil || result.Kind != h.nodeKind {
+		if err = result.CheckProjection(h.nodeID, storage.StateScalars); err != nil || result.Attr.Kind != h.nodeKind {
 			return nil, statusIO
 		}
 		switch parsed.FileInfoClass {
 		case wire.FileInternalInformation:
-			data = wire.FileInternalInformationBody(result.NodeID)
+			data = wire.FileInternalInformationBody(result.Attr.ID)
 		case wire.FileIdInformation:
 			serial, err := stableVolumeSerial(h.identity.Backend.Volume)
 			if err != nil {
 				return nil, statusIO
 			}
 			var id [16]byte
-			binary.LittleEndian.PutUint64(id[:8], result.NodeID)
+			binary.LittleEndian.PutUint64(id[:8], result.Attr.ID)
 			data = wire.FileIdInformationBody(serial, id)
 		case wire.FileStandardInformation:
-			if err = c.checkInformationAllocation(ctx, s, t, h, result.AllocationKnown, result.AllocationSize); err != nil {
+			if err = c.checkInformationAllocation(ctx, s, t, h, result.Attr.AllocationKnown, result.Attr.AllocationSize); err != nil {
 				return nil, ioStatusError(err)
 			}
 			links := uint32(1)
@@ -168,10 +173,10 @@ func (c *connection) queryFileInfo(ctx context.Context, s *session, t *tree, req
 				links = 0
 			}
 			eof := int64(0)
-			if result.Kind == storage.NodeRegular {
-				eof = result.Size
+			if result.Attr.Kind == storage.NodeRegular {
+				eof = result.Attr.Size
 			}
-			data = wire.FileStandardInformationBody(wire.FileStandardInfo{AllocationSize: result.AllocationSize, EndOfFile: eof, NumberOfLinks: links, DeletePending: result.PendingUnlink, Directory: result.Kind == storage.NodeDirectory})
+			data = wire.FileStandardInformationBody(wire.FileStandardInfo{AllocationSize: result.Attr.AllocationSize, EndOfFile: eof, NumberOfLinks: links, DeletePending: result.PendingUnlink, Directory: result.Attr.Kind == storage.NodeDirectory})
 		}
 	}
 	if err = authorize(ctx, h); err != nil {
@@ -246,31 +251,44 @@ func (c *connection) checkInformationAllocation(ctx context.Context, s *session,
 	if !known || allocated < 0 {
 		return syscall.EIO
 	}
-	if err := c.authorizeReference(ctx, s, t, h, storage.OpFileVolumeGeometry, nil); err != nil {
-		return err
-	}
-	geometry, ok := t.authority.raw.(storage.VolumeGeometryAccess)
+	reporter, ok := t.authority.raw.(storage.AllocationReporting)
 	if !ok {
 		return syscall.EOPNOTSUPP
 	}
-	if err := geometry.CheckVolumeGeometry(); err != nil {
+	identity, ok := t.authority.raw.(storage.FileSessionIdentity)
+	if !ok {
+		return syscall.EOPNOTSUPP
+	}
+	checkAuthority := func() error {
+		if err := c.authorizeReference(ctx, s, t, h, storage.OpFileAllocationUnit, nil); err != nil {
+			return err
+		}
+		if err := identity.CheckFileSessionIdentity(); err != nil {
+			return err
+		}
+		current, err := identity.FileSessionIdentity(ctx)
+		if err != nil {
+			return err
+		}
+		if current != h.identity {
+			return syscall.ESTALE
+		}
+		return checkFileIOIdentity(ctx, s, t, h)
+	}
+	if err := checkAuthority(); err != nil {
 		return err
 	}
-	result, err := geometry.VolumeGeometry(ctx)
+	if err := reporter.CheckAllocationReporting(); err != nil {
+		return err
+	}
+	unit, err := reporter.AllocationUnitBytes(ctx)
 	if err != nil {
 		return err
 	}
-	if err = result.CheckVolume(h.identity.Backend.Volume); err != nil {
-		return errors.Join(syscall.EIO, err)
-	}
-	unit, err := result.AllocationUnitBytes()
-	if err != nil {
-		return err
-	}
-	if uint64(allocated)%unit != 0 {
+	if unit == 0 || uint64(allocated)%unit != 0 {
 		return syscall.EIO
 	}
-	return nil
+	return checkAuthority()
 }
 
 func setFiletime(value int64) (*time.Time, error) {
@@ -335,24 +353,23 @@ func (c *connection) observeBasicMetadata(ctx context.Context, s *session, t *tr
 	if len(command.Metadata) == 0 {
 		return command, nil
 	}
-	if len(h.metadataObservations) != 1 {
-		return storage.FileMutation{}, syscall.EIO
-	}
-	if err := c.authorizeReference(ctx, s, t, h, storage.OpFileObserveMetadata, h.metadataObservations); err != nil {
+	request := storage.MetadataObservationRequest{Purpose: storage.MetadataObservationNamespace,
+		Namespace: windowsMetadataKey, MaxPayloadBytes: 8}
+	if err := c.authorizeReference(ctx, s, t, h, storage.OpFileObserveMetadata, &request); err != nil {
 		return storage.FileMutation{}, err
 	}
-	observer, ok := h.reference().(storage.ReferenceMetadataObserver)
+	observer, ok := h.reference().(storage.ReferenceMetadataAccess)
 	if !ok {
 		return storage.FileMutation{}, syscall.EOPNOTSUPP
 	}
-	if err := observer.CheckMetadataObservation(); err != nil {
+	if err := observer.CheckMetadataAccess(); err != nil {
 		return storage.FileMutation{}, err
 	}
-	observed, err := observer.ObserveMetadata(ctx, 0)
+	observed, err := observer.ObserveMetadata(ctx, request)
 	if err != nil {
 		return storage.FileMutation{}, err
 	}
-	if err = observed.CheckScope(h.nodeID, h.metadataObservations[0]); err != nil {
+	if err = observed.CheckNamespace(h.nodeID, request.Namespace, request.MaxPayloadBytes); err != nil {
 		return storage.FileMutation{}, err
 	}
 	values := map[string]storage.OpaquePayload{}

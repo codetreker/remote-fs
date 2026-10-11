@@ -112,3 +112,28 @@ func (fs *fileSession) CheckOpenMetadataAccess() error {
 	}
 	return native.CheckOpenMetadataAccess()
 }
+
+func (fs *fileSession) currentAllocationIdentity(ctx context.Context) (storage.FileSessionIdentityResult, error) {
+	backend, err := fs.native.(storage.BackendIdentity).BackendIdentity(ctx)
+	if err != nil {
+		return storage.FileSessionIdentityResult{}, err
+	}
+	if err := backend.Check(); err != nil {
+		return storage.FileSessionIdentityResult{}, err
+	}
+	if backend != fs.backendIdentity {
+		return storage.FileSessionIdentityResult{}, syscall.ESTALE
+	}
+	status, err := fs.status(ctx)
+	if err != nil {
+		return storage.FileSessionIdentityResult{}, err
+	}
+	result := storage.FileSessionIdentityResult{Backend: backend, SessionEpoch: fs.epoch}
+	if err := result.Check(); err != nil {
+		return storage.FileSessionIdentityResult{}, err
+	}
+	if result.SessionEpoch != status.Epoch {
+		return storage.FileSessionIdentityResult{}, syscall.EIO
+	}
+	return result, nil
+}

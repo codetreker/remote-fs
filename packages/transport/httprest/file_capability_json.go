@@ -11,7 +11,9 @@ func validateCapabilityArguments(req fileRequest) error {
 	switch req.Op {
 	case storage.OpFileScope:
 		return nil
-	case storage.OpFileState, storage.OpFileCloseOwnerStatus:
+	case storage.OpFileState:
+		return req.StateProjection.Check()
+	case storage.OpFileCloseOwnerStatus:
 		return nil
 	case storage.OpFileQueryAction:
 		return req.FileAction.Check()
@@ -72,8 +74,13 @@ func validateCapabilityArguments(req fileRequest) error {
 			return err
 		}
 		return req.DirectoryMetadata.storage().Check()
-	case storage.OpFileInformation, storage.OpFileVolumeGeometry, storage.OpFileObserveMetadata, storage.OpFileObserveContentMetadata:
+	case storage.OpFileAllocationUnit:
 		return nil
+	case storage.OpFileObserveMetadata:
+		if req.MetadataObservation == nil {
+			return syscall.EINVAL
+		}
+		return req.MetadataObservation.storage().Check()
 	case storage.OpFileObserveName:
 		return req.Guards.storage().Check()
 	case storage.OpFileMutateName:

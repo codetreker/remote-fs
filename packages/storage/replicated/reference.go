@@ -1,6 +1,7 @@
 package replicated
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -15,7 +16,6 @@ type nodeReference struct {
 	session *fileSession
 	remote  httprest.NodeReferenceWithBarrier
 	retainedClose
-	metadataObservations []storage.MetadataObservationScope
 }
 
 func referenceCall[C, R any](ctx context.Context, session *fileSession, remote any, call func(context.Context, C) (R, error)) (R, error) {
@@ -76,10 +76,8 @@ func (r *nodeReference) CheckReferenceState() error {
 	return capabilityCheck(r.remote, func(capability storage.ReferenceStateAccess) error { return capability.CheckReferenceState() })
 }
 
-func (r *nodeReference) State(ctx context.Context) (storage.ReferenceState, error) {
-	return referenceCall(ctx, r.session, r.remote, func(ctx context.Context, capability storage.ReferenceStateAccess) (storage.ReferenceState, error) {
-		return capability.State(ctx)
-	})
+func (r *nodeReference) State(ctx context.Context, projection storage.StateProjection) (storage.ReferenceState, error) {
+	return observeReferenceState(ctx, r.session, r.remote, projection)
 }
 
 func (r *nodeReference) CheckMetadataAccess() error {
@@ -149,10 +147,8 @@ func (f *retainedFile) CheckReferenceState() error {
 	return capabilityCheck(f.remote, func(capability storage.ReferenceStateAccess) error { return capability.CheckReferenceState() })
 }
 
-func (f *retainedFile) State(ctx context.Context) (storage.ReferenceState, error) {
-	return referenceCall(ctx, f.session, f.remote, func(ctx context.Context, capability storage.ReferenceStateAccess) (storage.ReferenceState, error) {
-		return capability.State(ctx)
-	})
+func (f *retainedFile) State(ctx context.Context, projection storage.StateProjection) (storage.ReferenceState, error) {
+	return observeReferenceState(ctx, f.session, f.remote, projection)
 }
 
 func (f *retainedFile) CheckDeleteIntent() error {
@@ -252,7 +248,7 @@ func (r *failedOpenReference) Scope(context.Context) (storage.UseScope, error) {
 	return storage.UseScope{}, r.failure
 }
 func (r *failedOpenReference) CheckReferenceState() error { return r.failure }
-func (r *failedOpenReference) State(context.Context) (storage.ReferenceState, error) {
+func (r *failedOpenReference) State(context.Context, storage.StateProjection) (storage.ReferenceState, error) {
 	return storage.ReferenceState{}, r.failure
 }
 func (r *failedOpenReference) Close(ctx context.Context) error {
@@ -339,3 +335,89 @@ var (
 	_ storage.ReferenceIdentity       = (*failedOpenReference)(nil)
 	_ storage.ReferenceIdentity       = (*failedOpenFile)(nil)
 )
+
+func (r *nodeReference) ObserveMetadata(ctx context.Context, request storage.MetadataObservationRequest) (storage.MetadataObservation, error) {
+	return observeReferenceMetadata(ctx, r.session, r.remote, request)
+}
+
+func (f *retainedFile) ObserveMetadata(ctx context.Context, request storage.MetadataObservationRequest) (storage.MetadataObservation, error) {
+	return observeReferenceMetadata(ctx, f.session, f.remote, request)
+}
+
+func observeReferenceState(ctx context.Context, session *fileSession, remote any, projection storage.StateProjection) (storage.ReferenceState, error) {
+	if err := projection.Check(); err != nil {
+		return storage.ReferenceState{}, err
+	}
+	return referenceCall(ctx, session, remote, func(ctx context.Context, backing storage.ReferenceStateAccess) (storage.ReferenceState, error) {
+		if err := backing.CheckReferenceState(); err != nil {
+			return storage.ReferenceState{}, err
+		}
+		id, err := storage.ReferenceNodeID(remote)
+		if err != nil {
+			return storage.ReferenceState{}, err
+		}
+		result, err := backing.State(ctx, projection)
+		if err != nil {
+			return storage.ReferenceState{}, err
+		}
+		if err := result.CheckProjection(id, projection); err != nil {
+			return storage.ReferenceState{}, err
+		}
+		if err := checkObservedReference(ctx, session, remote, id); err != nil {
+			return storage.ReferenceState{}, err
+		}
+		result.Attr = result.Attr.Clone()
+		result.LinkTarget = bytes.Clone(result.LinkTarget)
+		result.PendingGeneration = bytes.Clone(result.PendingGeneration)
+		return result, nil
+	})
+}
+
+func observeReferenceMetadata(ctx context.Context, session *fileSession, remote any, request storage.MetadataObservationRequest) (storage.MetadataObservation, error) {
+	if err := request.Check(); err != nil {
+		return storage.MetadataObservation{}, err
+	}
+	request = request.Clone()
+	return referenceCall(ctx, session, remote, func(ctx context.Context, backing httprest.ReferenceMetadataAccessWithBarrier) (storage.MetadataObservation, error) {
+		if err := backing.CheckMetadataAccess(); err != nil {
+			return storage.MetadataObservation{}, err
+		}
+		id, err := storage.ReferenceNodeID(remote)
+		if err != nil {
+			return storage.MetadataObservation{}, err
+		}
+		result, err := backing.ObserveMetadata(ctx, request)
+		if err != nil {
+			return storage.MetadataObservation{}, err
+		}
+		if request.Purpose == storage.MetadataObservationNamespace {
+			err = result.CheckNamespace(id, request.Namespace, request.MaxPayloadBytes)
+		} else {
+			err = result.Check()
+			if err == nil && result.NodeID != id {
+				err = syscall.EIO
+			}
+		}
+		if err != nil {
+			return storage.MetadataObservation{}, err
+		}
+		if err := checkObservedReference(ctx, session, remote, id); err != nil {
+			return storage.MetadataObservation{}, err
+		}
+		return result.Clone(), nil
+	})
+}
+
+func checkObservedReference(ctx context.Context, session *fileSession, remote any, expected uint64) error {
+	id, err := storage.ReferenceNodeID(remote)
+	if err != nil {
+		return err
+	}
+	if id != expected {
+		return syscall.ESTALE
+	}
+	if err := session.base.usable("file", ""); err != nil {
+		return err
+	}
+	return ctx.Err()
+}

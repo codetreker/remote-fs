@@ -294,6 +294,9 @@ func checkTypedJSONValue(decoder *json.Decoder, typ reflect.Type, maxElements in
 	for typ.Kind() == reflect.Pointer {
 		typ = typ.Elem()
 	}
+	if typ == reflect.TypeOf(referenceState{}) {
+		typ = reflect.TypeOf(referenceStateJSON{})
+	}
 	if typ == reflect.TypeOf(namespaceGuards{}) && guardBudget == nil {
 		guardBudget = &namespaceGuardJSONBudget{}
 	}

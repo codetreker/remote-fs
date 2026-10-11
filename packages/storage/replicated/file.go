@@ -11,7 +11,6 @@ type retainedFile struct {
 	session *fileSession
 	remote  httprest.FileWithBarrier
 	retainedClose
-	metadataObservations []storage.MetadataObservationScope
 }
 
 func fileCall[T any](ctx context.Context, session *fileSession, ordinary bool, call func(context.Context) (T, error)) (T, error) {

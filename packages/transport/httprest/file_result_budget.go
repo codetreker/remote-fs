@@ -25,7 +25,7 @@ func fileAttrResult(op storage.Operation) bool {
 
 func fileBoundedResult(op storage.Operation) bool {
 	return fileAttrResult(op) || op == storage.OpFileSetNodeMetadata || op == storage.OpFileSetMetadata ||
-		op == storage.OpFileReadDirNode || op == storage.OpFileObserveDirectoryMetadata || op == storage.OpFileObserveName || op == storage.OpFileObserveContentMetadata || op == storage.OpFileObserveMetadata
+		op == storage.OpFileReadDirNode || op == storage.OpFileObserveDirectoryMetadata || op == storage.OpFileObserveName || op == storage.OpFileObserveMetadata
 }
 
 func fileResponseLimit(req fileRequest, maximum int64) int64 {
@@ -66,8 +66,15 @@ func (h *Handler) attrResultBudget(req fileRequest) storage.AttrResultBudget {
 		extra := int64(0)
 		switch req.Op {
 		case storage.OpFileState, storage.OpFileSetPendingUnlink, storage.OpFileClearPendingUnlink:
-			response.State = &referenceState{Attr: AttrOf(attr), PendingGeneration: make([]byte, storage.MaxObservationTokenBytes)}
-			if attr.Kind == storage.NodeSymlink {
+			if req.Op == storage.OpFileState && req.StateProjection == storage.StateScalars {
+				if metadataBytes != 0 {
+					return syscall.EIO
+				}
+				response.State = referenceStateOfProjection(storage.ReferenceState{Attr: attr}, storage.StateScalars)
+			} else {
+				response.State = &referenceState{Attr: AttrOf(attr), PendingGeneration: make([]byte, storage.MaxObservationTokenBytes)}
+			}
+			if attr.Kind == storage.NodeSymlink && !(req.Op == storage.OpFileState && req.StateProjection == storage.StateScalars) {
 				if attr.Size < 0 || attr.Size > storage.MaxLinkTargetBytes {
 					return syscall.EFBIG
 				}
@@ -114,4 +121,15 @@ func (h *Handler) attrResultBudget(req fileRequest) storage.AttrResultBudget {
 		}
 		return nil
 	}
+}
+
+func boundedObservationResponse(response fileResponse, budget int64) (fileResponse, error) {
+	encoded, err := json.Marshal(response)
+	if err != nil {
+		return fileResponse{}, err
+	}
+	if int64(len(encoded))+32 > budget {
+		return fileResponse{}, syscall.EFBIG
+	}
+	return response, nil
 }

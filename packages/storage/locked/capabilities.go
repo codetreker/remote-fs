@@ -27,12 +27,41 @@ func (s *fileSession) CheckAllocationReporting() error {
 	return err
 }
 
-func (s *fileSession) OpenAt(ctx context.Context, selection storage.ChildSelection, options storage.OpenAtOptions) (storage.OpenResult, error) {
-	if err := s.checkMetadataObservationEnrollment(options.MetadataAccess, options.MetadataObservations); err != nil {
-		return storage.OpenResult{}, err
+func (s *fileSession) AllocationUnitBytes(ctx context.Context) (uint64, error) {
+	inner, err := capability(s.FileSession, storage.AllocationReporting.CheckAllocationReporting)
+	if err != nil {
+		return 0, err
 	}
-	scopes := storage.CloneMetadataObservationScopes(options.MetadataObservations)
-	options.MetadataObservations = storage.CloneMetadataObservationScopes(scopes)
+	before, err := s.FileSessionIdentity(ctx)
+	if err != nil {
+		return 0, err
+	}
+	unit, err := inner.AllocationUnitBytes(readContext(ctx))
+	if err != nil {
+		return 0, err
+	}
+	if unit == 0 {
+		return 0, syscall.EIO
+	}
+	after, err := s.FileSessionIdentity(ctx)
+	if err != nil {
+		return 0, err
+	}
+	if after != before {
+		return 0, syscall.ESTALE
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	return unit, nil
+}
+
+func (s *fileSession) CheckOpenContentMetadata() error {
+	_, err := capability(s.FileSession, storage.OpenContentMetadata.CheckOpenContentMetadata)
+	return err
+}
+
+func (s *fileSession) OpenAt(ctx context.Context, selection storage.ChildSelection, options storage.OpenAtOptions) (storage.OpenResult, error) {
 	if err := storage.CheckContentMetadataEffects(options.ContentMetadataEffects); err != nil {
 		return storage.OpenResult{}, err
 	}
@@ -53,9 +82,6 @@ func (s *fileSession) OpenAt(ctx context.Context, selection storage.ChildSelecti
 	}
 	result, err := backend.OpenAt(s.storage.mutationContext(ctx), selection, options)
 	result.File = s.storage.wrapFile(result.File)
-	if file, ok := result.File.(*file); ok {
-		file.metadataObservations = scopes
-	}
 	return result, err
 }
 
@@ -175,11 +201,6 @@ func (s *fileSession) AcknowledgeDeleteIntent(ctx context.Context, command stora
 }
 
 func (s *fileSession) OpenNodeRef(ctx context.Context, id uint64, options storage.NodeRefOptions) (storage.NodeOpenResult, error) {
-	if err := s.checkMetadataObservationEnrollment(options.MetadataAccess, options.MetadataObservations); err != nil {
-		return storage.NodeOpenResult{}, err
-	}
-	scopes := storage.CloneMetadataObservationScopes(options.MetadataObservations)
-	options.MetadataObservations = storage.CloneMetadataObservationScopes(scopes)
 	backend, err := capability(s.FileSession, storage.NodeReferences.CheckNodeReferences)
 	if err != nil {
 		return storage.NodeOpenResult{}, err
@@ -191,18 +212,10 @@ func (s *fileSession) OpenNodeRef(ctx context.Context, id uint64, options storag
 	}
 	result, err := backend.OpenNodeRef(ctx, id, options)
 	result.Reference = s.storage.wrapNodeReference(result.Reference)
-	if reference, ok := result.Reference.(*nodeReference); ok {
-		reference.metadataObservations = scopes
-	}
 	return result, err
 }
 
 func (s *fileSession) OpenChildRef(ctx context.Context, selection storage.ChildSelection, options storage.NodeRefOptions) (storage.NodeOpenResult, error) {
-	if err := s.checkMetadataObservationEnrollment(options.MetadataAccess, options.MetadataObservations); err != nil {
-		return storage.NodeOpenResult{}, err
-	}
-	scopes := storage.CloneMetadataObservationScopes(options.MetadataObservations)
-	options.MetadataObservations = storage.CloneMetadataObservationScopes(scopes)
 	backend, err := capability(s.FileSession, storage.NodeReferences.CheckNodeReferences)
 	if err != nil {
 		return storage.NodeOpenResult{}, err
@@ -214,9 +227,6 @@ func (s *fileSession) OpenChildRef(ctx context.Context, selection storage.ChildS
 	}
 	result, err := backend.OpenChildRef(ctx, selection, options)
 	result.Reference = s.storage.wrapNodeReference(result.Reference)
-	if reference, ok := result.Reference.(*nodeReference); ok {
-		reference.metadataObservations = scopes
-	}
 	return result, err
 }
 
@@ -300,9 +310,8 @@ func (s *fileSession) Drop(ctx context.Context, owner storage.UseOwner, domain s
 }
 
 type referenceCapabilities struct {
-	backend              any
-	storage              *Storage
-	metadataObservations []storage.MetadataObservationScope
+	backend any
+	storage *Storage
 }
 
 func (r *referenceCapabilities) CloseWithAction(ctx context.Context, attempt storage.CloseAttempt) (storage.ReferenceCloseResult, error) {
@@ -344,8 +353,51 @@ func (r *referenceCapabilities) Scope(ctx context.Context) (storage.UseScope, er
 }
 
 func (r *referenceCapabilities) CheckMetadataAccess() error {
-	_, err := capability(r.backend, storage.ReferenceMetadataAccess.CheckMetadataAccess)
+	if _, err := capability(r.backend, storage.ReferenceMetadataAccess.CheckMetadataAccess); err != nil {
+		return err
+	}
+	_, err := r.ReferenceNodeID()
 	return err
+}
+
+func (r *referenceCapabilities) ObserveMetadata(ctx context.Context, request storage.MetadataObservationRequest) (storage.MetadataObservation, error) {
+	if err := request.Check(); err != nil {
+		return storage.MetadataObservation{}, err
+	}
+	inner, err := capability(r.backend, storage.ReferenceMetadataAccess.CheckMetadataAccess)
+	if err != nil {
+		return storage.MetadataObservation{}, err
+	}
+	id, err := r.ReferenceNodeID()
+	if err != nil {
+		return storage.MetadataObservation{}, err
+	}
+	result, err := inner.ObserveMetadata(readContext(ctx), request.Clone())
+	if err != nil {
+		return storage.MetadataObservation{}, err
+	}
+	if err := result.Check(); err != nil {
+		return storage.MetadataObservation{}, err
+	}
+	if result.NodeID != id {
+		return storage.MetadataObservation{}, syscall.EIO
+	}
+	if request.Purpose == storage.MetadataObservationNamespace {
+		if err := result.CheckNamespace(id, request.Namespace, request.MaxPayloadBytes); err != nil {
+			return storage.MetadataObservation{}, err
+		}
+	}
+	after, err := r.ReferenceNodeID()
+	if err != nil {
+		return storage.MetadataObservation{}, err
+	}
+	if after != id {
+		return storage.MetadataObservation{}, syscall.ESTALE
+	}
+	if err := ctx.Err(); err != nil {
+		return storage.MetadataObservation{}, err
+	}
+	return result.Clone(), nil
 }
 
 func (r *referenceCapabilities) SetMetadata(ctx context.Context, namespace string, version, data []byte) (storage.OpaquePayload, error) {
@@ -361,12 +413,36 @@ func (r *referenceCapabilities) CheckReferenceState() error {
 	return err
 }
 
-func (r *referenceCapabilities) State(ctx context.Context) (storage.ReferenceState, error) {
-	backend, err := capability(r.backend, storage.ReferenceStateAccess.CheckReferenceState)
+func (r *referenceCapabilities) State(ctx context.Context, projection storage.StateProjection) (storage.ReferenceState, error) {
+	if err := projection.Check(); err != nil {
+		return storage.ReferenceState{}, err
+	}
+	inner, err := capability(r.backend, storage.ReferenceStateAccess.CheckReferenceState)
 	if err != nil {
 		return storage.ReferenceState{}, err
 	}
-	return backend.State(readContext(ctx))
+	id, err := r.ReferenceNodeID()
+	if err != nil {
+		return storage.ReferenceState{}, err
+	}
+	result, err := inner.State(readContext(ctx), projection)
+	if err != nil {
+		return storage.ReferenceState{}, err
+	}
+	if err := result.CheckProjection(id, projection); err != nil {
+		return storage.ReferenceState{}, err
+	}
+	after, err := r.ReferenceNodeID()
+	if err != nil {
+		return storage.ReferenceState{}, err
+	}
+	if after != id {
+		return storage.ReferenceState{}, syscall.ESTALE
+	}
+	if err := ctx.Err(); err != nil {
+		return storage.ReferenceState{}, err
+	}
+	return result, nil
 }
 
 func (r *referenceCapabilities) CheckDeleteIntent() error {
@@ -417,6 +493,8 @@ func (s *Storage) BindMaintenanceAccounting(ctx context.Context, chain storage.P
 }
 
 var (
+	_ storage.AllocationReporting     = (*fileSession)(nil)
+	_ storage.OpenContentMetadata     = (*fileSession)(nil)
 	_ storage.AtomicFileOpener        = (*fileSession)(nil)
 	_ storage.NamespaceAccess         = (*fileSession)(nil)
 	_ storage.DirectoryReader         = (*fileSession)(nil)

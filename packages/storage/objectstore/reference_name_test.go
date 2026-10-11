@@ -168,7 +168,7 @@ func TestObjectReferenceNameObservationRequiresNoMetadataPermission(t *testing.T
 	if _, err := opened.Reference.Stat(t.Context()); !errors.Is(err, syscall.EBADF) {
 		t.Fatalf("metadata-only permission = %v", err)
 	}
-	if _, err := objectCapability[storage.ReferenceStateAccess](t, opened.Reference).State(t.Context()); !errors.Is(err, syscall.EBADF) {
+	if _, err := objectCapability[storage.ReferenceStateAccess](t, opened.Reference).State(t.Context(), storage.StateFull); !errors.Is(err, syscall.EBADF) {
 		t.Fatalf("state permission = %v", err)
 	}
 	if err := volume.Rename(t.Context(), "source", "current"); err != nil {

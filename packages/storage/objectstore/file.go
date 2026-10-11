@@ -13,18 +13,17 @@ import (
 )
 
 type openFile struct {
-	contentEffects       []storage.ContentMetadataEffect
-	metadataObservations []storage.MetadataObservationScope
-	session              *fileSession
-	native               metastore.File
-	uses                 referenceUses
-	options              storage.FileOpenOptions
-	metadata             storage.MetadataPermissions
-	active               bool
-	operations           sync.WaitGroup
-	retireMu             sync.Mutex
-	retired              bool
-	closing              referenceCloseState
+	contentEffects []storage.ContentMetadataEffect
+	session        *fileSession
+	native         metastore.File
+	uses           referenceUses
+	options        storage.FileOpenOptions
+	metadata       storage.MetadataPermissions
+	active         bool
+	operations     sync.WaitGroup
+	retireMu       sync.Mutex
+	retired        bool
+	closing        referenceCloseState
 }
 
 var _ storage.File = (*openFile)(nil)

@@ -124,6 +124,13 @@ func TestFileInformationRealScalarQueriesDoNotGrantReadAttributes(t *testing.T) 
 		if _, err := h.node.Stat(t.Context()); !errors.Is(err, syscall.EBADF) {
 			t.Fatalf("metadata-only Stat gained access: %v", err)
 		}
+		if _, err := h.node.State(t.Context(), storage.StateFull); !errors.Is(err, syscall.EBADF) {
+			t.Fatalf("metadata-only full state gained access: %v", err)
+		}
+		state, err := h.node.State(t.Context(), storage.StateScalars)
+		if err != nil || state.CheckProjection(h.nodeID, storage.StateScalars) != nil {
+			t.Fatalf("live scalar projection failed: %+v %v", state, err)
+		}
 		for _, class := range []byte{wire.FileStandardInformation, wire.FileInternalInformation, wire.FileIdInformation} {
 			queryInfoForTest(t, f, id, class)
 		}
@@ -138,6 +145,15 @@ func TestFileInformationRealScalarQueriesDoNotGrantReadAttributes(t *testing.T) 
 		}
 		if _, status := f.connection.setFileInfo(t.Context(), f.session, f.tree, setInfoRequestForTest(id, wire.FileEndOfFileInformation, eofInfoForTest(0))); status != statusDenied {
 			t.Fatalf("metadata-only EOF status=%#x", status)
+		}
+		closeFixtureHandle(t, f, id)
+		id = openInfoFileForTest(t, f, "file", 0)
+		h = f.tree.findFileHandle(id)
+		if _, err := h.node.State(t.Context(), storage.StateFull); !errors.Is(err, syscall.EBADF) {
+			t.Fatalf("zero-access full state gained access: %v", err)
+		}
+		for _, class := range []byte{wire.FileStandardInformation, wire.FileInternalInformation, wire.FileIdInformation} {
+			queryInfoForTest(t, f, id, class)
 		}
 		closeFixtureHandle(t, f, id)
 	})
@@ -244,7 +260,7 @@ func TestFileInformationReauthorizesEveryLiveObservationAndMutation(t *testing.T
 		if err != nil {
 			t.Fatal(err)
 		}
-		for _, denied := range []storage.Operation{storage.OpFileInformation, storage.OpFileStat, storage.OpFileVolumeGeometry, storage.OpFileSetAttr, storage.OpFileSetMetadata, storage.OpFileObserveMetadata, storage.OpFileTruncate, storage.OpFileObserveContentMetadata} {
+		for _, denied := range []storage.Operation{storage.OpFileState, storage.OpFileStat, storage.OpFileAllocationUnit, storage.OpFileSetAttr, storage.OpFileSetMetadata, storage.OpFileObserveMetadata, storage.OpFileTruncate} {
 			f.server.config.Authorize = authz.AuthorizerFunc(func(_ context.Context, request authz.AccessRequest) error {
 				if request.Operation == denied {
 					return syscall.EACCES
@@ -253,11 +269,11 @@ func TestFileInformationReauthorizesEveryLiveObservationAndMutation(t *testing.T
 			})
 			var status uint32
 			switch denied {
-			case storage.OpFileInformation:
+			case storage.OpFileState:
 				_, status = f.connection.queryFileInfo(t.Context(), f.session, f.tree, queryInfoRequestForTest(id, wire.FileInternalInformation, 8))
 			case storage.OpFileStat:
 				_, status = f.connection.queryFileInfo(t.Context(), f.session, f.tree, queryInfoRequestForTest(id, wire.FileBasicInformation, 40))
-			case storage.OpFileVolumeGeometry:
+			case storage.OpFileAllocationUnit:
 				_, status = f.connection.queryFileInfo(t.Context(), f.session, f.tree, queryInfoRequestForTest(id, wire.FileStandardInformation, 24))
 			case storage.OpFileSetAttr, storage.OpFileSetMetadata, storage.OpFileObserveMetadata:
 				_, status = f.connection.setFileInfo(t.Context(), f.session, f.tree, setInfoRequestForTest(id, wire.FileBasicInformation, wire.FileBasicInformationBody(wire.FileBasicInfo{Attributes: dosHidden})))
@@ -430,32 +446,32 @@ func TestFileInfoRejectsMutationOwnerExhaustionBeforeEffects(t *testing.T) {
 	})
 }
 
-func TestFileInfoObservationScopeDoesNotAuthorizeMetadataMutation(t *testing.T) {
+func TestFileInfoObservationDoesNotAuthorizeMetadataMutation(t *testing.T) {
 	fileInfoFixturesForTest(t, func(t *testing.T, f realSMBFixture) {
 		if err := f.volume.Write(t.Context(), "file", []byte("body")); err != nil {
 			t.Fatal(err)
 		}
-		var enrollment, observe, deniedWrite bool
+		var observe, deniedWrite bool
 		f.server.config.Authorize = authz.AuthorizerFunc(func(_ context.Context, request authz.AccessRequest) error {
-			if (request.Operation == storage.OpFileOpenAt || request.Operation == storage.OpFileOpenChildRef) && len(request.Open.MetadataObservations) != 0 {
-				enrollment = true
-				request.Open.MetadataObservations[0].Namespace = "mutated"
-			}
-			if request.Operation == storage.OpFileObserveMetadata && len(request.MetadataObservations) != 0 {
+			if request.Operation == storage.OpFileObserveMetadata {
+				if request.MetadataObservation == nil || request.MetadataObservation.Purpose != storage.MetadataObservationNamespace ||
+					request.MetadataObservation.Namespace != windowsMetadataKey || request.MetadataObservation.MaxPayloadBytes != 8 ||
+					len(request.ContentMetadataEffects) != 0 {
+					t.Fatalf("incorrect namespace observation policy: %+v", request)
+				}
 				observe = true
-				request.MetadataObservations[0].Namespace = "mutated"
+				request.MetadataObservation.Namespace = "mutated"
 			}
-			if request.Operation == storage.OpFileSetMetadata && len(request.MetadataObservations) == 0 {
+			if request.Operation == storage.OpFileSetMetadata {
+				if request.MetadataObservation != nil {
+					t.Fatal("metadata mutation inherited observation authority")
+				}
 				deniedWrite = true
 				return syscall.EACCES
 			}
 			return nil
 		})
 		id := openInfoFileForTest(t, f, "file", accessWriteAttr)
-		h := f.tree.findFileHandle(id)
-		if !enrollment || len(h.metadataObservations) != 1 || h.metadataObservations[0].Namespace != windowsMetadataKey {
-			t.Fatalf("authorized enrollment aliased descriptor: %+v", h.metadataObservations)
-		}
 		before, err := f.volume.Stat(t.Context(), "file")
 		if err != nil {
 			t.Fatal(err)
@@ -474,8 +490,52 @@ func TestFileInfoObservationScopeDoesNotAuthorizeMetadataMutation(t *testing.T) 
 		if observe {
 			t.Fatal("time-only change observed a metadata namespace")
 		}
-		if len(h.metadataObservations) != 1 || h.metadataObservations[0].Namespace != windowsMetadataKey {
-			t.Fatal("authorization changed sealed observation scope")
+		closeFixtureHandle(t, f, id)
+	})
+}
+
+func TestFileInfoObservationPurposeChecksCurrentHostPolicy(t *testing.T) {
+	fileInfoFixturesForTest(t, func(t *testing.T, f realSMBFixture) {
+		if err := f.volume.Write(t.Context(), "file", []byte("body")); err != nil {
+			t.Fatal(err)
+		}
+		id := openInfoFileForTest(t, f, "file", accessWriteAttr|accessWriteData)
+		h := f.tree.findFileHandle(id)
+		allowed := storage.MetadataObservationNamespace
+		f.server.config.Authorize = authz.AuthorizerFunc(func(_ context.Context, request authz.AccessRequest) error {
+			if request.Operation == storage.OpFileObserveMetadata {
+				if request.MetadataObservation == nil || request.MetadataObservation.Purpose != allowed {
+					return authz.ErrDenied
+				}
+				request.MetadataObservation.Namespace = "policy.changed"
+				request.MetadataObservation.MaxPayloadBytes = 0
+			}
+			return nil
+		})
+		setInfoForTest(t, f, id, wire.FileBasicInformation, wire.FileBasicInformationBody(wire.FileBasicInfo{Attributes: dosHidden}))
+		before, err := f.volume.Stat(t.Context(), "file")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, status := f.connection.setFileInfo(t.Context(), f.session, f.tree, setInfoRequestForTest(id, wire.FileEndOfFileInformation, eofInfoForTest(1))); status != statusDenied {
+			t.Fatalf("namespace approval granted content observation: %#x", status)
+		}
+		after, err := f.volume.Stat(t.Context(), "file")
+		if err != nil || !reflect.DeepEqual(before, after) {
+			t.Fatalf("denied content observation changed authority: %+v %v", after, err)
+		}
+		allowed = storage.MetadataObservationContentEffect
+		requireIOWrite(t, f, id, 0, "good")
+		before = requireIOContents(t, f, "file", "good")
+		if _, status := f.connection.setFileInfo(t.Context(), f.session, f.tree, setInfoRequestForTest(id, wire.FileBasicInformation, wire.FileBasicInformationBody(wire.FileBasicInfo{Attributes: dosSystem}))); status != statusDenied {
+			t.Fatalf("content approval granted namespace observation: %#x", status)
+		}
+		after, err = f.volume.Stat(t.Context(), "file")
+		if err != nil || !reflect.DeepEqual(before, after) {
+			t.Fatalf("denied namespace observation changed authority: %+v %v", after, err)
+		}
+		if _, err := h.file.Stat(t.Context()); !errors.Is(err, syscall.EBADF) {
+			t.Fatalf("conditional observers granted Stat: %v", err)
 		}
 		closeFixtureHandle(t, f, id)
 	})

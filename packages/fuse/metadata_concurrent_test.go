@@ -23,6 +23,10 @@ func (f *concurrentMetadataFile) CheckMetadataAccess() error {
 	return f.metadata.CheckMetadataAccess()
 }
 
+func (f *concurrentMetadataFile) ObserveMetadata(ctx context.Context, request storage.MetadataObservationRequest) (storage.MetadataObservation, error) {
+	return f.metadata.ObserveMetadata(ctx, request)
+}
+
 func (f *concurrentMetadataFile) SetMetadata(ctx context.Context, namespace string, expected, data []byte) (storage.OpaquePayload, error) {
 	if err := f.barrier.wait(ctx); err != nil {
 		return storage.OpaquePayload{}, err

@@ -12,7 +12,7 @@ import (
 	"github.com/codetreker/remote-fs/packages/storage/objectstore/memory"
 )
 
-func TestObjectFileInformationTracksExactObjectWithoutMetadataGrant(t *testing.T) {
+func TestObjectScalarStateTracksExactObjectWithoutMetadataGrant(t *testing.T) {
 	volume, _ := fileVolume(t, memory.New(), 1<<20, nil)
 	session := fileSessionFor(t, volume, storage.DefaultFileSessionOptions())
 	root, err := volume.Stat(t.Context(), "")
@@ -20,13 +20,16 @@ func TestObjectFileInformationTracksExactObjectWithoutMetadataGrant(t *testing.T
 		t.Fatal(err)
 	}
 	file := openEffectFile(t, session, root.ID, "file", sealedEffect())
-	info := file.(storage.ReferenceInformationAccess)
-	before, err := info.Information(t.Context())
-	if err != nil || before.NodeID == 0 || before.Size != 0 || before.Kind != storage.NodeRegular {
-		t.Fatalf("information=%+v,%v", before, err)
+	stateAccess := file.(storage.ReferenceStateAccess)
+	before, err := stateAccess.State(t.Context(), storage.StateScalars)
+	if err != nil || before.Attr.ID == 0 || before.Attr.Size != 0 || before.Attr.Kind != storage.NodeRegular {
+		t.Fatalf("scalar state=%+v,%v", before, err)
 	}
 	if _, err := file.Stat(t.Context()); !errors.Is(err, syscall.EBADF) {
 		t.Fatalf("write-only Stat=%v", err)
+	}
+	if got, err := stateAccess.State(t.Context(), storage.StateFull); !errors.Is(err, syscall.EBADF) || !reflect.DeepEqual(got, storage.ReferenceState{}) {
+		t.Fatalf("write-only full state=%+v,%v", got, err)
 	}
 	if _, err := file.WriteAt(t.Context(), 0, []byte("old")); err != nil {
 		t.Fatal(err)
@@ -40,34 +43,28 @@ func TestObjectFileInformationTracksExactObjectWithoutMetadataGrant(t *testing.T
 	if err := volume.Write(t.Context(), "file", []byte("replacement")); err != nil {
 		t.Fatal(err)
 	}
-	after, err := info.Information(t.Context())
-	if err != nil || after.NodeID != before.NodeID || after.Size != 3 || !after.Detached || !after.AllocationKnown || after.AllocationSize != 4096 {
-		t.Fatalf("detached information=%+v,%v", after, err)
+	after, err := stateAccess.State(t.Context(), storage.StateScalars)
+	if err != nil || after.Attr.ID != before.Attr.ID || after.Attr.Size != 3 || !after.Detached || !after.Attr.AllocationKnown || after.Attr.AllocationSize != 4096 {
+		t.Fatalf("detached scalar state=%+v,%v", after, err)
 	}
 	if err := file.Close(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	if got, err := info.Information(t.Context()); err == nil || got != (storage.ReferenceInformation{}) {
-		t.Fatalf("closed information=%+v,%v", got, err)
+	if got, err := stateAccess.State(t.Context(), storage.StateScalars); err == nil || !reflect.DeepEqual(got, storage.ReferenceState{}) {
+		t.Fatalf("closed scalar state=%+v,%v", got, err)
 	}
-	geometry, err := session.(storage.VolumeGeometryAccess).VolumeGeometry(t.Context())
-	if err != nil || geometry.BytesPerSector != 4096 || geometry.SectorsPerAllocationUnit != 1 {
-		t.Fatalf("geometry=%+v,%v", geometry, err)
+	unit, err := session.(storage.AllocationReporting).AllocationUnitBytes(t.Context())
+	if err != nil || unit != 4096 {
+		t.Fatalf("allocation unit=%d,%v", unit, err)
 	}
-	identity, err := session.(storage.FileSessionIdentity).FileSessionIdentity(t.Context())
-	if err != nil || geometry.Volume != identity.Backend.Volume {
-		t.Fatalf("geometry identity=%+v,%+v,%v", geometry, identity, err)
-	}
+
 }
 
-func TestObjectMetadataObservationEnrollmentAllNodePaths(t *testing.T) {
+func TestObjectMetadataObservationAllNodePaths(t *testing.T) {
 	for _, path := range []string{"file", "node", "child"} {
 		t.Run(path, func(t *testing.T) {
 			volume, _ := fileVolume(t, memory.New(), 1<<20, nil)
 			session := fileSessionFor(t, volume, storage.DefaultFileSessionOptions())
-			if err := session.(storage.OpenMetadataObservation).CheckOpenMetadataObservation(); err != nil {
-				t.Fatal(err)
-			}
 			root, err := volume.Stat(t.Context(), "")
 			if err != nil {
 				t.Fatal(err)
@@ -80,21 +77,21 @@ func TestObjectMetadataObservationEnrollmentAllNodePaths(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			scopes := []storage.MetadataObservationScope{{Namespace: "test.flags", MaxPayloadBytes: 2}}
+			request := storage.MetadataObservationRequest{Purpose: storage.MetadataObservationNamespace, Namespace: "test.flags", MaxPayloadBytes: 2}
 			var reference interface {
 				Close(context.Context) error
 				Stat(context.Context) (storage.Attr, error)
 			}
-			var observer storage.ReferenceMetadataObserver
+			var observer storage.ReferenceMetadataAccess
 			if path == "file" {
-				opened, err := session.(storage.AtomicFileOpener).OpenAt(t.Context(), storage.ChildSelection{Name: storage.ChildName{Parent: storage.DirectoryTarget{NodeID: root.ID}, RawLeaf: []byte("file")}}, storage.OpenAtOptions{Write: true, Use: storage.UseClaim{Uses: storage.WriteData}, MetadataAccess: storage.WriteMetadata, MetadataObservations: scopes, Target: storage.ChildCondition{State: storage.SameNode, NodeID: fileAttr.ID}, Existing: storage.Keep, Action: fileActionFor(t, session)})
+				opened, err := session.(storage.AtomicFileOpener).OpenAt(t.Context(), storage.ChildSelection{Name: storage.ChildName{Parent: storage.DirectoryTarget{NodeID: root.ID}, RawLeaf: []byte("file")}}, storage.OpenAtOptions{Write: true, Use: storage.UseClaim{Uses: storage.WriteData}, MetadataAccess: storage.WriteMetadata, Target: storage.ChildCondition{State: storage.SameNode, NodeID: fileAttr.ID}, Existing: storage.Keep, Action: fileActionFor(t, session)})
 				if err != nil {
 					t.Fatal(err)
 				}
 				reference = opened.File
-				observer = opened.File.(storage.ReferenceMetadataObserver)
+				observer = opened.File.(storage.ReferenceMetadataAccess)
 			} else {
-				options := storage.NodeRefOptions{Kind: storage.NodeRegular, MetadataAccess: storage.WriteMetadata, MetadataObservations: scopes, Action: fileActionFor(t, session), Target: storage.ChildCondition{State: storage.SameNode, NodeID: fileAttr.ID}}
+				options := storage.NodeRefOptions{Kind: storage.NodeRegular, MetadataAccess: storage.WriteMetadata, Action: fileActionFor(t, session), Target: storage.ChildCondition{State: storage.SameNode, NodeID: fileAttr.ID}}
 				var opened storage.NodeOpenResult
 				if path == "node" {
 					opened, err = session.(storage.NodeReferences).OpenNodeRef(t.Context(), fileAttr.ID, options)
@@ -106,19 +103,17 @@ func TestObjectMetadataObservationEnrollmentAllNodePaths(t *testing.T) {
 					t.Fatal(err)
 				}
 				reference = opened.Reference
-				observer = opened.Reference.(storage.ReferenceMetadataObserver)
+				observer = opened.Reference.(storage.ReferenceMetadataAccess)
 			}
 			t.Cleanup(func() {
 				if err := reference.Close(context.Background()); err != nil {
 					t.Error(err)
 				}
 			})
-			scopes[0].Namespace = "wrong"
-			scopes[0].MaxPayloadBytes = 0
 			if _, err := reference.Stat(t.Context()); !errors.Is(err, syscall.EBADF) {
 				t.Fatalf("metadata-only Stat=%v", err)
 			}
-			absent, err := observer.ObserveMetadata(t.Context(), 0)
+			absent, err := observer.ObserveMetadata(t.Context(), request)
 			if err != nil || absent.NodeID != fileAttr.ID || absent.Value != nil {
 				t.Fatalf("absent=%+v,%v", absent, err)
 			}
@@ -126,25 +121,25 @@ func TestObjectMetadataObservationEnrollmentAllNodePaths(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			present, err := observer.ObserveMetadata(t.Context(), 0)
+			present, err := observer.ObserveMetadata(t.Context(), request)
 			if err != nil || present.Value == nil || !bytes.Equal(present.Value.Data, []byte{1, 2}) || !bytes.Equal(present.Value.Version, payload.Version) {
 				t.Fatalf("present=%+v,%v", present, err)
 			}
 			present.Value.Data[0] = 9
-			fresh, err := observer.ObserveMetadata(t.Context(), 0)
+			fresh, err := observer.ObserveMetadata(t.Context(), request)
 			if err != nil || fresh.Value.Data[0] != 1 {
 				t.Fatalf("alias=%+v,%v", fresh, err)
 			}
 			if _, err := session.(storage.MetadataAccess).SetMetadata(t.Context(), fileAttr.ID, "test.flags", payload.Version, []byte{1, 2, 3}); err != nil {
 				t.Fatal(err)
 			}
-			if got, err := observer.ObserveMetadata(t.Context(), 0); !errors.Is(err, syscall.EFBIG) || !reflect.DeepEqual(got, storage.ContentMetadataObservation{}) {
+			if got, err := observer.ObserveMetadata(t.Context(), request); !errors.Is(err, syscall.EFBIG) || !reflect.DeepEqual(got, storage.MetadataObservation{}) {
 				t.Fatalf("oversize=%+v,%v", got, err)
 			}
 			if err := reference.Close(t.Context()); err != nil {
 				t.Fatal(err)
 			}
-			if got, err := observer.ObserveMetadata(t.Context(), 0); err == nil || !reflect.DeepEqual(got, storage.ContentMetadataObservation{}) {
+			if got, err := observer.ObserveMetadata(t.Context(), request); err == nil || !reflect.DeepEqual(got, storage.MetadataObservation{}) {
 				t.Fatalf("closed=%+v,%v", got, err)
 			}
 		})
@@ -162,7 +157,7 @@ func TestObjectSealedTruncatePublishesContentAndMetadataAtomically(t *testing.T)
 	if _, err := file.WriteAt(t.Context(), 0, []byte("abcdef")); err != nil {
 		t.Fatal(err)
 	}
-	observer := file.(storage.ReferenceContentMetadata)
+	observer := file.(storage.ReferenceMetadataAccess)
 	mutator := file.(storage.ConditionalFileMutation)
 	var version []byte
 	for _, size := range []int64{3, 7, 0, 4, 4} {
@@ -190,7 +185,7 @@ func TestObjectSealedTruncatePublishesContentAndMetadataAtomically(t *testing.T)
 		}
 		version = bytes.Clone(changed.Metadata["test.flags"].Version)
 	}
-	current, err := observer.ObserveContentMetadata(t.Context(), 0)
+	current, err := observer.ObserveMetadata(t.Context(), storage.MetadataObservationRequest{Purpose: storage.MetadataObservationContentEffect, EffectIndex: 0})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -205,7 +200,7 @@ func TestObjectSealedTruncatePublishesContentAndMetadataAtomically(t *testing.T)
 	if err != nil || len(body) != 4 {
 		t.Fatalf("stale changed size=%q,%v", body, err)
 	}
-	actual, err := observer.ObserveContentMetadata(t.Context(), 0)
+	actual, err := observer.ObserveMetadata(t.Context(), storage.MetadataObservationRequest{Purpose: storage.MetadataObservationContentEffect, EffectIndex: 0})
 	if err != nil || !bytes.Equal(actual.Value.Data, []byte{0x31, 0x10}) {
 		t.Fatalf("stale changed metadata=%+v,%v", actual, err)
 	}

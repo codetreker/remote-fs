@@ -72,6 +72,9 @@ func TestNamespaceCapabilityIsIndependentOfDirectoryRead(t *testing.T) {
 }
 
 func (p *capabilitySessionProbe) CheckAllocationReporting() error { return p.checkErr }
+func (p *capabilitySessionProbe) AllocationUnitBytes(context.Context) (uint64, error) {
+	return 4096, p.checkErr
+}
 
 func TestAllocationReportingFollowsWrappedSession(t *testing.T) {
 	if err := (&fileSession{FileSession: namespaceOnlyProbe{}}).CheckAllocationReporting(); !errors.Is(err, syscall.EOPNOTSUPP) {
@@ -234,13 +237,17 @@ func (p *capabilityFileProbe) Scope(ctx context.Context) (storage.UseScope, erro
 	p.observed = locking.ScopeFromContext(ctx)
 	return storage.UseScope{Token: "scope"}, p.failure
 }
+func (p *capabilityFileProbe) ReferenceNodeID() (uint64, error) { return p.state.Attr.ID, nil }
+func (p *capabilityFileProbe) ObserveMetadata(context.Context, storage.MetadataObservationRequest) (storage.MetadataObservation, error) {
+	return storage.MetadataObservation{}, p.failure
+}
 func (p *capabilityFileProbe) CheckMetadataAccess() error { return p.checkErr }
 func (p *capabilityFileProbe) SetMetadata(ctx context.Context, _ string, _, _ []byte) (storage.OpaquePayload, error) {
 	p.observed = locking.ScopeFromContext(ctx)
 	return storage.OpaquePayload{Version: []byte{1}, Data: []byte("value")}, p.failure
 }
 func (p *capabilityFileProbe) CheckReferenceState() error { return p.checkErr }
-func (p *capabilityFileProbe) State(ctx context.Context) (storage.ReferenceState, error) {
+func (p *capabilityFileProbe) State(ctx context.Context, _ storage.StateProjection) (storage.ReferenceState, error) {
 	p.observed = locking.ScopeFromContext(ctx)
 	return p.state, p.failure
 }
@@ -289,7 +296,7 @@ func TestSessionCapabilitiesSeparateMutationProofsAndPreserveResults(t *testing.
 		t.Fatalf("retire owner=%v scope=%+v", err, probe.observed)
 	}
 
-	reference := &capabilityFileProbe{failure: failure}
+	reference := &capabilityFileProbe{failure: failure, state: storage.ReferenceState{Attr: storage.Attr{ID: 3, Kind: storage.NodeRegular}}}
 	file := view.wrapFile(reference)
 	if err := file.(storage.ScopedReference).CheckScopedReference(); err != nil {
 		t.Fatal(err)
@@ -424,7 +431,7 @@ func TestIdentityWrappersSeparateReadAndMutationScopes(t *testing.T) {
 	if !reflect.DeepEqual(probe.selection, childSelection) {
 		t.Fatalf("child reference selection=%+v, want %+v", probe.selection, childSelection)
 	}
-	if state, err := result.Reference.State(t.Context()); !errors.Is(err, failure) || state.Attr.ID != attr.ID || !reflect.DeepEqual(reference.observed, locking.MutationScope{}) {
+	if state, err := result.Reference.State(t.Context(), storage.StateFull); !errors.Is(err, failure) || !reflect.DeepEqual(state, storage.ReferenceState{}) || !reflect.DeepEqual(reference.observed, locking.MutationScope{}) {
 		t.Fatalf("reference state=%+v error=%v scope=%+v", state, err, reference.observed)
 	}
 	if attr, err := result.Reference.Stat(locking.WithScope(t.Context(), proof)); !errors.Is(err, failure) || attr.ID != 3 || !reflect.DeepEqual(reference.observed, locking.MutationScope{}) {

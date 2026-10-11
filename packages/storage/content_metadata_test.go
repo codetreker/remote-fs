@@ -75,7 +75,7 @@ func TestContentMetadataCloneObservationAndTransformation(t *testing.T) {
 			t.Fatalf("corrupt value accepted: %+v,%v", value, err)
 		}
 	}
-	observed := storage.ContentMetadataObservation{NodeID: 4, Value: &storage.OpaquePayload{Version: []byte{1}, Data: []byte{0x31, 0}}}
+	observed := storage.MetadataObservation{NodeID: 4, Value: &storage.OpaquePayload{Version: []byte{1}, Data: []byte{0x31, 0}}}
 	copy := observed.Clone()
 	observed.Value.Data[0] = 0
 	observed.Value.Version[0] = 0
@@ -85,10 +85,10 @@ func TestContentMetadataCloneObservationAndTransformation(t *testing.T) {
 	if err := copy.CheckEffect(5, cloned[0]); !errors.Is(err, syscall.EIO) {
 		t.Fatalf("wrong node: %v", err)
 	}
-	if err := (storage.ContentMetadataObservation{}).Check(); !errors.Is(err, syscall.EIO) {
+	if err := (storage.MetadataObservation{}).Check(); !errors.Is(err, syscall.EIO) {
 		t.Fatal(err)
 	}
-	if err := (storage.ContentMetadataObservation{NodeID: 4}).CheckEffect(4, cloned[0]); err != nil {
+	if err := (storage.MetadataObservation{NodeID: 4}).CheckEffect(4, cloned[0]); err != nil {
 		t.Fatal(err)
 	}
 	if !reflect.DeepEqual(storage.CloneContentMetadataEffects(nil), []storage.ContentMetadataEffect(nil)) {
@@ -143,8 +143,8 @@ func TestContentMutationRequiresEnrolledContentEffectAndExplicitAbsence(t *testi
 	}
 }
 
-func TestContentMetadataObservationKeepsAbsenceDistinctFromPresentEmpty(t *testing.T) {
-	valid := map[string]storage.ContentMetadataObservation{
+func TestMetadataObservationKeepsAbsenceDistinctFromPresentEmpty(t *testing.T) {
+	valid := map[string]storage.MetadataObservation{
 		"absent":                {NodeID: 7},
 		"present empty":         {NodeID: 7, Value: &storage.OpaquePayload{Version: []byte{1}}},
 		"largest bounded value": {NodeID: 7, Value: &storage.OpaquePayload{Version: make([]byte, storage.MaxObservationTokenBytes), Data: make([]byte, storage.MaxMetadataValueBytes)}},
@@ -160,7 +160,7 @@ func TestContentMetadataObservationKeepsAbsenceDistinctFromPresentEmpty(t *testi
 			}
 		})
 	}
-	for name, observation := range map[string]storage.ContentMetadataObservation{
+	for name, observation := range map[string]storage.MetadataObservation{
 		"unknown object":    {},
 		"missing version":   {NodeID: 7, Value: &storage.OpaquePayload{}},
 		"oversized version": {NodeID: 7, Value: &storage.OpaquePayload{Version: make([]byte, storage.MaxObservationTokenBytes+1)}},

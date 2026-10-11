@@ -111,7 +111,7 @@ func TestIdentityCapabilitiesConfirmAuthorityResultsThroughTheReplica(t *testing
 	if err := stateAccess.CheckReferenceState(); err != nil {
 		t.Fatal(err)
 	}
-	if state, err := stateAccess.State(t.Context()); err != nil || state.Attr.ID != fileAttr.ID || state.Detached || state.PendingUnlink {
+	if state, err := stateAccess.State(t.Context(), storage.StateFull); err != nil || state.Attr.ID != fileAttr.ID || state.Detached || state.PendingUnlink {
 		t.Fatalf("state=%+v error=%v", state, err)
 	}
 	metadata := file.(storage.ReferenceMetadataAccess)
@@ -198,7 +198,7 @@ func verifyNodeReference(t *testing.T, session storage.FileSession, references s
 	if err := reference.CheckReferenceState(); err != nil {
 		t.Fatal(err)
 	}
-	state, err := reference.State(t.Context())
+	state, err := reference.State(t.Context(), storage.StateFull)
 	if err != nil || state.Attr.ID != attr.ID || state.Detached || state.PendingUnlink {
 		t.Fatalf("reference state=%+v error=%v", state, err)
 	}

@@ -16,7 +16,8 @@ type AccessRequest struct {
     Operation storage.Operation
     Open      storage.OpenAccess
     ContentMetadataEffects []storage.ContentMetadataEffect
-    MetadataObservations []storage.MetadataObservationScope
+    StateProjection storage.StateProjection
+    MetadataObservation *storage.MetadataObservationRequest
 }
 ```
 
@@ -61,10 +62,8 @@ storage.Operation 是覆盖路径、文件会话、复制和锁控制的 transpo
 | `file.read-dir-node` | `/v5/file`，`file.read-dir-node` | 按目录身份执行应用枚举并检查 `ReadEntries` |
 | `file.observe-directory-metadata` | `/v5/file`，同名动作 | 取得完整目录 entries、revision 与可选目录当前名字 |
 | `file.observe-name` | `/v5/file`，`file.observe-name` | 取得一个保留引用的 Root／Linked／Detached 当前绑定 |
-| `file.information` | `/v5/file-control`，`file.information` | 原子读取确切活引用的 scalar 信息，不授予 metadata 读权 |
-| `file.observe-metadata` | `/v5/file`，`file.observe-metadata` | 只观察 WriteMetadata 引用已 enrollment 的限定 namespace，AccessRequest 携带原 scope |
-| `file.volume-geometry` | `/v5/file-control`，`file.volume-geometry` | 读取同一可信 session volume 的逻辑 allocation geometry |
-| `file.observe-content-metadata` | `/v5/file`，同名动作 | 只观察可写 exact reference 已 enrollment 的 namespace；AccessRequest 携带所选固定效果 |
+| `file.allocation-unit` | `/v5/file-control`，`file.allocation-unit` | 读取原 session volume 的可信非零分配单位，不查询 Space |
+| `file.observe-metadata` | `/v5/file`，`file.observe-metadata` | 按明确 ContentEffect／Namespace purpose 读取 exact 引用的条件，AccessRequest 携带实际请求和所选效果 |
 | `file.mutate-name` | `/v5/file`，`file.mutate-name` | 按父身份创建、删除或改名子项 |
 | `file.open-node-ref` | `/v5/file`，`file.open-node-ref` | 按 NodeID 打开 metadata-only 引用 |
 | `file.open-child-ref` | `/v5/file`，`file.open-child-ref` | 按父身份打开或创建节点引用 |
@@ -74,7 +73,7 @@ storage.Operation 是覆盖路径、文件会话、复制和锁控制的 transpo
 | `file.acknowledge-delete-intent` | `/v5/file-control`，同名动作 | 幂等确认并释放 durable 删除终态记录 |
 | `file.ack` | `/v5/file-control`，`file.ack` | 确认已交付的打开引用 |
 | `file.stat` | `/v5/file`，`file.stat` | 查询保留引用的属性 |
-| `file.state` | `/v5/file-control`，`file.state` | 原子读取引用属性、link target 与 pending 状态 |
+| `file.state` | `/v5/file-control`，`file.state` | 按明确 Full／Scalars 投影原子读取引用与 pending 事实，AccessRequest 携带实际投影 |
 | `file.read` | `/v5/file`，`file.read` | 按保留引用读取范围 |
 | `file.write` | `/v5/file`，`file.write` | 按保留引用修改范围 |
 | `file.truncate` | `/v5/file`，`file.truncate` | 改变保留文件长度 |
@@ -115,9 +114,9 @@ storage.Operation 是覆盖路径、文件会话、复制和锁控制的 transpo
 
 `volume.write` 可以创建缺失文件，单独拒绝 volume.create 不能禁止创建。应用枚举、完整目录 metadata 与 reference current-name 分别授权；允许 `file.read-dir-node` 不授予另两项，DirectoryMetadataObserver 也不从 `ReadEntries` 或 `ReadMetadata` 推导权限。metadata、range apply 与 range drop 同样分别授权；查询、取消或已有 owner 不能绕过本次策略。range mode 不代替内容读写权限，后续数据访问仍检查 file.read / file.write。FUSE 的 flock/POSIX 解释不进入 AccessRequest。
 
-OpenAt 的 ContentMetadataEffects 随实际 OpenAccess 交给策略，enrollment 另核对 OpFileSetMetadata 与 OpFileObserveContentMetadata。ReferenceContentMetadata 的 effect index 只选择原引用已深复制的 descriptor；新观察与每次非空 MutateWriteAt／MutateAppend 或 MutateTruncate 的 typed replay 都以当前策略核对真实效果。派生更新的 AccessRequest.ContentMetadataEffects 包含所选 namespace、格式和固定 masks；Metadata=nil 不省略 OpFileSetMetadata，打开批准不构成终身授权。限定 descriptor 的 OpFileSetMetadata 不替代 initial metadata 或公开 metadata 写权所需的普通 OpFileSetMetadata；去重同时核对 operation、Open 与 descriptor，不能合并不同语义。公开 Stat、SetAttr、SetMetadata 的 MetadataAccess 仍独立，固定效果不扩大它们的权限。
+OpenAt 的 ContentMetadataEffects 随实际 OpenAccess 交给策略，enrollment 另核对 OpFileSetMetadata 与 OpFileObserveMetadata；固定 descriptor 的批准不构成终身权限。每次 ContentEffect 观察从原引用的封存向量解析实际 descriptor，并将明确 MetadataObservationRequest 与所选 ContentMetadataEffects 交给当前策略。非空 WriteAt／Append 与 Truncate 的 typed replay 继续按真实派生效果核对 OpFileSetMetadata；Metadata=nil 不省略这项授权。固定效果许可不替代 initial metadata 或普通 metadata 更新的独立许可。
 
-MetadataObservations 与 ContentMetadataEffects 分别表达公开 metadata 条件观察范围和固定数据派生效果。OpenAt／OpenNodeRef／OpenChildRef 的 enrollment 将真实 scope 放入 AccessRequest.Open.MetadataObservations，并按 `OpFileObserveMetadata` 另行授权；每次 ObserveMetadata(index) 从原 immutable enrollment 解析 exact namespace／bound，再以 `AccessRequest.MetadataObservations` 核对当前策略。WriteMetadata 允许条件观察，不隐含 ReadMetadata；普通 metadata 修改仍独立核对 `OpFileSetMetadata`。scalarInformation 使用 `OpFileInformation`，geometry 使用 `OpFileVolumeGeometry`，不能借 Stat、Scope 或已有固定 ID 跳过本次授权。
+Namespace purpose 的 ObserveMetadata 使用 WriteMetadata，但不授予 ReadMetadata；每次 AccessRequest.MetadataObservation 携带实际 Namespace、MaxPayloadBytes 和明确 purpose，策略可逐 namespace／bound 批准或拒绝。它不在打开时 enrollment namespace scope，也不允许从另一个 purpose 推导权限。State 使用 OpFileState 与 AccessRequest.StateProjection，Full 仍需 ReadMetadata，Scalars 只读取低权限事实；分配单位使用 OpFileAllocationUnit。已有引用、固定 NodeID 或上次批准都不能跳过本次授权。selectors 与 callback 数据各自深复制，策略修改输入不能改变原请求。
 
 ## 三、请求、capability 与关闭
 

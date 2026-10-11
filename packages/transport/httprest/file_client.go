@@ -28,7 +28,7 @@ func fileReadOnly(op storage.Operation) bool {
 		return true
 	}
 	switch op {
-	case storage.OpFileBackendIdentity, storage.OpFileInformation, storage.OpFileVolumeGeometry, storage.OpFileObserveMetadata, storage.OpFileRead, storage.OpFileStat, storage.OpFileStatNode, storage.OpFileLookupAt, storage.OpFileReadDirNode, storage.OpFileObserveDirectoryMetadata, storage.OpFileObserveName, storage.OpFileObserveContentMetadata, storage.OpFileQueryAction, storage.OpFileCloseOwnerStatus, storage.OpFileQueryDeleteIntent, storage.OpFileListDeleteIntents, storage.OpFileState, storage.OpFileScope, storage.OpFileRangeGetConflict, storage.OpFileRangeQuery, storage.OpFileStatus:
+	case storage.OpFileBackendIdentity, storage.OpFileAllocationUnit, storage.OpFileObserveMetadata, storage.OpFileRead, storage.OpFileStat, storage.OpFileStatNode, storage.OpFileLookupAt, storage.OpFileReadDirNode, storage.OpFileObserveDirectoryMetadata, storage.OpFileObserveName, storage.OpFileQueryAction, storage.OpFileCloseOwnerStatus, storage.OpFileQueryDeleteIntent, storage.OpFileListDeleteIntents, storage.OpFileState, storage.OpFileScope, storage.OpFileRangeGetConflict, storage.OpFileRangeQuery, storage.OpFileStatus:
 		return true
 	}
 	return false
@@ -103,7 +103,6 @@ type remoteFile struct {
 	closeScopeSet        bool
 	capabilities         fileCapabilities
 	contentEffects       []storage.ContentMetadataEffect
-	metadataObservations []storage.MetadataObservationScope
 }
 
 type remoteClosePendingProof struct {

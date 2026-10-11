@@ -156,15 +156,15 @@ func TestHTTPBasicRecoveryPreservesTypedResultAndFrozenIntent(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			session := httpInformationSession(t, client)
+			session := httpStateSession(t, client)
 			var reference interface {
 				Stat(context.Context) (storage.Attr, error)
 				MutateFileWithBarrier(context.Context, storage.FileMutation) (storage.Attr, *MutationBarrier, error)
 			}
 			if kind == "byte file" {
-				reference = httpInformationFileNamed(t, session, root.ID, node.ID, []storage.MetadataObservationScope{{Namespace: "basic.flags", MaxPayloadBytes: 2}}, name).(*remoteFile)
+				reference = httpStateFileNamed(t, session, root.ID, node.ID, storage.WriteMetadata, name).(*remoteFile)
 			} else {
-				opened, err := session.OpenNodeRef(t.Context(), node.ID, storage.NodeRefOptions{Kind: nodeKind, Target: storage.ChildCondition{State: storage.SameNode, NodeID: node.ID}, Action: httpFileAction(t, session), MetadataAccess: storage.WriteMetadata, MetadataObservations: []storage.MetadataObservationScope{{Namespace: "basic.flags", MaxPayloadBytes: 2}}})
+				opened, err := session.OpenNodeRef(t.Context(), node.ID, storage.NodeRefOptions{Kind: nodeKind, Target: storage.ChildCondition{State: storage.SameNode, NodeID: node.ID}, Action: httpFileAction(t, session), MetadataAccess: storage.WriteMetadata})
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -227,7 +227,7 @@ func TestHTTPEOFRecoveryKeepsAtomicEffectsAndDoesNotBlockOtherActions(t *testing
 	if result, _, err := file.MutateFileWithBarrier(t.Context(), command); !errors.Is(err, syscall.EIO) || result.ID != 0 {
 		t.Fatalf("EOF unknown=%+v err=%v", result, err)
 	}
-	observed, err := file.ObserveContentMetadata(t.Context(), 0)
+	observed, err := file.ObserveMetadata(t.Context(), storage.MetadataObservationRequest{Purpose: storage.MetadataObservationContentEffect, EffectIndex: 0})
 	if err != nil || observed.Value == nil || !bytes.Equal(observed.Value.Data, []byte{'T', 1}) {
 		t.Fatalf("EOF and metadata did not commit together=%+v err=%v", observed, err)
 	}
@@ -260,7 +260,7 @@ func TestHTTPEOFRecoveryKeepsAtomicEffectsAndDoesNotBlockOtherActions(t *testing
 	if err != nil || read.Attr.Size != 4 || len(read.Data) != 4 {
 		t.Fatalf("EOF replay reapplied old truncation=%+v err=%v", read, err)
 	}
-	current, err := file.ObserveContentMetadata(t.Context(), 0)
+	current, err := file.ObserveMetadata(t.Context(), storage.MetadataObservationRequest{Purpose: storage.MetadataObservationContentEffect, EffectIndex: 0})
 	if err != nil || current.Value == nil || !bytes.Equal(current.Value.Version, observed.Value.Version) {
 		t.Fatalf("EOF replay repeated metadata effect=%+v err=%v", current, err)
 	}

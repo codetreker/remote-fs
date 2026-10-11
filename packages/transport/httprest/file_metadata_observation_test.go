@@ -15,7 +15,7 @@ import (
 	"github.com/codetreker/remote-fs/packages/storage/lockcontract/memoryfixture"
 )
 
-func TestHTTPMetadataObservationEnrollsOnlyBoundedNamespaceWithoutStat(t *testing.T) {
+func TestHTTPMetadataObservationReadsOnlyRequestedNamespaceWithoutStat(t *testing.T) {
 	_, backend := memoryfixture.New(t, "namespace-observation-http", 1<<20, locking.DefaultOptions())
 	for _, path := range []string{"file", "node", "child", "directory"} {
 		t.Run(path, func(t *testing.T) {
@@ -37,19 +37,16 @@ func TestHTTPMetadataObservationEnrollsOnlyBoundedNamespaceWithoutStat(t *testin
 			if err != nil {
 				t.Fatal(err)
 			}
-			session := httpInformationSession(t, client)
-			if err := storage.OpenMetadataObservation(session).CheckOpenMetadataObservation(); err != nil {
-				t.Fatal(err)
-			}
-			scopes := []storage.MetadataObservationScope{{Namespace: "test.flags", MaxPayloadBytes: 2}}
+			session := httpStateSession(t, client)
+			request := storage.MetadataObservationRequest{Purpose: storage.MetadataObservationNamespace, Namespace: "test.flags", MaxPayloadBytes: 2}
 			var reference interface {
 				Close(context.Context) error
 				Stat(context.Context) (storage.Attr, error)
 			}
 			if path == "file" {
-				reference = httpInformationFileNamed(t, session, root.ID, attr.ID, scopes, path)
+				reference = httpStateFileNamed(t, session, root.ID, attr.ID, storage.WriteMetadata, path)
 			} else {
-				options := storage.NodeRefOptions{Kind: kind, MetadataAccess: storage.WriteMetadata, MetadataObservations: scopes, Action: httpFileAction(t, session), Target: storage.ChildCondition{State: storage.SameNode, NodeID: attr.ID}}
+				options := storage.NodeRefOptions{Kind: kind, MetadataAccess: storage.WriteMetadata, Action: httpFileAction(t, session), Target: storage.ChildCondition{State: storage.SameNode, NodeID: attr.ID}}
 				var opened storage.NodeOpenResult
 				if path == "node" {
 					opened, err = session.OpenNodeRef(t.Context(), attr.ID, options)
@@ -61,15 +58,14 @@ func TestHTTPMetadataObservationEnrollsOnlyBoundedNamespaceWithoutStat(t *testin
 				}
 				reference = opened.Reference
 			}
-			scopes[0] = storage.MetadataObservationScope{Namespace: "wrong", MaxPayloadBytes: 0}
 			if _, err := reference.Stat(t.Context()); !errors.Is(err, syscall.EBADF) {
 				t.Fatalf("Stat granted=%v", err)
 			}
-			observer := reference.(storage.ReferenceMetadataObserver)
-			if err := observer.CheckMetadataObservation(); err != nil {
+			observer := reference.(storage.ReferenceMetadataAccess)
+			if err := observer.CheckMetadataAccess(); err != nil {
 				t.Fatal(err)
 			}
-			absent, err := observer.ObserveMetadata(t.Context(), 0)
+			absent, err := observer.ObserveMetadata(t.Context(), request)
 			if err != nil || absent.NodeID != attr.ID || absent.Value != nil {
 				t.Fatalf("absent=%+v err=%v", absent, err)
 			}
@@ -78,7 +74,7 @@ func TestHTTPMetadataObservationEnrollsOnlyBoundedNamespaceWithoutStat(t *testin
 			if err != nil {
 				t.Fatal(err)
 			}
-			empty, err := observer.ObserveMetadata(t.Context(), 0)
+			empty, err := observer.ObserveMetadata(t.Context(), request)
 			if err != nil || empty.Value == nil || len(empty.Value.Data) != 0 || !bytes.Equal(empty.Value.Version, payload.Version) {
 				t.Fatalf("present empty=%+v err=%v", empty, err)
 			}
@@ -86,35 +82,35 @@ func TestHTTPMetadataObservationEnrollsOnlyBoundedNamespaceWithoutStat(t *testin
 			if err != nil {
 				t.Fatal(err)
 			}
-			present, err := observer.ObserveMetadata(t.Context(), 0)
+			present, err := observer.ObserveMetadata(t.Context(), request)
 			if err != nil || present.Value == nil || !bytes.Equal(present.Value.Data, []byte{1, 2}) || !bytes.Equal(present.Value.Version, payload.Version) {
 				t.Fatalf("present=%+v err=%v", present, err)
 			}
 			present.Value.Data[0] = 9
-			fresh, err := observer.ObserveMetadata(t.Context(), 0)
+			fresh, err := observer.ObserveMetadata(t.Context(), request)
 			if err != nil || fresh.Value == nil || !bytes.Equal(fresh.Value.Data, []byte{1, 2}) {
 				t.Fatalf("result aliases transport=%+v err=%v", fresh, err)
 			}
-			if got, err := observer.ObserveMetadata(t.Context(), 1); !errors.Is(err, syscall.EINVAL) || !reflect.DeepEqual(got, storage.ContentMetadataObservation{}) {
-				t.Fatalf("unenrolled scope=%+v err=%v", got, err)
+			if got, err := observer.ObserveMetadata(t.Context(), storage.MetadataObservationRequest{Purpose: storage.MetadataObservationNamespace, Namespace: "invalid namespace", MaxPayloadBytes: 2}); !errors.Is(err, syscall.EINVAL) || !reflect.DeepEqual(got, storage.MetadataObservation{}) {
+				t.Fatalf("invalid namespace=%+v err=%v", got, err)
 			}
 			if _, err := metadata.SetMetadata(t.Context(), attr.ID, "test.flags", payload.Version, []byte{1, 2, 3}); err != nil {
 				t.Fatal(err)
 			}
-			if got, err := observer.ObserveMetadata(t.Context(), 0); !errors.Is(err, syscall.EFBIG) || !reflect.DeepEqual(got, storage.ContentMetadataObservation{}) {
+			if got, err := observer.ObserveMetadata(t.Context(), request); !errors.Is(err, syscall.EFBIG) || !reflect.DeepEqual(got, storage.MetadataObservation{}) {
 				t.Fatalf("oversize=%+v err=%v", got, err)
 			}
 			if err := reference.Close(t.Context()); err != nil {
 				t.Fatal(err)
 			}
-			if got, err := observer.ObserveMetadata(t.Context(), 0); err == nil || !reflect.DeepEqual(got, storage.ContentMetadataObservation{}) {
+			if got, err := observer.ObserveMetadata(t.Context(), request); err == nil || !reflect.DeepEqual(got, storage.MetadataObservation{}) {
 				t.Fatalf("closed=%+v err=%v", got, err)
 			}
 		})
 	}
 }
 
-func TestHTTPMetadataObservationRechecksCurrentEnrolledScopePolicy(t *testing.T) {
+func TestHTTPMetadataObservationRechecksCurrentNamespacePolicy(t *testing.T) {
 	client, handler, backend := retainedHTTPFixture(t, DefaultFileLimits())
 	if err := backend.Write(t.Context(), "file", []byte("body")); err != nil {
 		t.Fatal(err)
@@ -127,19 +123,20 @@ func TestHTTPMetadataObservationRechecksCurrentEnrolledScopePolicy(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	policy := &httpInformationPolicy{}
+	policy := &httpStatePolicy{}
 	handler.authorizer = policy
-	session := httpInformationSession(t, client)
-	file := httpInformationFile(t, session, root.ID, attr.ID, []storage.MetadataObservationScope{{Namespace: "test.flags", MaxPayloadBytes: 2}})
-	observer := file.(storage.ReferenceMetadataObserver)
+	session := httpStateSession(t, client)
+	file := httpStateFile(t, session, root.ID, attr.ID, storage.WriteMetadata)
+	request := storage.MetadataObservationRequest{Purpose: storage.MetadataObservationNamespace, Namespace: "test.flags", MaxPayloadBytes: 2}
+	observer := file.(storage.ReferenceMetadataAccess)
 	policy.mu.Lock()
 	policy.requests = nil
 	policy.mu.Unlock()
-	if _, err := observer.ObserveMetadata(t.Context(), 0); err != nil {
+	if _, err := observer.ObserveMetadata(t.Context(), request); err != nil {
 		t.Fatal(err)
 	}
 	policy.deny(storage.OpFileObserveMetadata)
-	if got, err := observer.ObserveMetadata(t.Context(), 0); !errors.Is(err, syscall.EACCES) || !reflect.DeepEqual(got, storage.ContentMetadataObservation{}) {
+	if got, err := observer.ObserveMetadata(t.Context(), request); !errors.Is(err, syscall.EACCES) || !reflect.DeepEqual(got, storage.MetadataObservation{}) {
 		t.Fatalf("revoked observation=%+v err=%v", got, err)
 	}
 	policy.mu.Lock()
@@ -151,8 +148,8 @@ func TestHTTPMetadataObservationRechecksCurrentEnrolledScopePolicy(t *testing.T)
 			continue
 		}
 		observations++
-		if !reflect.DeepEqual(request.MetadataObservations, []storage.MetadataObservationScope{{Namespace: "test.flags", MaxPayloadBytes: 2}}) {
-			t.Fatalf("authorization omitted sealed scope=%+v", request)
+		if !reflect.DeepEqual(request.MetadataObservation, &storage.MetadataObservationRequest{Purpose: storage.MetadataObservationNamespace, Namespace: "test.flags", MaxPayloadBytes: 2}) {
+			t.Fatalf("authorization omitted requested namespace=%+v", request)
 		}
 	}
 	if observations != 2 {
@@ -164,16 +161,16 @@ func TestHTTPMetadataObservationRechecksCurrentEnrolledScopePolicy(t *testing.T)
 	}
 }
 
-type httpObservationEnrollmentOnlyPolicy struct{}
+type httpObservationOnlyPolicy struct{}
 
-func (httpObservationEnrollmentOnlyPolicy) Authorize(_ context.Context, request authz.AccessRequest) error {
-	if request.Operation == storage.OpFileSetMetadata && len(request.MetadataObservations) == 0 {
+func (httpObservationOnlyPolicy) Authorize(_ context.Context, request authz.AccessRequest) error {
+	if request.Operation == storage.OpFileSetMetadata && request.MetadataObservation == nil {
 		return authz.ErrDenied
 	}
 	return nil
 }
 
-func TestHTTPObservationEnrollmentDoesNotAuthorizeInitialMetadata(t *testing.T) {
+func TestHTTPObservationPermissionDoesNotAuthorizeInitialMetadata(t *testing.T) {
 	_, backend := memoryfixture.New(t, "namespace-enrollment-http", 1<<20, locking.DefaultOptions())
 	for _, test := range []struct {
 		name     string
@@ -199,10 +196,9 @@ func TestHTTPObservationEnrollmentDoesNotAuthorizeInitialMetadata(t *testing.T) 
 			if err != nil {
 				t.Fatal(err)
 			}
-			session := httpInformationSession(t, client)
-			handler.authorizer = httpObservationEnrollmentOnlyPolicy{}
+			session := httpStateSession(t, client)
+			handler.authorizer = httpObservationOnlyPolicy{}
 			fields := storage.InitialFields{Metadata: map[string][]byte{"arbitrary.secret": []byte("unauthorized")}}
-			scopes := []storage.MetadataObservationScope{{Namespace: "test.flags", MaxPayloadBytes: 2}}
 			name := newName
 			initial := storage.InitialState{OnCreate: fields}
 			target := storage.ChildCondition{State: storage.Absent}
@@ -220,12 +216,12 @@ func TestHTTPObservationEnrollmentDoesNotAuthorizeInitialMetadata(t *testing.T) 
 			}
 			selection := storage.ChildSelection{Name: storage.ChildName{Parent: storage.DirectoryTarget{NodeID: root.ID}, RawLeaf: []byte(name)}}
 			if test.kind == storage.NodeRegular {
-				opened, err := session.OpenAt(t.Context(), selection, storage.OpenAtOptions{Write: true, Create: true, Target: target, Existing: test.existing, Use: uses, MetadataAccess: storage.WriteMetadata, MetadataObservations: scopes, Initial: initial, Action: httpFileAction(t, session)})
+				opened, err := session.OpenAt(t.Context(), selection, storage.OpenAtOptions{Write: true, Create: true, Target: target, Existing: test.existing, Use: uses, Initial: initial, Action: httpFileAction(t, session)})
 				if !errors.Is(err, syscall.EACCES) || opened.File != nil {
 					t.Fatalf("arbitrary file metadata accepted=%+v err=%v", opened, err)
 				}
 			} else {
-				opened, err := session.OpenChildRef(t.Context(), selection, storage.NodeRefOptions{Kind: test.kind, Create: true, Target: target, MetadataAccess: storage.WriteMetadata, MetadataObservations: scopes, InitialState: initial, Action: httpFileAction(t, session)})
+				opened, err := session.OpenChildRef(t.Context(), selection, storage.NodeRefOptions{Kind: test.kind, Create: true, Target: target, InitialState: initial, Action: httpFileAction(t, session)})
 				if !errors.Is(err, syscall.EACCES) || opened.Reference != nil {
 					t.Fatalf("arbitrary node metadata accepted=%+v err=%v", opened, err)
 				}
@@ -245,36 +241,39 @@ func TestHTTPObservationEnrollmentDoesNotAuthorizeInitialMetadata(t *testing.T) 
 	}
 }
 
-func TestHTTPMetadataObservationScopesUseStrictWireShape(t *testing.T) {
-	valid := []byte(`[{"namespace":"test.flags","maxPayloadBytes":2}]`)
-	var scopes []metadataObservationScope
-	if err := decodeFileJSON(valid, &scopes); err != nil {
+func TestHTTPMetadataObservationUsesStrictWireShape(t *testing.T) {
+	valid := []byte(`{"purpose":2,"effectIndex":0,"namespace":"test.flags","maxPayloadBytes":2}`)
+	var request metadataObservationRequest
+	if err := decodeFileJSON(valid, &request); err != nil {
 		t.Fatal(err)
 	}
 	for name, malformed := range map[string]string{
-		"missing namespace": `[{"maxPayloadBytes":2}]`,
-		"missing bound":     `[{"namespace":"test.flags"}]`,
-		"null namespace":    `[{"namespace":null,"maxPayloadBytes":2}]`,
-		"null bound":        `[{"namespace":"test.flags","maxPayloadBytes":null}]`,
-		"duplicate":         `[{"namespace":"test.flags","namespace":"other","maxPayloadBytes":2}]`,
-		"unknown":           `[{"namespace":"test.flags","maxPayloadBytes":2,"extra":1}]`,
-		"wrong case":        `[{"Namespace":"test.flags","maxPayloadBytes":2}]`,
-		"fractional bound":  `[{"namespace":"test.flags","maxPayloadBytes":2.5}]`,
+		"missing purpose":   `{"effectIndex":0,"namespace":"test.flags","maxPayloadBytes":2}`,
+		"missing namespace": `{"purpose":2,"effectIndex":0,"maxPayloadBytes":2}`,
+		"missing bound":     `{"purpose":2,"effectIndex":0,"namespace":"test.flags"}`,
+		"null namespace":    `{"purpose":2,"effectIndex":0,"namespace":null,"maxPayloadBytes":2}`,
+		"null bound":        `{"purpose":2,"effectIndex":0,"namespace":"test.flags","maxPayloadBytes":null}`,
+		"duplicate":         `{"purpose":2,"effectIndex":0,"namespace":"test.flags","namespace":"other","maxPayloadBytes":2}`,
+		"unknown":           `{"purpose":2,"effectIndex":0,"namespace":"test.flags","maxPayloadBytes":2,"extra":1}`,
+		"wrong case":        `{"purpose":2,"effectIndex":0,"Namespace":"test.flags","maxPayloadBytes":2}`,
+		"fractional bound":  `{"purpose":2,"effectIndex":0,"namespace":"test.flags","maxPayloadBytes":2.5}`,
 	} {
 		t.Run(name, func(t *testing.T) {
-			if err := decodeFileJSON([]byte(malformed), &scopes); err == nil {
-				t.Fatalf("malformed scope accepted: %s", malformed)
+			if err := decodeFileJSON([]byte(malformed), &request); err == nil {
+				t.Fatalf("malformed observation accepted: %s", malformed)
 			}
 		})
 	}
-	for _, scopes := range [][]storage.MetadataObservationScope{
-		{{Namespace: "invalid namespace", MaxPayloadBytes: 2}},
-		{{Namespace: "test.flags", MaxPayloadBytes: -1}},
-		{{Namespace: "test.flags", MaxPayloadBytes: storage.MaxMetadataValueBytes + 1}},
-		{{Namespace: "test.flags", MaxPayloadBytes: 2}, {Namespace: "test.flags", MaxPayloadBytes: 2}},
+	for _, request := range []storage.MetadataObservationRequest{
+		{Purpose: storage.MetadataObservationNamespace, Namespace: "invalid namespace", MaxPayloadBytes: 2},
+		{Purpose: storage.MetadataObservationNamespace, Namespace: "test.flags", MaxPayloadBytes: -1},
+		{Purpose: storage.MetadataObservationNamespace, Namespace: "test.flags", MaxPayloadBytes: storage.MaxMetadataValueBytes + 1},
+		{Purpose: storage.MetadataObservationNamespace, EffectIndex: 1, Namespace: "test.flags", MaxPayloadBytes: 2},
+		{Purpose: storage.MetadataObservationContentEffect, Namespace: "test.flags"},
+		{},
 	} {
-		if err := storage.CheckMetadataObservationScopes(metadataObservationScopesStorage(metadataObservationScopesOf(scopes))); err == nil {
-			t.Fatalf("invalid enrollment accepted: %+v", scopes)
+		if err := metadataObservationRequestOf(request).storage().Check(); err == nil {
+			t.Fatalf("invalid observation accepted: %+v", request)
 		}
 	}
 }

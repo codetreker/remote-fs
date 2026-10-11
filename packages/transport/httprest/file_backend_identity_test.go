@@ -384,7 +384,7 @@ func TestHTTPOpenAtForwardsMetadataRightsWithoutEscalatingByteRights(t *testing.
 				}
 				_, err = opened.File.Stat(t.Context())
 				assertAccess("Stat", err, permissions&storage.ReadMetadata != 0)
-				_, err = opened.File.(storage.ReferenceStateAccess).State(t.Context())
+				_, err = opened.File.(storage.ReferenceStateAccess).State(t.Context(), storage.StateFull)
 				assertAccess("State", err, permissions&storage.ReadMetadata != 0)
 				at := time.Unix(123, 456)
 				_, err = opened.File.SetAttr(t.Context(), storage.AttrChange{ModTime: &at})

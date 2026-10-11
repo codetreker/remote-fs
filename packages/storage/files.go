@@ -25,10 +25,14 @@ type FileStorage interface {
 }
 
 // AllocationReporting promises authoritative allocation in every Attr returned
-// by a file session, including the result of an atomic open. Check this before
-// an operation whose effect cannot be undone if allocation is unavailable.
+// by a file session, including an atomic open, and the volume's logical allocation
+// unit. Check the complete contract before effects that require allocation.
+// AllocationUnitBytes returns a nonzero unit from the same live authority;
+// missing support or failed verification returns zero and an error. Host disk
+// geometry and a configured capacity allowance do not determine this fact.
 type AllocationReporting interface {
 	CheckAllocationReporting() error
+	AllocationUnitBytes(context.Context) (uint64, error)
 }
 
 // FileSession owns file references, advisory owners, and action history until
@@ -105,8 +109,7 @@ type File interface {
 // Opening a retained node cannot carry Create or Exclusive. Validation belongs
 // to FileOpenOptions, which also supplies initial metadata and expected identity.
 type OpenAccess struct {
-	MetadataObservations   []MetadataObservationScope `json:",omitempty"`
-	ContentMetadataEffects []ContentMetadataEffect    `json:",omitempty"`
+	ContentMetadataEffects []ContentMetadataEffect `json:",omitempty"`
 	Read                   bool
 	Write                  bool
 	Create                 bool
@@ -115,7 +118,6 @@ type OpenAccess struct {
 }
 
 func (o OpenAccess) Clone() OpenAccess {
-	o.MetadataObservations = CloneMetadataObservationScopes(o.MetadataObservations)
 	o.ContentMetadataEffects = CloneContentMetadataEffects(o.ContentMetadataEffects)
 	return o
 }
@@ -132,7 +134,7 @@ type FileOpenOptions struct {
 
 // Check rejects invalid access, creation and initial metadata before admission.
 func (o FileOpenOptions) Check() error {
-	if len(o.ContentMetadataEffects) != 0 || len(o.MetadataObservations) != 0 {
+	if len(o.ContentMetadataEffects) != 0 {
 		return syscall.EINVAL
 	}
 	if !o.Read && !o.Write {

@@ -24,6 +24,37 @@ func (s *remoteFileSession) CheckAtomicFileOpen() error {
 func (s *remoteFileSession) CheckAllocationReporting() error {
 	return checkFileCapability(s.capabilities.Allocation)
 }
+func (s *remoteFileSession) AllocationUnitBytes(ctx context.Context) (uint64, error) {
+	if err := s.CheckAllocationReporting(); err != nil {
+		return 0, err
+	}
+	before, err := s.FileSessionIdentity(ctx)
+	if err != nil {
+		return 0, err
+	}
+	if err := before.Check(); err != nil {
+		return 0, err
+	}
+	response, err := s.call(ctx, fileRequest{Op: storage.OpFileAllocationUnit})
+	if err != nil {
+		return 0, err
+	}
+	after, err := s.FileSessionIdentity(ctx)
+	if err != nil {
+		return 0, err
+	}
+	if err := after.Check(); err != nil {
+		return 0, err
+	}
+	if after != before {
+		return 0, unreachable(Request{Op: OpFileControl}, syscall.EIO)
+	}
+	if response.AllocationUnitBytes == nil || *response.AllocationUnitBytes == 0 {
+		return 0, unreachable(Request{Op: OpFileControl}, syscall.EIO)
+	}
+	return *response.AllocationUnitBytes, nil
+}
+
 func (s *remoteFileSession) CheckNamespaceAccess() error {
 	return checkFileCapability(s.capabilities.Namespace)
 }
@@ -162,11 +193,6 @@ func (s *remoteFileSession) OpenAtWithBarrier(ctx context.Context, selection sto
 	if err := s.CheckAtomicFileOpen(); err != nil {
 		return storage.OpenResult{}, nil, err
 	}
-	if len(options.MetadataObservations) != 0 {
-		if err := s.CheckOpenMetadataObservation(); err != nil {
-			return storage.OpenResult{}, nil, err
-		}
-	}
 	if len(options.ContentMetadataEffects) != 0 {
 		if err := s.CheckOpenContentMetadata(); err != nil {
 			return storage.OpenResult{}, nil, err
@@ -183,12 +209,10 @@ func (s *remoteFileSession) OpenAtWithBarrier(ctx context.Context, selection sto
 	if err := options.Check(); err != nil {
 		return storage.OpenResult{}, nil, err
 	}
-	options.MetadataObservations = storage.CloneMetadataObservationScopes(options.MetadataObservations)
 	options.ContentMetadataEffects = storage.CloneContentMetadataEffects(options.ContentMetadataEffects)
 	child, guards := childSelectionWire(selection)
 	reference, response, err := s.openCapability(ctx, fileRequest{Op: storage.OpFileOpenAt, Child: child, Guards: guards, OpenAt: openAtOptionsOf(options)})
 	if reference != nil {
-		reference.metadataObservations = storage.CloneMetadataObservationScopes(options.MetadataObservations)
 		reference.contentEffects = storage.CloneContentMetadataEffects(options.ContentMetadataEffects)
 	}
 	result := openResultOf(reference, response)
@@ -273,18 +297,12 @@ func (s *remoteFileSession) openNodeReference(ctx context.Context, req fileReque
 	if err := validateCapabilityArguments(req); err != nil {
 		return storage.NodeOpenResult{}, nil, err
 	}
-	if len(req.NodeRef.MetadataObservations) != 0 {
-		if err := s.CheckOpenMetadataObservation(); err != nil {
-			return storage.NodeOpenResult{}, nil, err
-		}
-	}
 	reference, response, err := s.openCapability(ctx, req)
 	if err == nil && reference != nil && (!reference.capabilities.Scope || !reference.capabilities.State) {
 		err = unreachable(Request{Op: OpFile}, errors.New("node reference omitted mandatory scope or state capability"))
 	}
 	result := storage.NodeOpenResult{Outcome: response.Outcome}
 	if reference != nil {
-		reference.metadataObservations = metadataObservationScopesStorage(req.NodeRef.MetadataObservations)
 		result.Reference = &remoteNodeReference{file: reference}
 	}
 	if response.Attr != nil {
@@ -452,8 +470,8 @@ func (r *remoteNodeReference) SetMetadataWithBarrier(ctx context.Context, namesp
 	return r.file.SetMetadataWithBarrier(ctx, namespace, version, data)
 }
 func (r *remoteNodeReference) CheckReferenceState() error { return r.file.CheckReferenceState() }
-func (r *remoteNodeReference) State(ctx context.Context) (storage.ReferenceState, error) {
-	return r.file.State(ctx)
+func (r *remoteNodeReference) State(ctx context.Context, projection storage.StateProjection) (storage.ReferenceState, error) {
+	return r.file.State(ctx, projection)
 }
 func (r *remoteNodeReference) CheckDeleteIntent() error { return r.file.CheckDeleteIntent() }
 func (r *remoteNodeReference) SetPendingUnlink(ctx context.Context, command storage.PendingUnlinkCommand) (storage.ReferenceState, error) {
@@ -490,15 +508,25 @@ func (f *remoteFile) Scope(ctx context.Context) (storage.UseScope, error) {
 	return *response.Scope, nil
 }
 
-func (f *remoteFile) State(ctx context.Context) (storage.ReferenceState, error) {
+func (f *remoteFile) State(ctx context.Context, projection storage.StateProjection) (storage.ReferenceState, error) {
+	if err := projection.Check(); err != nil {
+		return storage.ReferenceState{}, err
+	}
 	if err := f.CheckReferenceState(); err != nil {
 		return storage.ReferenceState{}, err
 	}
-	response, err := f.call(ctx, fileRequest{Op: storage.OpFileState})
+	response, err := f.call(ctx, fileRequest{Op: storage.OpFileState, StateProjection: projection})
 	if response.State == nil {
 		return storage.ReferenceState{}, err
 	}
-	return response.State.storage(), err
+	if err != nil {
+		return storage.ReferenceState{}, err
+	}
+	value := response.State.storage()
+	if err := value.CheckProjection(f.node, projection); err != nil {
+		return storage.ReferenceState{}, unreachable(Request{Op: OpFileControl}, err)
+	}
+	return value, nil
 }
 
 func (f *remoteFile) SetMetadata(ctx context.Context, namespace string, version, data []byte) (storage.OpaquePayload, error) {

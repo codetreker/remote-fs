@@ -43,11 +43,11 @@ func TestSealedContentEffectsWriteOnlyCASReplayAndOrdinaryWrites(t *testing.T) {
 	}
 	effect := sealedEffect()
 	file := openEffectFile(t, session, root.ID, "file", effect)
-	observer := file.(storage.ReferenceContentMetadata)
-	if err := observer.CheckContentMetadata(); err != nil {
+	observer := file.(storage.ReferenceMetadataAccess)
+	if err := observer.CheckMetadataAccess(); err != nil {
 		t.Fatal(err)
 	}
-	observation, err := observer.ObserveContentMetadata(t.Context(), 0)
+	observation, err := observer.ObserveMetadata(t.Context(), storage.MetadataObservationRequest{Purpose: storage.MetadataObservationContentEffect, EffectIndex: 0})
 	if err != nil || observation.Value != nil || observation.NodeID == 0 {
 		t.Fatalf("absent observation=%+v,%v", observation, err)
 	}
@@ -74,7 +74,7 @@ func TestSealedContentEffectsWriteOnlyCASReplayAndOrdinaryWrites(t *testing.T) {
 	if _, err := file.(storage.ConditionalFileMutation).MutateFile(t.Context(), mutation); !errors.Is(err, syscall.EINVAL) {
 		t.Fatalf("changed action=%v", err)
 	}
-	observation, err = observer.ObserveContentMetadata(t.Context(), 0)
+	observation, err = observer.ObserveMetadata(t.Context(), storage.MetadataObservationRequest{Purpose: storage.MetadataObservationContentEffect, EffectIndex: 0})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -105,17 +105,17 @@ func TestSealedContentEffectsWriteOnlyCASReplayAndOrdinaryWrites(t *testing.T) {
 		t.Fatalf("ordinary write changed effect=%+v,%v", after, err)
 	}
 	observation.Value.Data[0] = 0
-	fresh, err := observer.ObserveContentMetadata(t.Context(), 0)
+	fresh, err := observer.ObserveMetadata(t.Context(), storage.MetadataObservationRequest{Purpose: storage.MetadataObservationContentEffect, EffectIndex: 0})
 	if err != nil || fresh.Value.Data[0] != 0x31 {
 		t.Fatalf("observation alias=%+v,%v", fresh, err)
 	}
-	if _, err := observer.ObserveContentMetadata(t.Context(), 1); !errors.Is(err, syscall.EINVAL) {
+	if _, err := observer.ObserveMetadata(t.Context(), storage.MetadataObservationRequest{Purpose: storage.MetadataObservationContentEffect, EffectIndex: 1}); !errors.Is(err, syscall.EINVAL) {
 		t.Fatalf("invalid index=%v", err)
 	}
 	if err := file.Close(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := observer.ObserveContentMetadata(t.Context(), 0); err == nil {
+	if _, err := observer.ObserveMetadata(t.Context(), storage.MetadataObservationRequest{Purpose: storage.MetadataObservationContentEffect, EffectIndex: 0}); err == nil {
 		t.Fatal("closed reference observed metadata")
 	}
 }

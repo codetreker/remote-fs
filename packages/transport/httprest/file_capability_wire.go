@@ -231,7 +231,6 @@ func (value initialState) storage() storage.InitialState {
 }
 
 type openAtOptions struct {
-	MetadataObservations   []metadataObservationScope  `json:"metadataObservations,omitempty"`
 	ContentMetadataEffects []contentMetadataEffect     `json:"contentMetadataEffects,omitempty"`
 	MetadataAccess         storage.MetadataPermissions `json:"metadataAccess"`
 	Read                   bool                        `json:"read"`
@@ -247,11 +246,11 @@ type openAtOptions struct {
 }
 
 func openAtOptionsOf(value storage.OpenAtOptions) *openAtOptions {
-	return &openAtOptions{MetadataObservations: metadataObservationScopesOf(value.MetadataObservations), ContentMetadataEffects: contentMetadataEffectsOf(value.ContentMetadataEffects), MetadataAccess: value.MetadataAccess, Read: value.Read, Write: value.Write, Create: value.Create, Exclusive: value.Exclusive, Target: childConditionOf(value.Target), Action: value.Action, Use: value.Use, Existing: value.Existing, Initial: initialStateOf(value.Initial), CloseIntent: closeIntentOf(value.CloseIntent)}
+	return &openAtOptions{ContentMetadataEffects: contentMetadataEffectsOf(value.ContentMetadataEffects), MetadataAccess: value.MetadataAccess, Read: value.Read, Write: value.Write, Create: value.Create, Exclusive: value.Exclusive, Target: childConditionOf(value.Target), Action: value.Action, Use: value.Use, Existing: value.Existing, Initial: initialStateOf(value.Initial), CloseIntent: closeIntentOf(value.CloseIntent)}
 }
 
 func (value openAtOptions) storage() storage.OpenAtOptions {
-	result := storage.OpenAtOptions{MetadataObservations: metadataObservationScopesStorage(value.MetadataObservations), ContentMetadataEffects: contentMetadataEffectsStorage(value.ContentMetadataEffects), MetadataAccess: value.MetadataAccess, Read: value.Read, Write: value.Write, Create: value.Create, Exclusive: value.Exclusive, Target: value.Target.storage(), Action: value.Action, Use: value.Use, Existing: value.Existing, Initial: value.Initial.storage()}
+	result := storage.OpenAtOptions{ContentMetadataEffects: contentMetadataEffectsStorage(value.ContentMetadataEffects), MetadataAccess: value.MetadataAccess, Read: value.Read, Write: value.Write, Create: value.Create, Exclusive: value.Exclusive, Target: value.Target.storage(), Action: value.Action, Use: value.Use, Existing: value.Existing, Initial: value.Initial.storage()}
 	if value.CloseIntent != nil {
 		intent := value.CloseIntent.storage()
 		result.CloseIntent = &intent
@@ -260,24 +259,23 @@ func (value openAtOptions) storage() storage.OpenAtOptions {
 }
 
 type nodeRefOptions struct {
-	MetadataObservations []metadataObservationScope  `json:"metadataObservations,omitempty"`
-	Kind                 storage.NodeKind            `json:"kind"`
-	Target               childCondition              `json:"target"`
-	Action               storage.FileActionID        `json:"action"`
-	Use                  storage.UseClaim            `json:"use"`
-	MetadataAccess       storage.MetadataPermissions `json:"metadataAccess"`
-	Create               bool                        `json:"create"`
-	Exclusive            bool                        `json:"exclusive"`
-	Initial              initialState                `json:"initial"`
-	CloseIntent          *closeIntent                `json:"closeIntent,omitempty"`
+	Kind           storage.NodeKind            `json:"kind"`
+	Target         childCondition              `json:"target"`
+	Action         storage.FileActionID        `json:"action"`
+	Use            storage.UseClaim            `json:"use"`
+	MetadataAccess storage.MetadataPermissions `json:"metadataAccess"`
+	Create         bool                        `json:"create"`
+	Exclusive      bool                        `json:"exclusive"`
+	Initial        initialState                `json:"initial"`
+	CloseIntent    *closeIntent                `json:"closeIntent,omitempty"`
 }
 
 func nodeRefOptionsOf(value storage.NodeRefOptions) *nodeRefOptions {
-	return &nodeRefOptions{MetadataObservations: metadataObservationScopesOf(value.MetadataObservations), Kind: value.Kind, Target: childConditionOf(value.Target), Action: value.Action, Use: value.Use, MetadataAccess: value.MetadataAccess, Create: value.Create, Exclusive: value.Exclusive, Initial: initialStateOf(value.InitialState), CloseIntent: closeIntentOf(value.CloseIntent)}
+	return &nodeRefOptions{Kind: value.Kind, Target: childConditionOf(value.Target), Action: value.Action, Use: value.Use, MetadataAccess: value.MetadataAccess, Create: value.Create, Exclusive: value.Exclusive, Initial: initialStateOf(value.InitialState), CloseIntent: closeIntentOf(value.CloseIntent)}
 }
 
 func (value nodeRefOptions) storage() storage.NodeRefOptions {
-	result := storage.NodeRefOptions{MetadataObservations: metadataObservationScopesStorage(value.MetadataObservations), Kind: value.Kind, Target: value.Target.storage(), Action: value.Action, Use: value.Use, MetadataAccess: value.MetadataAccess, Create: value.Create, Exclusive: value.Exclusive, InitialState: value.Initial.storage()}
+	result := storage.NodeRefOptions{Kind: value.Kind, Target: value.Target.storage(), Action: value.Action, Use: value.Use, MetadataAccess: value.MetadataAccess, Create: value.Create, Exclusive: value.Exclusive, InitialState: value.Initial.storage()}
 	if value.CloseIntent != nil {
 		intent := value.CloseIntent.storage()
 		result.CloseIntent = &intent
@@ -397,6 +395,8 @@ func (value clearPendingUnlinkCommand) storage() storage.ClearPendingUnlinkComma
 }
 
 type referenceState struct {
+	scalar            bool
+	protectedFields   bool
 	LinkTarget        canonicalBytes  `json:"linkTarget,omitempty"`
 	Attr              *Attr           `json:"attr"`
 	Detached          bool            `json:"detached"`

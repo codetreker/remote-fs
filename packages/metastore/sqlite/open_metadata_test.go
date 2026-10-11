@@ -37,7 +37,7 @@ func TestNativeAtomicOpenEnforcesIndependentMetadataPermissions(t *testing.T) {
 			assertAccess("SetAttr", err, permissions&storage.WriteMetadata != 0)
 			_, err = opened.File.SetMetadata(t.Context(), fmt.Sprintf("test.rights%d", permissions), nil, []byte("value"))
 			assertAccess("SetMetadata", err, permissions&storage.WriteMetadata != 0)
-			_, err = opened.File.(metastore.ReferenceStateAccess).State(t.Context())
+			_, err = opened.File.(metastore.ReferenceStateAccess).State(t.Context(), storage.StateFull)
 			assertAccess("State", err, permissions&storage.ReadMetadata != 0)
 			_, err = opened.File.Node(metastore.WithFileAccess(t.Context(), metastore.FileAccess{Uses: storage.ReadData}))
 			assertAccess("byte read with execute Use", err, false)

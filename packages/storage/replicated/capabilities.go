@@ -112,11 +112,6 @@ func (s *fileSession) AcknowledgeDeleteIntent(ctx context.Context, command stora
 }
 
 func (s *fileSession) OpenAt(ctx context.Context, selection storage.ChildSelection, options storage.OpenAtOptions) (storage.OpenResult, error) {
-	if err := s.checkMetadataObservationEnrollment(options.MetadataAccess, options.MetadataObservations); err != nil {
-		return storage.OpenResult{}, err
-	}
-	scopes := storage.CloneMetadataObservationScopes(options.MetadataObservations)
-	options.MetadataObservations = storage.CloneMetadataObservationScopes(scopes)
 	if err := storage.CheckContentMetadataEffects(options.ContentMetadataEffects); err != nil {
 		return storage.OpenResult{}, err
 	}
@@ -140,9 +135,6 @@ func (s *fileSession) OpenAt(ctx context.Context, selection storage.ChildSelecti
 			return barrier, err
 		})
 		result, err = s.wrapOpenResult(result, err)
-		if file, ok := result.File.(*retainedFile); ok {
-			file.metadataObservations = scopes
-		}
 		return result, err
 	})
 }
@@ -310,35 +302,19 @@ func (s *fileSession) MutateName(ctx context.Context, command storage.NameComman
 }
 
 func (s *fileSession) OpenNodeRef(ctx context.Context, id uint64, options storage.NodeRefOptions) (storage.NodeOpenResult, error) {
-	if err := s.checkMetadataObservationEnrollment(options.MetadataAccess, options.MetadataObservations); err != nil {
-		return storage.NodeOpenResult{}, err
-	}
-	scopes := storage.CloneMetadataObservationScopes(options.MetadataObservations)
-	options.MetadataObservations = storage.CloneMetadataObservationScopes(scopes)
 	return sessionCapability(ctx, s, true, func(ctx context.Context, capability httprest.NodeReferencesWithBarrier) (storage.NodeOpenResult, error) {
 		result, err := s.openReference(ctx, func(ctx context.Context) (storage.NodeOpenResult, *httprest.MutationBarrier, error) {
 			return capability.OpenNodeRefWithBarrier(ctx, id, options)
 		})
-		if reference, ok := result.Reference.(*nodeReference); ok {
-			reference.metadataObservations = scopes
-		}
 		return result, err
 	})
 }
 
 func (s *fileSession) OpenChildRef(ctx context.Context, selection storage.ChildSelection, options storage.NodeRefOptions) (storage.NodeOpenResult, error) {
-	if err := s.checkMetadataObservationEnrollment(options.MetadataAccess, options.MetadataObservations); err != nil {
-		return storage.NodeOpenResult{}, err
-	}
-	scopes := storage.CloneMetadataObservationScopes(options.MetadataObservations)
-	options.MetadataObservations = storage.CloneMetadataObservationScopes(scopes)
 	return sessionCapability(ctx, s, true, func(ctx context.Context, capability httprest.NodeReferencesWithBarrier) (storage.NodeOpenResult, error) {
 		result, err := s.openReference(ctx, func(ctx context.Context) (storage.NodeOpenResult, *httprest.MutationBarrier, error) {
 			return capability.OpenChildRefWithBarrier(ctx, selection, options)
 		})
-		if reference, ok := result.Reference.(*nodeReference); ok {
-			reference.metadataObservations = scopes
-		}
 		return result, err
 	})
 }
@@ -520,3 +496,47 @@ var (
 	_ storage.ScopedReference         = (*retainedFile)(nil)
 	_ storage.ReferenceMetadataAccess = (*retainedFile)(nil)
 )
+
+func (s *fileSession) CheckOpenContentMetadata() error {
+	return capabilityCheck(s.remote, storage.OpenContentMetadata.CheckOpenContentMetadata)
+}
+
+var _ storage.OpenContentMetadata = (*fileSession)(nil)
+
+func (s *fileSession) AllocationUnitBytes(ctx context.Context) (uint64, error) {
+	return fileCall(ctx, s, true, func(ctx context.Context) (uint64, error) {
+		if err := s.CheckAllocationReporting(); err != nil {
+			return 0, err
+		}
+		if err := s.CheckFileSessionIdentity(); err != nil {
+			return 0, err
+		}
+		before, err := s.FileSessionIdentity(ctx)
+		if err != nil {
+			return 0, err
+		}
+		result, err := s.remote.(storage.AllocationReporting).AllocationUnitBytes(ctx)
+		if err != nil {
+			return 0, err
+		}
+		if result == 0 {
+			return 0, syscall.EIO
+		}
+		after, err := s.FileSessionIdentity(ctx)
+		if err != nil {
+			return 0, err
+		}
+		if before != after {
+			return 0, syscall.ESTALE
+		}
+		if err := s.base.usable("file", ""); err != nil {
+			return 0, err
+		}
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
+		return result, nil
+	})
+}
+
+var _ storage.AllocationReporting = (*fileSession)(nil)

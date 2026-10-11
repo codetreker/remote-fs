@@ -71,6 +71,9 @@ func (f *metadataFileProbe) Stat(context.Context) (storage.Attr, error) {
 	return f.attr, nil
 }
 func (f *metadataFileProbe) CheckMetadataAccess() error { return nil }
+func (f *metadataFileProbe) ObserveMetadata(context.Context, storage.MetadataObservationRequest) (storage.MetadataObservation, error) {
+	return storage.MetadataObservation{}, syscall.EOPNOTSUPP
+}
 func (f *metadataFileProbe) SetMetadata(_ context.Context, _ string, expected, data []byte) (storage.OpaquePayload, error) {
 	f.updates++
 	f.expected = append([]byte(nil), expected...)

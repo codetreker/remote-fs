@@ -107,6 +107,12 @@ func TestFileIORealWriteOnlyAndAppendOnlyMetadataRights(t *testing.T) {
 					if _, err := handle.file.(storage.ReferenceMetadataAccess).SetMetadata(t.Context(), windowsMetadataKey, nil, []byte("unsealed")); !errors.Is(err, syscall.EBADF) {
 						t.Fatalf("WRITE-only SetMetadata gained metadata rights: %v", err)
 					}
+					observer := handle.file.(storage.ReferenceMetadataAccess)
+					for _, namespace := range []string{windowsMetadataKey, "arbitrary.namespace"} {
+						if _, err := observer.ObserveMetadata(t.Context(), storage.MetadataObservationRequest{Purpose: storage.MetadataObservationNamespace, Namespace: namespace, MaxPayloadBytes: 8}); !errors.Is(err, syscall.EBADF) {
+							t.Fatalf("WRITE-only gained namespace %s observation: %v", namespace, err)
+						}
+					}
 					requireIOWrite(t, fixture, id, 1, "XY")
 					want := "aXYd"
 					if access == accessAppend {
@@ -443,12 +449,15 @@ func TestFileIOEffectAuthorizationUsesSelectedDescriptorsAndOwnsCopies(t *testin
 						return authz.ErrDenied
 					}
 					request.Open.ContentMetadataEffects[0].SetMask[4] = byte(dosReadOnly)
-				case storage.OpFileObserveContentMetadata, storage.OpFileSetMetadata, storage.OpFileWrite:
+				case storage.OpFileObserveMetadata, storage.OpFileSetMetadata, storage.OpFileWrite:
 					if !reflect.DeepEqual(request.ContentMetadataEffects, windowsContentEffects()) {
 						return authz.ErrDenied
 					}
 					switch request.Operation {
-					case storage.OpFileObserveContentMetadata:
+					case storage.OpFileObserveMetadata:
+						if request.MetadataObservation == nil || *request.MetadataObservation != (storage.MetadataObservationRequest{Purpose: storage.MetadataObservationContentEffect}) {
+							t.Fatal("content observation did not identify sealed effect")
+						}
 						observeChecks++
 					case storage.OpFileSetMetadata:
 						metadataChecks++
@@ -472,10 +481,10 @@ func TestFileIOEffectAuthorizationUsesSelectedDescriptorsAndOwnsCopies(t *testin
 			requireIOWrite(t, fixture, id, 0, "good")
 			current := requireIOContents(t, fixture, "file", "good")
 			flags, err := decodeWindowsMetadata(current.Metadata)
-			if err != nil || flags.Attributes != dosHidden|dosArchive || current.ID != before.ID || observeChecks < 2 || metadataChecks < 2 || writeChecks < 2 {
+			if err != nil || flags.Attributes != dosHidden|dosArchive || current.ID != before.ID || observeChecks < 1 || metadataChecks < 2 || writeChecks < 2 {
 				t.Fatalf("sealed write after policy alias: flags=%+v obs=%d metadata=%d writes=%d err=%v", flags, observeChecks, metadataChecks, writeChecks, err)
 			}
-			for _, denied := range []storage.Operation{storage.OpFileObserveContentMetadata, storage.OpFileSetMetadata} {
+			for _, denied := range []storage.Operation{storage.OpFileObserveMetadata, storage.OpFileSetMetadata} {
 				fixture.server.config.Authorize = authz.AuthorizerFunc(func(_ context.Context, request authz.AccessRequest) error {
 					if request.Operation == denied {
 						if !reflect.DeepEqual(request.ContentMetadataEffects, windowsContentEffects()) {
@@ -485,8 +494,16 @@ func TestFileIOEffectAuthorizationUsesSelectedDescriptorsAndOwnsCopies(t *testin
 					}
 					return nil
 				})
-				if _, status, _ := fixture.connection.createFile(t.Context(), fixture.session, fixture.tree, createRequestForTest("file", 1, accessWriteData)); status != statusDenied {
-					t.Fatalf("denied %s allowed OPEN: %#x", denied, status)
+				_, openStatus, opened := fixture.connection.createFile(t.Context(), fixture.session, fixture.tree, createRequestForTest("file", 1, accessWriteData))
+				if denied == storage.OpFileSetMetadata {
+					if openStatus != statusDenied {
+						t.Fatalf("denied effect mutation allowed OPEN: %#x", openStatus)
+					}
+				} else {
+					if openStatus != statusOK {
+						t.Fatalf("per-call observation policy blocked OPEN: %#x", openStatus)
+					}
+					closeFixtureHandle(t, fixture, opened)
 				}
 				if _, status := fixture.connection.writeFile(t.Context(), fixture.session, fixture.tree, writeRequestForTest(id, 0, []byte("bad!"))); status != statusDenied {
 					t.Fatalf("denied %s allowed WRITE: %#x", denied, status)

@@ -64,14 +64,19 @@ func TestAccessRequestCloneOwnsSealedMetadataEffects(t *testing.T) {
 	}
 }
 
-func TestAccessRequestCloneOwnsMetadataObservationScope(t *testing.T) {
-	scope := storage.MetadataObservationScope{Namespace: "app.flags", MaxPayloadBytes: 8}
-	request := authz.AccessRequest{Open: storage.OpenAccess{MetadataObservations: []storage.MetadataObservationScope{scope}},
-		MetadataObservations: []storage.MetadataObservationScope{scope}}
+func TestAccessRequestCloneOwnsMetadataObservationRequest(t *testing.T) {
+	observation := storage.MetadataObservationRequest{Purpose: storage.MetadataObservationNamespace, Namespace: "app.flags", MaxPayloadBytes: 8}
+	request := authz.AccessRequest{StateProjection: storage.StateScalars, MetadataObservation: &observation}
 	cloned := request.Clone()
-	cloned.Open.MetadataObservations[0].Namespace = "different"
-	cloned.MetadataObservations[0].MaxPayloadBytes = 0
-	if request.Open.MetadataObservations[0] != scope || request.MetadataObservations[0] != scope {
-		t.Fatal("policy copy changed approved observation scopes")
+	cloned.MetadataObservation.Namespace = "different"
+	cloned.MetadataObservation.MaxPayloadBytes = 0
+	if *request.MetadataObservation != observation || cloned.StateProjection != storage.StateScalars {
+		t.Fatal("policy copy changed approved observation request")
+	}
+	if cloned.MetadataObservation == request.MetadataObservation {
+		t.Fatal("policy copy retained observation request pointer")
+	}
+	if (authz.AccessRequest{}).Clone().MetadataObservation != nil {
+		t.Fatal("policy copy invented an observation request")
 	}
 }

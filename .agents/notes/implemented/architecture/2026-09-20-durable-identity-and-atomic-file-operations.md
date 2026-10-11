@@ -22,7 +22,7 @@ Status: implemented
 
 `AtomicFileOpener.OpenAt` 使用 `ChildSelection` 在同一次原生顺序中解析父身份与叶名，核对可选 `NamespaceGuards` 和 `ChildCondition`，执行 Keep、ResetContent 或 ReplaceNode，应用对应 initial fields，登记 Use claim 和可选关闭删除义务，再返回捕获的 Attr、Outcome 与 File。`NodeReferences.OpenChildRef` 对普通文件、目录和符号链接执行同样的子项选择，`OpenNodeRef` 直接按 NodeID 选择已有节点。guard 接入的决定与边界见[权威子项选择](2026-09-22-guard-authoritative-child-selection.md)。
 
-`NodeReference` 没有字节方法，但编译期保证 `ScopedReference` 与 `ReferenceStateAccess`：成功 preflight 后，调用方一定能取得确切活引用的 Scope，并能原子读取 Attr、符号链接目标、detached 状态和 pending-delete generation。metadata 与删除修改仍按引用的 MetadataAccess 权限及可选能力分别检查。NodeReference 可以声明 ReadData／WriteData 作为与其它入口兼容的 Use claim，这些声明不授予字节方法。
+`NodeReference` 没有字节方法，但编译期保证 `ScopedReference` 与 `ReferenceStateAccess`：成功 preflight 后，调用方一定能取得确切活引用的 Scope，并能通过明确 StateFull 原子读取 Attr、符号链接目标、detached 状态和 pending-delete generation；Full 遵守 ReadMetadata，StateScalars 只返回低权限对象与删除事实。metadata 与删除修改仍按引用的 MetadataAccess 权限及可选能力分别检查。NodeReference 可以声明 ReadData／WriteData 作为与其它入口兼容的 Use claim，这些声明不授予字节方法。
 
 所有三种打开都带 `FileActionID`。ID 使用 FileSession 当前 action epoch 与随机 nonce；同 ID、同输入返回原结果，同 ID、不同输入拒绝。`FileActions.QueryFileAction` 报告 pending、completed、not-executed、unknown 或 retired。只有存在保留记录时 receipt 才带 Operation；没有记录或旧 authority 无法证明原操作时，空 Operation 只与 not-executed、unknown 或 retired 一起出现。unknown 与 retired 都不能解释为未执行。
 

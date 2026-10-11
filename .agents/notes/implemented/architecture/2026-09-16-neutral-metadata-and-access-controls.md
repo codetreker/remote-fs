@@ -24,7 +24,7 @@ metadata 每节点最多 16 个 namespace，namespace 名最长 128 字节，单
 
 `MetadataAccess` 按 NodeID 原子比较并替换一个 namespace；`ReferenceMetadataAccess` 在已有 File 身份上执行同一操作。空 expected version 表示该 namespace 必须不存在，空 data 表示一个存在的空值；authority 为成功结果分配非空版本，只比较这一 namespace，并保留其它 namespace。已知条件不符为 `ErrConditionConflict`，且没有修改；未知结果仍按原发布规则失败。返回属性和 metadata 在载入或保留变长数据前经过请求拥有的结果预算。
 
-数据操作可通过[文件内容访问](../feature/2026-09-28-smb-file-data-io.md)的 OpenContentMetadata／ReferenceContentMetadata enrollment 固定派生效果及限定观察；它不增加公开 MetadataAccess 权限，普通 namespace CAS 与版本规则继续成立。
+数据操作可通过[文件内容访问](../feature/2026-09-28-smb-file-data-io.md)的 OpenContentMetadata enrollment 固定派生效果，并通过既有 ReferenceMetadataAccess 的明确 ContentEffect purpose 条件观察；它不增加公开 MetadataAccess 权限，普通 namespace CAS 与版本规则继续成立。
 
 ### 使用声明与范围控制保持中立
 

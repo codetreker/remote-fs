@@ -1,8 +1,10 @@
 package sqlite
 
 import (
+	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"syscall"
 	"testing"
@@ -185,5 +187,146 @@ func TestLoweredAllowanceReportsOverQuotaAndPermitsRelease(t *testing.T) {
 	}
 	if space, err := store.Space(t.Context()); err != nil || space != (storage.Space{Total: 4096, Used: 4096, Avail: 0}) {
 		t.Fatalf("released allocation = %+v, %v", space, err)
+	}
+}
+
+func allocationUnitStore(t *testing.T, locking bool, allowance int64) (*Store, func() error) {
+	t.Helper()
+	if locking {
+		config := lockingTestConfig(t)
+		config.Allowance = allowance
+		store, err := OpenLocking(t.Context(), config)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			if err := store.Close(); err != nil {
+				t.Error(err)
+			}
+		})
+		return store.Store, store.Close
+	}
+	store, err := Open(t.Context(), filepath.Join(t.TempDir(), "volume.db"), "volume", allowance, DefaultWindow())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	return store, store.Close
+}
+
+func TestAllocationUnitBytesDoesNotRequireAllowance(t *testing.T) {
+	for _, locking := range []bool{false, true} {
+		for _, allowance := range []int64{0, 8192} {
+			t.Run(fmt.Sprintf("locking=%t/allowance=%d", locking, allowance), func(t *testing.T) {
+				store, _ := allocationUnitStore(t, locking, allowance)
+				if err := store.CheckAllocationReporting(); err != nil {
+					t.Fatal(err)
+				}
+				if got, err := store.AllocationUnitBytes(t.Context()); err != nil || got != 4096 {
+					t.Fatalf("allocation unit = %d, %v", got, err)
+				}
+				if allowance == 0 {
+					if _, err := store.Space(t.Context()); !errors.Is(err, syscall.ENOSYS) {
+						t.Fatalf("space without allowance = %v", err)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestAllocationUnitBytesZeroesPublicationAndLifetimeFailures(t *testing.T) {
+	for _, locking := range []bool{false, true} {
+		t.Run(fmt.Sprintf("locking=%t", locking), func(t *testing.T) {
+			store, closeStore := allocationUnitStore(t, locking, 0)
+			denied := errors.New("allocation publication denied")
+			for _, failAt := range []int{1, 2} {
+				calls := 0
+				ctx := metastore.WithFilePublicationGuard(t.Context(), func() error {
+					calls++
+					if calls >= failAt {
+						return denied
+					}
+					return nil
+				})
+				if got, err := store.AllocationUnitBytes(ctx); got != 0 || !errors.Is(err, denied) || calls != failAt {
+					t.Fatalf("guard %d = %d, %v (%d calls)", failAt, got, err, calls)
+				}
+			}
+			ctx, cancel := context.WithCancel(t.Context())
+			cancel()
+			if got, err := store.AllocationUnitBytes(ctx); got != 0 || !errors.Is(err, context.Canceled) {
+				t.Fatalf("canceled allocation query = %d, %v", got, err)
+			}
+			if err := closeStore(); err != nil {
+				t.Fatal(err)
+			}
+			if got, err := store.AllocationUnitBytes(t.Context()); got != 0 || !errors.Is(err, syscall.ESTALE) {
+				t.Fatalf("closed allocation query = %d, %v", got, err)
+			}
+		})
+	}
+}
+
+func TestAllocationUnitBytesRejectsUnverifiedVolumeIdentity(t *testing.T) {
+	for _, locking := range []bool{false, true} {
+		t.Run(fmt.Sprintf("locking=%t", locking), func(t *testing.T) {
+			store, _ := allocationUnitStore(t, locking, 0)
+			var databaseID string
+			if err := store.read.QueryRowContext(t.Context(), `SELECT database_id FROM database_state`).Scan(&databaseID); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				if _, err := store.write.ExecContext(context.Background(), `UPDATE volumes SET root=? WHERE id=?`, store.root, store.volume); err != nil {
+					t.Error(err)
+				}
+				if _, err := store.write.ExecContext(context.Background(), `UPDATE database_state SET database_id=?`, databaseID); err != nil {
+					t.Error(err)
+				}
+			})
+			if _, err := store.write.ExecContext(t.Context(), `UPDATE volumes SET root=? WHERE id=?`, store.root+1, store.volume); err != nil {
+				t.Fatal(err)
+			}
+			if got, err := store.AllocationUnitBytes(t.Context()); got != 0 || !errors.Is(err, syscall.EIO) {
+				t.Fatalf("unverified root allocation query = %d, %v", got, err)
+			}
+			if _, err := store.write.ExecContext(t.Context(), `UPDATE volumes SET root=? WHERE id=?`, store.root, store.volume); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := store.write.ExecContext(t.Context(), `UPDATE database_state SET database_id='INVALID0000000000000000000000000'`); err != nil {
+				t.Fatal(err)
+			}
+			if got, err := store.AllocationUnitBytes(t.Context()); got != 0 || !errors.Is(err, syscall.EIO) {
+				t.Fatalf("unverified database allocation query = %d, %v", got, err)
+			}
+			if _, err := store.write.ExecContext(t.Context(), `UPDATE database_state SET database_id=?`, databaseID); err != nil {
+				t.Fatal(err)
+			}
+			if got, err := store.AllocationUnitBytes(t.Context()); err != nil || got != 4096 {
+				t.Fatalf("restored allocation query = %d, %v", got, err)
+			}
+		})
+	}
+}
+
+func TestAllocationUnitBytesPreservesDurabilityFailure(t *testing.T) {
+	for _, locking := range []bool{false, true} {
+		t.Run(fmt.Sprintf("locking=%t", locking), func(t *testing.T) {
+			store, _ := allocationUnitStore(t, locking, 0)
+			failure := errors.New("allocation durability failure")
+			store.coordinator.poisonWith(failure)
+			t.Cleanup(func() {
+				store.coordinator.health.Lock()
+				store.coordinator.poison = nil
+				store.coordinator.health.Unlock()
+			})
+			if got, err := store.AllocationUnitBytes(t.Context()); got != 0 || !errors.Is(err, syscall.EIO) || !errors.Is(err, failure) {
+				t.Fatalf("poisoned allocation query = %d, %v", got, err)
+			}
+		})
 	}
 }

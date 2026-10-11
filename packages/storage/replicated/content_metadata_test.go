@@ -16,33 +16,39 @@ type contentMetadataAuthority struct {
 	*fileAuthorityStub
 	id                             uint64
 	identityErr, checkErr, callErr error
-	observed                       storage.ContentMetadataObservation
+	observed                       storage.MetadataObservation
 	calls                          int
 	index                          uint16
 }
 
 func (p *contentMetadataAuthority) ReferenceNodeID() (uint64, error) { return p.id, p.identityErr }
-func (p *contentMetadataAuthority) CheckContentMetadata() error      { return p.checkErr }
-func (p *contentMetadataAuthority) ObserveContentMetadata(_ context.Context, index uint16) (storage.ContentMetadataObservation, error) {
+func (p *contentMetadataAuthority) CheckMetadataAccess() error       { return p.checkErr }
+func (p *contentMetadataAuthority) ObserveMetadata(_ context.Context, request storage.MetadataObservationRequest) (storage.MetadataObservation, error) {
 	p.calls++
-	p.index = index
+	p.index = request.EffectIndex
 	return p.observed, p.callErr
+}
+func (p *contentMetadataAuthority) SetMetadata(context.Context, string, []byte, []byte) (storage.OpaquePayload, error) {
+	return storage.OpaquePayload{}, syscall.EBADF
+}
+func (p *contentMetadataAuthority) SetMetadataWithBarrier(context.Context, string, []byte, []byte) (storage.OpaquePayload, *httprest.MutationBarrier, error) {
+	return storage.OpaquePayload{}, nil, syscall.EBADF
 }
 func (p *contentMetadataAuthority) Stat(context.Context) (storage.Attr, error) {
 	return storage.Attr{}, syscall.EBADF
 }
 
 func TestContentMetadataPreservesByteOnlyAuthorityAndOwnsObservation(t *testing.T) {
-	want := storage.ContentMetadataObservation{NodeID: 19, Value: &storage.OpaquePayload{Version: []byte{1}, Data: []byte{'M', 0xff, 0}}}
+	want := storage.MetadataObservation{NodeID: 19, Value: &storage.OpaquePayload{Version: []byte{1}, Data: []byte{'M', 0xff, 0}}}
 	authority := &contentMetadataAuthority{fileAuthorityStub: &fileAuthorityStub{}, id: 19, observed: want}
 	file := &retainedFile{session: retainedTestSession(t, &fileSessionStub{}), remote: authority}
-	if err := file.CheckContentMetadata(); err != nil {
+	if err := file.CheckMetadataAccess(); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := file.Stat(t.Context()); !errors.Is(err, syscall.EBADF) {
 		t.Fatalf("public metadata access = %v", err)
 	}
-	got, err := file.ObserveContentMetadata(t.Context(), 3)
+	got, err := file.ObserveMetadata(t.Context(), storage.MetadataObservationRequest{Purpose: storage.MetadataObservationContentEffect, EffectIndex: 3})
 	if err != nil || !reflect.DeepEqual(got, want) || authority.index != 3 || authority.calls != 1 {
 		t.Fatalf("observation=%+v, %v; calls=%d index=%d", got, err, authority.calls, authority.index)
 	}
@@ -51,12 +57,12 @@ func TestContentMetadataPreservesByteOnlyAuthorityAndOwnsObservation(t *testing.
 	if authority.observed.Value.Version[0] != 1 || authority.observed.Value.Data[0] != 'M' {
 		t.Fatal("observation aliases authority payload")
 	}
-	authority.observed = storage.ContentMetadataObservation{NodeID: 19}
-	if got, err := file.ObserveContentMetadata(t.Context(), 0); err != nil || got.NodeID != 19 || got.Value != nil {
+	authority.observed = storage.MetadataObservation{NodeID: 19}
+	if got, err := file.ObserveMetadata(t.Context(), storage.MetadataObservationRequest{Purpose: storage.MetadataObservationContentEffect, EffectIndex: 0}); err != nil || got.NodeID != 19 || got.Value != nil {
 		t.Fatalf("confirmed absence=%+v, %v", got, err)
 	}
-	authority.observed = storage.ContentMetadataObservation{NodeID: 19, Value: &storage.OpaquePayload{Version: []byte{1}}}
-	if got, err := file.ObserveContentMetadata(t.Context(), 0); err != nil || got.Value == nil {
+	authority.observed = storage.MetadataObservation{NodeID: 19, Value: &storage.OpaquePayload{Version: []byte{1}}}
+	if got, err := file.ObserveMetadata(t.Context(), storage.MetadataObservationRequest{Purpose: storage.MetadataObservationContentEffect, EffectIndex: 0}); err != nil || got.Value == nil {
 		t.Fatalf("present empty value became absent: %+v, %v", got, err)
 	}
 }
@@ -65,7 +71,7 @@ func TestContentMetadataRejectsAuthorityFailuresAndLocalRetirement(t *testing.T)
 	failure := errors.New("authority content metadata unavailable")
 	for _, scenario := range []string{"missing capability", "missing identity", "check failure", "identity failure", "zero identity", "wrong identity", "malformed", "capture failure", "unhealthy replica", "retired session"} {
 		t.Run(scenario, func(t *testing.T) {
-			authority := &contentMetadataAuthority{fileAuthorityStub: &fileAuthorityStub{}, id: 19, observed: storage.ContentMetadataObservation{NodeID: 19, Value: &storage.OpaquePayload{Version: []byte{1}, Data: []byte{1}}}}
+			authority := &contentMetadataAuthority{fileAuthorityStub: &fileAuthorityStub{}, id: 19, observed: storage.MetadataObservation{NodeID: 19, Value: &storage.OpaquePayload{Version: []byte{1}, Data: []byte{1}}}}
 			session := retainedTestSession(t, &fileSessionStub{})
 			var remote httprest.FileWithBarrier = authority
 			switch scenario {
@@ -74,8 +80,8 @@ func TestContentMetadataRejectsAuthorityFailuresAndLocalRetirement(t *testing.T)
 			case "missing identity":
 				remote = &struct {
 					httprest.FileWithBarrier
-					storage.ReferenceContentMetadata
-				}{FileWithBarrier: &fileAuthorityStub{}, ReferenceContentMetadata: authority}
+					storage.ReferenceMetadataAccess
+				}{FileWithBarrier: &fileAuthorityStub{}, ReferenceMetadataAccess: authority}
 			case "check failure":
 				authority.checkErr = failure
 			case "identity failure":
@@ -94,8 +100,8 @@ func TestContentMetadataRejectsAuthorityFailuresAndLocalRetirement(t *testing.T)
 				session.closing = true
 			}
 			file := &retainedFile{session: session, remote: remote}
-			got, err := file.ObserveContentMetadata(t.Context(), 0)
-			if err == nil || !reflect.DeepEqual(got, storage.ContentMetadataObservation{}) {
+			got, err := file.ObserveMetadata(t.Context(), storage.MetadataObservationRequest{Purpose: storage.MetadataObservationContentEffect, EffectIndex: 0})
+			if err == nil || !reflect.DeepEqual(got, storage.MetadataObservation{}) {
 				t.Fatalf("invalid observation=%+v, %v", got, err)
 			}
 			preflight := scenario == "missing capability" || scenario == "missing identity" || scenario == "check failure" || scenario == "identity failure" || scenario == "zero identity" || scenario == "unhealthy replica" || scenario == "retired session"

@@ -1,83 +1,87 @@
 package storage
 
 import (
-	"context"
-	"slices"
+	"bytes"
 	"strings"
 	"syscall"
 )
 
-// MetadataObservationScope enrolls a single bounded namespace for conditional
-// metadata updates. A zero payload bound admits present empty values.
-type MetadataObservationScope struct {
+type MetadataObservationPurpose uint8
+
+const (
+	MetadataObservationContentEffect MetadataObservationPurpose = iota + 1
+	MetadataObservationNamespace
+)
+
+// MetadataObservationRequest selects either an enrolled content effect or a
+// bounded namespace condition. The selectors have separate permissions and
+// cannot be combined. Namespace is checked against current host policy per call.
+type MetadataObservationRequest struct {
+	Purpose         MetadataObservationPurpose
+	EffectIndex     uint16
 	Namespace       string
 	MaxPayloadBytes int
 }
 
-// OpenMetadataObservation verifies enrollment support through the complete
-// backing chain before an open can have effects.
-type OpenMetadataObservation interface {
-	CheckOpenMetadataObservation() error
-}
-
-// ReferenceMetadataObserver observes only an enrolled namespace through the
-// exact live File or NodeReference. Enrollment and calls require WriteMetadata;
-// they grant no ReadMetadata or additional metadata mutation permissions.
-// The result owns its bytes, distinguishes absence from an empty present value,
-// and is zero on every error. Backend scratch space remains bounded separately.
-type ReferenceMetadataObserver interface {
-	CheckMetadataObservation() error
-	ObserveMetadata(context.Context, uint16) (ContentMetadataObservation, error)
-}
-
-func (s MetadataObservationScope) Check() error {
-	if err := CheckMetadataNamespace(s.Namespace); err != nil {
-		return err
-	}
-	if s.MaxPayloadBytes < 0 {
-		return syscall.EINVAL
-	}
-	if s.MaxPayloadBytes > MaxMetadataValueBytes {
-		return syscall.EFBIG
-	}
-	return nil
-}
-
-func CheckMetadataObservationScopes(scopes []MetadataObservationScope) error {
-	if len(scopes) > MaxMetadataNamespaces {
-		return syscall.EFBIG
-	}
-	seen := make(map[string]struct{}, len(scopes))
-	bytes := 6
-	for _, scope := range scopes {
-		if err := scope.Check(); err != nil {
-			return err
-		}
-		if _, exists := seen[scope.Namespace]; exists {
+func (r MetadataObservationRequest) Check() error {
+	switch r.Purpose {
+	case MetadataObservationContentEffect:
+		if r.Namespace != "" || r.MaxPayloadBytes != 0 {
 			return syscall.EINVAL
 		}
-		seen[scope.Namespace] = struct{}{}
-		bytes += 8 + len(scope.Namespace) + MaxObservationTokenBytes + scope.MaxPayloadBytes
-		if bytes > MaxMetadataBytes {
+	case MetadataObservationNamespace:
+		if r.EffectIndex != 0 {
+			return syscall.EINVAL
+		}
+		if err := CheckMetadataNamespace(r.Namespace); err != nil {
+			return err
+		}
+		if r.MaxPayloadBytes < 0 {
+			return syscall.EINVAL
+		}
+		if r.MaxPayloadBytes > MaxMetadataValueBytes {
 			return syscall.EFBIG
 		}
+	default:
+		return syscall.EINVAL
 	}
 	return nil
 }
 
-func CloneMetadataObservationScopes(scopes []MetadataObservationScope) []MetadataObservationScope {
-	if len(scopes) == 0 {
-		return nil
-	}
-	result := slices.Clone(scopes)
-	for i := range result {
-		result[i].Namespace = strings.Clone(result[i].Namespace)
-	}
-	return result
+func (r MetadataObservationRequest) Clone() MetadataObservationRequest {
+	r.Namespace = strings.Clone(r.Namespace)
+	return r
 }
 
-func (o ContentMetadataObservation) CheckScope(nodeID uint64, scope MetadataObservationScope) error {
-	if err := scope.Check(); err != nil {
+// MetadataObservation owns exactly one namespace condition. Nil Value is
+// confirmed absence; a nonnil value with empty Data is present. Failed queries
+// return zero. Backends separately bound their decoding scratch space.
+type MetadataObservation struct {
+	NodeID uint64
+	Value  *OpaquePayload
+}
+
+func (o MetadataObservation) Clone() MetadataObservation {
+	if o.Value != nil {
+		value := OpaquePayload{Version: bytes.Clone(o.Value.Version), Data: bytes.Clone(o.Value.Data)}
+		o.Value = &value
+	}
+	return o
+}
+
+func (o MetadataObservation) Check() error {
+	if o.NodeID == 0 {
+		return syscall.EIO
+	}
+	if o.Value != nil && (len(o.Value.Version) == 0 || len(o.Value.Version) > MaxObservationTokenBytes || len(o.Value.Data) > MaxMetadataValueBytes) {
+		return syscall.EIO
+	}
+	return nil
+}
+
+func (o MetadataObservation) CheckNamespace(nodeID uint64, namespace string, maxPayloadBytes int) error {
+	request := MetadataObservationRequest{Purpose: MetadataObservationNamespace, Namespace: namespace, MaxPayloadBytes: maxPayloadBytes}
+	if err := request.Check(); err != nil {
 		return err
 	}
 	if err := o.Check(); err != nil {
@@ -86,7 +90,7 @@ func (o ContentMetadataObservation) CheckScope(nodeID uint64, scope MetadataObse
 	if nodeID == 0 || o.NodeID != nodeID {
 		return syscall.EIO
 	}
-	if o.Value != nil && len(o.Value.Data) > scope.MaxPayloadBytes {
+	if o.Value != nil && len(o.Value.Data) > maxPayloadBytes {
 		return syscall.EFBIG
 	}
 	return nil

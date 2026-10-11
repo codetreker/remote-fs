@@ -9,68 +9,48 @@ import (
 	"github.com/codetreker/remote-fs/packages/storage"
 )
 
-func TestMetadataObservationEnrollmentBoundsAndPermissions(t *testing.T) {
-	valid := []storage.MetadataObservationScope{{Namespace: "app.flags", MaxPayloadBytes: 8}, {Namespace: "app.empty"}}
-	if err := storage.CheckMetadataObservationScopes(valid); err != nil {
-		t.Fatal(err)
-	}
-	for _, test := range []struct {
-		scopes []storage.MetadataObservationScope
-		want   error
-	}{
-		{[]storage.MetadataObservationScope{{Namespace: "bad space", MaxPayloadBytes: 1}}, syscall.EINVAL},
-		{[]storage.MetadataObservationScope{{Namespace: "app.flags", MaxPayloadBytes: -1}}, syscall.EINVAL},
-		{[]storage.MetadataObservationScope{{Namespace: "app.flags", MaxPayloadBytes: storage.MaxMetadataValueBytes + 1}}, syscall.EFBIG},
-		{[]storage.MetadataObservationScope{valid[0], valid[0]}, syscall.EINVAL},
-		{make([]storage.MetadataObservationScope, storage.MaxMetadataNamespaces+1), syscall.EFBIG},
-		{[]storage.MetadataObservationScope{{Namespace: "a", MaxPayloadBytes: storage.MaxMetadataValueBytes}, {Namespace: "b", MaxPayloadBytes: storage.MaxMetadataValueBytes}}, syscall.EFBIG},
+func TestMetadataObservationRequestsKeepPermissionsAndBoundsSeparate(t *testing.T) {
+	for _, request := range []storage.MetadataObservationRequest{
+		{Purpose: storage.MetadataObservationContentEffect},
+		{Purpose: storage.MetadataObservationContentEffect, EffectIndex: 65535},
+		{Purpose: storage.MetadataObservationNamespace, Namespace: "app.flags", MaxPayloadBytes: 8},
+		{Purpose: storage.MetadataObservationNamespace, Namespace: "app.empty"},
+		{Purpose: storage.MetadataObservationNamespace, Namespace: "app.large", MaxPayloadBytes: storage.MaxMetadataValueBytes},
 	} {
-		if err := storage.CheckMetadataObservationScopes(test.scopes); !errors.Is(err, test.want) {
-			t.Fatalf("enrollment %+v = %v, want %v", test.scopes, err, test.want)
+		if err := request.Check(); err != nil {
+			t.Fatalf("valid request %+v = %v", request, err)
+		}
+		if request.Clone() != request {
+			t.Fatal("clone changed namespace request")
 		}
 	}
-	cloned := storage.CloneMetadataObservationScopes(valid)
-	cloned[0].Namespace, cloned[0].MaxPayloadBytes = "other", 0
-	if valid[0].Namespace != "app.flags" || valid[0].MaxPayloadBytes != 8 {
-		t.Fatal("scope clone changed enrollment")
-	}
-	if storage.CloneMetadataObservationScopes(nil) != nil || storage.CloneMetadataObservationScopes([]storage.MetadataObservationScope{}) != nil {
-		t.Fatal("empty enrollment gained scopes")
-	}
-	action, err := storage.NewFileActionID(1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	file := storage.OpenAtOptions{Read: true, Target: storage.ChildCondition{State: storage.Any}, Existing: storage.Keep,
-		Action: action, Use: storage.UseClaim{Uses: storage.ReadData}, MetadataAccess: storage.WriteMetadata, MetadataObservations: valid}
-	node := storage.NodeRefOptions{Kind: storage.NodeDirectory, Target: storage.ChildCondition{State: storage.Any}, Action: action,
-		MetadataAccess: storage.WriteMetadata, MetadataObservations: valid}
-	if err := file.Check(); err != nil {
-		t.Fatal(err)
-	}
-	if err := node.Check(); err != nil {
-		t.Fatal(err)
-	}
-	file.MetadataAccess, node.MetadataAccess = storage.ReadMetadata, 0
-	if err := file.Check(); !errors.Is(err, syscall.EINVAL) {
-		t.Fatalf("read-only file enrollment = %v", err)
-	}
-	if err := node.Check(); !errors.Is(err, syscall.EINVAL) {
-		t.Fatalf("unprivileged node enrollment = %v", err)
-	}
-	if err := (storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true, MetadataObservations: valid}}).Check(); !errors.Is(err, syscall.EINVAL) {
-		t.Fatalf("legacy open enrollment = %v", err)
+	for _, test := range []struct {
+		request storage.MetadataObservationRequest
+		want    error
+	}{
+		{storage.MetadataObservationRequest{}, syscall.EINVAL},
+		{storage.MetadataObservationRequest{Purpose: 3}, syscall.EINVAL},
+		{storage.MetadataObservationRequest{Purpose: storage.MetadataObservationContentEffect, Namespace: "app.flags"}, syscall.EINVAL},
+		{storage.MetadataObservationRequest{Purpose: storage.MetadataObservationContentEffect, MaxPayloadBytes: 1}, syscall.EINVAL},
+		{storage.MetadataObservationRequest{Purpose: storage.MetadataObservationNamespace, EffectIndex: 1, Namespace: "app.flags"}, syscall.EINVAL},
+		{storage.MetadataObservationRequest{Purpose: storage.MetadataObservationNamespace}, syscall.EINVAL},
+		{storage.MetadataObservationRequest{Purpose: storage.MetadataObservationNamespace, Namespace: "bad space"}, syscall.EINVAL},
+		{storage.MetadataObservationRequest{Purpose: storage.MetadataObservationNamespace, Namespace: "app.flags", MaxPayloadBytes: -1}, syscall.EINVAL},
+		{storage.MetadataObservationRequest{Purpose: storage.MetadataObservationNamespace, Namespace: "app.flags", MaxPayloadBytes: storage.MaxMetadataValueBytes + 1}, syscall.EFBIG},
+	} {
+		if err := test.request.Check(); !errors.Is(err, test.want) {
+			t.Fatalf("request %+v = %v, want %v", test.request, err, test.want)
+		}
 	}
 }
 
-func TestMetadataScopeObservationKeepsPresenceAndOwnedBytes(t *testing.T) {
-	scope := storage.MetadataObservationScope{Namespace: "app.flags", MaxPayloadBytes: 1}
-	for _, observed := range []storage.ContentMetadataObservation{
+func TestMetadataNamespaceObservationKeepsPresenceAndOwnedBytes(t *testing.T) {
+	for _, observed := range []storage.MetadataObservation{
 		{NodeID: 7},
 		{NodeID: 7, Value: &storage.OpaquePayload{Version: []byte{1}}},
 		{NodeID: 7, Value: &storage.OpaquePayload{Version: []byte{1}, Data: []byte{2}}},
 	} {
-		if err := observed.CheckScope(7, scope); err != nil {
+		if err := observed.CheckNamespace(7, "app.flags", 1); err != nil {
 			t.Fatal(err)
 		}
 		copied := observed.Clone()
@@ -82,28 +62,30 @@ func TestMetadataScopeObservationKeepsPresenceAndOwnedBytes(t *testing.T) {
 			if observed.Value.Version[0] != 1 {
 				t.Fatal("clone changed namespace token")
 			}
+			if len(copied.Value.Data) != 0 {
+				copied.Value.Data[0] = 99
+				if observed.Value.Data[0] != 2 {
+					t.Fatal("clone changed namespace payload")
+				}
+			}
 		}
 	}
-	valid := storage.ContentMetadataObservation{NodeID: 7, Value: &storage.OpaquePayload{Version: []byte{1}, Data: []byte{2}}}
-	if err := valid.CheckScope(7, storage.MetadataObservationScope{Namespace: "app.empty"}); !errors.Is(err, syscall.EFBIG) {
-		t.Fatalf("payload exceeds enrollment = %v", err)
-	}
-	if err := valid.CheckScope(0, scope); !errors.Is(err, syscall.EIO) {
-		t.Fatalf("unknown expected identity = %v", err)
-	}
-	if err := valid.CheckScope(8, scope); !errors.Is(err, syscall.EIO) {
-		t.Fatalf("substituted object = %v", err)
-	}
-	if err := (storage.ContentMetadataObservation{NodeID: 7, Value: &storage.OpaquePayload{}}).CheckScope(7, scope); !errors.Is(err, syscall.EIO) {
-		t.Fatalf("present without token = %v", err)
-	}
-	if err := valid.CheckScope(7, storage.MetadataObservationScope{}); !errors.Is(err, syscall.EINVAL) {
-		t.Fatalf("invalid scope = %v", err)
-	}
-	access := storage.OpenAccess{MetadataObservations: []storage.MetadataObservationScope{scope}}
-	cloned := access.Clone()
-	cloned.MetadataObservations[0].Namespace = "other"
-	if access.MetadataObservations[0].Namespace != "app.flags" {
-		t.Fatal("policy clone changed sealed scope")
+	valid := storage.MetadataObservation{NodeID: 7, Value: &storage.OpaquePayload{Version: []byte{1}, Data: []byte{2}}}
+	for _, test := range []struct {
+		observation storage.MetadataObservation
+		id          uint64
+		namespace   string
+		bound       int
+		want        error
+	}{
+		{valid, 7, "app.empty", 0, syscall.EFBIG},
+		{valid, 0, "app.flags", 1, syscall.EIO},
+		{valid, 8, "app.flags", 1, syscall.EIO},
+		{storage.MetadataObservation{NodeID: 7, Value: &storage.OpaquePayload{}}, 7, "app.flags", 1, syscall.EIO},
+		{valid, 7, "", 1, syscall.EINVAL},
+	} {
+		if err := test.observation.CheckNamespace(test.id, test.namespace, test.bound); !errors.Is(err, test.want) {
+			t.Fatalf("bounded observation = %v, want %v", err, test.want)
+		}
 	}
 }

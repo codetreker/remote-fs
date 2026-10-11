@@ -178,12 +178,6 @@ func (s InitialState) Check() error {
 }
 
 func (o OpenAtOptions) Check() error {
-	if err := CheckMetadataObservationScopes(o.MetadataObservations); err != nil {
-		return err
-	}
-	if len(o.MetadataObservations) != 0 && o.MetadataAccess&WriteMetadata == 0 {
-		return syscall.EINVAL
-	}
 	if err := CheckContentMetadataEffects(o.ContentMetadataEffects); err != nil {
 		return err
 	}
@@ -234,12 +228,6 @@ func (o OpenAtOptions) Check() error {
 }
 
 func (o NodeRefOptions) Check() error {
-	if err := CheckMetadataObservationScopes(o.MetadataObservations); err != nil {
-		return err
-	}
-	if len(o.MetadataObservations) != 0 && o.MetadataAccess&WriteMetadata == 0 {
-		return syscall.EINVAL
-	}
 	if err := o.Kind.Check(); err != nil {
 		return err
 	}

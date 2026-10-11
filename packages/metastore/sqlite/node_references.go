@@ -27,7 +27,7 @@ func (s *Store) OpenChildRef(ctx context.Context, selection storage.ChildSelecti
 	selection = selection.Clone()
 	file, state, outcome, err := s.openAtomicChild(ctx, selection, options.Kind, false, false, options.MetadataAccess,
 		options.Create, options.Exclusive, options.Target, options.Use, storage.Keep,
-		options.InitialState, options.CloseIntent, nil, options.MetadataObservations)
+		options.InitialState, options.CloseIntent, nil)
 	if file == nil {
 		return metastore.NodeOpenResult{}, err
 	}
@@ -44,7 +44,6 @@ func (s *Store) OpenNodeRef(ctx context.Context, id uint64, options storage.Node
 	if id > math.MaxInt64 {
 		return metastore.NodeOpenResult{}, syscall.ESTALE
 	}
-	observations := storage.CloneMetadataObservationScopes(options.MetadataObservations)
 	scope, err := newReferenceScope()
 	if err != nil {
 		return metastore.NodeOpenResult{}, err
@@ -60,7 +59,7 @@ func (s *Store) OpenNodeRef(ctx context.Context, id uint64, options storage.Node
 		return metastore.NodeOpenResult{}, syscall.EAGAIN
 	}
 	file := &retainedFile{store: s, id: int64(id), scope: scope, session: metastore.ReferenceSession(ctx),
-		use: options.Use, metadata: options.MetadataAccess, metadataObservations: observations, active: true}
+		use: options.Use, metadata: options.MetadataAccess, active: true}
 	var state metastore.FileState
 	claimed := false
 	open := func(tx *sql.Tx) error {
@@ -140,9 +139,12 @@ func (r *retainedNodeReference) SetMetadata(ctx context.Context, namespace strin
 	}
 	return r.file.SetMetadata(ctx, namespace, expected, data)
 }
+func (r *retainedNodeReference) ObserveMetadata(ctx context.Context, request storage.MetadataObservationRequest) (storage.MetadataObservation, error) {
+	return r.file.ObserveMetadata(ctx, request)
+}
 func (r *retainedNodeReference) CheckReferenceState() error { return r.file.CheckReferenceState() }
-func (r *retainedNodeReference) State(ctx context.Context) (metastore.ReferenceState, error) {
-	return r.file.State(ctx)
+func (r *retainedNodeReference) State(ctx context.Context, projection storage.StateProjection) (metastore.ReferenceState, error) {
+	return r.file.State(ctx, projection)
 }
 func (r *retainedNodeReference) CheckDeleteIntent() error { return r.file.CheckDeleteIntent() }
 func (r *retainedNodeReference) SetPendingUnlink(ctx context.Context, command storage.PendingUnlinkCommand) (metastore.ReferenceState, error) {

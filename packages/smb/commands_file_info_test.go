@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/codetreker/remote-fs/packages/authz"
 	"github.com/codetreker/remote-fs/packages/smb/internal/wire"
 	"github.com/codetreker/remote-fs/packages/storage"
 )
@@ -46,14 +47,17 @@ func eofInfoForTest(size int64) []byte {
 type infoFileProbe struct {
 	handleFileStub
 	attr         storage.Attr
-	info         storage.ReferenceInformation
+	info         storage.ReferenceState
 	err          error
 	stats, infos atomic.Int32
 }
 
 func (*infoFileProbe) ReferenceNodeID() (uint64, error) { return 7, nil }
-func (*infoFileProbe) CheckReferenceInformation() error { return nil }
-func (f *infoFileProbe) Information(context.Context) (storage.ReferenceInformation, error) {
+func (*infoFileProbe) CheckReferenceState() error       { return nil }
+func (f *infoFileProbe) State(_ context.Context, projection storage.StateProjection) (storage.ReferenceState, error) {
+	if projection != storage.StateScalars {
+		return storage.ReferenceState{}, syscall.EACCES
+	}
 	f.infos.Add(1)
 	return f.info, f.err
 }
@@ -62,25 +66,29 @@ func (f *infoFileProbe) Stat(context.Context) (storage.Attr, error) {
 	return f.attr, f.err
 }
 
-type infoGeometrySession struct {
+type infoAllocationSession struct {
 	*endpointFileSession
-	geometry storage.VolumeGeometry
-	err      error
+	unit          uint64
+	checkErr, err error
+	units         int
+	afterUnit     func()
 }
 
-func (s *infoGeometrySession) CheckVolumeGeometry() error { return s.err }
-func (s *infoGeometrySession) VolumeGeometry(context.Context) (storage.VolumeGeometry, error) {
-	return s.geometry, s.err
+func (s *infoAllocationSession) CheckAllocationReporting() error { return s.checkErr }
+func (s *infoAllocationSession) AllocationUnitBytes(context.Context) (uint64, error) {
+	s.units++
+	if s.afterUnit != nil {
+		s.afterUnit()
+	}
+	return s.unit, s.err
 }
 
 func newInfoCommandFixture(t *testing.T, file *infoFileProbe, access uint32) (*connection, *session, *tree, *fileHandle) {
 	t.Helper()
 	c, s, tree, h := newIOCommandFixture(t, &ioFileProbe{}, access)
-	identity := storage.FileSessionIdentityResult{Backend: endpointBackendIdentity(), SessionEpoch: "test-session"}
+	identity := storage.FileSessionIdentityResult{Backend: endpointBackendIdentity(), SessionEpoch: "endpoint"}
 	tree.authority.identity, h.identity = identity, identity
-	tree.authority.raw = &infoGeometrySession{endpointFileSession: newEndpointFileSession(), geometry: storage.VolumeGeometry{
-		Volume: identity.Backend.Volume, BytesPerSector: 512, SectorsPerAllocationUnit: 8,
-	}}
+	tree.authority.raw = &infoAllocationSession{endpointFileSession: newEndpointFileSession(), unit: 4096}
 	h.file, h.nodeKind = file, storage.NodeRegular
 	return c, s, tree, h
 }
@@ -89,7 +97,7 @@ func validInfoFileProbe() *infoFileProbe {
 	return &infoFileProbe{
 		attr: storage.Attr{ID: 7, Kind: storage.NodeRegular, Size: 3, AllocationKnown: true, AllocationSize: 4096,
 			AccessTime: time.Unix(1700000000, 0), ModTime: time.Unix(1700000001, 0)},
-		info: storage.ReferenceInformation{NodeID: 7, Kind: storage.NodeRegular, Size: 3, AllocationKnown: true, AllocationSize: 4096},
+		info: storage.ReferenceState{Attr: storage.Attr{ID: 7, Kind: storage.NodeRegular, Size: 3, AllocationKnown: true, AllocationSize: 4096}},
 	}
 }
 
@@ -138,11 +146,15 @@ func TestFileInformationRejectsContradictoryFacts(t *testing.T) {
 		class  byte
 		change func(*infoFileProbe, *tree)
 	}{
-		{"scalar-wrong-object", wire.FileInternalInformation, func(f *infoFileProbe, _ *tree) { f.info.NodeID++ }},
-		{"scalar-wrong-kind", wire.FileInternalInformation, func(f *infoFileProbe, _ *tree) { f.info.Kind = storage.NodeDirectory }},
-		{"scalar-negative-eof", wire.FileStandardInformation, func(f *infoFileProbe, _ *tree) { f.info.Size = -1 }},
-		{"scalar-unknown-allocation", wire.FileStandardInformation, func(f *infoFileProbe, _ *tree) { f.info.AllocationKnown = false; f.info.AllocationSize = 0 }},
-		{"scalar-misaligned-allocation", wire.FileStandardInformation, func(f *infoFileProbe, _ *tree) { f.info.AllocationSize = 4095 }},
+		{"scalar-wrong-object", wire.FileInternalInformation, func(f *infoFileProbe, _ *tree) { f.info.Attr.ID++ }},
+		{"scalar-leaks-metadata", wire.FileInternalInformation, func(f *infoFileProbe, _ *tree) { f.info.Attr.Metadata = map[string]storage.OpaquePayload{} }},
+		{"scalar-leaks-times", wire.FileInternalInformation, func(f *infoFileProbe, _ *tree) { f.info.Attr.ModTime = time.Now() }},
+		{"scalar-leaks-link", wire.FileInternalInformation, func(f *infoFileProbe, _ *tree) { f.info.LinkTarget = []byte("target") }},
+		{"scalar-leaks-generation", wire.FileInternalInformation, func(f *infoFileProbe, _ *tree) { f.info.PendingGeneration = []byte("private") }},
+		{"scalar-wrong-kind", wire.FileInternalInformation, func(f *infoFileProbe, _ *tree) { f.info.Attr.Kind = storage.NodeDirectory }},
+		{"scalar-negative-eof", wire.FileStandardInformation, func(f *infoFileProbe, _ *tree) { f.info.Attr.Size = -1 }},
+		{"scalar-unknown-allocation", wire.FileStandardInformation, func(f *infoFileProbe, _ *tree) { f.info.Attr.AllocationKnown = false; f.info.Attr.AllocationSize = 0 }},
+		{"scalar-misaligned-allocation", wire.FileStandardInformation, func(f *infoFileProbe, _ *tree) { f.info.Attr.AllocationSize = 4095 }},
 		{"attr-wrong-object", wire.FileBasicInformation, func(f *infoFileProbe, _ *tree) { f.attr.ID++ }},
 		{"attr-wrong-kind", wire.FileBasicInformation, func(f *infoFileProbe, _ *tree) { f.attr.Kind = storage.NodeDirectory }},
 		{"attr-negative-eof", wire.FileNetworkOpenInformation, func(f *infoFileProbe, _ *tree) { f.attr.Size = -1 }},
@@ -152,11 +164,11 @@ func TestFileInformationRejectsContradictoryFacts(t *testing.T) {
 			f.attr.Metadata = map[string]storage.OpaquePayload{windowsMetadataKey: {Version: []byte("1"), Data: []byte("bad")}}
 		}},
 		{"time-before-epoch", wire.FileBasicInformation, func(f *infoFileProbe, _ *tree) { f.attr.ModTime = time.Unix(-filetimeUnixOffset-1, 0) }},
-		{"geometry-wrong-volume", wire.FileStandardInformation, func(_ *infoFileProbe, tree *tree) {
-			tree.authority.raw.(*infoGeometrySession).geometry.Volume = "other"
+		{"allocation-zero-unit", wire.FileNetworkOpenInformation, func(_ *infoFileProbe, tree *tree) {
+			tree.authority.raw.(*infoAllocationSession).unit = 0
 		}},
-		{"geometry-zero-sector", wire.FileNetworkOpenInformation, func(_ *infoFileProbe, tree *tree) {
-			tree.authority.raw.(*infoGeometrySession).geometry.BytesPerSector = 0
+		{"allocation-error-with-data", wire.FileStandardInformation, func(_ *infoFileProbe, tree *tree) {
+			tree.authority.raw.(*infoAllocationSession).err = syscall.EIO
 		}},
 		{"backing-error-with-data", wire.FileInternalInformation, func(f *infoFileProbe, _ *tree) { f.err = syscall.EIO }},
 	} {
@@ -172,18 +184,18 @@ func TestFileInformationRejectsContradictoryFacts(t *testing.T) {
 	}
 }
 
-func TestFileInformationMissingGeometryIsClassLocal(t *testing.T) {
+func TestFileInformationMissingAllocationUnitIsClassLocal(t *testing.T) {
 	f := validInfoFileProbe()
 	c, s, tree, h := newInfoCommandFixture(t, f, accessReadAttr)
-	tree.authority.raw = newEndpointFileSession()
+	tree.authority.raw.(*infoAllocationSession).checkErr = syscall.EOPNOTSUPP
 	for _, class := range []byte{wire.FileBasicInformation, wire.FileInternalInformation, wire.FileIdInformation} {
 		if _, status := c.queryFileInfo(t.Context(), s, tree, queryInfoRequestForTest(h.id, class, 56)); status != statusOK {
-			t.Fatalf("geometry-independent class %d status=%#x", class, status)
+			t.Fatalf("allocation-independent class %d status=%#x", class, status)
 		}
 	}
 	for _, class := range []byte{wire.FileStandardInformation, wire.FileNetworkOpenInformation} {
 		if _, status := c.queryFileInfo(t.Context(), s, tree, queryInfoRequestForTest(h.id, class, 56)); status != statusUnsupported {
-			t.Fatalf("geometry-dependent class %d status=%#x", class, status)
+			t.Fatalf("allocation-dependent class %d status=%#x", class, status)
 		}
 	}
 }
@@ -306,5 +318,63 @@ func TestFileInformationDirectorySizeSentinelDoesNotEnterEOFProjection(t *testin
 		if class == wire.FileNetworkOpenInformation && binary.LittleEndian.Uint64(body[48:]) != 0 {
 			t.Fatalf("directory sentinel projected as EOF: %x", body)
 		}
+	}
+}
+
+func TestFileInformationAllocationUnitChecksOwningSessionAndCurrentPolicy(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		setup func(context.CancelFunc, *connection, *tree, *infoAllocationSession)
+		want  error
+		calls int
+	}{
+		{"substituted-before", func(_ context.CancelFunc, _ *connection, _ *tree, reporter *infoAllocationSession) {
+			reporter.status.Epoch = "substituted"
+		}, syscall.ESTALE, 0},
+		{"substituted-after", func(_ context.CancelFunc, _ *connection, _ *tree, reporter *infoAllocationSession) {
+			reporter.afterUnit = func() { reporter.status.Epoch = "substituted" }
+		}, syscall.ESTALE, 1},
+		{"retired-after", func(_ context.CancelFunc, _ *connection, tree *tree, reporter *infoAllocationSession) {
+			reporter.afterUnit = func() { tree.authority.closed = true }
+		}, syscall.ESTALE, 1},
+		{"canceled-after", func(cancel context.CancelFunc, _ *connection, _ *tree, reporter *infoAllocationSession) {
+			reporter.afterUnit = cancel
+		}, context.Canceled, 1},
+		{"denied-before", func(_ context.CancelFunc, c *connection, _ *tree, _ *infoAllocationSession) {
+			c.server.config.Authorize = authz.AuthorizerFunc(func(_ context.Context, request authz.AccessRequest) error {
+				if request.Operation == storage.OpFileAllocationUnit {
+					return authz.ErrDenied
+				}
+				return nil
+			})
+		}, authz.ErrDenied, 0},
+		{"revoked-after", func(_ context.CancelFunc, c *connection, _ *tree, reporter *infoAllocationSession) {
+			reporter.afterUnit = func() {
+				c.server.config.Authorize = authz.AuthorizerFunc(func(_ context.Context, request authz.AccessRequest) error {
+					if request.Operation == storage.OpFileAllocationUnit {
+						return authz.ErrDenied
+					}
+					return nil
+				})
+			}
+		}, authz.ErrDenied, 1},
+		{"checker-error", func(_ context.CancelFunc, _ *connection, _ *tree, reporter *infoAllocationSession) {
+			reporter.checkErr = syscall.EIO
+		}, syscall.EIO, 0},
+		{"unit-error", func(_ context.CancelFunc, _ *connection, _ *tree, reporter *infoAllocationSession) {
+			reporter.err = syscall.EIO
+		}, syscall.EIO, 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			c, s, tree, h := newInfoCommandFixture(t, validInfoFileProbe(), accessReadAttr)
+			reporter := tree.authority.raw.(*infoAllocationSession)
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			test.setup(cancel, c, tree, reporter)
+			err := c.checkInformationAllocation(ctx, s, tree, h, true, 4096)
+			if !errors.Is(err, test.want) || reporter.units != test.calls {
+				t.Fatalf("allocation unit err=%v calls=%d; want %v/%d", err, reporter.units, test.want, test.calls)
+			}
+		})
 	}
 }

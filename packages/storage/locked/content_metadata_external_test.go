@@ -69,8 +69,8 @@ func TestContentMetadataSurvivesLockedAllowanceChainOnByteOnlyUnlinkedFile(t *te
 		t.Fatalf("byte-only enrollment = %+v, %v", opened, err)
 	}
 	file := opened.File
-	observer := file.(storage.ReferenceContentMetadata)
-	if err := observer.CheckContentMetadata(); err != nil {
+	observer := file.(storage.ReferenceMetadataAccess)
+	if err := observer.CheckMetadataAccess(); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := file.Stat(t.Context()); !errors.Is(err, syscall.EBADF) {
@@ -79,7 +79,7 @@ func TestContentMetadataSurvivesLockedAllowanceChainOnByteOnlyUnlinkedFile(t *te
 	if _, err := file.(storage.ReferenceMetadataAccess).SetMetadata(t.Context(), "app.flags", nil, []byte("bad")); !errors.Is(err, syscall.EBADF) {
 		t.Fatalf("content enrollment granted public metadata mutation: %v", err)
 	}
-	observed, err := observer.ObserveContentMetadata(t.Context(), 0)
+	observed, err := observer.ObserveMetadata(t.Context(), storage.MetadataObservationRequest{Purpose: storage.MetadataObservationContentEffect, EffectIndex: 0})
 	if err != nil || observed.NodeID != original.ID || observed.Value != nil {
 		t.Fatalf("initial absence = %+v, %v", observed, err)
 	}
@@ -95,7 +95,7 @@ func TestContentMetadataSurvivesLockedAllowanceChainOnByteOnlyUnlinkedFile(t *te
 	if content, err := backend.Read(t.Context(), "file"); err != nil || string(content) != "new" {
 		t.Fatalf("confirmed bytes = %q, %v", content, err)
 	}
-	observed, err = observer.ObserveContentMetadata(t.Context(), 0)
+	observed, err = observer.ObserveMetadata(t.Context(), storage.MetadataObservationRequest{Purpose: storage.MetadataObservationContentEffect, EffectIndex: 0})
 	if err != nil || observed.Value == nil {
 		t.Fatalf("derived observation = %+v, %v", observed, err)
 	}
@@ -105,7 +105,7 @@ func TestContentMetadataSurvivesLockedAllowanceChainOnByteOnlyUnlinkedFile(t *te
 	if _, err := mutator.MutateFile(t.Context(), command); !errors.Is(err, syscall.EDQUOT) {
 		t.Fatalf("allowance did not reject oversize effect write: %v", err)
 	}
-	if after, err := observer.ObserveContentMetadata(t.Context(), 0); err != nil || after.Value == nil || !bytes.Equal(after.Value.Version, observed.Value.Version) {
+	if after, err := observer.ObserveMetadata(t.Context(), storage.MetadataObservationRequest{Purpose: storage.MetadataObservationContentEffect, EffectIndex: 0}); err != nil || after.Value == nil || !bytes.Equal(after.Value.Version, observed.Value.Version) {
 		t.Fatalf("refused write changed metadata = %+v, %v", after, err)
 	}
 	if err := volume.Rename(t.Context(), "file", "moved"); err != nil {

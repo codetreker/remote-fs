@@ -29,7 +29,7 @@
 
 `OpenAtOptions.MetadataAccess` 独立控制 File 的属性／metadata 读取与修改；零值不授予这两类权限，Read、Write 和 Uses 也不隐含它们。原子打开结果本身仍返回同次捕获的 Attr，不需要另一次 Stat。`OpenMetadataAccess` 在 FileSession 上预检整个链是否保持这项区分。旧路径 OpenFile/OpenNode 保留其已有 metadata 访问语义；Truncate 只依赖字节写权。
 
-`NodeReference` 提供属性、Scope、State、scalar Information、限定 metadata 观察与关闭；它不提供 ReadAt、WriteAt 或 Truncate。`NodeRefOptions.MetadataAccess` 控制属性与 metadata 权限，Use 可声明 ReadData／WriteData 以参与其它入口的兼容性检查，但不会据此增加字节方法。NodeReference 编译期包含 `ScopedReference` 与 `ReferenceStateAccess`，因此通过 `NodeReferences` preflight 后不会在取得目录引用后才以 `EOPNOTSUPP` 拒绝 Scope 或 State。
+`NodeReference` 提供属性、Scope、State 投影、条件 metadata 观察与关闭；它不提供 ReadAt、WriteAt 或 Truncate。`NodeRefOptions.MetadataAccess` 控制属性与 metadata 权限，Use 可声明 ReadData／WriteData 以参与其它入口的兼容性检查，但不会据此增加字节方法。NodeReference 编译期包含 `ScopedReference` 与 `ReferenceStateAccess`，因此通过 `NodeReferences` preflight 后不会在取得目录引用后才以 `EOPNOTSUPP` 拒绝 Scope 或 State。
 
 `FileSession`、`File` 和 `NodeReference` 的 `CloseWithResult` 返回 `ReferenceCloseResult{Released, Determined}` 与错误。FileSession 的肯定 Released 覆盖其拥有的全部子引用；结合完整链已结算事实，它可作为已停止并排空 parent 的责任终结证明，不提供逐 action 成功／未执行结论。`Released=true` 本身确认引用已释放；旧实现可能未设置 `Determined`，action-aware 实现也将它设为 true。删除义务的语义错误可以和该释放事实共存。仅当 `Released=false` 时，`Determined=true` 表示 authority 已证明原引用、pin、Use claim 和容量仍保留，调用方可以发起下一次关闭；`Released=false, Determined=false` 表示结果未知，只能继续核对原尝试。`Close` 是只返回错误的便利入口，遵守同一生命周期。包装层和 HTTP 保留完整结果，不根据错误类型、断线或取消推断释放。
 
@@ -53,39 +53,38 @@ advisory session 的普通 `Status`／历史在退休后仍拒绝；仅 `WithClo
 |---|---|
 | `BackendIdentity` / `FileSessionIdentity` | 验证持久 volume、共享 authority incarnation、固定根与 session epoch 的实际绑定 |
 | `StableReferenceIdentity` / `OpenMetadataAccess` | 在打开效果前保证不可变引用身份和独立 metadata 权限贯穿完整链 |
-| `OpenContentMetadata` / `ReferenceContentMetadata` | 检查固定数据派生 metadata enrollment，并只观察 exact 可写引用已 enrollment 的 namespace |
-| `ReferenceInformationAccess` | 以同一权威 snapshot 返回 exact live 引用的 scalar 事实；逐引用检查实际能力，不授予 metadata 读权 |
-| `OpenMetadataObservation` / `ReferenceMetadataObserver` | 在 WriteMetadata 引用上封存、观察限定 namespace；不授予 ReadMetadata |
-| `VolumeGeometryAccess` | 返回当前可信 volume 的逻辑 sector／allocation-unit geometry；缺席不补 host 磁盘事实 |
+| `OpenContentMetadata` | 检查固定数据派生 metadata enrollment 及既有 ReferenceMetadataAccess 的 content-effect 观察能力 |
 | `AtomicFileOpener` | 按带可选 namespace guards 的子项选择原子打开、创建、清空或替换普通文件 |
 | `NamespaceAccess` | 按父 NodeID/Scope 执行 LookupAt 与 MutateName |
 | `DirectoryReader` | 按 DirectoryTarget 执行完整、有界、身份绑定的应用枚举 |
 | `NodeReferences` | 按 NodeID 或带可选 namespace guards 的子项选择打开普通文件、目录及符号链接的 NodeReference |
-| `ScopedReference` / `ReferenceStateAccess` | 返回确切活引用的 Scope，以及同次捕获的 Attr、link target、detached/pending 状态 |
+| `ScopedReference` / `ReferenceStateAccess` | 返回确切活引用的 Scope，以及显式 Full／Scalars 投影的同次对象与删除事实 |
 | `DirectoryMetadataObserver` | 在独立授权下返回完整 entries、directory revision 与可选目录当前名字 |
 | `ReferenceIdentity` / `ReferenceNameObserver` | 核对保留引用的固定 NodeID，并观察 Root、Linked 或 Detached 当前绑定 |
 | `FileActions` | 核对 session 内有限 action receipt，按持久 owner 查询、分页发现并显式 ACK durable 删除终态 |
 | `ReferenceCloseActions` / `RecoverableReferenceClose` | 对精确引用按 action ID 与 generation 关闭，读取绑定引用的清理状态，并在可能成功的打开之前验证清理回执保留 |
 | `InlineCloseSettlement` | 保证 session/ref 的 Released 结果已在完整链内结算；用于 HTTP server 的 CloseRecovery 宣告 |
 | `MetadataAccess` | 按 NodeID 对一个 metadata namespace 作 CAS |
-| `ReferenceMetadataAccess` | 通过保留 File 对一个 metadata namespace 作 CAS |
+| `ReferenceMetadataAccess` | 通过保留 File／NodeReference 观察明确 purpose 的 namespace 条件，并对一个 namespace 作 CAS |
 | `UseOwners` | 以有效 File scope 注册和退役 range owner |
 | `RangeControl` | 查询冲突、批量编辑、核对、取消和按 domain 清理范围 |
 | `DeleteIntent` | 设置或按 generation 清除节点 pending deletion |
 | `ConditionalFileMutation` | 在最终发布处比较 size/metadata 条件并修改内容或属性 |
-| `AllocationReporting` | 检查本会话返回的每份 Attr 都具有已知分配量 |
+| `AllocationReporting` | 检查本会话返回的每份 Attr 都具有已知分配量，并返回新鲜、可信、非零的 AllocationUnitBytes |
 
-Go 的 NamespaceAccess、DirectoryReader、DirectoryMetadataObserver 与 AllocationReporting 可以独立实现，各有自己的 Check。HTTP v5 的 DirectoryMetadata capability 是一个 transport bundle gate：server 只有在 FileSession 的完整包装链同时通过 CheckDirectoryRead 与 CheckDirectoryMetadataObservation 时才宣告 true，remote FileSession 的 ReadDirNode、ReadDirNodeBounded 与 ObserveDirectoryMetadata 都要求它。Namespace bit 只表示 LookupAt 与 MutateName，不参与这个 bundle。AllocationReporting bit 只有完整链保证所有 Attr 已知时才宣告；objectstore 只转发 metastore 的显式保证，locked、replicated 与 HTTP 会话逐层保留该检查。按精确 payload 收费的 `limited` 遮蔽所有返回 Attr 的底层分配量，将其标为未知，并以 `EOPNOTSUPP` 拒绝 AllocationReporting。ReferenceName 在 File/NodeReference 上独立宣告。能力缺失时不能由路径查询、副本或缓存模拟。
+Go 的 NamespaceAccess、DirectoryReader、DirectoryMetadataObserver 与 AllocationReporting 可以独立实现，各有自己的 Check。HTTP v5 的 DirectoryMetadata capability 是一个 transport bundle gate：server 只有在 FileSession 的完整包装链同时通过 CheckDirectoryRead 与 CheckDirectoryMetadataObservation 时才宣告 true，remote FileSession 的 ReadDirNode、ReadDirNodeBounded 与 ObserveDirectoryMetadata 都要求它。Namespace bit 只表示 LookupAt 与 MutateName，不参与这个 bundle。AllocationReporting bit 只有完整链保证所有 Attr 已知并可取得可信非零单位时才宣告；objectstore 只转发 metastore 的显式保证，locked、replicated 与 HTTP 会话逐层保留该检查。按精确 payload 收费的 `limited` 遮蔽所有返回 Attr 的底层分配量，将其标为未知，并以 `EOPNOTSUPP` 拒绝 AllocationReporting。ReferenceName 在 File/NodeReference 上独立宣告。能力缺失时不能由路径查询、副本或缓存模拟。
 
-### Scalar 信息、限定观察与 geometry
+### State 投影与条件观察
 
-`ReferenceInformationAccess.CheckReferenceInformation` 在已经取得的 File／NodeReference 上检查实际能力；`Information(ctx)` 在 exact live scope、当前 authority ownership、publication health 和同一个 read transaction 下返回 `ReferenceInformation{NodeID, Kind, Size, AllocationSize, AllocationKnown, Detached, PendingUnlink}`；任何错误返回零值。普通文件 Size 非负，目录 Size 不指定文件字节长度；SMB 依 kind 报告目录 EOF=0，不将未指定 Size 当作文件长度。它不读取时间、名字、link target 或 opaque metadata，不授予 ReadMetadata；公开 Stat／State 保持独立权限。Internal／Id 等身份查询也必须用本次 Information 确認引用生命期，退休后仍可用的 ReferenceNodeID 不授予 lifetime。SQLite 的 scalar SQL 在同一 transaction 捕获节点，复用私有 pending deletion 捕获取得明确 pending 与已接受 durable intent 的聚合事实，验证 kind／allocation／detached／pending 结构，再用不复制 raw leaf 的 scalar header 核对 root／linked／detached entry 关系；objectstore 在捕获前后核对 IOHealth 与引用状态。
+`ReferenceStateAccess.State(ctx, projection)` 显式选择 `StateFull=1` 或 `StateScalars=2`，零与未知值拒绝。Full 要求 ReadMetadata，返回完整 Attr、link target、detached／pending 与 pending generation；FUSE 和需要完整事实的既有调用明确使用 Full。Scalars 不授予 metadata 读权，只在 Attr 中返回 ID、Kind、Size、AllocationSize、AllocationKnown，加 Detached／PendingUnlink；metadata、四类时间、link target 和 pending generation 必须缺席，不能先载入完整状态再删字段。任何查询错误返回零结果。
 
-`OpenAtOptions.MetadataObservations` 与 `NodeRefOptions.MetadataObservations` 将 `MetadataObservationScope{Namespace, MaxPayloadBytes}` 深复制封存在返回引用中；旧 FileOpenOptions 不接受 enrollment。最多 16 项，namespace 唯一；单 payload bound 为 0 至 32 KiB，零可观察存在的空值。scope、固定结构、namespace、最大 token 与 payload 的合计结果预算不超过 64 KiB。enrollment 及观察要求 WriteMetadata，不授予 ReadMetadata 或额外 setter 权限；完整链由 `OpenMetadataObservation` 检查。
+两种投影均验证 exact live scope、authority ownership、publication health 与当前授权，在同一个 transaction 内捕获节点与聚合 pending deletion。Scalars 另以不复制 raw leaf 的 scalar header 核对 root／linked／detached 关系。普通文件 Size 非负，目录 Size 不指定文件字节长度；SMB 按 kind 报告目录 EOF=0。Internal／Id 也通过本次 Scalars 查询确认引用生命期，退休后仍可用的固定 ReferenceNodeID 不提供 lifetime。objectstore 在捕获前后核对 IOHealth 与引用状态，limited 对两种投影均保持自己的 allocation unknown 规则。
 
-`ReferenceMetadataObserver.ObserveMetadata(ctx,index)` 只读取原引用所选 scope，返回 `ContentMetadataObservation{NodeID, Value}`；Value=nil 仅表示权威确认缺席，存在空值携带有效 token。返回 bytes 由调用方拥有，错误返回零；native 的私有 namespace 捕获由固定效果观察与限定 metadata 观察共用，对整个 canonical metadata envelope 的解码 scratch 最多 64 KiB，返回值仍只包含所选 namespace；各公开方法独立检查 descriptor 或 scope 的 payload bound。观察验证 exact live 引用、scope、ownership、当前 publication 与 payload bound；SMB 与 HTTP 在 backing 前各按实际 `OpFileObserveMetadata` 和 scope 授权，不能通过公开 Stat 替代。
+`ReferenceMetadataAccess.ObserveMetadata(ctx, request)` 与已有 SetMetadata 使用同一引用能力。`MetadataObservationRequest` 的 purpose 必须是 ContentEffect 或 Namespace，零值、未知值和混合 selector 拒绝。ContentEffect 只携带已封存效果的 EffectIndex，要求 writable content reference，并按 descriptor 检查格式／长度；Namespace 只携带实际 Namespace 与 MaxPayloadBytes，要求 WriteMetadata，每次由当前业务策略批准该 namespace 和上限，不授予 ReadMetadata。namespace 请求的 EffectIndex 必须为零，content 请求的 Namespace 与 MaxPayloadBytes 必须为空／零。
 
-`VolumeGeometryAccess` 在 FileSession 上返回 `VolumeGeometry{Volume, BytesPerSector, SectorsPerAllocationUnit}`。非零 sector／unit 的无溢出乘积是逻辑 allocation 单位，Volume 必须等于固定 BackendIdentity.Volume；不能读 host 物理磁盘来补来源。SQLite 仅在原生文件能力、ownership、健康与 volume identity 可验证时报告 4096×1 的虚拟几何。objectstore、locked、HTTP 与 replicated 沿下层事实转送，replica 不使用本地 cache 几何；limited 遵守自身 allocation 口径，不能用下层单位解释已掩蔽分配量。缺席能力或错误使依赖该事实的查询失败，不废弃不依赖它的文件操作。
+返回 `MetadataObservation{NodeID,Value}` 拥有自己的 bytes。Value=nil 仅表示权威确认缺席；存在空值仍携带有效 token。结果核对 exact NodeID、实际 purpose 与 payload bound，错误返回零。native 的私有 namespace capture 只加载至多 64 KiB canonical envelope，供两个 purpose 在同一读事务中取得一个 namespace；各公开入口仍独立核对权限、生命期、descriptor 或 per-call bound。Namespace 条件观察不增加打开 enrollment、引用 scope registry 或另一套 checker；完整契约由 OpenMetadataAccess／CheckMetadataAccess 逐层验证。
+
+`AllocationReporting.AllocationUnitBytes(ctx)` 返回同一 volume／session 的可信、非零分配单位，不读取 Space 或 host 磁盘 sector。既有 CheckAllocationReporting 验证实际 Attr 分配事实及这个 getter 的完整链；失败返回零单位。原生 getter 核对实际 mode、identity 和健康，objectstore／HTTP／wrappers 逐层保持 session 身份与来源；limited 继续拒绝底层分配保证。SMB Standard／NetworkOpen 的已知 AllocationSize 必须被该单位整除，不舍入或从 EOF 推算。未配置 allowance 时 Space 可以 ENOSYS，分配单位仍按其独立事实可查询；文件能力不增加第二套 geometry checker／capability。
 
 ## 二、保留节点、名字与回收
 
@@ -169,7 +168,7 @@ metadata 返回值与 Attr 载入前先经过 `AttrResultBudget`。每 volume �
 
 OpenAtOptions.ContentMetadataEffects 将通用固定 namespace 转换密封在同一可写引用上；OpenContentMetadata.CheckOpenContentMetadata 在对象效果前检查完整 backing chain。FileOpenOptions 不接受这类 enrollment。每个 ContentMetadataEffect 指定 Namespace、PayloadBytes、PresentPrefix、AbsentPayload、ClearMask、SetMask；prefix 对应 mask 均为零，确认缺席使用唯一已 enrollment 的 payload，存在空值不冒充缺席。向量最多 16 项，单个 payload 最多 32 KiB，namespace、prefix、absence 与两种 mask 合计最多 64 KiB，重复 namespace 和非法形状拒绝。
 
-ReferenceContentMetadata.ObserveContentMetadata 以 effect index 读取 exact live writable reference 的一个已 enrollment namespace，只返回 ContentMetadataObservation{NodeID, Value}。Value=nil 只表示权威确认缺席，非 nil OpaquePayload 的 token／data 保持原值；CheckEffect 验证捕获 NodeID 与所选 descriptor 格式。它不授予公开 Stat、SetAttr、SetMetadata 或任意属性修改权限，MetadataAccess 继续独立。
+ReferenceMetadataAccess.ObserveMetadata 使用 ContentEffect purpose 和 EffectIndex 读取 exact live writable reference 的一个已 enrollment namespace，只返回 MetadataObservation{NodeID, Value}。Value=nil 只表示权威确认缺席，非 nil OpaquePayload 的 token／data 保持原值；CheckEffect 验证捕获 NodeID 与所选 descriptor 格式。它不授予公开 Stat、SetAttr、SetMetadata 或任意属性修改权限，MetadataAccess 继续独立。
 
 FileMutation.ContentEffects 对非空 MutateWriteAt／MutateAppend 和 MutateTruncate 有效；请求不携带任意 Attr／Metadata。每个所选 namespace 都必须有显式 ExpectedMetadata entry，空 token 要求确认缺席，遗漏 entry 是非法请求。native 在原最终 publication 内检查 exact scope、数据 Use、metadata token 与密封格式，以 (old &^ ClearMask) | SetMask 计算新值，再与内容、时间和日志一同提交；其它 namespace 保留。OpenAt 全向量及 mutation 的原 target／command／enrolled vector 参与 action digest，每层持有独立深复制。
 
@@ -209,15 +208,17 @@ HTTP 文件请求先执行[业务授权](authorization.md)，再读取或触碰 
 
 HTTP v5 统一转发基础 volume、中立 Attr、metadata、文件引用、目录／名字观察、range 和强 S/X。请求的 `op` 直接使用 `storage.Operation` 的规范值；二进制内容、原始叶名、revision、metadata version 和 payload 使用 canonical base64。`file.open-at` 与 `file.open-child-ref` 保留既有顶层 `child` 并接受可选顶层 `guards`，server 把二者组装为 `ChildSelection`；OpenAt options 必须显式携带 lower-camel `metadataAccess`，零值按无权限处理。协议拒绝未知、重复、缺席、null 或无关字段，所有结果都携带 v5 marker 与封闭 errno 词汇；v3 路由不提供兼容旁路。
 
-OpenAt 的 `contentMetadataEffects` 与 mutation 的 `contentEffects` 使用独立 lower-camel DTO。descriptor 字段为 `namespace,payloadBytes,presentPrefix,absentPayload,clearMask,setMask`，字节字段 canonical base64；`file.observe-content-metadata` 请求携带 exact `file` 与 `contentEffect` index，响应 `contentMetadata{nodeId,value?{version,data}}`，确认缺席省略 value。session 的 `openContentMetadata` 与 File 的 `contentMetadata` bool 只在完整 checker 成立时宣告；缺席能力不由公开 Stat 代替。
+OpenAt 的 `contentMetadataEffects` 与 mutation 的 `contentEffects` 使用独立 lower-camel DTO。descriptor 字段为 `namespace,payloadBytes,presentPrefix,absentPayload,clearMask,setMask`，字节字段 canonical base64；session 的 `openContentMetadata` 只在完整 checker 成立时宣告，固定效果保留原 enrollment 与 mutation digest。
 
 `file.backend-identity` 是 `/v5/file-control` 上不要求 session capability 的只读操作，先独立授权，再查询 handler 实际注册的 backend；成功响应携带 backend descriptor，transport epoch 固定为零。session-open 响应在 `sessionIdentity` capability 为 true 时携带独立 lower-camel DTO：`sessionIdentity{backend{volume,authority,rootNodeId},sessionEpoch}`；两端验证完整值，client 再核对 SessionEpoch 与 status epoch。该 descriptor 不回显 HandlerOptions.Volume，也不从 URL 推导存储身份。
 
 delete-intent query 使用顶层 `deleteOwner` 与 `deleteIntent`，list 使用 `deleteOwner`、`deleteAfter` 与 `deleteLimit`，ACK 命令携带 `owner`、`intent` 与 `action`。CloseIntent 的嵌套值也携带 `owner`。这些字段在访问持久账本前验证，HTTP 的 list、query 和 ACK 分别授权；同一个 owner 的页游标可跨 authority 重启继续使用。
 
-`MetadataObservations` 的独立 DTO 为 `metadataObservations:[{namespace,maxPayloadBytes}]`，OpenAt／NodeRefOptions 原样封存；`file.observe-metadata` 位于 `/v5/file`，以 exact file capability 与 `metadataObservation` index 选择原 scope，响应 `observedMetadata{nodeId,value?{version,data}}`，确认缺席省略 value。`file.information` 与 `file.volume-geometry` 位于 `/v5/file-control`，响应分别为 `information{nodeId,kind,size,allocationSize,allocationKnown,detached,pendingUnlink}` 和 `geometry{volume,bytesPerSector,sectorsPerAllocationUnit}`；必要 scalar 字段不允许缺席、null、未知或重复，结果身份逐层核对。session 的 `openMetadataObservation`／`geometry` 与 reference 的 `information`／`metadataObservation` bool 只在完整 checker 成立时宣告；可写 metadata 引用仍没有公开 ReadMetadata。
+`file.state` 位于 `/v5/file-control`，必须携带非零 `stateProjection`。两种投影使用同一 `state` envelope；Scalars 的 `attr` 仅含 `id,kind,size,allocation_size,allocation_known`，外层仅含 detached／pendingUnlink，protected 字段即使为 null 或空值也拒绝。Full 要求完整时间／metadata 与对应 link／generation 结构，不能接受 scalar reply。两端按请求投影验证结果与 exact 引用身份，不隐式选 Full。
 
-server 的 session 能力宣告 AtomicOpen、Namespace、References、FileActions、CloseRecovery、Metadata、Owners、Ranges、DirectoryMetadata、SessionIdentity、StableIdentity、OpenMetadata 与 OpenContentMetadata，wire 使用 lower-camel bool。DirectoryMetadata 只在 DirectoryReader 和 DirectoryMetadataObserver 的完整 backing chain 都可用时为 true。remote client 用这个 bit 同时 gate ReadDirNode 与 ObserveDirectoryMetadata，Namespace bit 只覆盖 LookupAt 与 MutateName。File 与 NodeReference 按实际方法宣告 Metadata、Scope、State、Delete、Conditional 与 ReferenceName；可写 File 另宣告 ContentMetadata，NodeReference 不获得该能力；StableIdentity 另承诺两类引用的稳定 ReferenceNodeID，client 即使未取得 ReferenceName 也验证返回身份。v5 client 只在对应 bool 为 true 时暴露可选接口，任意未知 capability 字段仍是协议错误。
+`file.observe-metadata` 位于 `/v5/file`，以 exact file capability 和 `metadataObservation{purpose,effectIndex,namespace,maxPayloadBytes}` 选择条件；所有 selector 字段显式传输，按 purpose 验证互斥组合。响应 `observedMetadata{nodeId,value?{version,data}}`，确认缺席省略 value。完整最大 payload、token、JSON／base64 envelope 在 backing 前按实际 purpose 预留，短预算以 EFBIG 拒绝。session 的 `openMetadata` 与 reference 的 `metadata` bool 验证同一 ReferenceMetadataAccess 契约；state 使用既有 reference `state` bool，没有另设信息／观察 capability bit。`file.allocation-unit` 是 control 查询，通过既有 session `allocation` bool 暴露，响应的 `allocationUnitBytes` 必须明确存在、非 null、整数且非零；失败返回零而不补固定单位。
+
+server 的 session 能力宣告 AtomicOpen、Namespace、References、FileActions、CloseRecovery、Metadata、Owners、Ranges、DirectoryMetadata、SessionIdentity、StableIdentity、OpenMetadata 与 OpenContentMetadata，wire 使用 lower-camel bool。DirectoryMetadata 只在 DirectoryReader 和 DirectoryMetadataObserver 的完整 backing chain 都可用时为 true。remote client 用这个 bit 同时 gate ReadDirNode 与 ObserveDirectoryMetadata，Namespace bit 只覆盖 LookupAt 与 MutateName。File 与 NodeReference 按实际方法宣告 Metadata、Scope、State、Delete、Conditional 与 ReferenceName；固定 ContentMetadataEffects 只在可写 File enrollment，NodeReference 不获得数据派生效果；StableIdentity 另承诺两类引用的稳定 ReferenceNodeID，client 即使未取得 ReferenceName 也验证返回身份。v5 client 只在对应 bool 为 true 时暴露可选接口，任意未知 capability 字段仍是协议错误。
 
 HTTP handler 只有在原生 session 通过 RecoverableReferenceClose 和 InlineCloseSettlement 的完整链检查时宣告 CloseRecovery。InlineCloseSettlement 保证 session/ref 的 CloseWithResult 和引用 CloseWithAction 一旦报告 Released，下游已无待结算责任。SQLite 提供该保证，objectstore、locked 与 limited 逐层检查；HTTP client 与 replicated 返回 `EOPNOTSUPP`。因此在 HTTP server 下嵌入仍有 downstream barrier 的链不能宣告可恢复关闭。普通 native → HTTP client → replica 链继续通过中立 settlement marker 向 SMB 保留结算责任；SMB 不要求 inline settlement。
 

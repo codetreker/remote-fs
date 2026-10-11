@@ -71,9 +71,12 @@ type ReferenceState struct {
 	PendingGeneration []byte
 }
 
+// ReferenceStateAccess follows storage's explicit projection permissions.
+// Scalars exclude every native payload and revision field as well as public
+// metadata, times, link target and pending generation. Failures return zero.
 type ReferenceStateAccess interface {
 	CheckReferenceState() error
-	State(context.Context) (ReferenceState, error)
+	State(context.Context, storage.StateProjection) (ReferenceState, error)
 }
 
 // ConditionalFileMutation applies attribute-only changes directly and publishes

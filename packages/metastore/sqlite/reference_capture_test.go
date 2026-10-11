@@ -40,10 +40,10 @@ func TestReferenceProjectionsRejectCorruptPendingDeletion(t *testing.T) {
 			if _, err := connection.ExecContext(t.Context(), `UPDATE nodes SET `+update+` WHERE volume=? AND id=?`, store.volume, file.id); err != nil {
 				t.Fatal(err)
 			}
-			if got, err := file.Information(t.Context()); !errors.Is(err, syscall.EIO) || got != (storage.ReferenceInformation{}) {
+			if got, err := file.State(t.Context(), storage.StateScalars); !errors.Is(err, syscall.EIO) || !reflect.DeepEqual(got, metastore.ReferenceState{}) {
 				t.Fatalf("corrupt pending scalar projection = %+v, %v", got, err)
 			}
-			if got, err := reader.(*retainedFile).State(t.Context()); !errors.Is(err, syscall.EIO) || !reflect.DeepEqual(got, metastore.ReferenceState{}) {
+			if got, err := reader.(*retainedFile).State(t.Context(), storage.StateFull); !errors.Is(err, syscall.EIO) || !reflect.DeepEqual(got, metastore.ReferenceState{}) {
 				t.Fatalf("corrupt pending full projection = %+v, %v", got, err)
 			}
 		})
@@ -58,8 +58,7 @@ func TestNamespaceCapturePreservesObserverKindRules(t *testing.T) {
 			opened, err := store.OpenAt(t.Context(), selection, storage.OpenAtOptions{Write: true, Existing: storage.Keep,
 				MetadataAccess: storage.WriteMetadata, Action: fileAction(t), Use: storage.UseClaim{Uses: storage.WriteData},
 				Target:                 storage.ChildCondition{State: storage.SameNode, NodeID: uint64(node.ID)},
-				ContentMetadataEffects: []storage.ContentMetadataEffect{effect},
-				MetadataObservations:   []storage.MetadataObservationScope{{Namespace: effect.Namespace, MaxPayloadBytes: effect.PayloadBytes}}})
+				ContentMetadataEffects: []storage.ContentMetadataEffect{effect}})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -82,8 +81,11 @@ func TestNamespaceCapturePreservesObserverKindRules(t *testing.T) {
 			if _, err := connection.ExecContext(t.Context(), `UPDATE nodes SET `+update+` WHERE volume=? AND id=?`, store.volume, file.id); err != nil {
 				t.Fatal(err)
 			}
-			for _, observe := range []func(context.Context, uint16) (storage.ContentMetadataObservation, error){file.ObserveContentMetadata, file.ObserveMetadata} {
-				if got, err := observe(t.Context(), 0); !errors.Is(err, syscall.EIO) || got.NodeID != 0 || got.Value != nil {
+			for _, request := range []storage.MetadataObservationRequest{
+				{Purpose: storage.MetadataObservationContentEffect},
+				namespaceObservation(effect.Namespace, effect.PayloadBytes),
+			} {
+				if got, err := file.ObserveMetadata(t.Context(), request); !errors.Is(err, syscall.EIO) || got.NodeID != 0 || got.Value != nil {
 					t.Fatalf("corrupt namespace observation = %+v, %v", got, err)
 				}
 			}
@@ -110,7 +112,7 @@ func TestReferenceCapturesShareThePassedSnapshot(t *testing.T) {
 	defer store.write.ExecContext(context.Background(), `UPDATE nodes SET size=?,pending_unlink=0,pending_generation=0,metadata=? WHERE volume=? AND id=?`,
 		before.Size, baseline, store.volume, file.id)
 	err = store.inspect(t.Context(), func(tx *sql.Tx) error {
-		previous, err := store.captureReferenceInformation(t.Context(), tx, file.id)
+		previous, err := store.referenceScalarState(t.Context(), tx, file.id)
 		if err != nil {
 			return err
 		}
@@ -118,7 +120,7 @@ func TestReferenceCapturesShareThePassedSnapshot(t *testing.T) {
 			changed, store.volume, file.id); err != nil {
 			return err
 		}
-		information, err := store.captureReferenceInformation(t.Context(), tx, file.id)
+		information, err := store.referenceScalarState(t.Context(), tx, file.id)
 		if err != nil {
 			return err
 		}
@@ -130,7 +132,7 @@ func TestReferenceCapturesShareThePassedSnapshot(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		if information != previous || state.State.Size != before.Size || state.PendingUnlink || observed.Value != nil {
+		if !reflect.DeepEqual(information, previous) || state.State.Size != before.Size || state.PendingUnlink || observed.Value != nil {
 			t.Fatalf("capture escaped original snapshot: information=%+v, state=%+v, namespace=%+v", information, state, observed)
 		}
 		return nil
@@ -138,14 +140,14 @@ func TestReferenceCapturesShareThePassedSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if current, err := file.Information(t.Context()); err != nil || current.Size != 8 || !current.PendingUnlink {
+	if current, err := file.State(t.Context(), storage.StateScalars); err != nil || current.State.Size != 8 || !current.PendingUnlink {
 		t.Fatalf("fresh scalar capture = %+v, %v", current, err)
 	}
 }
 
-func TestReferenceInformationDoesNotLoadOversizedMetadata(t *testing.T) {
+func TestReferenceScalarStateDoesNotLoadOversizedMetadata(t *testing.T) {
 	store, file := openContentEffectFile(t, nil)
-	want, err := file.Information(t.Context())
+	want, err := file.State(t.Context(), storage.StateScalars)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -167,10 +169,10 @@ func TestReferenceInformationDoesNotLoadOversizedMetadata(t *testing.T) {
 		bytes.Repeat([]byte{0}, storage.MaxMetadataBytes+1), store.volume, file.id); err != nil {
 		t.Fatal(err)
 	}
-	if got, err := file.Information(t.Context()); err != nil || got != want {
+	if got, err := file.State(t.Context(), storage.StateScalars); err != nil || !reflect.DeepEqual(got, want) {
 		t.Fatalf("scalar observation depended on unrequested metadata = %+v, %v", got, err)
 	}
-	if _, err := reader.(*retainedFile).State(t.Context()); !errors.Is(err, syscall.EIO) {
+	if _, err := reader.(*retainedFile).State(t.Context(), storage.StateFull); !errors.Is(err, syscall.EIO) {
 		t.Fatalf("full observation failed to check metadata bound: %v", err)
 	}
 }
@@ -179,24 +181,23 @@ func TestMetadataCaptureSupportsWriteOnlyDirectoryReference(t *testing.T) {
 	store, root, _, _ := guardedFileFixture(t)
 	opened, err := store.OpenChildRef(t.Context(), selectChild(storage.ChildName{Parent: directoryTarget(root), RawLeaf: []byte("observed-dir")}),
 		storage.NodeRefOptions{Kind: storage.NodeDirectory, Create: true, Exclusive: true, Action: fileAction(t),
-			MetadataAccess: storage.WriteMetadata, Target: storage.ChildCondition{State: storage.Absent},
-			MetadataObservations: []storage.MetadataObservationScope{{Namespace: "test.directory"}}})
+			MetadataAccess: storage.WriteMetadata, Target: storage.ChildCondition{State: storage.Absent}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer opened.Reference.Close(context.Background())
 	ref := opened.Reference.(*retainedNodeReference)
-	if got, err := ref.ObserveMetadata(t.Context(), 0); err != nil || got.NodeID != uint64(opened.State.ID) || got.Value != nil {
+	if got, err := ref.ObserveMetadata(t.Context(), namespaceObservation("test.directory", 0)); err != nil || got.NodeID != uint64(opened.State.ID) || got.Value != nil {
 		t.Fatalf("write-only directory absence = %+v, %v", got, err)
 	}
 	value, err := store.SetMetadata(t.Context(), uint64(opened.State.ID), "test.directory", nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, err := ref.ObserveMetadata(t.Context(), 0); err != nil || got.Value == nil || len(got.Value.Data) != 0 || !bytes.Equal(got.Value.Version, value.Version) {
+	if got, err := ref.ObserveMetadata(t.Context(), namespaceObservation("test.directory", 0)); err != nil || got.Value == nil || len(got.Value.Data) != 0 || !bytes.Equal(got.Value.Version, value.Version) {
 		t.Fatalf("write-only directory present empty = %+v, %v", got, err)
 	}
-	if _, err := ref.State(t.Context()); !errors.Is(err, syscall.EBADF) {
+	if _, err := ref.State(t.Context(), storage.StateFull); !errors.Is(err, syscall.EBADF) {
 		t.Fatalf("directory observer granted full metadata read: %v", err)
 	}
 }

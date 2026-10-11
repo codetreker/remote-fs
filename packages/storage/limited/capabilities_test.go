@@ -184,12 +184,16 @@ func (p *referenceProbe) CheckScopedReference() error { return p.checkErr }
 func (p *referenceProbe) Scope(context.Context) (storage.UseScope, error) {
 	return storage.UseScope{Token: "scope"}, p.callErr
 }
+func (p *referenceProbe) ReferenceNodeID() (uint64, error) { return p.state.Attr.ID, nil }
+func (p *referenceProbe) ObserveMetadata(context.Context, storage.MetadataObservationRequest) (storage.MetadataObservation, error) {
+	return storage.MetadataObservation{}, p.callErr
+}
 func (p *referenceProbe) CheckMetadataAccess() error { return p.checkErr }
 func (p *referenceProbe) SetMetadata(context.Context, string, []byte, []byte) (storage.OpaquePayload, error) {
 	return p.metadata, p.callErr
 }
 func (p *referenceProbe) CheckReferenceState() error { return p.checkErr }
-func (p *referenceProbe) State(context.Context) (storage.ReferenceState, error) {
+func (p *referenceProbe) State(context.Context, storage.StateProjection) (storage.ReferenceState, error) {
 	return p.state, p.callErr
 }
 func (p *referenceProbe) CheckDeleteIntent() error { return p.checkErr }
@@ -243,7 +247,7 @@ func TestCapabilityWrappersPreserveChecksAndPartialResults(t *testing.T) {
 	if err := wrapper.Drop(t.Context(), 17, storage.DomainEnforced); !errors.Is(err, failure) {
 		t.Fatalf("drop=%v", err)
 	}
-	reference := &referenceProbe{callErr: failure, metadata: probe.metadata}
+	reference := &referenceProbe{callErr: failure, metadata: probe.metadata, state: storage.ReferenceState{Attr: storage.Attr{ID: 3, Kind: storage.NodeRegular}}}
 	file := wrapFile(wrapper.storage, reference)
 	if err := file.(storage.ScopedReference).CheckScopedReference(); err != nil {
 		t.Fatal(err)
@@ -397,8 +401,8 @@ func TestIdentityCapabilityWrappersPreservePartialResultsAndReferences(t *testin
 	if err := wrapper.AcknowledgeDeleteIntent(t.Context(), storage.AcknowledgeDeleteIntentCommand{Action: action, Owner: "owner", Intent: intent}); !errors.Is(err, failure) {
 		t.Fatalf("acknowledge delete intent=%v", err)
 	}
-	state, err := reference.Reference.State(t.Context())
-	if !errors.Is(err, failure) || state.Attr.ID != attr.ID || !state.PendingUnlink {
+	state, err := reference.Reference.State(t.Context(), storage.StateFull)
+	if !errors.Is(err, failure) || !reflect.DeepEqual(state, storage.ReferenceState{}) {
 		t.Fatalf("reference state=%+v error=%v", state, err)
 	}
 	deleteRef := reference.Reference.(storage.DeleteIntent)

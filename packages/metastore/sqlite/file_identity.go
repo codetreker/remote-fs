@@ -48,26 +48,31 @@ func (s *Store) BackendIdentity(ctx context.Context) (storage.BackendIdentityRes
 }
 
 func (s *Store) captureBackendIdentity(ctx context.Context, tx *sql.Tx) (storage.BackendIdentityResult, error) {
-	state, err := dbstate.Read(ctx, tx)
+	volume, err := s.captureVolumeIdentity(ctx, tx)
 	if err != nil {
 		return storage.BackendIdentityResult{}, err
+	}
+	result := storage.BackendIdentityResult{Volume: volume, Authority: s.fileDomain.authority, RootNodeID: uint64(s.root)}
+	if err := result.Check(); err != nil {
+		return storage.BackendIdentityResult{}, err
+	}
+	return result, nil
+}
+
+func (s *Store) captureVolumeIdentity(ctx context.Context, tx *sql.Tx) (storage.VolumeID, error) {
+	state, err := dbstate.Read(ctx, tx)
+	if err != nil {
+		return "", err
 	}
 	var roots int
 	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM volumes v JOIN nodes n ON n.id=v.root
 		WHERE v.id=? AND typeof(v.root)='integer' AND v.root=? AND n.volume=v.id
 		AND typeof(n.kind)='integer' AND n.kind=? AND typeof(n.detached)='integer' AND n.detached=0`,
 		s.volume, s.root, storage.NodeDirectory).Scan(&roots); err != nil {
-		return storage.BackendIdentityResult{}, err
+		return "", err
 	}
 	if roots != 1 || state.NodeHighWater < s.root {
-		return storage.BackendIdentityResult{}, syscall.EIO
+		return "", syscall.EIO
 	}
-	result := storage.BackendIdentityResult{
-		Volume:    storage.VolumeID(state.DatabaseID + "/" + strconv.FormatInt(s.root, 10)),
-		Authority: s.fileDomain.authority, RootNodeID: uint64(s.root),
-	}
-	if err := result.Check(); err != nil {
-		return storage.BackendIdentityResult{}, err
-	}
-	return result, nil
+	return storage.VolumeID(state.DatabaseID + "/" + strconv.FormatInt(s.root, 10)), nil
 }

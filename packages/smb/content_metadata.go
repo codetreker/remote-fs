@@ -24,17 +24,18 @@ func (c *connection) observeWriteMetadata(ctx context.Context, s *session, t *tr
 	if len(h.contentEffects) != 1 {
 		return nil, syscall.EIO
 	}
-	if err := c.authorizeFileIO(ctx, s, t, h, storage.OpFileObserveContentMetadata, h.contentEffects); err != nil {
+	request := storage.MetadataObservationRequest{Purpose: storage.MetadataObservationContentEffect, EffectIndex: 0}
+	if err := c.authorizeReference(ctx, s, t, h, storage.OpFileObserveMetadata, &request); err != nil {
 		return nil, err
 	}
-	observer, ok := h.reference().(storage.ReferenceContentMetadata)
+	observer, ok := h.reference().(storage.ReferenceMetadataAccess)
 	if !ok {
 		return nil, syscall.EOPNOTSUPP
 	}
-	if err := observer.CheckContentMetadata(); err != nil {
+	if err := observer.CheckMetadataAccess(); err != nil {
 		return nil, err
 	}
-	observation, err := observer.ObserveContentMetadata(ctx, 0)
+	observation, err := observer.ObserveMetadata(ctx, request)
 	if err != nil {
 		return nil, err
 	}

@@ -172,7 +172,7 @@ func TestIdentityCapabilitiesRoundTripOverHTTP(t *testing.T) {
 	if _, ok := referenceResult.Reference.(storage.File); ok {
 		t.Fatal("node reference exposed byte methods")
 	}
-	state, err := referenceResult.Reference.State(ctx)
+	state, err := referenceResult.Reference.State(ctx, storage.StateFull)
 	if err != nil || state.Attr.ID != opened.Attr.ID || state.Detached || state.PendingUnlink {
 		t.Fatalf("reference state=%+v err=%v", state, err)
 	}
@@ -989,7 +989,7 @@ func TestNodeReferenceCapabilityMethodsRoundTrip(t *testing.T) {
 	if err != nil || cleared.PendingUnlink {
 		t.Fatalf("clear pending=%+v error=%v", cleared, err)
 	}
-	if _, err := reference.State(t.Context()); err != nil {
+	if _, err := reference.State(t.Context(), storage.StateFull); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, err := reference.CloseWithBarrier(t.Context()); err != nil {

@@ -56,7 +56,16 @@ func (r *nodeReferenceFixture) Scope(context.Context) (storage.UseScope, error) 
 	return r.scope, r.scopeErr
 }
 func (r *nodeReferenceFixture) CheckReferenceState() error { return nil }
-func (r *nodeReferenceFixture) State(context.Context) (storage.ReferenceState, error) {
+func (r *nodeReferenceFixture) State(_ context.Context, projection storage.StateProjection) (storage.ReferenceState, error) {
+	if err := projection.Check(); err != nil {
+		return storage.ReferenceState{}, err
+	}
+	if projection == storage.StateScalars {
+		attr := r.attr
+		attr.Metadata, attr.BirthTime, attr.ChangeTime = nil, nil, nil
+		attr.AccessTime, attr.ModTime = time.Time{}, time.Time{}
+		return storage.ReferenceState{Attr: attr}, nil
+	}
 	return storage.ReferenceState{Attr: r.attr, LinkTarget: append([]byte(nil), r.link...)}, nil
 }
 

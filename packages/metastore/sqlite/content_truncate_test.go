@@ -63,7 +63,7 @@ func TestContentMetadataTruncateCASRejectsReadonlyChangeWithoutEffects(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	observed, err := file.ObserveContentMetadata(t.Context(), 0)
+	observed, err := file.ObserveMetadata(t.Context(), storage.MetadataObservationRequest{Purpose: storage.MetadataObservationContentEffect, EffectIndex: 0})
 	if err != nil {
 		t.Fatal(err)
 	}

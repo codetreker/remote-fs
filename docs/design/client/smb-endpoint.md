@@ -60,7 +60,7 @@ authentication exchange 受 `HandshakeTimeout` 约束，完成后的 identity �
 | `file_handles.go`、`commands_close.go`、`authority_recovery.go`、`handle_diagnostics.go` | typed owner、准入／容量、恢复、关闭尝试与结算 |
 | `session_cleanup.go`、`connection.go`、`server.go` | tree/session/export 退休、compound 执行与 signer 所有权 |
 
-每个 authority session 保存不可变 `FileSessionIdentityResult{Backend, SessionEpoch}`。Backend 的 Volume、Authority 与 RootNodeID 全部必须和经验证 backend 相同，Volume／Root 还须匹配宿主 pin，SessionEpoch 必须等于其 Status.Epoch。Share.Volume 只用于业务授权。新的 tree 在公布成功前完成 AtomicFileOpener、NodeReferences、DirectoryMetadataObserver、StableReferenceIdentity、OpenMetadataAccess、OpenContentMetadata、OpenMetadataObservation、FileActions、AllocationReporting 与 RecoverableReferenceClose 的完整链检查；wrapper 缺失能力时明确拒绝。身份与中立能力的定义见[文件句柄设计](../server/file-handles.md#一身份与会话)。
+每个 authority session 保存不可变 `FileSessionIdentityResult{Backend, SessionEpoch}`。Backend 的 Volume、Authority 与 RootNodeID 全部必须和经验证 backend 相同，Volume／Root 还须匹配宿主 pin，SessionEpoch 必须等于其 Status.Epoch。Share.Volume 只用于业务授权。新的 tree 在公布成功前完成 AtomicFileOpener、NodeReferences、DirectoryMetadataObserver、StableReferenceIdentity、OpenMetadataAccess、OpenContentMetadata、FileActions、AllocationReporting 与 RecoverableReferenceClose 的完整链检查；wrapper 缺失能力时明确拒绝。身份与中立能力的定义见[文件句柄设计](../server/file-handles.md#一身份与会话)。
 
 ### 名字选择
 
@@ -86,7 +86,7 @@ CREATE contexts 有严格数量、alignment、Next 范围、重复与 payload �
 
 ### 文件内容与引用准入
 
-READ／WRITE／FLUSH 经原签名 frame 分派，related FileId 在 frame-local context 中解析，原字节不改。每次请求核对 exact typed FileId、tree／session／authority descriptor、原 File／NodeReference 类型及实际访问权，先授权再入队，取得 turn 后在 backing dispatch 前重新授权。READ 用 OpFileRead，所有 WRITE 用 OpFileWrite，非空派生效果另用 OpFileSetMetadata，限定观察用 OpFileObserveContentMetadata，FLUSH 用 OpFileSync；拒绝不能把先前 Unknown 改成 NotExecuted。
+READ／WRITE／FLUSH 经原签名 frame 分派，related FileId 在 frame-local context 中解析，原字节不改。每次请求核对 exact typed FileId、tree／session／authority descriptor、原 File／NodeReference 类型及实际访问权，先授权再入队，取得 turn 后在 backing dispatch 前重新授权。READ 用 OpFileRead，所有 WRITE 用 OpFileWrite，非空派生效果另用 OpFileSetMetadata，条件观察用 OpFileObserveMetadata，FLUSH 用 OpFileSync；拒绝不能把先前 Unknown 改成 NotExecuted。
 
 逐句柄 FIFO 与 running pointer 由 file_io_gate.go 管理。MaxHandleIORequests 默认 32，不能超过 MaxRequests；queued 项保留原 frame 费用，取得 turn 前不复制写内容。短锁按 authority installation、tree fileMu、session mu、handle ioMu 顺序取得，放锁后才授权／调用 backing。不同 FileId 并行；同一对象的最终内容顺序归 authority。
 
@@ -100,11 +100,11 @@ FLUSH owner 无 Data，用原 File.Sync 作有限 confirmation；失败与丢响
 
 ### 文件信息与条件修改
 
-QUERY_INFO 的 `InfoType=File` 显式支持 Basic `0x04`（40 bytes）、Standard `0x05`（24）、Internal `0x06`（8）、NetworkOpen `0x22`（56）和 Id `0x3B`（24）。Basic／NetworkOpen 要求 FILE_READ_ATTRIBUTES，各自只用本次原引用 Stat 的完整 Attr；Standard／Internal／Id 使用 `ReferenceInformationAccess.Information` 的本次 scalar snapshot 确认 exact live 引用，不能用退休后仍可读的 ReferenceNodeID 代替生命期。Standard 同次返回 EOF／allocation／kind／detached／pending，具名 link count 为1、detached 为0。每类以实际语义 Operation 在入队前和 turn 后授权，固定输出不足不发送半个结构。
+QUERY_INFO 的 `InfoType=File` 显式支持 Basic `0x04`（40 bytes）、Standard `0x05`（24）、Internal `0x06`（8）、NetworkOpen `0x22`（56）和 Id `0x3B`（24）。Basic／NetworkOpen 要求 FILE_READ_ATTRIBUTES，各自只用本次原引用 Stat 的完整 Attr；Standard／Internal／Id 使用 `ReferenceStateAccess.State(ctx, StateScalars)` 的本次 scalar snapshot 确认 exact live 引用，不能用退休后仍可读的 ReferenceNodeID 代替生命期。Standard 同次返回 EOF／allocation／kind／detached／pending，具名 link count 为1、detached 为0。每类以实际语义 Operation 在入队前和 turn 后授权，固定输出不足不发送半个结构。
 
-FILE_READ_ATTRIBUTES 与公开 ReadMetadata 保持绑定；其余三类不增加 metadata 读权。File 与 NodeReference 都在同一 FIFO 下查询，所有返回 NodeID／kind 与捕获 identity 相符。NetworkOpen／Standard 的 allocation 先验证中立已知字节事实，再按可信 VolumeGeometry 的 allocation unit 核对整数倍；geometry.Volume 必须匹配固定 BackendIdentity.Volume。能力缺席、事实不自洽或无法表达使相关类失败，不中止 tree 其它工作。64-bitserial 从 durableVolumeID 稳定投影，不同发布 volume 的碰撞在发布前拒绝；128-bit 对象 ID 无损编码不可复用 NodeID，与每次打开的 SMBFileId 独立。
+FILE_READ_ATTRIBUTES 与公开 ReadMetadata 保持绑定；其余三类不增加 metadata 读权。File 与 NodeReference 都在同一 FIFO 下查询，所有返回 NodeID／kind 与捕获 identity 相符。NetworkOpen／Standard 的 allocation 先验证中立已知字节事实，再从既有 AllocationReporting.AllocationUnitBytes 取得新鲜可信单位并核对整数倍；getter 沿原 session 身份绑定验证来源。能力缺席、事实不自洽或无法表达使相关类失败，不中止 tree 其它工作。64-bitserial 从 durableVolumeID 稳定投影，不同发布 volume 的碰撞在发布前拒绝；128-bit 对象 ID 无损编码不可复用 NodeID，与每次打开的 SMBFileId 独立。
 
-Basic SET_INFO 要求 FILE_WRITE_ATTRIBUTES，严格40bytes；允许 READONLY／HIDDEN／SYSTEM／ARCHIVE 及 Birth／Access／Mod 时间，零保持原值，NORMAL 清空可设置位；实际 volume 根的 HIDDEN／SYSTEM 保留，通过有效 mask 处理其它可设置位，subtree share 根不冒充实际 volume 根。DIRECTORY 等报告位由 kind 派生，非零 ChangeTime 与-1／-2 时间控制明确拒绝；其它时间在 mutation 前完成 FILETIME 范围检查。通过打开时封存的八字节 smb.windows `MetadataObservationScope` 取得条件，调用 `MutateAttributes` 一次提交 AttrChange 和 namespace 更新。WRITE_ATTRIBUTES-only 观察使用 WriteMetadata，不取得公开 Stat／ReadMetadata。条件重试同时刷新 ExpectedMetadata 与更新 Version，只在原 action 绑定 NotExecuted 时允许有限新尝试。
+Basic SET_INFO 要求 FILE_WRITE_ATTRIBUTES，严格40bytes；允许 READONLY／HIDDEN／SYSTEM／ARCHIVE 及 Birth／Access／Mod 时间，零保持原值，NORMAL 清空可设置位；实际 volume 根的 HIDDEN／SYSTEM 保留，通过有效 mask 处理其它可设置位，subtree share 根不冒充实际 volume 根。DIRECTORY 等报告位由 kind 派生，非零 ChangeTime 与-1／-2 时间控制明确拒绝；其它时间在 mutation 前完成 FILETIME 范围检查。通过既有 ReferenceMetadataAccess 的 Namespace purpose 请求 smb.windows、MaxPayloadBytes=8 取得条件，调用 `MutateAttributes` 一次提交 AttrChange 和 namespace 更新。WRITE_ATTRIBUTES-only 每次观察使用 WriteMetadata 和当前 namespace／bound 授权，不取得公开 Stat／StateFull／ReadMetadata，也不增加 namespace enrollment。条件重试同时刷新 ExpectedMetadata 与更新 Version，只在原 action 绑定 NotExecuted 时允许有限新尝试。
 
 EOF SET_INFO 要求普通 File 的 FILE_WRITE_DATA，严格8bytes 且长度非负；APPEND-only／目录／metadata-only 明确拒绝。`MutateTruncate` 在最终 authority 事务中核对 READONLY 条件并同时提交长度、ARCHIVE、时间与日志；既有 scope／Use／配额继续参与最终许可。属性与 EOF 均使用 mutation_owner.go 保存完整不可变 command，Unknown 只核对／重投原 action，不能 remint。
 

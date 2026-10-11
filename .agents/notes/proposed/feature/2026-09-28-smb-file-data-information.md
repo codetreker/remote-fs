@@ -6,7 +6,7 @@ Status: proposed
 
 Windows 程序需要通过已经打开的对象取得真实的 volume 身份、时间与容量。已有用量可能超过后来下调的配额；标准 SMB 容量结构不能直接报告 Used。未知 creation time、allocation geometry 或容量不能由当前时间、固定 cluster 和旧数字猜测；失败的容量查询也不能阻止程序读取文件或释放空间。
 
-本提案拥有[Windows 总提案](2026-09-16-windows-network-drive-support.md)中的 **7.4c volume 信息**。普通文件 READ／WRITE／FLUSH 由[文件内容访问](../../implemented/feature/2026-09-28-smb-file-data-io.md)拥有；五种文件查询与 Basic／EOF 修改由[文件信息](../../implemented/feature/2026-09-28-smb-file-information.md)拥有。文件信息建立的可信 volume identity／allocation geometry 基础只负责文件字段，不能代替本提案的容量、label、creation fact 与能力投影。
+本提案拥有[Windows 总提案](2026-09-16-windows-network-drive-support.md)中的 **7.4c volume 信息**。普通文件 READ／WRITE／FLUSH 由[文件内容访问](../../implemented/feature/2026-09-28-smb-file-data-io.md)拥有；五种文件查询与 Basic／EOF 修改由[文件信息](../../implemented/feature/2026-09-28-smb-file-information.md)拥有。文件信息建立的可信 volume identity／AllocationReporting 分配字节与单位事实只负责文件字段，不能代替本提案的容量、label、creation fact 与能力投影。
 
 需求依据为 [R-WIN-2、R-WIN-5、R-WS-5、R-INT-8](../../../../docs/spec/requirements.md)。本提案只承担 volume 信息能力，不宣布完整 Windows drive 已完成。
 
@@ -18,7 +18,7 @@ volume 信息以 `InfoType/class → rights → 完整输出预算 → 权威来
 
 中立可选 presentation 能力携带 `VolumeID`、稳定 `Label`、`CreatedAt`、`BytesPerSector` 与 `SectorsPerAllocationUnit`，不含 Windows 协议或平台模式。FileId serial 与 FileFsVolumeInformation serial 同源于可信 volume identity 的稳定投影；不能按连接随机生成，跨重连的同一 volume 身份不变。label 也可由宿主可信 share 配置给出，不能被请求方冒名替换。creation fact 缺失时相关类整体失败，不用零或当前时间补齐。
 
-最小身份／geometry 能力与完整 presentation 分开检查。第三方 backend 缺少 label、creation fact 或 Space 时，只失败依赖该事实的类；FileId 查询及文件读写仍依各自能力工作。HTTP、objectstore、locked、limited 与 replicated wrappers逐层传递实际来源并保留 checker，不由包装器名字或内置 storage 类型推导保证。
+文件分配单位复用既有 AllocationReporting；完整容量／sector 事实按本提案的实际消费者定义并验证，不复制文件查询机制。第三方 backend 缺少 label、creation fact 或 Space 时，只失败依赖该事实的类；FileId 查询及文件读写仍依各自能力工作。HTTP、objectstore、locked、limited 与 replicated wrappers逐层传递实际来源并保留 checker，不由包装器名字或内置 storage 类型推导保证。
 
 ### 目录与职责
 
@@ -26,7 +26,7 @@ volume 信息以 `InfoType/class → rights → 完整输出预算 → 权威来
 |---|---|
 | `packages/smb/commands_volume_info.go`、`volume_geometry.go` | volume 类表、固定 identity、当前 Space 与 geometry 的精确投影 |
 | `packages/smb/internal/wire/file_info.go` | QUERY_INFO extent、长度、class codec 与完整输出 |
-| `packages/storage` | 中立 presentation 与 geometry 能力、来源一致性和数值验证 |
+| `packages/storage` | 复用既有容量契约承载实际需要的 presentation／单位事实，检查来源与数值 |
 | HTTP capability／wire 与 storage wrappers | 真实能力、严格 DTO、identity 与 geometry 原样转送 |
 | native／objectstore | 经健康验证的持久 identity、creation fact、label、allocation／capacity 单位及实测 Space |
 | 相邻 package-local tests、实施时设计文档 | 类表 vectors、数值不可表达、预算／授权、当前状态与能力故障 |
@@ -77,7 +77,7 @@ QUERY_INFO 输入／输出长度按无溢出算术核对，完整固定部分与
 
 **Windows 层统一使用 SQLite 的 4096 cluster。** 第三方 FileStorage 可以报告有效非对齐分配字节，固定 cluster 会使查询与真实额度相矛盾。只有完整 capability 证明时才采用该几何，无法表达的类明确失败。
 
-**只提供 volume identity，容量类一律延后。** 它可以避免几何与超额用量的表达问题，但不完成 Windows 程序需要的容量信息。身份及最小 allocation geometry 归文件信息，当前查询真实 Space 与标准容量编码归此独立目的。
+**只提供 volume identity，容量类一律延后。** 它可以避免几何与超额用量的表达问题，但不完成 Windows 程序需要的容量信息。身份及文件分配字节／单位归文件信息，当前查询真实 Space 与标准容量编码归此独立目的。
 
 **完整 7.4 一个 PR。** 文件内容、文件信息与 volume geometry 交叠不同权限和故障证明。三个独立目的分别落实内容的 owner／关闭排序、文件信息的权限／条件修改，以及 volume 的实测容量投影；仍共享同一引用与身份基础。
 

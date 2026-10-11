@@ -25,20 +25,19 @@ type retainedNode struct{ volume, id int64 }
 // All fields are protected by the database commit gate. Physical retention is
 // distinct from active publication authority, which is revoked before I/O drains.
 type retainedFile struct {
-	scope                storage.UseScope
-	session              *advisory.Session
-	use                  storage.UseClaim
-	metadata             storage.MetadataPermissions
-	contentEffects       []storage.ContentMetadataEffect
-	metadataObservations []storage.MetadataObservationScope
-	closeIntent          storage.DeleteIntentID
-	store                *Store
-	id                   int64
-	read, write          bool
-	active, closed       bool
-	finalizationDone     bool
-	retireResult         error
-	closeErr             error
+	scope            storage.UseScope
+	session          *advisory.Session
+	use              storage.UseClaim
+	metadata         storage.MetadataPermissions
+	contentEffects   []storage.ContentMetadataEffect
+	closeIntent      storage.DeleteIntentID
+	store            *Store
+	id               int64
+	read, write      bool
+	active, closed   bool
+	finalizationDone bool
+	retireResult     error
+	closeErr         error
 }
 
 var _ metastore.FileStore = (*Store)(nil)

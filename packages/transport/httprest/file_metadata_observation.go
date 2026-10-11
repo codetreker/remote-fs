@@ -1,6 +1,7 @@
 package httprest
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -10,102 +11,106 @@ import (
 	"github.com/codetreker/remote-fs/packages/storage"
 )
 
-type metadataObservationScope struct {
-	Namespace       string `json:"namespace"`
-	MaxPayloadBytes int    `json:"maxPayloadBytes"`
+type metadataObservationRequest struct {
+	Purpose         storage.MetadataObservationPurpose `json:"purpose"`
+	EffectIndex     uint16                             `json:"effectIndex"`
+	Namespace       string                             `json:"namespace"`
+	MaxPayloadBytes int                                `json:"maxPayloadBytes"`
 }
 
-func metadataObservationScopesOf(values []storage.MetadataObservationScope) []metadataObservationScope {
-	if len(values) == 0 {
-		return nil
-	}
-	result := make([]metadataObservationScope, len(values))
-	for i, v := range values {
-		result[i] = metadataObservationScope{v.Namespace, v.MaxPayloadBytes}
+func metadataObservationRequestOf(value storage.MetadataObservationRequest) *metadataObservationRequest {
+	return &metadataObservationRequest{value.Purpose, value.EffectIndex, value.Namespace, value.MaxPayloadBytes}
+}
+func (value metadataObservationRequest) storage() storage.MetadataObservationRequest {
+	return storage.MetadataObservationRequest{Purpose: value.Purpose, EffectIndex: value.EffectIndex, Namespace: value.Namespace, MaxPayloadBytes: value.MaxPayloadBytes}
+}
+
+type metadataObservation struct {
+	NodeID uint64         `json:"nodeId"`
+	Value  *OpaquePayload `json:"value,omitempty"`
+}
+
+func metadataObservationOf(value storage.MetadataObservation) *metadataObservation {
+	result := &metadataObservation{NodeID: value.NodeID}
+	if value.Value != nil {
+		result.Value = &OpaquePayload{Version: bytes.Clone(value.Value.Version), Data: append([]byte{}, value.Value.Data...)}
 	}
 	return result
 }
-func metadataObservationScopesStorage(values []metadataObservationScope) []storage.MetadataObservationScope {
-	if len(values) == 0 {
-		return nil
+func (value metadataObservation) storage() storage.MetadataObservation {
+	result := storage.MetadataObservation{NodeID: value.NodeID}
+	if value.Value != nil {
+		result.Value = &storage.OpaquePayload{Version: bytes.Clone(value.Value.Version), Data: bytes.Clone(value.Value.Data)}
 	}
-	result := make([]storage.MetadataObservationScope, len(values))
-	for i, v := range values {
-		result[i] = storage.MetadataObservationScope{Namespace: v.Namespace, MaxPayloadBytes: v.MaxPayloadBytes}
-	}
-	return storage.CloneMetadataObservationScopes(result)
+	return result
 }
-func (s *remoteFileSession) CheckOpenMetadataObservation() error {
-	return checkFileCapability(s.capabilities.OpenMetadataObservation)
-}
-func (f *remoteFile) CheckMetadataObservation() error {
-	return checkFileCapability(f.capabilities.MetadataObservation)
-}
-func (f *remoteFile) ObserveMetadata(ctx context.Context, index uint16) (storage.ContentMetadataObservation, error) {
-	if err := f.CheckMetadataObservation(); err != nil {
-		return storage.ContentMetadataObservation{}, err
+
+func (f *remoteFile) ObserveMetadata(ctx context.Context, request storage.MetadataObservationRequest) (storage.MetadataObservation, error) {
+	if err := request.Check(); err != nil {
+		return storage.MetadataObservation{}, err
 	}
-	if int(index) >= len(f.metadataObservations) {
-		return storage.ContentMetadataObservation{}, syscall.EINVAL
+	if err := f.CheckMetadataAccess(); err != nil {
+		return storage.MetadataObservation{}, err
 	}
-	response, err := f.call(ctx, fileRequest{Op: storage.OpFileObserveMetadata, MetadataObservation: index})
+	var effect *storage.ContentMetadataEffect
+	if request.Purpose == storage.MetadataObservationContentEffect {
+		effects, err := storage.ResolveContentMetadataEffects(f.contentEffects, []uint16{request.EffectIndex})
+		if err != nil {
+			return storage.MetadataObservation{}, err
+		}
+		effect = &effects[0]
+	}
+	request = request.Clone()
+	response, err := f.call(ctx, fileRequest{Op: storage.OpFileObserveMetadata, MetadataObservation: metadataObservationRequestOf(request)})
 	if err != nil {
-		return storage.ContentMetadataObservation{}, err
+		return storage.MetadataObservation{}, err
 	}
 	value := response.ObservedMetadata.storage()
-	if err := value.CheckScope(f.node, f.metadataObservations[index]); err != nil {
-		return storage.ContentMetadataObservation{}, unreachable(Request{Op: OpFile}, err)
+	if effect != nil {
+		err = value.CheckEffect(f.node, *effect)
+	} else {
+		err = value.CheckNamespace(f.node, request.Namespace, request.MaxPayloadBytes)
+	}
+	if err != nil {
+		return storage.MetadataObservation{}, unreachable(Request{Op: OpFile}, err)
 	}
 	return value, nil
 }
-func (r *remoteNodeReference) CheckMetadataObservation() error {
-	return r.file.CheckMetadataObservation()
-}
-func (r *remoteNodeReference) ObserveMetadata(ctx context.Context, index uint16) (storage.ContentMetadataObservation, error) {
-	return r.file.ObserveMetadata(ctx, index)
+func (r *remoteNodeReference) ObserveMetadata(ctx context.Context, request storage.MetadataObservationRequest) (storage.MetadataObservation, error) {
+	return r.file.ObserveMetadata(ctx, request)
 }
 
-func (h *Handler) fileMetadataObservation(request fileRequest) ([]storage.MetadataObservationScope, error) {
-	if request.Op != storage.OpFileObserveMetadata {
-		return nil, nil
-	}
-	h.files.mu.Lock()
-	session := h.files.sessions[request.Session]
-	h.files.mu.Unlock()
-	if session == nil {
-		return nil, syscall.ESTALE
-	}
-	session.mu.Lock()
-	defer session.mu.Unlock()
-	reference := session.files[request.File]
-	if reference == nil {
-		return nil, syscall.ESTALE
-	}
-	if int(request.MetadataObservation) >= len(reference.metadataObservations) {
-		return nil, syscall.EINVAL
-	}
-	return storage.CloneMetadataObservationScopes(reference.metadataObservations[request.MetadataObservation : request.MetadataObservation+1]), nil
-}
-func performMetadataObservation(ctx context.Context, reference retainedReference, req fileRequest, scope storage.MetadataObservationScope) (fileResponse, error) {
-	if err := scope.Check(); err != nil {
+func performMetadataObservation(ctx context.Context, reference retainedReference, req fileRequest, effects []storage.ContentMetadataEffect) (fileResponse, error) {
+	request := req.MetadataObservation.storage()
+	if err := request.Check(); err != nil {
 		return fileResponse{}, err
 	}
-	maximum := fileResponse{Epoch: math.MaxUint64, Data: []byte{}, ObservedMetadata: contentMetadataObservationOf(storage.ContentMetadataObservation{NodeID: math.MaxUint64, Value: &storage.OpaquePayload{Version: make([]byte, storage.MaxObservationTokenBytes), Data: []byte{}}})}
+	maximumPayload := request.MaxPayloadBytes
+	var effect *storage.ContentMetadataEffect
+	if request.Purpose == storage.MetadataObservationContentEffect {
+		selected, err := storage.ResolveContentMetadataEffects(effects, []uint16{request.EffectIndex})
+		if err != nil {
+			return fileResponse{}, err
+		}
+		effect = &selected[0]
+		maximumPayload = effect.PayloadBytes
+	}
+	maximum := fileResponse{Epoch: math.MaxUint64, Data: []byte{}, ObservedMetadata: metadataObservationOf(storage.MetadataObservation{NodeID: math.MaxUint64, Value: &storage.OpaquePayload{Version: make([]byte, storage.MaxObservationTokenBytes), Data: []byte{}}})}
 	encoded, err := json.Marshal(maximum)
 	if err != nil {
 		return fileResponse{}, err
 	}
-	if int64(len(encoded))+int64(base64.StdEncoding.EncodedLen(scope.MaxPayloadBytes)) > req.ResultBytes {
+	if int64(len(encoded))+int64(base64.StdEncoding.EncodedLen(maximumPayload)) > req.ResultBytes {
 		return fileResponse{}, syscall.EFBIG
 	}
-	capability, ok := reference.(storage.ReferenceMetadataObserver)
+	capability, ok := reference.(storage.ReferenceMetadataAccess)
 	if !ok {
 		return fileResponse{}, syscall.EOPNOTSUPP
 	}
-	if err := capability.CheckMetadataObservation(); err != nil {
+	if err := capability.CheckMetadataAccess(); err != nil {
 		return fileResponse{}, err
 	}
-	value, err := capability.ObserveMetadata(ctx, req.MetadataObservation)
+	value, err := capability.ObserveMetadata(ctx, request)
 	if err != nil {
 		return fileResponse{}, err
 	}
@@ -113,14 +118,13 @@ func performMetadataObservation(ctx context.Context, reference retainedReference
 	if err != nil {
 		return fileResponse{}, err
 	}
-	if err := value.CheckScope(node, scope); err != nil {
+	if effect != nil {
+		err = value.CheckEffect(node, *effect)
+	} else {
+		err = value.CheckNamespace(node, request.Namespace, request.MaxPayloadBytes)
+	}
+	if err != nil {
 		return fileResponse{}, err
 	}
-	return boundedObservationResponse(fileResponse{ObservedMetadata: contentMetadataObservationOf(value)}, req.ResultBytes)
+	return boundedObservationResponse(fileResponse{ObservedMetadata: metadataObservationOf(value)}, req.ResultBytes)
 }
-
-var (
-	_ storage.OpenMetadataObservation   = (*remoteFileSession)(nil)
-	_ storage.ReferenceMetadataObserver = (*remoteFile)(nil)
-	_ storage.ReferenceMetadataObserver = (*remoteNodeReference)(nil)
-)

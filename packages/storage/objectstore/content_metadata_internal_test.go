@@ -32,10 +32,7 @@ func TestContentMetadataRequiresNativeEnrollmentAndObservation(t *testing.T) {
 		t.Fatal(err)
 	}
 	file := &openFile{}
-	if err := file.CheckContentMetadata(); !errors.Is(err, syscall.EOPNOTSUPP) {
-		t.Fatal(err)
-	}
-	if _, err := file.ObserveContentMetadata(context.Background(), 0); !errors.Is(err, syscall.EBADF) {
+	if _, err := file.ObserveMetadata(context.Background(), storage.MetadataObservationRequest{Purpose: storage.MetadataObservationContentEffect, EffectIndex: 0}); !errors.Is(err, syscall.EBADF) {
 		t.Fatal(err)
 	}
 }
