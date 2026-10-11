@@ -132,7 +132,7 @@ Server.Shutdown 永久停止 listener 与新工作，等待 connection 退出，
 
 ### 内容失败事实与宿主责任
 
-write_diagnostics.go 在 dispatch 前预留 WRITE／FLUSH 失败事实。Status 的 WriteOwners、UnknownWrites、PendingFlushes、RetainedWriteBytes 与 copied WriteFailures 区分仍持有内容、已终结资源及原 execution unknown；ResponseSent 只表示本机发送完成，不确认 Windows 应用消费。SMB 原 payload 只在 exact reference／完整父 session no-future-publication 与包含 replica 的完整链 settlement 正面证明后释放。HTTP 可在本层下游证明成立后先 fence 并撤下自己的 pending copy，不能因此撤销外层 SMB charge。失败事实不因 FileId 删除或断线消失。
+write_diagnostics.go 在 dispatch 前预留 WRITE／FLUSH 失败事实。Status 的 WriteOwners、UnknownWrites、PendingFlushes、RetainedWriteBytes 与 copied WriteFailures 区分内容持有、已终结资源及原 execution unknown；ResponseSent 不证明应用消费。SMB 原 payload 只在 exact reference／完整父 no-future-publication 与包含 replica 的全链 settlement 正面证明后释放。HTTP 下游已释放而 action gate 排空超时时，仍返回 Released=true 的 Pending CloseSettlementError，保留本层 copy 与原 SemanticErr；SMB 继续保留 owner／charge，后续同关闭 owner 续作排空。失败事实不因 FileId 删除或断线消失。
 
 WriteFailure 保存 typed WriteOwnerID 的随机 incarnation／单调 generation、export／FileId generation、NodeID、action、operation、byte count／digest、execution、FLUSH durability、ResponseFinal、Terminal、PayloadReleased、ReferenceReleased、ChainSettled 与固定 error category，不保存 Data。Server.AcknowledgeWriteFailures 全批验证 final terminal settled IDs 后才移除记录；宿主必须先保存并接管继续报告事实，ack 不改变 Unknown、不确认执行、不重发内容。未确认资源或尚未交出失败事实时 Shutdown／Unpublish 返回错误并保留 stopping；责任完成后后续停止可成功。
 

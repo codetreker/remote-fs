@@ -46,7 +46,7 @@ CLOSE 在既有 requestCloseMu／closeLifetime 保护下 fence 新 I/O、移除 
 
 不超过 8 MiB 的 explicit WriteAt／Append 有独立 file capability＋nested action＋immutable request pending entry 与 recovery gate；其它 FileId、Renew、Status、Sync 与 cleanup 不扫描它。初次使用 data admission，原动作重投使用 POST /v5/file-recovery，业务授权仍是原 file.mutate／write／所选 metadata 效果。recovery envelope 为 min(maxBodyBytes,12 MiB)，每 session 一项、无排队，server 全局 MaxSessions；client 全局独立 MaxConcurrentLockControls。256 KiB control 和关闭保留容量不被大 data replay 占用。既有 native history、digest、quota 和 close receipts 不重设计。
 
-exact reference 或完整父 session 的正面 Released 与 HTTP 下游链 settled 后，HTTP 在原 action gates 内撤下该 file／session pending entries、fence 迟到 replay 并释放本层复制 Data。等待 gate 不持短锁。HTTP 不确认其上方 replica 的 barrier；外层 SMB owner 保留原 Data 与额度，直到包含 replica 的完整链关闭／settlement 证明成立。只凭 ESTALE、receipt Retired、局部 Released 或待结算 barrier 不能释放相应责任；原 ExecutionUnknown 不变成未执行。
+exact reference 或完整父 session 的正面 Released 与 HTTP 下游链 settled 后，HTTP 在 session 短锁内 fence 原 entries，锁外用关闭 context 等待各 action gate，排空后才释放本层复制 Data。取消／deadline 保留未排空的 fenced payload，返回 Released=true 与 Pending CloseSettlementError，并保留原 SemanticErr 和暂时 Cause；迟到 WRITE 成功／失败响应都不能删掉它。后续同 owner 关闭继续本地排空，不再执行 native 关闭或写入。HTTP 不确认其上方 replica barrier；SMB 原 Data／额度保持到包含 replica 的全链关闭／settlement。原 ExecutionUnknown 不变成未执行。
 
 write_diagnostics.go 的 WriteFailure 不包含内容，保存不可复用 WriteOwnerID、export／FileId generation、NodeID、action、operation、byte count／digest、execution、FLUSH durability、response disposition、terminal／payload／reference／settlement 事实与净化 error category。ResponseSent 只代表本机发送，不证明应用消费。事实独立于已释放 handle，Status 返回 copied snapshot；diagnostic slot 在效果前预留，不自动逐出 Unknown。
 

@@ -98,6 +98,7 @@ type remoteFile struct {
 	closeBarrier         *MutationBarrier
 	closeErr             error
 	closeBarrierPending  bool
+	closeDetachPending   bool
 	closeScope           locking.MutationScope
 	closeScopeSet        bool
 	capabilities         fileCapabilities
@@ -796,7 +797,7 @@ func (s *remoteFileSession) closeWithResultAndBarrier(ctx context.Context) (stor
 		barrier := s.closeBarrier
 		err := s.closeErr
 		s.mu.Unlock()
-		return storage.ReferenceCloseResult{Released: true, Determined: true}, barrier, err
+		return storage.ReferenceCloseResult{Released: true, Determined: true}, barrier, s.settleExplicitWrites(ctx, "", err)
 	}
 	wasReleased := s.closed
 	previousBarrier := s.closeBarrier
@@ -861,7 +862,7 @@ func (s *remoteFileSession) closeWithResultAndBarrier(ctx context.Context) (stor
 		s.closeBarrierPending = r.CloseResult.BarrierPending
 		s.mu.Unlock()
 		if !r.CloseResult.BarrierPending {
-			s.detachExplicitWrites("")
+			e = s.settleExplicitWrites(ctx, "", e)
 		}
 		return r.CloseResult.storage(), r.Barrier, e
 	}
@@ -1022,6 +1023,11 @@ func (f *remoteFile) closeWithActionAndBarrier(ctx context.Context, attempt stor
 	f.closeCallMu.Lock()
 	defer f.closeCallMu.Unlock()
 	f.mu.Lock()
+	if f.closed && !f.closeBarrierPending && f.closeDetachPending && f.closeAction == storage.LockRequestID(attempt.Action) && f.closeGeneration == attempt.Generation {
+		barrier, semantic := f.closeBarrier, f.closeErr
+		f.mu.Unlock()
+		return storage.ReferenceCloseResult{Released: true, Determined: true}, barrier, f.settleExplicitWrites(ctx, semantic)
+	}
 	f.pruneCloseProofsLocked(time.Now())
 	if f.closePendingProof != nil && f.closePendingProof.attempt == attempt {
 		f.mu.Unlock()
@@ -1201,9 +1207,10 @@ func (f *remoteFile) closeWithActionAndBarrier(ctx context.Context, attempt stor
 		f.closeBarrier = response.Barrier
 		f.closeErr = err
 		f.closeBarrierPending = response.CloseResult.BarrierPending
+		f.closeDetachPending = !response.CloseResult.BarrierPending
 		f.mu.Unlock()
 		if !response.CloseResult.BarrierPending {
-			f.session.detachExplicitWrites(f.id)
+			err = f.settleExplicitWrites(ctx, err)
 		}
 	} else if response.CloseResult.Determined {
 		f.mu.Lock()
@@ -1296,7 +1303,7 @@ func (f *remoteFile) closeWithResultAndBarrier(ctx context.Context) (storage.Ref
 		barrier := f.closeBarrier
 		err := f.closeErr
 		f.mu.Unlock()
-		return storage.ReferenceCloseResult{Released: true, Determined: true}, barrier, err
+		return storage.ReferenceCloseResult{Released: true, Determined: true}, barrier, f.settleExplicitWrites(ctx, err)
 	}
 	wasReleased := f.closed
 	previousBarrier := f.closeBarrier
@@ -1371,9 +1378,10 @@ func (f *remoteFile) closeWithResultAndBarrier(ctx context.Context) (storage.Ref
 		f.closeBarrier = r.Barrier
 		f.closeErr = e
 		f.closeBarrierPending = r.CloseResult.BarrierPending
+		f.closeDetachPending = !r.CloseResult.BarrierPending
 		f.mu.Unlock()
 		if !r.CloseResult.BarrierPending {
-			f.session.detachExplicitWrites(f.id)
+			e = f.settleExplicitWrites(ctx, e)
 		}
 		return r.CloseResult.storage(), r.Barrier, e
 	}

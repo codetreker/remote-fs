@@ -110,9 +110,11 @@ func TestHTTPExplicitWriteDetachWaitsForActionGate(t *testing.T) {
 	entry := &explicitFileWrite{request: fileRequest{File: "one"}, pending: true}
 	sibling := &explicitFileWrite{request: fileRequest{File: "two"}, pending: true}
 	session.explicitWrites["one:action"], session.explicitWrites["two:action"] = entry, sibling
-	entry.mu.Lock()
+	if err := entry.gate.lock(t.Context()); err != nil {
+		t.Fatal(err)
+	}
 	done := make(chan struct{})
-	go func() { session.detachExplicitWrites("one"); close(done) }()
+	go func() { session.detachExplicitWrites(t.Context(), "one"); close(done) }()
 	select {
 	case <-done:
 		t.Fatal("detached while replay owns gate")
@@ -124,7 +126,7 @@ func TestHTTPExplicitWriteDetachWaitsForActionGate(t *testing.T) {
 	if count != 2 {
 		t.Fatalf("map removed before gate=%d", count)
 	}
-	entry.mu.Unlock()
+	entry.gate.unlock()
 	select {
 	case <-done:
 	case <-time.After(time.Second):
@@ -133,7 +135,7 @@ func TestHTTPExplicitWriteDetachWaitsForActionGate(t *testing.T) {
 	if !entry.detached || len(session.explicitWrites) != 1 || session.explicitWrites["two:action"] != sibling {
 		t.Fatalf("wrong detach=%+v", session.explicitWrites)
 	}
-	session.detachExplicitWrites("")
+	session.detachExplicitWrites(t.Context(), "")
 	if !sibling.detached || len(session.explicitWrites) != 0 {
 		t.Fatal("parent detach failed")
 	}

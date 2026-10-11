@@ -12,7 +12,7 @@ import (
 )
 
 type explicitFileWrite struct {
-	mu       sync.Mutex
+	gate     explicitWriteGate
 	request  fileRequest
 	scope    locking.MutationScope
 	hasScope bool
@@ -85,8 +85,10 @@ func (s *remoteFileSession) callExplicitWrite(ctx context.Context, req fileReque
 	if err != nil {
 		return fileResponse{}, err
 	}
-	entry.mu.Lock()
-	defer entry.mu.Unlock()
+	if err := entry.gate.lock(ctx); err != nil {
+		return fileResponse{}, err
+	}
+	defer entry.gate.unlock()
 	s.mu.Lock()
 	stale := s.closed || entry.detached
 	s.mu.Unlock()
@@ -117,7 +119,9 @@ func (s *remoteFileSession) callExplicitWrite(ctx context.Context, req fileReque
 		return response, unreachable(Request{Op: OpFileRecovery}, errors.New("explicit mutation received an epoch retry"))
 	}
 	s.mu.Lock()
-	delete(s.explicitWrites, req.File+":"+string(req.Mutation.Action))
+	if !entry.detached {
+		delete(s.explicitWrites, req.File+":"+string(req.Mutation.Action))
+	}
 	if response.Epoch > s.epoch {
 		s.epoch = response.Epoch
 	}
@@ -132,25 +136,58 @@ func (s *remoteFileSession) callExplicitWrite(ctx context.Context, req fileReque
 
 // Retirement first fences the exact reference. Waiting on action gates happens
 // outside the session map lock; a released backing cannot publish another write.
-func (s *remoteFileSession) detachExplicitWrites(file string) {
+func (s *remoteFileSession) detachExplicitWrites(ctx context.Context, file string) error {
 	s.mu.Lock()
 	entries := make(map[string]*explicitFileWrite)
 	for key, entry := range s.explicitWrites {
 		if file == "" || entry.request.File == file {
+			entry.detached = true
 			entries[key] = entry
 		}
 	}
 	s.mu.Unlock()
 	for key, entry := range entries {
-		entry.mu.Lock()
-		entry.detached = true
+		if err := entry.gate.lock(ctx); err != nil {
+			return err
+		}
 		s.mu.Lock()
 		if s.explicitWrites[key] == entry {
 			delete(s.explicitWrites, key)
 		}
 		s.mu.Unlock()
-		entry.mu.Unlock()
+		entry.gate.unlock()
 	}
+	return nil
+}
+
+type explicitWriteGate struct {
+	once      sync.Once
+	available chan struct{}
+}
+
+func (g *explicitWriteGate) lock(ctx context.Context) error {
+	g.once.Do(func() { g.available = make(chan struct{}, 1); g.available <- struct{}{} })
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-g.available:
+		if err := ctx.Err(); err != nil {
+			g.unlock()
+			return err
+		}
+		return nil
+	}
+}
+func (g *explicitWriteGate) unlock() { g.available <- struct{}{} }
+
+func (s *remoteFileSession) settleExplicitWrites(ctx context.Context, file string, semantic error) error {
+	if err := s.detachExplicitWrites(ctx, file); err != nil {
+		return &storage.CloseSettlementError{State: storage.CloseSettlementPending, SemanticErr: semantic, Cause: err}
+	}
+	return semantic
 }
 
 type fileRecoveryKey struct{}
@@ -199,4 +236,13 @@ func (s *remoteFileSession) admitExplicitWrite(ctx context.Context, file string,
 	}
 	ctx = context.WithValue(ctx, explicitWriteAdmissionKey{}, explicitWriteAdmission{session: s, file: file, action: action, recovery: recovery})
 	return ctx, release, recovery, nil
+}
+
+func (f *remoteFile) settleExplicitWrites(ctx context.Context, semantic error) error {
+	err := f.session.settleExplicitWrites(ctx, f.id, semantic)
+	var pending *storage.CloseSettlementError
+	f.mu.Lock()
+	f.closeDetachPending = errors.As(err, &pending)
+	f.mu.Unlock()
+	return err
 }

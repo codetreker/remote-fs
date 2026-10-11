@@ -55,6 +55,9 @@ func closeReplayResultError(result *referenceCloseResult, wasReleased bool, prev
 }
 
 func neutralCloseSettlement(err error) error {
+	if _, ok := err.(*storage.CloseSettlementError); ok {
+		return err
+	}
 	if pending, ok := err.(*CloseBarrierPendingError); ok {
 		state := pending.State
 		if state == 0 {
