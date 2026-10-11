@@ -149,14 +149,13 @@ func TestMetadataObservationOwnsBoundedValueAndConfirmsAbsence(t *testing.T) {
 
 type observationSessionProbe struct {
 	*identitySessionProbe
-	node                                     storage.NodeReference
-	nodeOptions                              storage.NodeRefOptions
-	checkObservationErr, checkInformationErr error
+	node                storage.NodeReference
+	nodeOptions         storage.NodeRefOptions
+	checkObservationErr error
 }
 
-func (p *observationSessionProbe) CheckOpenMetadataObservation() error  { return p.checkObservationErr }
-func (p *observationSessionProbe) CheckOpenReferenceInformation() error { return p.checkInformationErr }
-func (p *observationSessionProbe) CheckNodeReferences() error           { return nil }
+func (p *observationSessionProbe) CheckOpenMetadataObservation() error { return p.checkObservationErr }
+func (p *observationSessionProbe) CheckNodeReferences() error          { return nil }
 func (p *observationSessionProbe) OpenNodeRef(_ context.Context, _ uint64, options storage.NodeRefOptions) (storage.NodeOpenResult, error) {
 	p.nodeOptions = options
 	p.openCalls++
@@ -184,9 +183,6 @@ func TestMetadataObservationEnrollmentAcrossAllReferenceOpenPaths(t *testing.T) 
 					r, e := wrapper.OpenChildRef(t.Context(), storage.ChildSelection{}, storage.NodeRefOptions{MetadataAccess: storage.WriteMetadata, MetadataObservations: scopes})
 					return r.Reference, e
 				}
-			}
-			if err := wrapper.CheckOpenReferenceInformation(); err != nil {
-				t.Fatal(err)
 			}
 			resource, err := open()
 			if err != nil {

@@ -36,9 +36,6 @@ func TestReferenceInformationAndMetadataObservationAcrossLockedAllowanceChain(t 
 			t.Error(err)
 		}
 	})
-	if err := session.(storage.OpenReferenceInformation).CheckOpenReferenceInformation(); err != nil {
-		t.Fatal(err)
-	}
 	if err := session.(storage.OpenMetadataObservation).CheckOpenMetadataObservation(); err != nil {
 		t.Fatal(err)
 	}

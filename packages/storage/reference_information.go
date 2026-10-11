@@ -5,12 +5,6 @@ import (
 	"syscall"
 )
 
-// OpenReferenceInformation verifies scalar observation support on every File
-// and NodeReference returned by the complete implementation chain.
-type OpenReferenceInformation interface {
-	CheckOpenReferenceInformation() error
-}
-
 // ReferenceInformationAccess captures scalar facts through the exact live
 // reference in one authoritative snapshot. It grants no metadata permissions.
 // Current authorization and reference lifetime apply; every error returns zero.

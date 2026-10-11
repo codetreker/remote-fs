@@ -6,14 +6,6 @@ import (
 	"syscall"
 )
 
-func (s *fileSession) CheckOpenReferenceInformation() error {
-	if err := s.storage.healthy(); err != nil {
-		return err
-	}
-	_, err := capability(s.FileSession, storage.OpenReferenceInformation.CheckOpenReferenceInformation)
-	return err
-}
-
 func (r *referenceCapabilities) CheckReferenceInformation() error {
 	if err := r.storage.healthy(); err != nil {
 		return err
@@ -65,7 +57,6 @@ func (r *referenceCapabilities) Information(ctx context.Context) (storage.Refere
 }
 
 var (
-	_ storage.OpenReferenceInformation   = (*fileSession)(nil)
 	_ storage.ReferenceInformationAccess = (*file)(nil)
 	_ storage.ReferenceInformationAccess = (*nodeReference)(nil)
 )

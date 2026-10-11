@@ -11,11 +11,9 @@ import (
 	"github.com/codetreker/remote-fs/packages/storage"
 )
 
-var _ storage.OpenReferenceInformation = (*Store)(nil)
 var _ storage.ReferenceInformationAccess = (*retainedFile)(nil)
 var _ storage.ReferenceInformationAccess = (*retainedNodeReference)(nil)
 
-func (s *Store) CheckOpenReferenceInformation() error    { return s.CheckFileStore() }
 func (f *retainedFile) CheckReferenceInformation() error { return f.store.CheckFileStore() }
 
 func (f *retainedFile) checkReferenceObservation(ctx context.Context) error {
@@ -32,34 +30,30 @@ func (f *retainedFile) checkReferenceObservation(ctx context.Context) error {
 }
 
 func (s *Store) captureReferenceInformation(ctx context.Context, tx *sql.Tx, id int64) (storage.ReferenceInformation, error) {
-	var kind, size, allocation, detached, explicit, generation int64
-	var accepted, invalidIntent bool
+	var kind, size, allocation, detached int64
 	err := tx.QueryRowContext(ctx, `SELECT
 		CASE WHEN typeof(n.kind)='integer' THEN n.kind ELSE 0 END,
 		CASE WHEN typeof(n.size)='integer' THEN n.size ELSE -1 END,
 		CASE WHEN typeof(n.allocation_size)='integer' THEN n.allocation_size ELSE -1 END,
-		CASE WHEN typeof(n.detached)='integer' THEN n.detached ELSE -1 END,
-		CASE WHEN typeof(n.pending_unlink)='integer' THEN n.pending_unlink ELSE -1 END,
-		CASE WHEN typeof(n.pending_generation)='integer' THEN n.pending_generation ELSE -1 END,
-		EXISTS(SELECT 1 FROM delete_intents i WHERE i.volume=n.volume AND i.node=n.id AND i.outcome IN (?,?)),
-		EXISTS(SELECT 1 FROM delete_intents i WHERE i.volume=n.volume AND i.node=n.id
-			AND (typeof(i.outcome)!='integer' OR i.outcome NOT BETWEEN 1 AND 5))
-		FROM nodes n WHERE n.volume=? AND n.id=?`, storage.DeleteIntentPending, storage.DeleteIntentCleanupFailed,
-		s.volume, id).Scan(&kind, &size, &allocation, &detached, &explicit, &generation, &accepted, &invalidIntent)
+		CASE WHEN typeof(n.detached)='integer' THEN n.detached ELSE -1 END
+		FROM nodes n WHERE n.volume=? AND n.id=?`, s.volume, id).Scan(&kind, &size, &allocation, &detached)
 	if errors.Is(err, sql.ErrNoRows) {
 		return storage.ReferenceInformation{}, syscall.ESTALE
 	}
 	if err != nil {
 		return storage.ReferenceInformation{}, err
 	}
-	pending := explicit == 1 || accepted
 	if kind < int64(storage.NodeRegular) || kind > int64(storage.NodeSymlink) || size < 0 || allocation < 0 ||
-		detached < 0 || detached > 1 || explicit < 0 || explicit > 1 || generation < 0 || pending && generation == 0 || invalidIntent {
+		detached < 0 || detached > 1 {
 		return storage.ReferenceInformation{}, syscall.EIO
 	}
 	want, err := allocatedSize(storage.NodeKind(kind), size)
 	if err != nil || allocation != want || kind == int64(storage.NodeDirectory) && size != 0 {
 		return storage.ReferenceInformation{}, syscall.EIO
+	}
+	pending, err := s.capturePendingDeletion(ctx, tx, id)
+	if err != nil {
+		return storage.ReferenceInformation{}, err
 	}
 	name, _, err := s.nameObservationHeader(ctx, tx, id)
 	if err != nil {
@@ -69,7 +63,7 @@ func (s *Store) captureReferenceInformation(ctx context.Context, tx *sql.Tx, id 
 		return storage.ReferenceInformation{}, syscall.EIO
 	}
 	information := storage.ReferenceInformation{NodeID: uint64(id), Kind: storage.NodeKind(kind), Size: size,
-		AllocationSize: allocation, AllocationKnown: true, Detached: detached == 1, PendingUnlink: pending}
+		AllocationSize: allocation, AllocationKnown: true, Detached: detached == 1, PendingUnlink: pending.pending}
 	if err := information.Check(uint64(id)); err != nil {
 		return storage.ReferenceInformation{}, err
 	}

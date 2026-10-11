@@ -15,9 +15,6 @@ import (
 func TestObjectFileInformationTracksExactObjectWithoutMetadataGrant(t *testing.T) {
 	volume, _ := fileVolume(t, memory.New(), 1<<20, nil)
 	session := fileSessionFor(t, volume, storage.DefaultFileSessionOptions())
-	if err := session.(storage.OpenReferenceInformation).CheckOpenReferenceInformation(); err != nil {
-		t.Fatal(err)
-	}
 	root, err := volume.Stat(t.Context(), "")
 	if err != nil {
 		t.Fatal(err)

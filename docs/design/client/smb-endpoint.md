@@ -60,7 +60,7 @@ authentication exchange 受 `HandshakeTimeout` 约束，完成后的 identity �
 | `file_handles.go`、`commands_close.go`、`authority_recovery.go`、`handle_diagnostics.go` | typed owner、准入／容量、恢复、关闭尝试与结算 |
 | `session_cleanup.go`、`connection.go`、`server.go` | tree/session/export 退休、compound 执行与 signer 所有权 |
 
-每个 authority session 保存不可变 `FileSessionIdentityResult{Backend, SessionEpoch}`。Backend 的 Volume、Authority 与 RootNodeID 全部必须和经验证 backend 相同，Volume／Root 还须匹配宿主 pin，SessionEpoch 必须等于其 Status.Epoch。Share.Volume 只用于业务授权。新的 tree 在公布成功前完成 AtomicFileOpener、NodeReferences、DirectoryMetadataObserver、StableReferenceIdentity、OpenMetadataAccess、OpenContentMetadata、OpenReferenceInformation、OpenMetadataObservation、FileActions、AllocationReporting 与 RecoverableReferenceClose 的完整链检查；wrapper 缺失能力时明确拒绝。身份与中立能力的定义见[文件句柄设计](../server/file-handles.md#一身份与会话)。
+每个 authority session 保存不可变 `FileSessionIdentityResult{Backend, SessionEpoch}`。Backend 的 Volume、Authority 与 RootNodeID 全部必须和经验证 backend 相同，Volume／Root 还须匹配宿主 pin，SessionEpoch 必须等于其 Status.Epoch。Share.Volume 只用于业务授权。新的 tree 在公布成功前完成 AtomicFileOpener、NodeReferences、DirectoryMetadataObserver、StableReferenceIdentity、OpenMetadataAccess、OpenContentMetadata、OpenMetadataObservation、FileActions、AllocationReporting 与 RecoverableReferenceClose 的完整链检查；wrapper 缺失能力时明确拒绝。身份与中立能力的定义见[文件句柄设计](../server/file-handles.md#一身份与会话)。
 
 ### 名字选择
 

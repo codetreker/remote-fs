@@ -22,9 +22,6 @@ func TestReferenceInformationDoesNotGrantMetadataAndTracksDetachedObject(t *test
 	}
 	defer opened.Reference.Close(context.Background())
 	ref := opened.Reference.(*retainedNodeReference)
-	if err := store.CheckOpenReferenceInformation(); err != nil {
-		t.Fatal(err)
-	}
 	if err := ref.CheckReferenceInformation(); err != nil {
 		t.Fatal(err)
 	}
@@ -248,6 +245,10 @@ func TestReferenceInformationProjectsAcceptedIntentAndRejectsMalformedOutcome(t 
 		if err != nil || got.PendingUnlink != (outcome != storage.DeleteIntentArmed) {
 			t.Fatalf("outcome %d information = %+v, %v", outcome, got, err)
 		}
+		state, err := file.State(t.Context())
+		if err != nil || state.PendingUnlink != got.PendingUnlink || state.PendingUnlink && len(state.PendingGeneration) != 8 {
+			t.Fatalf("outcome %d full state = %+v, %v", outcome, state, err)
+		}
 	}
 	connection, err := store.write.Conn(t.Context())
 	if err != nil {
@@ -258,11 +259,16 @@ func TestReferenceInformationProjectsAcceptedIntentAndRejectsMalformedOutcome(t 
 		t.Fatal(err)
 	}
 	defer connection.ExecContext(context.Background(), `PRAGMA ignore_check_constraints=OFF`)
-	if _, err := connection.ExecContext(t.Context(), `UPDATE delete_intents SET outcome=X'32' WHERE volume=? AND intent=?`, store.volume, intent); err != nil {
-		t.Fatal(err)
-	}
-	if got, err := file.Information(t.Context()); !errors.Is(err, syscall.EIO) || got != (storage.ReferenceInformation{}) {
-		t.Fatalf("malformed intent information = %+v, %v", got, err)
+	for _, outcome := range []string{`X'32'`, `0`, `6`, `7`, `2.5`} {
+		if _, err := connection.ExecContext(t.Context(), `UPDATE delete_intents SET outcome=`+outcome+` WHERE volume=? AND intent=?`, store.volume, intent); err != nil {
+			t.Fatal(err)
+		}
+		if got, err := file.Information(t.Context()); !errors.Is(err, syscall.EIO) || got != (storage.ReferenceInformation{}) {
+			t.Fatalf("malformed outcome %s scalar projection = %+v, %v", outcome, got, err)
+		}
+		if got, err := file.State(t.Context()); !errors.Is(err, syscall.EIO) || !reflect.DeepEqual(got, metastore.ReferenceState{}) {
+			t.Fatalf("malformed outcome %s full projection = %+v, %v", outcome, got, err)
+		}
 	}
 	if _, err := connection.ExecContext(t.Context(), `UPDATE delete_intents SET outcome=?,failure=NULL WHERE volume=? AND intent=?`,
 		storage.DeleteIntentArmed, store.volume, intent); err != nil {

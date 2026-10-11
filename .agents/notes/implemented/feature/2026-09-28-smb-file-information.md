@@ -22,13 +22,15 @@ SMB 文件信息在[有界 CREATE/CLOSE](2026-09-28-smb-bounded-create-close.md)
 | `FileNetworkOpenInformation` `0x22` | FILE_READ_ATTRIBUTES；同一次 Stat | 56 字节，四个时间、EOF／allocation、Windows 属性 |
 | `FileIdInformation` `0x3B` | 活引用与当前查询授权；本次 scalar Information、固定可信 volume identity | 24 字节，稳定 64-bit volume serial 与 128-bit 对象 ID |
 
-Basic／NetworkOpen 不能拼接多次 Stat 的字段。Standard／Internal／Id 不要求 FILE_READ_ATTRIBUTES，使用 `ReferenceInformationAccess.Information`，一次 snapshot 返回 NodeID、Kind、Size、AllocationSize、AllocationKnown、Detached、PendingUnlink；不返回时间、opaque metadata 或名字，不授予 byte/setter 方法。普通文件 Size 非负，目录的 Size 不指定字节长度；Windows 信息依目录 kind 报告 EOF=0。公开 Stat／State 继续遵守 ReadMetadata。FileSession 的 `OpenReferenceInformation` 在完整链检查两种返回引用，当前业务授权仍逐次执行。
+Basic／NetworkOpen 不能拼接多次 Stat 的字段。Standard／Internal／Id 不要求 FILE_READ_ATTRIBUTES，使用 `ReferenceInformationAccess.Information`，一次 snapshot 返回 NodeID、Kind、Size、AllocationSize、AllocationKnown、Detached、PendingUnlink；不返回时间、opaque metadata 或名字，不授予 byte/setter 方法。普通文件 Size 非负，目录的 Size 不指定字节长度；Windows 信息依目录 kind 报告 EOF=0。公开 Stat／State 继续遵守 ReadMetadata。`CheckReferenceInformation` 在取得的 exact File／NodeReference 上核对实际能力，当前业务授权仍逐次执行；tree 接纳不依赖额外的 session 预检或 HTTP session capability bit。
 
 NodeID 在同一 volume 内不可复用；128-bit ID 对 uint64 NodeID 做无损单射编码，不增加另一份持久 ID map。64-bit serial 从 canonical durable VolumeID 稳定投影，不同发布 volume 的投影碰撞在发布准入拒绝；SMB 每次打开的 FileId 只标识 capability，与对象 ID 分离。未来 32-bit volume serial 的投影与碰撞规则由 volume 信息独立决定。
 
 AllocationKnown／AllocationSize 先遵守中立字节事实验证，再核对信息类所需 cluster 整数倍；非对齐值不能暗中取整。`VolumeGeometryAccess` 返回可信 `VolumeGeometry{Volume, BytesPerSector, SectorsPerAllocationUnit}`，Volume 必须匹配固定 backend identity。随附 authority 报告经过验证的逻辑 4096×1 allocation geometry，不读 host 物理磁盘。replica 转发远端事实，limited 遵守既有未知 allocation 规则。缺席／非法几何只使依赖它的类失败，不废弃整个 tree。
 
-### 限定 namespace 条件观察
+### 私有事实捕获与限定 namespace 条件观察
+
+SQLite 的私有 namespace 捕获由 ContentMetadata 与 MetadataObservation 共用，只处理同一 read transaction 中的 kind、canonical metadata envelope 与所选 namespace。公开入口分别核对 writable reference、descriptor、WriteMetadata 和 enrollment scope；共享捕获不合并权限。scalar Information 与公开 ReferenceState 复用同一 pending deletion 捕获，统一核对 explicit pending、generation、accepted durable intent 与损坏状态；两者仍分别返回低权限 scalar 和有权限的完整状态。
 
 WRITE_ATTRIBUTES-only Basic setter 通过 `MetadataObservations` 在 OpenAt／NodeRefOptions 中封存 `MetadataObservationScope{Namespace, MaxPayloadBytes}`。`OpenMetadataObservation` 验证完整链；`ReferenceMetadataObserver.ObserveMetadata(index)` 在 exact live、具有 WriteMetadata 的引用上，只观察已批准范围，返回 NodeID 与存在／缺席的 OpaquePayload。它不要求或授予 ReadMetadata，也不允许任意 namespace 查询。
 
@@ -76,6 +78,14 @@ allocation setter、EA／streams／compression／reparse、position／mode sette
 
 **EOF 调用 Truncate 后再补 ARCHIVE。** 两个动作之间可观察到部分状态，回复丢失也无法恢复一个完整结果。现有 conditionalmutation 扩展 sealed 效果到 Truncate，最终 CAS 一次完成。
 
+**仅分别测试 SMB 与 FUSE API。** 各自成功不能证明两个同时打开的入口共享新时间、EOF 与对象身份，也不能检出一方误写另一平台 metadata。有限 direct／HTTP 联合矩阵使用原 fd 和 FileId 验证交接，不将 FUSE 改用新 SMB 权限接口。
+
+**把 FUSE 挂载测试放进默认 SMB package suite。** 会使 Windows runner 与无 mountpoint 的非挂载 jobs 承担 Linux 依赖。独立 test-only package 和测试标签将实际挂载放在既有 mounted gate，并保留严格 verdict。
+
+**为 scalar 信息增加 session 预检和 transport session bit。** 查询只在已经取得的 exact 引用上使用能力，独立 preflight 没有调用方却要求所有 wrappers 与 wire 维护冗余状态。逐引用 checker 与实际结果身份验证足以承担该查询，保留公开低权限 Information 接口。
+
+**为两个 namespace 观察或两个 pending 查询复制 SQL。** 同一事实会产生不同的长度、类型与 corruption 判断；使用私有 capture helper统一读事务内的事实，各公开操作分别执行自己的授权与格式检查，避免权限合并。
+
 **为 SET_INFO 再建一份恢复／关闭 owner。** 属性和 EOF 的未知动作会与 WRITE 争用同一引用，增加两套 fence、预算和责任终结顺序。通用条件 owner 保存完整不可变 command，以 kind 区分授权和 result 规则，并复用原关闭证明。
 
 **持久化另一份128-bit 身份 map。** 现有不可复用 uint64NodeID 可以无损编码到128bit，同 volume 内没有 hash 碰撞；新增 map 会引入 schema、迁移与回收职责。保持 volume serial 与对象 ID 的组合，独立检查 volume 投影碰撞。
@@ -85,6 +95,8 @@ allocation setter、EA／streams／compression／reparse、position／mode sette
 HTTP 文件信息、metadata观察与恢复矩阵共用各自顶层的真实 authority准备，每项新建对象、HTTPpair、session、journal和fault状态，不继承别项的action或dirty内容。纯错误传递fixture只返回原注入错误，storage与十二个lockservice方法都没有健康fallback；健康publication／lock用例仍需真实native后端。fixture准备与测试判据的取舍由[测试工作量决定](../testing/2026-09-09-scale-test-work-to-its-assertions.md)记录。CI watchdog、strict无skip检查、函数coverage和protectedcheck均保持原标准。
 
 command-only SMB share矩阵没有后台续期任务，每次新打开之前通过真实FileSession.Renew与authority.acceptStatus刷新admission epoch。lease和actionhistory分别保留原期限；中立semanticAction的epoch由nativejournal验证，HTTPelapsed window不替代它；用长lease不能使已经退役的action epoch重新有效。短 history 回归验证过期 epoch 拒绝与真实续期后的 CREATE，share 矩阵独立验证原 sharing 约束。
+
+同 volume 的联合验收位于 test-only `packages/smb/internal/mountacceptance`，使用真实签名 SMB TCP 与实际 FUSE 挂载，在 direct／HTTP 下分别建立独立 session，并保留原 Linux fd 与 SMB FileId。它核对共享时间、长度、内容、补零与身份，以及 Windows 属性／ARCHIVE 和 POSIX mode 的独立解释。`linux && rfs_mountacceptance` 只控制测试收集，CI mounted job 通过 strict runner 执行整包并检查挂载清理；原非挂载 SMB、Windows 和 coverage 层不借此新增平台依赖。
 
 ## 后果
 

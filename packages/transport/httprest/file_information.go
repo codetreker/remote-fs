@@ -38,9 +38,6 @@ func (v volumeGeometry) storage() storage.VolumeGeometry {
 	return storage.VolumeGeometry{Volume: v.Volume, BytesPerSector: v.BytesPerSector, SectorsPerAllocationUnit: v.SectorsPerAllocationUnit}
 }
 
-func (s *remoteFileSession) CheckOpenReferenceInformation() error {
-	return checkFileCapability(s.capabilities.OpenInformation)
-}
 func (s *remoteFileSession) CheckVolumeGeometry() error {
 	return checkFileCapability(s.capabilities.Geometry)
 }
@@ -146,7 +143,6 @@ func boundedObservationResponse(response fileResponse, budget int64) (fileRespon
 }
 
 var (
-	_ storage.OpenReferenceInformation   = (*remoteFileSession)(nil)
 	_ storage.VolumeGeometryAccess       = (*remoteFileSession)(nil)
 	_ storage.ReferenceInformationAccess = (*remoteFile)(nil)
 	_ storage.ReferenceInformationAccess = (*remoteNodeReference)(nil)

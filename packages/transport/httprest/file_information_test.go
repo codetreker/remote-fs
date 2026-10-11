@@ -47,6 +47,20 @@ func httpInformationFileNamed(t *testing.T, session *remoteFileSession, root, no
 	return opened.File
 }
 
+func TestHTTPInformationMissingCapabilityFailsBeforeTransport(t *testing.T) {
+	for _, reference := range []storage.ReferenceInformationAccess{
+		&remoteFile{},
+		&remoteNodeReference{file: &remoteFile{}},
+	} {
+		if err := reference.CheckReferenceInformation(); !errors.Is(err, syscall.EOPNOTSUPP) {
+			t.Fatalf("missing information capability=%v", err)
+		}
+		if got, err := reference.Information(t.Context()); !errors.Is(err, syscall.EOPNOTSUPP) || got != (storage.ReferenceInformation{}) {
+			t.Fatalf("unadvertised information=%+v,%v", got, err)
+		}
+	}
+}
+
 func TestHTTPFileInformationUsesFreshExactReferenceWithoutStatGrant(t *testing.T) {
 	client, _, backend := retainedHTTPFixture(t, DefaultFileLimits())
 	if err := backend.Write(t.Context(), "file", []byte("before")); err != nil {
@@ -61,9 +75,6 @@ func TestHTTPFileInformationUsesFreshExactReferenceWithoutStatGrant(t *testing.T
 		t.Fatal(err)
 	}
 	session := httpInformationSession(t, client)
-	if err := storage.OpenReferenceInformation(session).CheckOpenReferenceInformation(); err != nil {
-		t.Fatal(err)
-	}
 	file := httpInformationFile(t, session, root.ID, attr.ID, nil)
 	information := file.(storage.ReferenceInformationAccess)
 	if err := information.CheckReferenceInformation(); err != nil {

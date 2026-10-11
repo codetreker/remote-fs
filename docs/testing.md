@@ -381,7 +381,9 @@ HTTP 文件信息／metadata／恢复的 table tests在顶层建立一份真实 
 
 wire file_info 用例核对 QUERY_INFO／SET_INFO 固定体、当前 compoundextent、offset、保留字段、relatedFileId 和五类完整输出。五个文件 QUERY 类的 Flags、AdditionalInformation、InputBufferLength／Offset 按规范忽略，含超界输入字段；SET 非 securityAdditionalInformation 须零，SET payload 越过当前 command、半个 all-onesFileId、畸形 length 在 backing 前失败。固定输出不足的 INFO_LENGTH_MISMATCH 携带规范 errorcontext，不能返回半个结构；黄金向量逐字段核对时间、allocation、EOF、linkcount、pending、kind、serial 和128-bitID。
 
-ReferenceInformation 用例分别通过 File／NodeReference 验证 zero-access、WRITE-only、APPEND-only、execute-only 及 WRITE_ATTRIBUTES-only 的 scalar 查询，不授予公开 Stat／State 权限。native 用同一 snapshot 捕获 size／allocation／detached／pending，验证 root／linked／detached 关系但不复制 rawleaf 或 metadata；fault、invalidkind、错误 allocation、取消、过期与身份不符均返回零结果。HTTP、objectstore 与 wrappers 逐层验证 checker 和 exactNodeID，limited 与已有 Attr 保持未知 allocation 规则；授权拒绝不得读取受控事实。
+ReferenceInformation 用例分别通过 File／NodeReference 验证 zero-access、WRITE-only、APPEND-only、execute-only 及 WRITE_ATTRIBUTES-only 的 scalar 查询，不授予公开 Stat／State 权限。native 用同一 snapshot 捕获 size／allocation／detached／pending，验证 root／linked／detached 关系但不复制 rawleaf 或 metadata；fault、invalidkind、错误 allocation、取消、过期与身份不符均返回零结果。HTTP、objectstore 与 wrappers 逐引用验证 checker 和 exactNodeID，limited 与已有 Attr 保持未知 allocation 规则；授权拒绝不得读取受控事实。
+
+私有 namespace capture 的测试同时驱动 ContentMetadata 与 MetadataObservation，分别核对原 WriteData／WriteMetadata 和 descriptor／scope；缺席、present-empty、坏 token、超限 envelope 与错误 kind 保持同一事实判断。私有 pending deletion capture 由 scalar Information 与完整 ReferenceState 在各自原 transaction 使用，逐项核对 explicit pending、generation、accepted intent 与损坏状态；不能通过共享 SQL 为低权限查询载入完整 Attr／metadata／linktarget。
 
 MetadataObservation 用例覆盖 immutable enrollment、重复 namespace、0／32KiB 单 payload、16 项与64KiB 合计 bound、absence／presentempty 及 resultowningbytes。WRITE_ATTRIBUTES-only 通过 WriteMetadata 和限定 scope 观察 smb.windows，不取得 ReadMetadata；公开 Stat 继续 EBADF。enrollment、观察和实际 metadata 更新各自验证当前 Op 授权，restricted 观察许可不能代替普通 metadata 修改授权；错误格式、超 bound、staleindex、取消和退休不暴露部分 payload。
 
@@ -390,6 +392,21 @@ SMB 五类查询在 directnative 与真实 HTTP 中核对原对象：rename／un
 Basic SET 组合在 File、directory 和 metadata-only 上一次提交 AttrChange 与 smb.windows；零字段保持、NORMAL 清空、实际 volume 根 HIDDEN／SYSTEM 保留且其它属性可修改、subtreeshare 根区别、派生位、非零 ChangeTime、-1／-2 与 FILETIME 范围分别验证。EOF 要求 WRITE_DATA，APPEND-only／目录／metadata-only 无效果拒绝；成功截短／增长和 ARCHIVE、时间、日志同动作，READONLY 在观察后改变、metadata policy 撤销、quota 或 CAS 冲突无部分效果。Basic 条件重试同时更新 ExpectedMetadata 和 Metadata.Version，Changed／Completed 只用原 typedmethod 取回结果，unboundNotExecuted／Unknown／Retired 不 remint。
 
 mutation_owner 用例涵盖完整 Attr／Metadata／Data／token／effect 深复制、保留 bytes 计费、cancel／CLOSE 排空与同 action 恢复。directory／metadata-only 使用同一 gate 及 owner；reconcile 失败仍继续 exactclose，只有 Released 加全链 settlement 释放保留 payload，原 failurefacts 保持可查询。HTTP 显式 Truncate／Attributes 恢复与 WRITE 相同地按 exactfilecapability／nestedAction 隔离，Unknown 不阻塞 siblingInformation／geometry、Renew／Status 或 cleanup。正常／错误、fullresultbudget、signedrelatedcompound 与必要 race 分别提供 package-local 证据。
+
+### SMB 与 FUSE 的同 volume 联合验收
+
+[`mountacceptance`](../packages/smb/internal/mountacceptance/cross_entry_linux_test.go) 使用真实签名 SMB 3.1.1 TCP 请求与实际 FUSE 挂载，各自持有独立 FileSession；direct 与 HTTP 两种路径都指向同一 native volume。Linux fd 从创建起持续打开，SMB FileId 也持续保留，不以重新打开掩盖身份或可见性问题。
+
+SMB Basic 设置共享时间与 HIDDEN／SYSTEM 后，Linux 原 fd 的 fstat 必须看到准确时间，inode 与 POSIX mode 保持不变；SMB EOF 缩短／扩展后，Linux 原 fd 必须看到相同对象的长度、内容与补零，SMB ARCHIVE 同时设置。随后设置 READONLY／HIDDEN／SYSTEM 并清除 ARCHIVE，经 FUSE fd 执行 chmod、write、truncate，SMB 的新 QUERY_INFO／READ 必须看到新公共事实与相同对象 ID，而 Windows 三个位保持、ARCHIVE 不因 Linux 修改被自动设置。READONLY 限制 SMB EOF，不能替代 Linux 的 mode 检查；被拒绝的 SMB 修改仍须无内容效果。
+
+测试文件只有 `linux && rfs_mountacceptance` 标签，不选择不同生产代码。CI 的 mounted job 在已有挂载测试之后、coverage gate 之前执行整个 test-only package，使用 strict runner，不加 `-run`：
+
+```text
+.github/scripts/assert-every-test-ran.sh -race -count=1 -timeout 10m \
+  -tags rfs_mountacceptance ./packages/smb/internal/mountacceptance
+```
+
+该验收使用 `/dev/fuse` 与现有挂载清理检查；默认非挂载 SMB／Windows suites 保持独立。此 test binary 的执行不记入生产 package coverage，也不证明 Windows 11 redirector／WNet 或私有缓存资格。
 
 `packages/smb/windows` 的平台无关测试核对 canonical SID／logon-session、同 SID 不同登录会话的拒绝、anonymous／Guest／service account 拒绝、context cancellation 和 secret-free `SECURITY_STATUS`。SMB session 用例另验证 `AuthorizeIdentity` 在 signer/principal 安装前执行，明确拒绝与无法决定分别映射为 access denied 和 I/O failure，并且失败的 reauthentication 不改变旧身份或 expiry。`windows-2025` CI job 在 Windows Server 2025 runner 上以 race detector 执行 native SSPI Negotiate exchange，核对 current token 的 SID、`TOKEN_STATISTICS.AuthenticationId`、session key 与 security-context expiry；取消用例核对 exchange 关闭且不能复用。注入失败的 ownership 用例分别核对 credential、context、token 与 buffer cleanup 会尝试全部独立 owner、保留失败项并在后续 Close 重试。该 runner 验证 Windows API 与 SSPI ownership，不是 R-INT-8 所要求的 Windows 11 24H2 redirector/WNet 环境；其它平台仍须明确返回不支持，不能用假的身份通过。
 

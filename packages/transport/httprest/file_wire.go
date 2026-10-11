@@ -216,7 +216,6 @@ type FileSessionWithBarrier interface {
 
 type fileCapabilities struct {
 	Information             bool `json:"information"`
-	OpenInformation         bool `json:"openInformation"`
 	Geometry                bool `json:"geometry"`
 	MetadataObservation     bool `json:"metadataObservation"`
 	OpenMetadataObservation bool `json:"openMetadataObservation"`

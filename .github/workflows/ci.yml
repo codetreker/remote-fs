@@ -158,6 +158,11 @@ jobs:
           # shellcheck disable=SC2086
           .github/scripts/assert-every-test-ran.sh -race -count=1 -timeout 10m $MOUNTING_PACKAGES
 
+      - name: SMB and FUSE shared-volume acceptance
+        run: |
+          .github/scripts/assert-every-test-ran.sh -race -count=1 -timeout 10m \
+            -tags rfs_mountacceptance ./packages/smb/internal/mountacceptance
+
       - name: Install the coverage gate
         run: go install github.com/codetreker/go-cov/cmd/go-cov@v0.1.4-0.20260617124522-d6caf2759e33
 

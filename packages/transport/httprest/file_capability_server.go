@@ -94,9 +94,6 @@ func sessionCapabilitiesOf(value storage.FileSession) (*fileCapabilities, error)
 			err = errors.Join(err, checkErr)
 		}
 	}
-	if c, ok := value.(storage.OpenReferenceInformation); ok {
-		check(&caps.OpenInformation, c.CheckOpenReferenceInformation)
-	}
 	if c, ok := value.(storage.OpenMetadataObservation); ok {
 		check(&caps.OpenMetadataObservation, c.CheckOpenMetadataObservation)
 	}

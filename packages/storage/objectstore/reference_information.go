@@ -9,25 +9,10 @@ import (
 )
 
 var (
-	_ storage.OpenReferenceInformation   = (*fileSession)(nil)
 	_ storage.ReferenceInformationAccess = (*openFile)(nil)
 	_ storage.ReferenceInformationAccess = (*nodeReference)(nil)
 	_ storage.VolumeGeometryAccess       = (*fileSession)(nil)
 )
-
-func (fs *fileSession) CheckOpenReferenceInformation() error {
-	if err := fs.CheckAtomicFileOpen(); err != nil {
-		return err
-	}
-	if err := fs.CheckNodeReferences(); err != nil {
-		return err
-	}
-	capability, ok := fs.native.(storage.OpenReferenceInformation)
-	if !ok {
-		return syscall.EOPNOTSUPP
-	}
-	return capability.CheckOpenReferenceInformation()
-}
 
 func informationCapability(native any) (storage.ReferenceInformationAccess, uint64, error) {
 	capability, ok := native.(storage.ReferenceInformationAccess)

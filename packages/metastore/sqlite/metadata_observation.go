@@ -3,7 +3,6 @@ package sqlite
 import (
 	"context"
 	"database/sql"
-	"errors"
 	"syscall"
 
 	"github.com/codetreker/remote-fs/packages/metastore"
@@ -33,36 +32,17 @@ func (f *retainedFile) ObserveMetadata(ctx context.Context, index uint16) (stora
 		return storage.ContentMetadataObservation{}, err
 	}
 	scope := f.metadataObservations[index]
-	observed := storage.ContentMetadataObservation{NodeID: uint64(f.id)}
+	var observed storage.ContentMetadataObservation
 	err := f.store.inspect(ctx, func(tx *sql.Tx) error {
-		var kind, metadataBytes int64
-		var encoded []byte
-		err := tx.QueryRowContext(ctx, `SELECT
-			CASE WHEN typeof(kind)='integer' THEN kind ELSE 0 END,
-			CASE WHEN typeof(metadata)='blob' THEN length(metadata) ELSE -1 END,
-			CASE WHEN typeof(metadata)='blob' AND length(metadata)<=? THEN metadata END
-			FROM nodes WHERE volume=? AND id=?`, storage.MaxMetadataBytes, f.store.volume, f.id).Scan(&kind, &metadataBytes, &encoded)
-		if errors.Is(err, sql.ErrNoRows) {
-			return syscall.ESTALE
-		}
+		_, captured, err := f.store.captureNamespace(ctx, tx, f.id, scope.Namespace)
 		if err != nil {
 			return err
 		}
-		if kind < int64(storage.NodeRegular) || kind > int64(storage.NodeSymlink) || metadataBytes < 0 ||
-			metadataBytes > storage.MaxMetadataBytes || int64(len(encoded)) != metadataBytes {
-			return syscall.EIO
-		}
-		metadata, err := storage.DecodeMetadata(encoded)
-		if err != nil {
+		if err := captured.CheckScope(uint64(f.id), scope); err != nil {
 			return err
 		}
-		if value, ok := metadata[scope.Namespace]; ok {
-			observed.Value = &value
-		}
-		if err := checkContentMetadataValue(observed.Value); err != nil {
-			return err
-		}
-		return observed.CheckScope(uint64(f.id), scope)
+		observed = captured
+		return nil
 	})
 	if err == nil {
 		err = metastore.CheckFilePublication(ctx)

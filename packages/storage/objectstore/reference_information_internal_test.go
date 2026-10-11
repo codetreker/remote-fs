@@ -55,9 +55,8 @@ type informationEnrollmentProbe struct {
 	hook        func()
 }
 
-func (p *informationEnrollmentProbe) CheckOpenReferenceInformation() error { return p.checkErr }
-func (p *informationEnrollmentProbe) CheckOpenMetadataObservation() error  { return p.checkErr }
-func (p *informationEnrollmentProbe) CheckVolumeGeometry() error           { return p.checkErr }
+func (p *informationEnrollmentProbe) CheckOpenMetadataObservation() error { return p.checkErr }
+func (p *informationEnrollmentProbe) CheckVolumeGeometry() error          { return p.checkErr }
 func (p *informationEnrollmentProbe) VolumeGeometry(context.Context) (storage.VolumeGeometry, error) {
 	if p.hook != nil {
 		p.hook()
@@ -68,7 +67,7 @@ func (p *informationEnrollmentProbe) VolumeGeometry(context.Context) (storage.Vo
 func TestObjectInformationEnrollmentRequiresCompleteNativeChain(t *testing.T) {
 	missing := &identityAuthorityProbe{}
 	session := &fileSession{native: missing, storage: &Storage{meta: missing, objects: struct{ BoundedObjects }{}}}
-	for _, check := range []func() error{session.CheckOpenReferenceInformation, session.CheckOpenMetadataObservation, session.CheckVolumeGeometry} {
+	for _, check := range []func() error{session.CheckOpenMetadataObservation, session.CheckVolumeGeometry} {
 		if err := check(); !errors.Is(err, syscall.EOPNOTSUPP) {
 			t.Fatal(err)
 		}
@@ -86,14 +85,14 @@ func TestObjectInformationEnrollmentRequiresCompleteNativeChain(t *testing.T) {
 	session.native, session.storage.meta = native, native
 	session.hasBackendIdentity = true
 	session.backendIdentity = storage.BackendIdentityResult{Volume: "volume", Authority: "authority", RootNodeID: 1}
-	for _, check := range []func() error{session.CheckOpenReferenceInformation, session.CheckOpenMetadataObservation, session.CheckVolumeGeometry} {
+	for _, check := range []func() error{session.CheckOpenMetadataObservation, session.CheckVolumeGeometry} {
 		if err := check(); !errors.Is(err, cause) {
 			t.Fatal(err)
 		}
 	}
 	native.checkErr = nil
 	missing.fileErr = cause
-	for _, check := range []func() error{session.CheckOpenReferenceInformation, session.CheckOpenMetadataObservation, session.CheckVolumeGeometry} {
+	for _, check := range []func() error{session.CheckOpenMetadataObservation, session.CheckVolumeGeometry} {
 		if err := check(); !errors.Is(err, cause) {
 			t.Fatal(err)
 		}

@@ -6,10 +6,6 @@ import (
 	"syscall"
 )
 
-func (s *fileSession) CheckOpenReferenceInformation() error {
-	return capabilityCheck(s.remote, storage.OpenReferenceInformation.CheckOpenReferenceInformation)
-}
-
 func checkReferenceInformation(remote any) error {
 	if err := capabilityCheck(remote, storage.ReferenceInformationAccess.CheckReferenceInformation); err != nil {
 		return err
@@ -65,7 +61,6 @@ func observeReferenceInformation(ctx context.Context, session *fileSession, remo
 }
 
 var (
-	_ storage.OpenReferenceInformation   = (*fileSession)(nil)
 	_ storage.ReferenceInformationAccess = (*retainedFile)(nil)
 	_ storage.ReferenceInformationAccess = (*nodeReference)(nil)
 )

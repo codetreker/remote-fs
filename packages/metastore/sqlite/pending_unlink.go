@@ -33,22 +33,13 @@ func (s *Store) referenceState(ctx context.Context, tx *sql.Tx, id int64) (metas
 	if err != nil {
 		return metastore.ReferenceState{}, err
 	}
-	var explicit bool
-	var generation int64
-	var accepted bool
-	if err := tx.QueryRowContext(ctx, `SELECT pending_unlink,pending_generation,EXISTS(
-		SELECT 1 FROM delete_intents WHERE volume=? AND node=? AND outcome IN (?,?))
-		FROM nodes WHERE volume=? AND id=?`, s.volume, id, storage.DeleteIntentPending,
-		storage.DeleteIntentCleanupFailed, s.volume, id).Scan(&explicit, &generation, &accepted); err != nil {
+	pending, err := s.capturePendingDeletion(ctx, tx, id)
+	if err != nil {
 		return metastore.ReferenceState{}, err
 	}
-	pending := explicit || accepted
-	if generation < 0 || pending && generation == 0 {
-		return metastore.ReferenceState{}, fmt.Errorf("node %d has an invalid pending-unlink generation: %w", id, syscall.EIO)
-	}
-	result := metastore.ReferenceState{State: state, LinkTarget: bytes.Clone(state.LinkTarget), PendingUnlink: pending}
-	if pending {
-		result.PendingGeneration = binary.BigEndian.AppendUint64(nil, uint64(generation))
+	result := metastore.ReferenceState{State: state, LinkTarget: bytes.Clone(state.LinkTarget), PendingUnlink: pending.pending}
+	if pending.pending {
+		result.PendingGeneration = binary.BigEndian.AppendUint64(nil, uint64(pending.generation))
 	}
 	return result, nil
 }
