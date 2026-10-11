@@ -24,6 +24,8 @@ metadata 每节点最多 16 个 namespace，namespace 名最长 128 字节，单
 
 `MetadataAccess` 按 NodeID 原子比较并替换一个 namespace；`ReferenceMetadataAccess` 在已有 File 身份上执行同一操作。空 expected version 表示该 namespace 必须不存在，空 data 表示一个存在的空值；authority 为成功结果分配非空版本，只比较这一 namespace，并保留其它 namespace。已知条件不符为 `ErrConditionConflict`，且没有修改；未知结果仍按原发布规则失败。返回属性和 metadata 在载入或保留变长数据前经过请求拥有的结果预算。
 
+数据操作可通过[文件内容访问](../feature/2026-09-28-smb-file-data-io.md)的 OpenContentMetadata／ReferenceContentMetadata enrollment 固定派生效果及限定观察；它不增加公开 MetadataAccess 权限，普通 namespace CAS 与版本规则继续成立。
+
 ### 使用声明与范围控制保持中立
 
 每个成功打开的 File 注册一份 `UseClaim{Uses, Deny}`。旧路径读写打开自动加入 `ReadData` / `WriteData`；OpenAt 显式要求 Read/Write 的对应 Use，允许 execute 等非字节权限增加冲突声明，调用方不能用空声明绕过已经存在的限制；公开目录读取派生 `ReadEntries`，`DeleteName` 为身份名字操作保留。新旧 claim 双向比较：任一方声明的 Deny 与另一方的 Uses 相交即冲突。实际读取、写入、目录枚举与发布在原生最终顺序重新检查对应 Uses；较早的客户端预检不能代替这一检查。

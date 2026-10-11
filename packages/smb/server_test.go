@@ -233,6 +233,7 @@ func (endpointCreateCapabilities) AcknowledgeDeleteIntent(context.Context, stora
 }
 func (endpointCreateCapabilities) CheckStableReferenceIdentity() error   { return nil }
 func (endpointCreateCapabilities) CheckOpenMetadataAccess() error        { return nil }
+func (endpointCreateCapabilities) CheckOpenContentMetadata() error       { return nil }
 func (endpointCreateCapabilities) CheckRecoverableReferenceClose() error { return nil }
 
 func endpointConfig() Config {

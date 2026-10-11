@@ -27,6 +27,15 @@ func (s *fileSession) CheckAllocationReporting() error {
 }
 
 func (s *fileSession) OpenAt(ctx context.Context, selection storage.ChildSelection, options storage.OpenAtOptions) (storage.OpenResult, error) {
+	if err := storage.CheckContentMetadataEffects(options.ContentMetadataEffects); err != nil {
+		return storage.OpenResult{}, err
+	}
+	if len(options.ContentMetadataEffects) != 0 {
+		if err := s.CheckOpenContentMetadata(); err != nil {
+			return storage.OpenResult{}, err
+		}
+		options.ContentMetadataEffects = storage.CloneContentMetadataEffects(options.ContentMetadataEffects)
+	}
 	backing, err := capability(s.FileSession, storage.AtomicFileOpener.CheckAtomicFileOpen)
 	if err != nil {
 		return storage.OpenResult{}, err

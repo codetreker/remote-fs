@@ -162,6 +162,11 @@ func (s *remoteFileSession) OpenAtWithBarrier(ctx context.Context, selection sto
 	if err := s.CheckAtomicFileOpen(); err != nil {
 		return storage.OpenResult{}, nil, err
 	}
+	if len(options.ContentMetadataEffects) != 0 {
+		if err := s.CheckOpenContentMetadata(); err != nil {
+			return storage.OpenResult{}, nil, err
+		}
+	}
 	if options.MetadataAccess != 0 {
 		if err := s.CheckOpenMetadataAccess(); err != nil {
 			return storage.OpenResult{}, nil, err
@@ -173,8 +178,12 @@ func (s *remoteFileSession) OpenAtWithBarrier(ctx context.Context, selection sto
 	if err := options.Check(); err != nil {
 		return storage.OpenResult{}, nil, err
 	}
+	options.ContentMetadataEffects = storage.CloneContentMetadataEffects(options.ContentMetadataEffects)
 	child, guards := childSelectionWire(selection)
 	reference, response, err := s.openCapability(ctx, fileRequest{Op: storage.OpFileOpenAt, Child: child, Guards: guards, OpenAt: openAtOptionsOf(options)})
+	if reference != nil {
+		reference.contentEffects = storage.CloneContentMetadataEffects(options.ContentMetadataEffects)
+	}
 	result := openResultOf(reference, response)
 	return result, response.Barrier, err
 }
@@ -554,6 +563,14 @@ func (f *remoteFile) mutateFileWithBarrier(ctx context.Context, mutation storage
 	}
 	if err := mutation.CheckDataLimit(f.session.storage.maxWriteBytes); err != nil {
 		return storage.Attr{}, nil, err
+	}
+	if mutation.Action != "" && len(mutation.Data) <= MaxFileRecoveryDataBytes && (mutation.Kind == storage.MutateWriteAt || mutation.Kind == storage.MutateAppend) {
+		admitted, release, _, err := f.session.admitExplicitWrite(ctx, f.id, mutation.Action)
+		if err != nil {
+			return storage.Attr{}, nil, err
+		}
+		defer release()
+		ctx = admitted
 	}
 	response, err := f.call(ctx, fileRequest{Op: storage.OpFileMutate, Mutation: fileMutationOf(mutation)})
 	var result storage.Attr

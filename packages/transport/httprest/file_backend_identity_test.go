@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -182,7 +183,7 @@ func TestHTTPBackendIdentityFailuresAndAuthorizationHaveNoInventedIdentity(t *te
 				t.Fatalf("identity = %+v, %v; calls = %d", result, err, probe.calls.Load())
 			}
 			request := <-requests
-			if request.Operation != storage.OpFileBackendIdentity || request.Volume != "authorized-volume-label" || request.Open != (storage.OpenAccess{}) {
+			if request.Operation != storage.OpFileBackendIdentity || request.Volume != "authorized-volume-label" || !reflect.DeepEqual(request.Open, storage.OpenAccess{}) {
 				t.Fatalf("authorization = %+v", request)
 			}
 		})
@@ -442,7 +443,7 @@ func TestHTTPOpenAtAuthorizesMetadataIndependentlyBeforeCreation(t *testing.T) {
 				if request.Operation == denied {
 					found = true
 				}
-				if request.Operation == storage.OpFileOpenAt && request.Open != (storage.OpenAccess{Read: true, Create: true, Exclusive: true}) {
+				if request.Operation == storage.OpFileOpenAt && !reflect.DeepEqual(request.Open, storage.OpenAccess{Read: true, Create: true, Exclusive: true}) {
 					t.Fatalf("metadata grants changed byte authorization: %+v", request)
 				}
 			}

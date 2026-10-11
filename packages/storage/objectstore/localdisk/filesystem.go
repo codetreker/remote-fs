@@ -364,7 +364,7 @@ func requireNameCapacity(fd int, ops fileOperations) error {
 	if err := ops.fstatfs(fd, &st); err != nil {
 		return err
 	}
-	longest := len(deleteMarkerPrefix) + 1 + base64.RawURLEncoding.EncodedLen(MaxKeyBytes)
+	longest := len(markerPreparationPrefix) + len(deleteMarkerPrefix) + 1 + base64.RawURLEncoding.EncodedLen(MaxKeyBytes)
 	if st.Namelen > 0 && uint64(st.Namelen) < uint64(longest) {
 		return fmt.Errorf("filesystem accepts %d-byte names; object recovery needs %d: %w",
 			st.Namelen, longest, syscall.ENAMETOOLONG)

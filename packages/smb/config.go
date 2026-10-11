@@ -29,6 +29,8 @@ type Limits struct {
 	MaxExports, MaxConnections, MaxSessions, MaxTrees   int
 	MaxRequests, MaxCompound, MaxContexts               int
 	MaxHandles, MaxUnresolvedOwners, MaxDiagnosticBytes int
+	MaxWriteOwners, MaxRetainedWriteBytes               int
+	MaxHandleIORequests                                 int
 	MaxDirectoryBytes                                   int
 	MaxFrameBytes, MaxIOBytes, MaxTokenBytes            int
 	HandshakeTimeout, RequestTimeout, CleanupTimeout    time.Duration
@@ -40,6 +42,7 @@ func DefaultLimits() Limits {
 		MaxExports: 32, MaxConnections: 16, MaxSessions: 16, MaxTrees: 32,
 		MaxRequests: 128, MaxCompound: 32, MaxContexts: 16,
 		MaxHandles: 256, MaxUnresolvedOwners: 256, MaxDiagnosticBytes: 256 * 256,
+		MaxWriteOwners: 128, MaxRetainedWriteBytes: 32 << 20, MaxHandleIORequests: 32,
 		MaxDirectoryBytes: 8 << 20,
 		MaxFrameBytes:     2 << 20, MaxIOBytes: 1 << 20, MaxTokenBytes: 65535,
 		HandshakeTimeout: 30 * time.Second, RequestTimeout: time.Minute,
@@ -51,6 +54,7 @@ func (l Limits) check() error {
 	if l.MaxExports < 1 || l.MaxConnections < 1 || l.MaxSessions < 1 || l.MaxTrees < 1 ||
 		l.MaxRequests < 1 || l.MaxRequests > 65535 || l.MaxCompound < 1 || l.MaxCompound > 128 || l.MaxCompound > l.MaxRequests ||
 		l.MaxDirectoryBytes < 1 || l.MaxHandles < 1 || l.MaxUnresolvedOwners < 1 || l.MaxDiagnosticBytes < diagnosticOwnerBytes ||
+		l.MaxWriteOwners < 1 || l.MaxRetainedWriteBytes < 1 || l.MaxHandleIORequests < 1 || l.MaxHandleIORequests > l.MaxRequests ||
 		l.MaxContexts < 1 || l.MaxIOBytes < 65536 || l.MaxIOBytes > 8<<20 ||
 		l.MaxFrameBytes < l.MaxIOBytes+65536 || l.MaxFrameBytes > 0xffffff ||
 		l.MaxTokenBytes < 1 || l.MaxTokenBytes > 65535 ||
@@ -72,6 +76,8 @@ type Share struct {
 
 // Status reports resources still owned, including cleanup-only owners.
 type Status struct {
+	WriteOwners, UnknownWrites, PendingFlushes, RetainedWriteBytes  int
+	WriteFailures                                                   []WriteFailure
 	Serving, Stopping, Stopped                                      bool
 	Exports, StoppingExports, Connections, RetainedConnections      int
 	Sessions, ExpiredSessions, Trees, PendingRequests               int

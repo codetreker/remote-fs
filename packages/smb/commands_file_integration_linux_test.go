@@ -545,6 +545,7 @@ func TestCreateRootRulesRetainPinnedDirectoryDirectAndHTTP(t *testing.T) {
 }
 
 type createSessionContract interface {
+	storage.OpenContentMetadata
 	storage.FileSession
 	storage.AllocationReporting
 	storage.FileSessionIdentity

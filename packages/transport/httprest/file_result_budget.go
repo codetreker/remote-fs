@@ -25,7 +25,7 @@ func fileAttrResult(op storage.Operation) bool {
 
 func fileBoundedResult(op storage.Operation) bool {
 	return fileAttrResult(op) || op == storage.OpFileSetNodeMetadata || op == storage.OpFileSetMetadata ||
-		op == storage.OpFileReadDirNode || op == storage.OpFileObserveDirectoryMetadata || op == storage.OpFileObserveName
+		op == storage.OpFileReadDirNode || op == storage.OpFileObserveDirectoryMetadata || op == storage.OpFileObserveName || op == storage.OpFileObserveContentMetadata
 }
 
 func fileResponseLimit(req fileRequest, maximum int64) int64 {

@@ -37,6 +37,17 @@ func (c *connection) closeFile(ctx context.Context, s *session, t *tree, request
 	if err := c.server.config.Authorize.Authorize(ctx, authz.AccessRequest{Volume: t.export.share.Volume, Operation: storage.OpFileClose}); err != nil {
 		return nil, closeStatusError(err)
 	}
+	if err := handle.closeLifetime.lock(ctx); err != nil {
+		return nil, closeStatusError(err)
+	}
+	defer handle.closeLifetime.unlock()
+	if t.findFileHandle(parsed.FileID) != handle {
+		return nil, closeStatusError(syscall.EBADF)
+	}
+	if err := waitFileWork(ctx, t.fenceHandleFileIO(handle)); err != nil {
+		return nil, closeStatusError(err)
+	}
+	pendingIOErr := settlePendingFileIO(ctx, handle)
 	response := wire.CloseResponse{}
 	if parsed.Flags&1 != 0 {
 		if err := c.server.config.Authorize.Authorize(ctx, authz.AccessRequest{Volume: t.export.share.Volume, Operation: storage.OpFileStat}); err == nil {
@@ -57,7 +68,7 @@ func (c *connection) closeFile(ctx context.Context, s *session, t *tree, request
 			}
 		}
 	}
-	if err := t.closeFileHandle(ctx, handle); err != nil {
+	if err := t.closeFileHandlePrepared(ctx, handle, pendingIOErr); err != nil {
 		return nil, closeStatusError(err)
 	}
 	return wire.CloseResponseBody(response), statusOK

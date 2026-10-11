@@ -71,7 +71,7 @@ func mutationAccess(command storage.FileMutation) metastore.FileAccess {
 }
 
 func (f *retainedFile) MutateFile(ctx context.Context, command storage.FileMutation) (metastore.FileState, error) {
-	if err := command.Check(); err != nil {
+	if err := storage.CheckContentMutation(command, f.contentEffects); err != nil {
 		return metastore.FileState{}, err
 	}
 	metadataOnly := command.Kind == storage.MutateAttributes
@@ -128,7 +128,7 @@ func (f *retainedFile) MutateFile(ctx context.Context, command storage.FileMutat
 }
 
 func (f *retainedFile) CommitMutation(ctx context.Context, command storage.FileMutation, expected uint64, object metastore.Object) (metastore.FileState, error) {
-	if err := command.Check(); err != nil {
+	if err := storage.CheckContentMutation(command, f.contentEffects); err != nil {
 		return metastore.FileState{}, err
 	}
 	if command.Kind == storage.MutateAttributes || expected == 0 || object.Size < 0 {
@@ -145,6 +145,11 @@ func (f *retainedFile) CommitMutation(ctx context.Context, command storage.FileM
 	err := f.store.mutatePublication(ctx, &volumeIntent{kind: locking.WriteMutation, node: f.id, scope: f.scope}, func(tx *sql.Tx) error {
 		if err := f.check(); err != nil {
 			return err
+		}
+		if len(command.ContentEffects) != 0 {
+			if err := f.checkContentReference(ctx); err != nil {
+				return err
+			}
 		}
 		before, err := f.store.fileState(ctx, tx, f.id)
 		if err != nil {
@@ -172,6 +177,22 @@ func (f *retainedFile) CommitMutation(ctx context.Context, command storage.FileM
 		if object.Size != size {
 			return syscall.EINVAL
 		}
+		effectData := make([][]byte, len(command.ContentEffects))
+		for i, index := range command.ContentEffects {
+			effect := f.contentEffects[index]
+			var current *storage.OpaquePayload
+			if value, ok := before.Metadata[effect.Namespace]; ok {
+				current = &value
+			}
+			if err := checkContentMetadataValue(current); err != nil {
+				return err
+			}
+			var err error
+			effectData[i], err = effect.Apply(current)
+			if err != nil {
+				return err
+			}
+		}
 		at := time.Now()
 		if err := f.store.replaceNodeContentFields(ctx, tx, before.Node, object, at); err != nil {
 			return err
@@ -189,6 +210,12 @@ func (f *retainedFile) CommitMutation(ctx context.Context, command storage.FileM
 		for _, namespace := range names {
 			update := command.Metadata[namespace]
 			if _, err := f.store.setNodeMetadata(ctx, tx, f.id, namespace, update.Version, update.Data, at); err != nil {
+				return err
+			}
+		}
+		for i, index := range command.ContentEffects {
+			effect := f.contentEffects[index]
+			if _, err := f.store.setNodeMetadata(ctx, tx, f.id, effect.Namespace, command.ExpectedMetadata[effect.Namespace], effectData[i], at); err != nil {
 				return err
 			}
 		}

@@ -54,7 +54,7 @@ func (p *lockAuthorizationPolicy) check(t *testing.T, operation string, count in
 	}
 	for i, request := range p.requests {
 		want := authz.AccessRequest{Volume: "trusted-policy-volume", Operation: storage.Operation(operation)}
-		if request != want || p.identity[i] != "host-identity" {
+		if !reflect.DeepEqual(request, want) || p.identity[i] != "host-identity" {
 			t.Fatalf("authorization request = %+v, identity = %v; want %+v and host identity", request, p.identity[i], want)
 		}
 	}

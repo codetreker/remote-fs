@@ -326,7 +326,17 @@ func (c *connection) writeLocked(packet []byte) error {
 	return nil
 }
 
-func (c *connection) process(requests []wire.Request) error {
+func (c *connection) process(requests []wire.Request) (processErr error) {
+	var ioResponses []func(ResponseDisposition)
+	defer func() {
+		disposition := ResponseSent
+		if processErr != nil {
+			disposition = ResponseSendFailed
+		}
+		for _, record := range ioResponses {
+			record(disposition)
+		}
+	}()
 	defer c.retireRequests(requests)
 	var output []byte
 	var inheritedSession uint64
@@ -349,6 +359,7 @@ func (c *connection) process(requests []wire.Request) error {
 		pending.treeID = request.Header.TreeID
 		c.mu.Unlock()
 		ctx := context.WithValue(pending.ctx, pendingFrameKey{}, requestFrame{connection: c, id: pending.frame})
+		ctx = context.WithValue(ctx, ioResponseKey{}, &ioResponses)
 		if request.Header.Flags&wire.FlagRelated != 0 {
 			ctx = context.WithValue(ctx, relatedFileKey{}, inheritedFile)
 		} else {
@@ -468,6 +479,16 @@ func requiredCredits(request wire.Request) int {
 	if controlCommand(request.Header.Command) {
 		return 1
 	}
+	switch request.Header.Command {
+	case wire.Read:
+		if parsed, err := request.Read(); err == nil {
+			return max(1, int((uint64(parsed.Length)+65535)/65536))
+		}
+	case wire.Write:
+		if parsed, err := request.Write(); err == nil {
+			return max(1, int((uint64(parsed.Length)+65535)/65536))
+		}
+	}
 	return max(1, (len(request.Packet)+65535)/65536)
 }
 
@@ -554,6 +575,15 @@ func responseBudget(request wire.Request) int {
 		return 72 + 65535
 	case wire.Create:
 		return 152
+	case wire.Read:
+		if parsed, err := request.Read(); err == nil {
+			return (80 + int(parsed.Length) + 7) &^ 7
+		}
+		return 128
+	case wire.Write:
+		return 80
+	case wire.Flush:
+		return 72
 	default:
 		return 128
 	}

@@ -79,4 +79,6 @@ const (
 	OpLockStatus                  Operation = "lock.status"
 )
 
+const OpFileObserveContentMetadata Operation = "file.observe-content-metadata"
+
 const OpFileObserveDirectoryMetadata Operation = "file.observe-directory-metadata"

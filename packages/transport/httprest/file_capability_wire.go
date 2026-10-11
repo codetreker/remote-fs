@@ -231,25 +231,26 @@ func (value initialState) storage() storage.InitialState {
 }
 
 type openAtOptions struct {
-	MetadataAccess storage.MetadataPermissions `json:"metadataAccess"`
-	Read           bool                        `json:"read"`
-	Write          bool                        `json:"write"`
-	Create         bool                        `json:"create"`
-	Exclusive      bool                        `json:"exclusive"`
-	Target         childCondition              `json:"target"`
-	Action         storage.FileActionID        `json:"action"`
-	Use            storage.UseClaim            `json:"use"`
-	Existing       storage.ExistingEffect      `json:"existing"`
-	Initial        initialState                `json:"initial"`
-	CloseIntent    *closeIntent                `json:"closeIntent,omitempty"`
+	ContentMetadataEffects []contentMetadataEffect     `json:"contentMetadataEffects,omitempty"`
+	MetadataAccess         storage.MetadataPermissions `json:"metadataAccess"`
+	Read                   bool                        `json:"read"`
+	Write                  bool                        `json:"write"`
+	Create                 bool                        `json:"create"`
+	Exclusive              bool                        `json:"exclusive"`
+	Target                 childCondition              `json:"target"`
+	Action                 storage.FileActionID        `json:"action"`
+	Use                    storage.UseClaim            `json:"use"`
+	Existing               storage.ExistingEffect      `json:"existing"`
+	Initial                initialState                `json:"initial"`
+	CloseIntent            *closeIntent                `json:"closeIntent,omitempty"`
 }
 
 func openAtOptionsOf(value storage.OpenAtOptions) *openAtOptions {
-	return &openAtOptions{MetadataAccess: value.MetadataAccess, Read: value.Read, Write: value.Write, Create: value.Create, Exclusive: value.Exclusive, Target: childConditionOf(value.Target), Action: value.Action, Use: value.Use, Existing: value.Existing, Initial: initialStateOf(value.Initial), CloseIntent: closeIntentOf(value.CloseIntent)}
+	return &openAtOptions{ContentMetadataEffects: contentMetadataEffectsOf(value.ContentMetadataEffects), MetadataAccess: value.MetadataAccess, Read: value.Read, Write: value.Write, Create: value.Create, Exclusive: value.Exclusive, Target: childConditionOf(value.Target), Action: value.Action, Use: value.Use, Existing: value.Existing, Initial: initialStateOf(value.Initial), CloseIntent: closeIntentOf(value.CloseIntent)}
 }
 
 func (value openAtOptions) storage() storage.OpenAtOptions {
-	result := storage.OpenAtOptions{MetadataAccess: value.MetadataAccess, Read: value.Read, Write: value.Write, Create: value.Create, Exclusive: value.Exclusive, Target: value.Target.storage(), Action: value.Action, Use: value.Use, Existing: value.Existing, Initial: value.Initial.storage()}
+	result := storage.OpenAtOptions{ContentMetadataEffects: contentMetadataEffectsStorage(value.ContentMetadataEffects), MetadataAccess: value.MetadataAccess, Read: value.Read, Write: value.Write, Create: value.Create, Exclusive: value.Exclusive, Target: value.Target.storage(), Action: value.Action, Use: value.Use, Existing: value.Existing, Initial: value.Initial.storage()}
 	if value.CloseIntent != nil {
 		intent := value.CloseIntent.storage()
 		result.CloseIntent = &intent
@@ -343,6 +344,7 @@ func metadataUpdatesStorage(values map[string]metadataUpdate) map[string]storage
 }
 
 type fileMutationOptions struct {
+	ContentEffects   []uint16                   `json:"contentEffects,omitempty"`
 	Action           storage.FileActionID       `json:"action"`
 	Offset           int64                      `json:"offset"`
 	Data             canonicalBytes             `json:"data,omitempty"`
@@ -356,11 +358,11 @@ type fileMutationOptions struct {
 }
 
 func fileMutationOf(value storage.FileMutation) *fileMutationOptions {
-	return &fileMutationOptions{Action: value.Action, Offset: value.Offset, Data: canonicalBytes(bytes.Clone(value.Data)), ExpectedSize: value.ExpectedSize, ExpectedMetadata: metadataVersionsOf(value.ExpectedMetadata), Kind: value.Kind, Size: value.Size, Attr: *AttrChangeOf(value.Attr), Metadata: metadataUpdatesOf(value.Metadata), Uses: value.Uses}
+	return &fileMutationOptions{ContentEffects: append([]uint16(nil), value.ContentEffects...), Action: value.Action, Offset: value.Offset, Data: canonicalBytes(bytes.Clone(value.Data)), ExpectedSize: value.ExpectedSize, ExpectedMetadata: metadataVersionsOf(value.ExpectedMetadata), Kind: value.Kind, Size: value.Size, Attr: *AttrChangeOf(value.Attr), Metadata: metadataUpdatesOf(value.Metadata), Uses: value.Uses}
 }
 
 func (value fileMutationOptions) storage() storage.FileMutation {
-	return storage.FileMutation{Action: value.Action, Offset: value.Offset, Data: bytes.Clone(value.Data), ExpectedSize: value.ExpectedSize, ExpectedMetadata: metadataVersionsStorage(value.ExpectedMetadata), Kind: value.Kind, Size: value.Size, Attr: value.Attr.Storage(), Metadata: metadataUpdatesStorage(value.Metadata), Uses: value.Uses}
+	return storage.FileMutation{ContentEffects: append([]uint16(nil), value.ContentEffects...), Action: value.Action, Offset: value.Offset, Data: bytes.Clone(value.Data), ExpectedSize: value.ExpectedSize, ExpectedMetadata: metadataVersionsStorage(value.ExpectedMetadata), Kind: value.Kind, Size: value.Size, Attr: value.Attr.Storage(), Metadata: metadataUpdatesStorage(value.Metadata), Uses: value.Uses}
 }
 
 type pendingUnlinkCommand struct {

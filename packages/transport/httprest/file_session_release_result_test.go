@@ -363,7 +363,7 @@ func TestHTTPSessionReleaseResultUsesCurrentCloseAuthorizationBeforeBarrier(t *t
 		t.Fatalf("denied release read = %+v, %v; closes=%d barriers=%d", response, err, fixture.backend.closes.Load(), fixture.log.calls.Load())
 	}
 	request := <-requests
-	if request.Operation != storage.OpFileSessionClose || request.Volume != "trusted-release-volume" || request.Open != (storage.OpenAccess{}) {
+	if request.Operation != storage.OpFileSessionClose || request.Volume != "trusted-release-volume" || !reflect.DeepEqual(request.Open, storage.OpenAccess{}) {
 		t.Fatalf("release authorization = %+v", request)
 	}
 }

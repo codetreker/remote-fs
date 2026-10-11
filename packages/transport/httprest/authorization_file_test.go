@@ -9,6 +9,7 @@ import (
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"sync"
 	"syscall"
@@ -194,7 +195,7 @@ func TestEveryFileOperationAuthorizesBeforeCapabilityLookup(t *testing.T) {
 			if req.Op == storage.OpFileOpen || req.Op == storage.OpFileOpenNode {
 				want.Open = req.Open.OpenAccess
 			}
-			if len(policy.requests) != 1 || policy.requests[0] != want || policy.identities[0] != "member" {
+			if len(policy.requests) != 1 || !reflect.DeepEqual(policy.requests[0], want) || policy.identities[0] != "member" {
 				t.Fatalf("authorization=%+v identities=%v; want %+v", policy.requests, policy.identities, want)
 			}
 		})
