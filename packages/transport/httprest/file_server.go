@@ -1200,11 +1200,13 @@ func (h *Handler) fileCall(ctx context.Context, req fileRequest, digest [32]byte
 			}
 			return fileResponse{}, syscall.EAGAIN
 		}
-		if actionEpoch != epoch && !nativeExplicitClose {
+		// Semantic identities belong to the native action journal. Its admission
+		// clock and exact replay checks are independent of the HTTP action window.
+		if actionEpoch != epoch && !nativeExplicitClose && semanticFileAction(req) == "" {
 			session.mu.Unlock()
 			// The immediately preceding window still has every admitted result.
 			// Absence here proves this action never ran; older windows cannot prove it.
-			if actionEpoch+1 == epoch && semanticFileAction(req) == "" {
+			if actionEpoch+1 == epoch {
 				return fileResponse{Epoch: epoch, Retry: true}, nil
 			}
 			return fileResponse{}, syscall.ESTALE

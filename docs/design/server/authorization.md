@@ -128,7 +128,7 @@ MetadataObservations 与 ContentMetadataEffects 分别表达公开 metadata 条�
 3. handler 从已解码语义构造一个 AccessRequest，执行一次入口 Authorize。
 4. 允许后才读取或触碰 capability、分配引用或动作、重放回执、读取 Log、取得订阅／snapshot／page 资源或访问 backend。存储权限、配额、锁与原有取消分类继续生效。
 
-格式合法但不存在的 capability、action receipt、delete intent、无 Log（包括 publisher 为 nil）或错误续订游标，在拒绝时只返回授权错误；允许后才返回原有 ESTALE／ENOSYS 等结果。旧 action ID、成功过的动作、durable intent ID 与已有 capability 均不能省略检查。ack、renew、status、metadata、query、list、cancel、drop、release、retire 与 close 各自可被拒绝；intent list、query 与 ACK 各执行自己的授权。已经接受的 CloseIntent 后续触发是原动作固定效果，不因原会话消失或权限撤销而重新授权；对其状态的新查询仍独立授权。
+格式合法但不存在的 capability、action receipt、delete intent、无 Log（包括 publisher 为 nil）或错误续订游标，在拒绝时只返回授权错误；允许后才返回原有 ESTALE／ENOSYS 等结果。旧 action ID、成功过的动作、durable intent ID 与已有 capability 均不能省略检查。带中立 semantic FileActionID 的请求即使经过原 ID 重投仍执行当前授权，epoch／digest／history 由 native journal 验证；HTTP elapsed window 不替代 native 结果或产生换 ID 的 Retry。ack、renew、status、metadata、query、list、cancel、drop、release、retire 与 close 各自可被拒绝；intent list、query 与 ACK 各执行自己的授权。已经接受的 CloseIntent 后续触发是原动作固定效果，不因原会话消失或权限撤销而重新授权；对其状态的新查询仍独立授权。
 
 拒绝只说明本次尝试未获准，不能证明此前超时的动作未执行。client 无法获准核对时保留原来的未知结果，不合成 Cancelled、Released、NotApplied 或已记录的 rejection。请求 cleanup 被拒绝仍报告拒绝；服务器自主 lease 到期、退休、shutdown 与资源回收由原拥有者执行，不重新请求该访问身份的权限。
 

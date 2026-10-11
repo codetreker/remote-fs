@@ -84,7 +84,7 @@ allocation setter、EA／streams／compression／reparse、position／mode sette
 
 HTTP 文件信息、metadata观察与恢复矩阵共用各自顶层的真实 authority准备，每项新建对象、HTTPpair、session、journal和fault状态，不继承别项的action或dirty内容。纯错误传递fixture只返回原注入错误，storage与十二个lockservice方法都没有健康fallback；健康publication／lock用例仍需真实native后端。fixture准备与测试判据的取舍由[测试工作量决定](../testing/2026-09-09-scale-test-work-to-its-assertions.md)记录。CI watchdog、strict无skip检查、函数coverage和protectedcheck均保持原标准。
 
-command-only SMB share矩阵没有后台续期任务，每次新打开之前通过真实FileSession.Renew与authority.acceptStatus刷新admission epoch。lease和actionhistory分别保留原期限；用长lease不能使已经退役的action epoch重新有效。短 history 回归验证过期 epoch 拒绝与真实续期后的 CREATE，share 矩阵独立验证原 sharing 约束。
+command-only SMB share矩阵没有后台续期任务，每次新打开之前通过真实FileSession.Renew与authority.acceptStatus刷新admission epoch。lease和actionhistory分别保留原期限；中立semanticAction的epoch由nativejournal验证，HTTPelapsed window不替代它；用长lease不能使已经退役的action epoch重新有效。短 history 回归验证过期 epoch 拒绝与真实续期后的 CREATE，share 矩阵独立验证原 sharing 约束。
 
 ## 后果
 

@@ -345,7 +345,7 @@ SMB CREATE 直接核对五种 disposition 的缺席／已有结果、目录与 m
 
 访问矩阵区分 byte rights、Use/share 与 MetadataAccess：execute-only、DELETE-only、attribute-only 是 NodeReference；execute+write 声明 read/write Use 却没有字节读；字节读+metadata 写与字节写+metadata 读分别保持授予。参与 sharing 的 data/execute/write/append/DELETE access 与三种 share 位在两个 SMB sessions 及非 SMB 入口上双向核对，目录也参与 ReadEntries 声明。metadata/control-only Use=0 的 Windows 打开忽略 ShareAccess、Deny=0；在参与者之前／之后打开均不能产生 sharing conflict。授权拒绝不得留下引用、Use、创建、内容、metadata 或 allocation 效果。
 
-跨两个SMB sessions与非SMB入口的share矩阵使用command-only fixture，没有后台renew worker；每个新SMB打开前调用真实FileSession.Renew，并经authority.acceptStatus安装返回的admission epoch。延长lease不延长actionhistory；矩阵不能沿过期epoch生成新action。短 history 回归跨过原 history 期限，验证旧 admission epoch 的新动作被拒绝，真实续期后 CREATE 成功；sharing 结果仍由独立矩阵逐项验证。
+跨两个SMB sessions与非SMB入口的share矩阵使用command-only fixture，没有后台renew worker；每个新SMB打开前调用真实FileSession.Renew，并经authority.acceptStatus安装返回的admission epoch。延长lease不延长actionhistory；矩阵不能沿过期epoch生成新action。显式 semanticAction 以 native history 判定；回归先观察真实 native epoch 轮换，再改变 served session 的 HTTP started 起算点制造两层 clock 偏差，验证仍有效的 OpenAt／MutateTruncate 可执行、typed replay 保留原 Attr／barrier、未来／陈旧 native ID 拒绝且无效果。同 ID 意图变化、implicit transport epoch／Retry 和 explicit close cursor 继续由各自原有测试验证。短 history 回归跨过原 history 期限，验证旧 admission epoch 的新动作被拒绝，真实续期后 CREATE 成功；sharing 结果仍由独立矩阵逐项验证。
 
 容量用例分别限制 MaxHandles、底层 MaxFiles、open action、close receipt、未结清 owner、directory observation 和响应 frame。opening、cleanup-only、barrier-only 继续计费，历史 close receipt 未到期时新 CREATE 不能借端点空闲槽绕过。error+非 nil reference、取消、响应丢失、编码／发送失败始终保留清理 owner；无引用的 Unknown 只重投原方法／action／输入，NotExecuted 必须绑定原动作。恢复沿原授权后接受的不可变意图续作；endpoint 当前策略随后撤销不能遗弃该 owner，公共 HTTP RPC 的独立授权仍须保留。
 

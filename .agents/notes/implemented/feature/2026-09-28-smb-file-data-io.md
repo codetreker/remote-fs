@@ -44,7 +44,7 @@ CLOSE 在既有 requestCloseMu／closeLifetime 保护下 fence 新 I/O、移除 
 
 ### HTTP 恢复与责任终结
 
-不超过 8 MiB 的 explicit WriteAt／Append／Truncate／Attributes 有独立 file capability＋nested action＋immutable request pending entry 与 recovery gate；其它 FileId、Renew、Status、Sync 与 cleanup 不扫描它。初次使用 data admission，原动作重投使用 POST /v5/file-recovery，业务授权仍是原 file.mutate／write／所选 metadata 效果。recovery envelope 为 min(maxBodyBytes,12 MiB)，每 session 一项、无排队，server 全局 MaxSessions；client 全局独立 MaxConcurrentLockControls。256 KiB control 和关闭保留容量不被大 data replay 占用。既有 native history、digest、quota 和 close receipts 不重设计。
+不超过 8 MiB 的 explicit WriteAt／Append／Truncate／Attributes 有独立 file capability＋nested action＋immutable request pending entry 与 recovery gate；其它 FileId、Renew、Status、Sync 与 cleanup 不扫描它。初次使用 data admission，原动作重投使用 POST /v5/file-recovery，业务授权仍是原 file.mutate／write／所选 metadata 效果。recovery envelope 为 min(maxBodyBytes,12 MiB)，每 session 一项、无排队，server 全局 MaxSessions；client 全局独立 MaxConcurrentLockControls。256 KiB control 和关闭保留容量不被大 data replay 占用。中立 semantic Action 使用 native journal 的 epoch／digest／history，HTTP elapsed window 只管隐式 transport 动作，不能因两层起算时刻不同拒绝仍有效的原 Action 或要求换 ID；native 对陈旧／未知 ID 与意图改变的拒绝继续保留。既有 native history、digest、quota 和 close receipts 不重设计。
 
 exact reference 或完整父 session 的正面 Released 与 HTTP 下游链 settled 后，HTTP 在 session 短锁内 fence 原 entries，锁外用关闭 context 等待各 action gate，排空后才释放本层复制 Data。取消／deadline 保留未排空的 fenced payload，返回 Released=true 与 Pending CloseSettlementError，并保留原 SemanticErr 和暂时 Cause；迟到 WRITE 成功／失败响应都不能删掉它。后续同 owner 关闭继续本地排空，不再执行 native 关闭或写入。HTTP 不确认其上方 replica barrier；SMB 原 Data／额度保持到包含 replica 的全链关闭／settlement。原 ExecutionUnknown 不变成未执行。
 
