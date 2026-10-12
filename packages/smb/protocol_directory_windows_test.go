@@ -146,14 +146,25 @@ func TestNativeWindowsDirectoryEnumeration(t *testing.T) {
 	t.Run("nt/application-short-buffer", func(t *testing.T) {
 		h := nativeOpenDirectory(t, drive+`\`)
 		status, data := nativeQueryDirectory(t, h, 12, "long*", 15, true, true, false)
+		if status != nativeInfoLengthMismatch || len(data) != 0 {
+			t.Fatalf("undersized native structure status=%#x bytes=%d", status, len(data))
+		}
+		var names nativeFileNamesInformation
+		baseSize := int(unsafe.Sizeof(names))
+		nameOffset := int(unsafe.Offsetof(names.FileName))
+		nameBytes := wire.EncodeUTF16("long-😀-name.txt")
+		if baseSize != 16 || nameOffset != 12 || baseSize >= nameOffset+len(nameBytes) {
+			t.Fatalf("invalid native fixture layout: base=%d offset=%d full=%d", baseSize, nameOffset, nameOffset+len(nameBytes))
+		}
+		status, data = nativeQueryDirectory(t, h, 12, "long*", baseSize, true, true, false)
 		if status != nativeBufferOverflow {
 			t.Fatalf("short buffer status=%#x bytes=%d", status, len(data))
 		}
-		if len(data) < 12 || binary.LittleEndian.Uint32(data[8:]) != uint32(2*len(utf16.Encode([]rune("long-😀-name.txt")))) {
+		if len(data) < nameOffset || binary.LittleEndian.Uint32(data[8:]) != uint32(len(nameBytes)) {
 			t.Fatalf("partial name length lost: %x", data)
 		}
-		prefix := []byte{'l', 0, 'o'}
-		if len(data) != 15 || !reflect.DeepEqual(data[12:], prefix) {
+		prefix := []byte{'l', 0, 'o', 0}
+		if len(data) != baseSize || !reflect.DeepEqual(data[nameOffset:], prefix) {
 			t.Fatalf("partial native name prefix changed: %x", data)
 		}
 		// The redirector owns its own application buffer/cursor adaptation. A
@@ -269,10 +280,21 @@ func nativeOpenDirectory(t *testing.T, path string) win.Handle {
 }
 
 const (
-	nativeNoMoreFiles    uint32 = 0x80000006
-	nativeNoSuchFile     uint32 = 0xc000000f
-	nativeBufferOverflow uint32 = 0x80000005
+	nativeInfoLengthMismatch uint32 = 0xc0000004
+	nativeNoMoreFiles        uint32 = 0x80000006
+	nativeNoSuchFile         uint32 = 0xc000000f
+	nativeBufferOverflow     uint32 = 0x80000005
 )
+
+// Native FILE_NAMES_INFORMATION includes WCHAR FileName[1] and structure
+// padding. Its 16-byte C base differs from the 12-byte SMB wire header.
+// https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/ns-ntifs-_file_names_information
+type nativeFileNamesInformation struct {
+	NextEntryOffset uint32
+	FileIndex       uint32
+	FileNameLength  uint32
+	FileName        [1]uint16
+}
 
 var nativeNTDLL = win.NewLazySystemDLL("ntdll.dll")
 var nativeNTQueryDirectory = nativeNTDLL.NewProc("NtQueryDirectoryFile")
