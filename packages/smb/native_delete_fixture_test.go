@@ -738,21 +738,7 @@ func TestNativeDeleteProbeByteCreateUsesEndpointContract(t *testing.T) {
 		t.Fatalf("native fixture TREE_CONNECT=%#x", status)
 	}
 	tr := s.trees[header.TreeID]
-	request := func(name string, disposition, access, share, options uint32) wire.Request {
-		encoded := wire.EncodeUTF16(name)
-		packet := make([]byte, 64+max(57, 56+len(encoded)))
-		body := packet[64:]
-		binary.LittleEndian.PutUint16(body, 57)
-		binary.LittleEndian.PutUint32(body[4:], 2)
-		binary.LittleEndian.PutUint32(body[24:], access)
-		binary.LittleEndian.PutUint32(body[32:], share)
-		binary.LittleEndian.PutUint32(body[36:], disposition)
-		binary.LittleEndian.PutUint32(body[40:], options)
-		binary.LittleEndian.PutUint16(body[44:], 120)
-		binary.LittleEndian.PutUint16(body[46:], uint16(len(encoded)))
-		copy(packet[120:], encoded)
-		return wire.Request{Header: wire.Header{Command: wire.Create}, Body: body, Packet: packet}
-	}
+
 	for _, test := range []struct {
 		name                                string
 		disposition, access, share, options uint32
@@ -760,7 +746,7 @@ func TestNativeDeleteProbeByteCreateUsesEndpointContract(t *testing.T) {
 		{"exclusive.txt", 2, accessGenericRead | accessDelete, 0, createDeleteOnClose},
 		{"beta.bin", 1, accessGenericRead, 7, 0},
 	} {
-		body, status, id := c.createFile(ctx, s, tr, request(test.name, test.disposition, test.access, test.share, test.options))
+		body, status, id := c.createFile(ctx, s, tr, nativeProbeCreateRequest(test.name, test.disposition, test.access, test.share, test.options))
 		if status != statusOK || len(body) != 88 || id == (wire.FileID{}) {
 			t.Fatalf("byte CREATE %q status=%#x body=%d id=%x", test.name, status, len(body), id)
 		}
@@ -779,12 +765,12 @@ func TestNativeDeleteProbeByteCreateUsesEndpointContract(t *testing.T) {
 			t.Fatalf("byte CLOSE %q=%#x", test.name, status)
 		}
 		if test.name == "exclusive.txt" {
-			if _, status, id := c.createFile(ctx, s, tr, request(test.name, 1, accessReadAttr, 7, createBackupIntent)); status != statusNameNotFound || id != (wire.FileID{}) {
+			if _, status, id := c.createFile(ctx, s, tr, nativeProbeCreateRequest(test.name, 1, accessReadAttr, 7, createBackupIntent)); status != statusNameNotFound || id != (wire.FileID{}) {
 				t.Fatalf("deleted metadata-only OPEN_EXISTING status=%#x id=%x", status, id)
 			}
 		}
 	}
-	_, status, metadataID := c.createFile(ctx, s, tr, request("beta.bin", 1, accessReadAttr, 7, createBackupIntent))
+	_, status, metadataID := c.createFile(ctx, s, tr, nativeProbeCreateRequest("beta.bin", 1, accessReadAttr, 7, createBackupIntent))
 	if status != statusOK || metadataID == (wire.FileID{}) {
 		t.Fatalf("existing metadata-only OPEN_EXISTING status=%#x id=%x", status, metadataID)
 	}
@@ -794,7 +780,7 @@ func TestNativeDeleteProbeByteCreateUsesEndpointContract(t *testing.T) {
 	if _, status := c.closeFile(ctx, s, tr, wire.Request{Header: wire.Header{Command: wire.Close}, Body: closeMetadata}, wire.FileID{}); status != statusOK {
 		t.Fatalf("metadata-only CLOSE=%#x", status)
 	}
-	if _, status, _ := c.createFile(ctx, s, tr, request("without-delete.txt", 2, accessReadAttr, 7, createDeleteOnClose)); status != statusDenied {
+	if _, status, _ := c.createFile(ctx, s, tr, nativeProbeCreateRequest("without-delete.txt", 2, accessReadAttr, 7, createDeleteOnClose)); status != statusDenied {
 		t.Fatalf("missing DELETE CREATE=%#x", status)
 	}
 	backend.mu.Lock()
@@ -803,5 +789,114 @@ func TestNativeDeleteProbeByteCreateUsesEndpointContract(t *testing.T) {
 		if entry.Name == "exclusive.txt" || entry.Name == "without-delete.txt" {
 			t.Fatalf("native contract retained unexpected name %q", entry.Name)
 		}
+	}
+}
+
+func nativeProbeCreateRequest(name string, disposition, access, share, options uint32) wire.Request {
+	encoded := wire.EncodeUTF16(name)
+	packet := make([]byte, 64+max(57, 56+len(encoded)))
+	body := packet[64:]
+	binary.LittleEndian.PutUint16(body, 57)
+	binary.LittleEndian.PutUint32(body[4:], 2)
+	binary.LittleEndian.PutUint32(body[24:], access)
+	binary.LittleEndian.PutUint32(body[32:], share)
+	binary.LittleEndian.PutUint32(body[36:], disposition)
+	binary.LittleEndian.PutUint32(body[40:], options)
+	binary.LittleEndian.PutUint16(body[44:], 120)
+	binary.LittleEndian.PutUint16(body[46:], uint16(len(encoded)))
+	copy(packet[120:], encoded)
+	return wire.Request{Header: wire.Header{Command: wire.Create}, Body: body, Packet: packet}
+}
+
+func TestNativeDeleteProbeSignedPendingStandardInformation(t *testing.T) {
+	server, _, client := startProtocolServer(t, DefaultLimits())
+	ctx := WithPrincipal(t.Context(), testPrincipal("0123456789abcdef"))
+	var original *Export
+	server.mu.Lock()
+	for _, export := range server.exports {
+		if export.share.Name == "data" {
+			original = export
+		}
+	}
+	server.mu.Unlock()
+	if original == nil {
+		t.Fatal("protocol harness data export missing")
+	}
+	if err := original.Unpublish(ctx); err != nil {
+		t.Fatal(err)
+	}
+	backend := NewNativeDeleteProbeBackend()
+	owner, err := storage.NewDeleteIntentOwner()
+	if err != nil {
+		t.Fatal(err)
+	}
+	export, err := server.Publish(Share{Name: "data", Volume: "volume", BackendVolume: "test-volume", RootNodeID: 1, Backend: backend, DeleteIntentOwner: owner})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := export.RecoverDeleteIntents(ctx); err != nil {
+		t.Fatal(err)
+	}
+	session, key := authenticateProtocol(t, client)
+	tree := connectProtocolTree(t, client, key, session, 3, "data")
+	message := uint64(4)
+	exchange := func(command uint16, body []byte) []byte {
+		t.Helper()
+		header := wire.Header{Command: command, MessageID: message, SessionID: session, TreeID: tree, Credits: 1, CreditCharge: 1}
+		sendFrame(t, client, signedRequest(t, key, header, body))
+		response := readFrame(t, client)
+		actual, err := wire.ParseHeader(response)
+		if err != nil || actual.Command != command || actual.MessageID != message || actual.SessionID != session || actual.TreeID != tree || actual.Flags&(wire.FlagResponse|wire.FlagSigned) != (wire.FlagResponse|wire.FlagSigned) || actual.Status != statusOK || key.Verify(response) != nil {
+			t.Fatalf("signed command%d response=%+v error=%v", command, actual, err)
+		}
+		message++
+		return response[wire.HeaderSize:]
+	}
+	open := func(access, options uint32) wire.FileID {
+		t.Helper()
+		body := exchange(wire.Create, nativeProbeCreateRequest("beta.bin", 1, access, 7, options).Body)
+		if len(body) != 88 {
+			t.Fatalf("CREATE body bytes=%d", len(body))
+		}
+		var id wire.FileID
+		copy(id[:], body[64:80])
+		return id
+	}
+	close := func(id wire.FileID) {
+		body := make([]byte, 24)
+		binary.LittleEndian.PutUint16(body, 24)
+		copy(body[8:], id[:])
+		exchange(wire.Close, body)
+	}
+	reader := open(accessGenericRead, 0)
+	initiator := open(accessReadAttr|accessDelete, createDeleteOnClose)
+	close(initiator)
+	found := false
+	for _, intent := range backend.ProbeDeleteOutcomes() {
+		if intent.NodeID == 4 && intent.Outcome == storage.DeleteIntentPending {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("signed initiator CLOSE did not establish Pending")
+	}
+	query := queryInfoRequestForTest(reader, wire.FileStandardInformation, 24)
+	actual := exchange(wire.QueryInfo, query.Body)
+	expected, err := wire.QueryInfoResponseBody(wire.FileStandardInformationBody(wire.FileStandardInfo{DeletePending: true}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(actual, expected) {
+		t.Fatalf("signed pending standard body=%x expected=%x", actual, expected)
+	}
+	close(reader)
+	completed := false
+	for _, intent := range backend.ProbeDeleteOutcomes() {
+		if intent.NodeID == 4 && intent.Outcome == storage.DeleteIntentCompleted {
+			completed = true
+		}
+	}
+	if !completed {
+		t.Fatal("last signed CLOSE did not complete original delete")
 	}
 }
