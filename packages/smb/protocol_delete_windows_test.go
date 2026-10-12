@@ -147,6 +147,15 @@ func TestNativeWindowsDeleteOnClose(t *testing.T) {
 	})
 	t.Run("nonempty-directory-close-results", func(t *testing.T) {
 		path := drive + `\folder`
+		survivor := nativeOpenDirectory(t, path)
+		var before [24]byte
+		if err := win.GetFileInformationByHandleEx(survivor, win.FileIdInfo, &before[0], uint32(len(before))); err != nil {
+			t.Fatal(err)
+		}
+		if id := binary.LittleEndian.Uint64(before[8:]); id != 2 {
+			t.Fatalf("native original directory ID=%d", id)
+		}
+		nativeFindNames(t, path+`\*`, []string{"nested.txt"})
 		h := nativeDeleteOpen(t, path, win.FILE_READ_ATTRIBUTES|0x10000, 7, win.OPEN_EXISTING, win.FILE_FLAG_DELETE_ON_CLOSE|win.FILE_FLAG_BACKUP_SEMANTICS)
 		start := receipts.closeCount()
 		appErr := h.Close()
@@ -163,29 +172,80 @@ func TestNativeWindowsDeleteOnClose(t *testing.T) {
 		if !found {
 			t.Fatal("authority did not retain nonempty directory NotExecuted result")
 		}
-		nativeFindNames(t, path+`\*`, []string{"nested.txt"})
-	})
-	t.Run("missing-delete-access", func(t *testing.T) {
-		name, err := win.UTF16PtrFromString(drive + `\long-😀-name.txt`)
+		var after [24]byte
+		if err := win.GetFileInformationByHandleEx(survivor, win.FileIdInfo, &after[0], uint32(len(after))); err != nil {
+			t.Fatal(err)
+		}
+		if before != after {
+			t.Fatalf("native directory identity changed: before=%x after=%x", before, after)
+		}
+		nativeWantNames(t, nativeReadAll(t, survivor, 12, "*", true), []string{"nested.txt"})
+		authority, err := backend.NewFileSession(t.Context(), storage.DefaultFileSessionOptions())
 		if err != nil {
 			t.Fatal(err)
 		}
-		h, err := win.CreateFile(name, win.FILE_READ_ATTRIBUTES, 7, nil, win.OPEN_EXISTING, win.FILE_FLAG_DELETE_ON_CLOSE, 0)
-		if err == nil {
-			_ = win.CloseHandle(h)
-			t.Fatal("delete-on-close accepted without DELETE access")
-		}
-		if !errors.Is(err, win.ERROR_ACCESS_DENIED) && !errors.Is(err, win.ERROR_INVALID_PARAMETER) {
-			t.Fatal(err)
-		}
-		if _, err := win.GetFileAttributes(name); err != nil {
-			t.Fatalf("rejected native open changed its original name: %v", err)
-		}
-		for _, intent := range backend.ProbeDeleteOutcomes() {
-			if intent.NodeID == 5 {
-				t.Fatal("missing DELETE access established an authority intent")
+		t.Cleanup(func() {
+			if err := authority.Close(context.Background()); err != nil {
+				t.Error(err)
+			}
+		})
+		for _, expected := range []struct {
+			parent, id uint64
+			name       string
+		}{{1, 2, "folder"}, {2, 6, "nested.txt"}} {
+			result, err := storage.NewListResult(65536, 0, func(_ int, name, metadata int64, _ storage.Attr) (int64, error) {
+				return storage.ObservedEntryBytes(name, metadata)
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := authority.(storage.DirectoryReader).ReadDirNodeBounded(t.Context(), storage.DirectoryTarget{NodeID: expected.parent}, result); err != nil {
+				t.Fatal(err)
+			}
+			entries, err := result.Entries()
+			if err != nil {
+				t.Fatal(err)
+			}
+			found := false
+			for _, entry := range entries {
+				if entry.Name == expected.name && entry.Attr.ID == expected.id {
+					found = true
+				}
+			}
+			if !found {
+				t.Fatalf("authority lost original %q node%d under node%d", expected.name, expected.id, expected.parent)
 			}
 		}
+		search, err := win.UTF16PtrFromString(path + `\*`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var data win.Win32finddata
+		find, findErr := win.FindFirstFile(search, &data)
+		t.Logf("Win32 FindFirstFile(nonempty directory after CLOSE): %v", findErr)
+		if findErr == nil {
+			if err := win.FindClose(find); err != nil {
+				t.Fatal(err)
+			}
+			nativeFindNames(t, path+`\*`, []string{"nested.txt"})
+		}
+	})
+	t.Run("translates-delete-access", func(t *testing.T) {
+		path := drive + `\long-😀-name.txt`
+		receipts.mu.Lock()
+		before := len(receipts.creates)
+		receipts.mu.Unlock()
+		h := nativeDeleteOpen(t, path, win.FILE_READ_ATTRIBUTES, 7, win.OPEN_EXISTING, win.FILE_FLAG_DELETE_ON_CLOSE)
+		receipts.mu.Lock()
+		creates := append([]wire.CreateRequest(nil), receipts.creates[before:]...)
+		receipts.mu.Unlock()
+		if len(creates) != 1 || creates[0].DesiredAccess&0x10000 == 0 {
+			t.Fatalf("native delete access normalization=%+v", creates)
+		}
+		if err := h.Close(); err != nil {
+			t.Fatal(err)
+		}
+		nativeDeleteAbsent(t, path)
 	})
 	t.Run("connection-loss", func(t *testing.T) {
 		path := drive + `\disconnect.txt`

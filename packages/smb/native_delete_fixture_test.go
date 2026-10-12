@@ -3,6 +3,7 @@ package smb
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"sort"
@@ -11,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/codetreker/remote-fs/packages/smb/internal/wire"
 	"github.com/codetreker/remote-fs/packages/storage"
 )
 
@@ -463,6 +465,17 @@ type nativeDeleteFile struct {
 	readable bool
 }
 
+func (*nativeDeleteFile) CheckConditionalFileMutation() error { return nil }
+func (f *nativeDeleteFile) MutateFile(ctx context.Context, command storage.FileMutation) (storage.Attr, error) {
+	if err := command.Check(); err != nil {
+		return storage.Attr{}, err
+	}
+	if _, err := f.State(ctx, storage.StateScalars); err != nil {
+		return storage.Attr{}, err
+	}
+	return storage.Attr{}, syscall.EACCES
+}
+
 func (f *nativeDeleteFile) ReadAt(ctx context.Context, offset int64, length int) (storage.FileRead, error) {
 	if !f.readable {
 		return storage.FileRead{}, syscall.EBADF
@@ -661,4 +674,95 @@ func TestNativeDeleteProbeFixture(t *testing.T) {
 			t.Fatal(err)
 		}
 	})
+}
+
+func TestNativeDeleteProbeByteCreateUsesEndpointContract(t *testing.T) {
+	backend := NewNativeDeleteProbeBackend()
+	server, err := New(endpointConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner, err := storage.NewDeleteIntentOwner()
+	if err != nil {
+		t.Fatal(err)
+	}
+	export, err := server.Publish(Share{Name: "native-probe", Volume: "native-probe", BackendVolume: "test-volume", RootNodeID: 1, Backend: backend, DeleteIntentOwner: owner})
+	if err != nil {
+		t.Fatal(err)
+	}
+	principal := testPrincipal("0123456789abcdef")
+	ctx := WithPrincipal(t.Context(), principal)
+	if err := export.RecoverDeleteIntents(ctx); err != nil {
+		t.Fatal(err)
+	}
+	c := newConnection(server, nil)
+	s := &session{id: 21, principal: principal, trees: make(map[uint32]*tree)}
+	c.sessions[s.id] = s
+	t.Cleanup(func() {
+		cleanup, cancel := context.WithTimeout(WithPrincipal(context.Background(), principal), time.Second)
+		defer cancel()
+		if err := c.closeOwnedExport(cleanup, export); err != nil {
+			t.Error(err)
+		}
+		if err := export.Unpublish(cleanup); err != nil {
+			t.Error(err)
+		}
+		c.cancel()
+	})
+	header := wire.Header{}
+	if _, status := c.connectVolume(ctx, s, export.key, &header); status != statusOK {
+		t.Fatalf("native fixture TREE_CONNECT=%#x", status)
+	}
+	tr := s.trees[header.TreeID]
+	request := func(name string, disposition, access, share, options uint32) wire.Request {
+		encoded := wire.EncodeUTF16(name)
+		packet := make([]byte, 64+max(57, 56+len(encoded)))
+		body := packet[64:]
+		binary.LittleEndian.PutUint16(body, 57)
+		binary.LittleEndian.PutUint32(body[4:], 2)
+		binary.LittleEndian.PutUint32(body[24:], access)
+		binary.LittleEndian.PutUint32(body[32:], share)
+		binary.LittleEndian.PutUint32(body[36:], disposition)
+		binary.LittleEndian.PutUint32(body[40:], options)
+		binary.LittleEndian.PutUint16(body[44:], 120)
+		binary.LittleEndian.PutUint16(body[46:], uint16(len(encoded)))
+		copy(packet[120:], encoded)
+		return wire.Request{Header: wire.Header{Command: wire.Create}, Body: body, Packet: packet}
+	}
+	for _, test := range []struct {
+		name                                string
+		disposition, access, share, options uint32
+	}{
+		{"exclusive.txt", 2, accessGenericRead | accessDelete, 0, createDeleteOnClose},
+		{"beta.bin", 1, accessGenericRead, 7, 0},
+	} {
+		body, status, id := c.createFile(ctx, s, tr, request(test.name, test.disposition, test.access, test.share, test.options))
+		if status != statusOK || len(body) != 88 || id == (wire.FileID{}) {
+			t.Fatalf("byte CREATE %q status=%#x body=%d id=%x", test.name, status, len(body), id)
+		}
+		mutation := tr.findFileHandle(id).file.(storage.ConditionalFileMutation)
+		action, err := storage.NewFileActionID(1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := mutation.MutateFile(ctx, storage.FileMutation{Kind: storage.MutateTruncate, Action: action, Size: 1}); !errors.Is(err, syscall.EACCES) {
+			t.Fatalf("readonly mutation %q=%v", test.name, err)
+		}
+		closeBody := make([]byte, 24)
+		binary.LittleEndian.PutUint16(closeBody, 24)
+		copy(closeBody[8:], id[:])
+		if _, status := c.closeFile(ctx, s, tr, wire.Request{Header: wire.Header{Command: wire.Close}, Body: closeBody}, wire.FileID{}); status != statusOK {
+			t.Fatalf("byte CLOSE %q=%#x", test.name, status)
+		}
+	}
+	if _, status, _ := c.createFile(ctx, s, tr, request("without-delete.txt", 2, accessReadAttr, 7, createDeleteOnClose)); status != statusDenied {
+		t.Fatalf("missing DELETE CREATE=%#x", status)
+	}
+	backend.mu.Lock()
+	defer backend.mu.Unlock()
+	for _, entry := range backend.views[1] {
+		if entry.Name == "exclusive.txt" || entry.Name == "without-delete.txt" {
+			t.Fatalf("native contract retained unexpected name %q", entry.Name)
+		}
+	}
 }

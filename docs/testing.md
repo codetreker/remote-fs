@@ -445,7 +445,11 @@ ACK 用例分别丢失执行前与执行后响应，保留固定 owner／intent�
 
 [进程 kill 用例](../packages/smb/delete_intent_restart_integration_linux_test.go)运行独立 SMB 宿主及 HTTP authority 子进程，authority 使用公开 localstore.Open、真实持久 backend 与 lock evidence，宿主配置保存同一 owner。矩阵在 Armed、Pending、已提交且 ACK 响应丢失三个边界分别 SIGKILL 宿主、authority 或两者，并 wait／reap；重新打开用此前接受的 NodeID／intent 和原 owner 查询，核对未 ACK 义务的原对象身份、最终名字及查询／ACK 回收；ACK-lost 的已回收记录允许为 Unknown。ACK-lost 的 HTTP fault receipt 证明真实提交后响应丢失，CLOSE 可凭原 terminal witness 与后续缺失确认回收，不要求制造 I/O 错误。authority-only 场景先让旧宿主观察失效引用，再结束旧宿主并以原配置恢复；它不证明退役旧 HTTP session 可以无条件完成 adapter settlement。
 
-[Windows 原生关闭删除用例](../packages/smb/protocol_delete_windows_test.go)复用实际 SSPI、loopback 映射和 Win32 CreateFile／CloseHandle，使用[窄 mutable fixture](../packages/smb/native_delete_fixture_test.go)实现现有中立打开／intent 能力。覆盖新文件 ShareAccess=0、metadata-only 文件、空目录、两个相容句柄、缺少 DELETE 拒绝，以及实际 TCP 连接中断后的原义务完成。相容 survivor 用 Standard 信息核对 pending／links0，继续读取，冲突新打开拒绝，最后关闭后名字消失。非空目录分别记录应用 CloseHandle 结果、要求签名 SMB CLOSE 为 STATUS_DIRECTORY_NOT_EMPTY，并核对 authority NotExecuted 和原 child；应用返回值不能冒充 wire 状态。fixture 使用内存 authority，不承担 SQLite 跨重启证明；实际 Windows execution verdict 与清理由当次 CI 回执给出，cross-build 或 wire 模拟不代替原生执行，也不证明 Windows 11 Home／Pro 普通用户资格。
+[签名缺少 DELETE 用例](../packages/smb/protocol_delete_linux_test.go)通过真实 TCP、签名 SMB CREATE 发送关闭删除但不携带 DELETE，分别尝试新建与清空已有文件。响应必须为签名 ACCESS_DENIED 且关联原 message／session／tree；新名字仍缺席，原身份、内容和 metadata 不变，没有持久 intent 或本地 owner。它直接证明 wire 请求的无效果拒绝，不依赖 Win32 权限转换。
+
+[Windows 原生关闭删除用例](../packages/smb/protocol_delete_windows_test.go)复用实际 SSPI、loopback 映射和 Win32 CreateFile／CloseHandle，使用[窄 mutable fixture](../packages/smb/native_delete_fixture_test.go)实现现有中立打开／intent 及字节打开预检需要的 ConditionalFileMutation 能力；只读 mutation 仍明确拒绝。覆盖新文件 ShareAccess=0、metadata-only 文件、空目录、两个相容句柄、实际 DELETE 权限转换，以及实际 TCP 连接中断后的原义务完成。Win32 CreateFile 未显式请求 DELETE 时，用例核对恰好一份捕获的签名关闭删除 CREATE 已携带 DELETE，再要求关闭成功和名字消失；该应用调用不作为缺少 wire DELETE 的拒绝场景。相容 survivor 用 Standard 信息核对 pending／links0，继续读取，冲突新打开拒绝，最后关闭后名字消失。
+
+非空目录在关闭前取得相容原生目录句柄并确认 FileIdInfo 和 child；发起关闭后要求签名 SMB CLOSE 为 STATUS_DIRECTORY_NOT_EMPTY、authority 为 NotExecuted，原相容句柄的 FileIdInfo 不变且同句柄 NtQueryDirectory 仍返回原 child。authority 完整有界观察另核对原目录及 child 身份。应用 CloseHandle 和重新按名 FindFirstFile 的结果分别记录，不由应用成功推断 wire 成功，也不为按名失败猜测原因或宣称缓存资格；同步应用错误与 fresh-name 资格由 8.3／10 继续验收。fixture 使用内存 authority，不承担 SQLite 跨重启证明；实际 Windows execution verdict 与清理由当次 CI 回执给出，cross-build 或 wire 模拟不代替原生执行，也不证明 Windows 11 Home／Pro 普通用户资格。
 
 ### SMB 与 FUSE 的同 volume 联合验收
 
