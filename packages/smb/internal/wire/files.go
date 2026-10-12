@@ -146,10 +146,20 @@ type CreateResponse struct {
 	EndOfFile      uint64
 	Attributes     uint32
 	FileID         FileID
+	OnDiskID       *CreateOnDiskID
+}
+
+type CreateOnDiskID struct {
+	DiskFileID uint64
+	VolumeID   uint64
 }
 
 func CreateResponseBody(response CreateResponse) []byte {
-	body := make([]byte, 88)
+	size := 88
+	if response.OnDiskID != nil {
+		size += 56
+	}
+	body := make([]byte, size)
 	le.PutUint16(body, 89)
 	body[2], body[3] = response.OplockLevel, response.Flags
 	le.PutUint32(body[4:8], response.CreateAction)
@@ -161,6 +171,18 @@ func CreateResponseBody(response CreateResponse) []byte {
 	le.PutUint64(body[48:56], response.EndOfFile)
 	le.PutUint32(body[56:60], response.Attributes)
 	copy(body[64:80], response.FileID[:])
+	if response.OnDiskID != nil {
+		le.PutUint32(body[80:84], HeaderSize+88)
+		le.PutUint32(body[84:88], 56)
+		context := body[88:]
+		le.PutUint16(context[4:6], 16)
+		le.PutUint16(context[6:8], 4)
+		le.PutUint16(context[10:12], 24)
+		le.PutUint32(context[12:16], 32)
+		copy(context[16:20], "QFid")
+		le.PutUint64(context[24:32], response.OnDiskID.DiskFileID)
+		le.PutUint64(context[32:40], response.OnDiskID.VolumeID)
+	}
 	return body
 }
 

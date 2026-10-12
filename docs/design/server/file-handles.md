@@ -110,6 +110,8 @@ SQLite authority schema v11 在 v7 的符号链接目标、节点 pending genera
 
 公开 List/ListBounded 保持路径入口；FileSession 的 DirectoryReader.ReadDirNode/ReadDirNodeBounded 以 DirectoryTarget 执行身份绑定的应用枚举，并在原生顺序检查 `ReadEntries`。两者都返回完整 entries，但只有身份入口同时返回该捕获的 directory revision。具名目录接受裸 NodeID；detached 目录只接受它原有活引用的确切 Scope，使已打开目录句柄可继续枚举原对象。错误或缺失 Scope 失败，DirectoryMetadataObserver 不接受 detached 目录。
 
+SMB 目录分页只在端点保存原完整 capture 的紧凑视图，不给中立 DirectoryReader 增加 cursor 或分页 API。每次新 capture 在当前 `file.scope` 授权下从原引用取得实际 Scope，核对后调用 DirectoryTarget；普通 continuation 和 EOF 以真实 StateScalars 观察当前 SQL、IOHealth、对象与生命期，不重取 Scope 或目录 revision。健康结果不替换冻结 entries，缺席／失效 scope 不能退回裸 NodeID。Windows 名字、DOS expression、wire class 和 retained-byte 预算仍由[SMB 端点](../client/smb-endpoint.md)拥有。
+
 ### 名字与目录观察
 
 `DirectoryObservation{ParentID, Revision}` 标识一次完整目录捕获。Revision 是非空、不透明、只可比较相等的 token；新目录从 1 开始，成功改变名字集合的 create、remove 或 rename 在同一事务中推进相应父目录。失败、回滚和不改变集合的 no-op 不推进；跨目录 rename 分别推进两个父目录，耗尽可表示范围时以 `EOVERFLOW` 拒绝修改。
@@ -211,6 +213,8 @@ FUSE 将 `flock` 映射到 whole-file domain，将传统 POSIX `fcntl` 映射到
 ## 五、HTTP、复制与资源
 
 HTTP 文件请求先执行[业务授权](authorization.md)，再读取或触碰 Session、File、NodeReference、动作历史或 durable intent。OpenAt/OpenNodeRef/OpenChildRef 先授权自身 Operation 和导出的 OpenAccess，再按固定顺序授权实际包含的 remove、set-attr、set-metadata 或 set-pending 效果；全部允许后 native action 才执行。LookupAt、ReadDirNode、ObserveDirectoryMetadata、ObserveName、MutateName、条件 mutation、pending set/clear、action query、intent list/query/ACK 分别使用自己的规范 Operation。已有 bearer 引用、owner、action ID 或 durable intent ID 都不能绕过当前请求授权；authority 自主完成已经接受的固定删除效果时不重新解释成外部请求。
+
+SMB 已收到的完整目录 capture 属于它自己的只读视图。HTTP 对实际 ReadDirNodeBounded 或 StateScalars 请求分别执行当前授权；backend list policy 后来改变不收回先前已经交付的数据，也不需要 authorization-only RPC。宿主的当前 SMB list policy 决定每个新页面与 EOF 能否发送，实际 StateScalars 仍证明当前引用和 authority 健康。分页不触发重新捕获，不建立修改 action 或另一份关闭 owner。
 
 HTTP v5 统一转发基础 volume、中立 Attr、metadata、文件引用、目录／名字观察、range 和强 S/X。请求的 `op` 直接使用 `storage.Operation` 的规范值；二进制内容、原始叶名、revision、metadata version 和 payload 使用 canonical base64。`file.open-at` 与 `file.open-child-ref` 保留既有顶层 `child` 并接受可选顶层 `guards`，server 把二者组装为 `ChildSelection`；OpenAt options 必须显式携带 lower-camel `metadataAccess`，零值按无权限处理。协议拒绝未知、重复、缺席、null 或无关字段，所有结果都携带 v5 marker 与封闭 errno 词汇；v3 路由不提供兼容旁路。
 

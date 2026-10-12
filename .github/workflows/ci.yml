@@ -79,10 +79,13 @@ jobs:
           set -euo pipefail
           # Both expansions are lists of import paths and must split into arguments.
           # shellcheck disable=SC2046,SC2086
-          go list $MOUNTING_PACKAGES ./packages/metastore/sqlite >"$RUNNER_TEMP/separate-packages"
+          go list $MOUNTING_PACKAGES ./packages/metastore/sqlite ./packages/transport/httprest >"$RUNNER_TEMP/separate-packages"
           # shellcheck disable=SC2046
           .github/scripts/assert-every-test-ran.sh -race -count=1 -timeout 10m \
             $(go list ./... | grep -vxF -f "$RUNNER_TEMP/separate-packages")
+
+      - name: HTTP contract and race tests
+        run: .github/scripts/assert-every-test-ran.sh -race -count=1 -timeout 10m ./packages/transport/httprest
 
       - name: Require SQLite contract and race tests
         if: ${{ always() && !cancelled() }}
@@ -206,8 +209,9 @@ jobs:
   windows-sspi:
     name: native Windows SSPI tests
     # This hosted label is Windows Server 2025. It exercises native SSPI and ordinal
-    # name APIs plus portable SMB/wire tests. Windows 11 redirector and WNet
-    # acceptance belongs to later work.
+    # name APIs and the actual redirector directory APIs against the loopback
+    # endpoint, plus portable SMB/wire tests. Windows 11 Home/Pro qualification
+    # requires its own acceptance environment.
     # https://github.com/actions/runner-images/blob/9d7eec51794bb688d6c7ce00550cda5a134c88a3/README.md#available-images
     runs-on: windows-2025
     timeout-minutes: 10
@@ -223,6 +227,6 @@ jobs:
       - name: Vet the native SSPI adapter
         run: go vet ./packages/smb/windows
 
-      - name: Test native Windows names and portable SMB protocol
+      - name: Test native Windows directory APIs and SMB protocol
         shell: bash
         run: .github/scripts/assert-every-test-ran.sh -race -count=1 -timeout 10m ./packages/smb ./packages/smb/internal/wire

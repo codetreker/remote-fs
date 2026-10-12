@@ -32,6 +32,7 @@ const (
 	createNonDirectory   uint32 = 0x00000040
 	createDeleteOnClose  uint32 = 0x00001000
 	createOpenByFileID   uint32 = 0x00002000
+	createBackupIntent   uint32 = 0x00004000
 )
 
 type openIntent struct {
@@ -43,6 +44,7 @@ type openIntent struct {
 	metadata                       storage.MetadataPermissions
 	attributes                     uint32
 	contentEffects                 []storage.ContentMetadataEffect
+	queryOnDiskID                  bool
 }
 
 func normalizeAccess(access uint32) (uint32, error) {
@@ -74,7 +76,10 @@ func classifyCreate(request wire.CreateRequest) (openIntent, error) {
 	if request.ShareAccess&^uint32(7) != 0 || request.Options&createDirectory != 0 && request.Options&createNonDirectory != 0 {
 		return intent, syscall.EINVAL
 	}
-	if request.Options&(createDeleteOnClose|createOpenByFileID) != 0 || request.Options&^(createDirectory|createNonDirectory|createSyncAlert|createSyncNonAlert) != 0 {
+	// Backup intent grants no privilege here; normal host authorization and
+	// storage rights still decide whether the requested open is allowed.
+	// https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-smb2/e8fb45c1-a03d-44ca-b7ae-47385cfd7997
+	if request.Options&(createDeleteOnClose|createOpenByFileID) != 0 || request.Options&^(createDirectory|createNonDirectory|createSyncAlert|createSyncNonAlert|createBackupIntent) != 0 {
 		return intent, syscall.EOPNOTSUPP
 	}
 	if request.OplockLevel != 0 && request.OplockLevel != 1 && request.OplockLevel != 8 && request.OplockLevel != 9 && request.OplockLevel != 0xff || request.Impersonation > 3 {
@@ -88,6 +93,7 @@ func classifyCreate(request wire.CreateRequest) (openIntent, error) {
 	if err := validateCreateContexts(request); err != nil {
 		return intent, err
 	}
+	intent.queryOnDiskID = requestsOnDiskID(request)
 	access, err := normalizeAccess(request.DesiredAccess)
 	if err != nil {
 		return intent, err
@@ -388,6 +394,9 @@ func (c *connection) createFile(ctx context.Context, s *session, t *tree, reques
 	response := wire.CreateResponse{CreateAction: uint32(outcome), CreationTime: metadata.CreationTime,
 		LastAccessTime: metadata.LastAccessTime, LastWriteTime: metadata.LastWriteTime, ChangeTime: metadata.ChangeTime,
 		AllocationSize: metadata.AllocationSize, EndOfFile: metadata.EndOfFile, Attributes: metadata.Attributes, FileID: handle.id}
+	if intent.queryOnDiskID {
+		response.OnDiskID = &wire.CreateOnDiskID{DiskFileID: handle.nodeID, VolumeID: t.export.volumeSerial}
+	}
 	return wire.CreateResponseBody(response), statusOK, handle.id
 }
 

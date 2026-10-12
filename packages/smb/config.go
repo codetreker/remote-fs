@@ -31,7 +31,8 @@ type Limits struct {
 	MaxHandles, MaxUnresolvedOwners, MaxDiagnosticBytes int
 	MaxWriteOwners, MaxRetainedWriteBytes               int
 	MaxHandleIORequests                                 int
-	MaxDirectoryBytes                                   int
+	MaxDirectoryBytes, MaxRetainedDirectoryBytes        int
+	MaxDirectoryMatchWork                               uint64
 	MaxFrameBytes, MaxIOBytes, MaxTokenBytes            int
 	HandshakeTimeout, RequestTimeout, CleanupTimeout    time.Duration
 	FileSession                                         storage.FileSessionOptions
@@ -43,8 +44,8 @@ func DefaultLimits() Limits {
 		MaxRequests: 128, MaxCompound: 32, MaxContexts: 16,
 		MaxHandles: 256, MaxUnresolvedOwners: 256, MaxDiagnosticBytes: 256 * 256,
 		MaxWriteOwners: 128, MaxRetainedWriteBytes: 32 << 20, MaxHandleIORequests: 32,
-		MaxDirectoryBytes: 8 << 20,
-		MaxFrameBytes:     2 << 20, MaxIOBytes: 1 << 20, MaxTokenBytes: 65535,
+		MaxDirectoryBytes: 8 << 20, MaxRetainedDirectoryBytes: 64 << 20, MaxDirectoryMatchWork: 16 << 20,
+		MaxFrameBytes: 2 << 20, MaxIOBytes: 1 << 20, MaxTokenBytes: 65535,
 		HandshakeTimeout: 30 * time.Second, RequestTimeout: time.Minute,
 		CleanupTimeout: 30 * time.Second, FileSession: storage.DefaultFileSessionOptions(),
 	}
@@ -53,7 +54,7 @@ func DefaultLimits() Limits {
 func (l Limits) check() error {
 	if l.MaxExports < 1 || l.MaxConnections < 1 || l.MaxSessions < 1 || l.MaxTrees < 1 ||
 		l.MaxRequests < 1 || l.MaxRequests > 65535 || l.MaxCompound < 1 || l.MaxCompound > 128 || l.MaxCompound > l.MaxRequests ||
-		l.MaxDirectoryBytes < 1 || l.MaxHandles < 1 || l.MaxUnresolvedOwners < 1 || l.MaxDiagnosticBytes < diagnosticOwnerBytes ||
+		l.MaxDirectoryBytes < 1 || l.MaxRetainedDirectoryBytes < 1 || l.MaxDirectoryMatchWork < 1 || l.MaxHandles < 1 || l.MaxUnresolvedOwners < 1 || l.MaxDiagnosticBytes < diagnosticOwnerBytes ||
 		l.MaxWriteOwners < 1 || l.MaxRetainedWriteBytes < 1 || l.MaxHandleIORequests < 1 || l.MaxHandleIORequests > l.MaxRequests ||
 		l.MaxContexts < 1 || l.MaxIOBytes < 65536 || l.MaxIOBytes > 8<<20 ||
 		l.MaxFrameBytes < l.MaxIOBytes+65536 || l.MaxFrameBytes > 0xffffff ||
@@ -82,6 +83,7 @@ type Share struct {
 type Status struct {
 	WriteOwners, UnknownWrites, PendingFlushes, RetainedWriteBytes  int
 	WriteFailures                                                   []WriteFailure
+	RetainedDirectoryBytes                                          int
 	Serving, Stopping, Stopped                                      bool
 	Exports, StoppingExports, Connections, RetainedConnections      int
 	Sessions, ExpiredSessions, Trees, PendingRequests               int

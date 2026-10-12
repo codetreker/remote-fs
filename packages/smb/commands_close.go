@@ -47,6 +47,7 @@ func (c *connection) closeFile(ctx context.Context, s *session, t *tree, request
 	if err := waitFileWork(ctx, t.fenceHandleFileIO(handle)); err != nil {
 		return nil, closeStatusError(err)
 	}
+	handle.releaseDirectoryEnumeration()
 	pendingIOErr := settlePendingFileIO(ctx, handle)
 	response := wire.CloseResponse{}
 	if parsed.Flags&1 != 0 {

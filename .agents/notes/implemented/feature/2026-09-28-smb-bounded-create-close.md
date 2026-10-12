@@ -82,7 +82,11 @@ CREATE 的属性输入允许已支持的可设置位与结构性 DIRECTORY，规
 
 接受目录／非目录选项和互斥的同步 alert/nonalert 选项；同步选项需要 SYNCHRONIZE。SUPERSEDE、delete-on-close、reparse、ADS 及其它未实现效果在 backend 前拒绝。CREATE/CLOSE 的协议 reserved 字段按标准忽略，不把它们作为新的功能开关。
 
-well-formed DHnQ、DH2Q、RqLs、AlSi 和协议 reserved GUID context 只解析并忽略：返回 oplock NONE、零 response contexts，不建立 durable/persistent/lease 状态。重复、混用互斥 durable 请求或畸形 recognized context 是 invalid parameter。well-formed reconnect、MxAc 与 QFid 明确不支持；ExtA、SecD、TWrp、app-instance、virtual-disk 和未知 context 也在效果前拒绝。这样 optional request 不形成隐含授予，而会改变打开效果的 context 不能被悄悄降级。
+well-formed DHnQ、DH2Q、RqLs、AlSi 和协议 reserved GUID context 只解析并忽略，不建立 durable/persistent/lease 状态；BATCH 等已接受的 oplock 请求仍返回 NONE。空 QFid 请求返回已确认原对象的 on-disk identity：DiskFileId 为绑定后的 NodeID，VolumeId 为同一 export 的稳定 64-bit serial，Reserved 的 16 字节全零。未请求 QFid 时没有该 response context；请求时仅增加固定 56 字节 QFid context，不授予 durable 或 oplock 状态。
+
+重复、混用互斥 durable 请求、非空 QFid 或畸形 recognized context 在效果前以 invalid parameter 拒绝。well-formed reconnect、MxAc、ExtA、SecD、TWrp、app-instance、virtual-disk 和未知 context 仍不支持。FILE_OPEN_FOR_BACKUP_INTENT `0x4000` 作为兼容提示接受，但不授予 backup privilege；原 DesiredAccess、业务授权、storage rights、共享和 READONLY 规则继续决定打开。
+
+QFid 由 `wire.CreateResponse.OnDiskID` 可选字段编码，成功 bindReference 之后才从已核对 NodeID／serial 构造，不作额外 RPC 或随后 Stat。普通 CREATE 的完整 frame 为 152 字节，QFid frame 为 208 字节；完整 context 与 compound response 预算在原子打开效果前预留，不能先打开再发现输出无处保留。
 
 ### 关闭与退休
 
@@ -128,4 +132,4 @@ CREATE/CLOSE 有可独立审查的签名、名字选择、访问、共享、身�
 
 每级完整目录观察使深路径和大目录冷打开昂贵；MaxDirectoryBytes 耗尽明确失败。优化只能采用 revision 耦合的权威索引或可证明失效的观察缓存。action history 有限，窗口之外的未知动作可能无法在原 Windows 调用中结清；有界诊断不能冒充应用成功。不能提供身份、allocation、稳定引用或可恢复关闭的第三方链拒绝 tree；HTTP server 下尚有异步 settlement 的组合不宣告 CloseRecovery。
 
-本决定不交付文件数据、目录浏览、名字修改、范围锁、通知、WNet 或原生发布资格。内容路径由[文件内容访问](2026-09-28-smb-file-data-io.md)接续，其余由[文件信息](2026-09-28-smb-file-information.md)、[volume 信息](2026-09-28-smb-volume-information.md)、[目录枚举](../../proposed/feature/2026-09-28-smb-directory-enumeration.md)、[关闭删除义务](../../proposed/feature/2026-09-28-smb-close-delete-obligation.md)及整体 Windows 提案中的独立工作承担。实际结构见[SMB 端点设计](../../../../docs/design/client/smb-endpoint.md)，错误与竞争路径验证见[测试策略](../../../../docs/testing.md)。
+本决定不交付文件数据、目录浏览、名字修改、范围锁、通知、WNet 或原生发布资格。内容路径由[文件内容访问](2026-09-28-smb-file-data-io.md)接续，其余由[文件信息](2026-09-28-smb-file-information.md)、[volume 信息](2026-09-28-smb-volume-information.md)、[目录枚举](2026-09-28-smb-directory-enumeration.md)、[关闭删除义务](../../proposed/feature/2026-09-28-smb-close-delete-obligation.md)及整体 Windows 提案中的独立工作承担。实际结构见[SMB 端点设计](../../../../docs/design/client/smb-endpoint.md)，错误与竞争路径验证见[测试策略](../../../../docs/testing.md)。

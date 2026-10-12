@@ -10,7 +10,7 @@ Status: implemented
 
 ## 决定
 
-[CI workflow](../../../../.github/workflows/ci.yml)使用三个 Linux 作业。`checks` 执行 build、vet、格式、链接、串行全负载验收和其它非挂载包的 race suite；它用 `go list` 从这份 suite 中精确排除挂载包及**根** `./packages/metastore/sqlite`。`sqlite-race` 在独立 Ubuntu runner 上只对这个根包执行 `assert-every-test-ran.sh -race -count=1 -timeout 10m ./packages/metastore/sqlite`。SQLite 的内部子包仍由 `checks` 运行，不能在两个过滤列表之间丢包。`mounted` 保持 FUSE／端到端 race、卸载检查及整个模块的 package-local 覆盖率门禁；覆盖率调用仍包含根 SQLite 包。Windows SSPI 作业独立。
+[CI workflow](../../../../.github/workflows/ci.yml)使用三个 Linux 作业。`checks` 执行 build、vet、格式、链接、串行全负载验收和其它非挂载包的 race suite；它用 `go list` 从并行 suite 中精确排除挂载包、**根** `./packages/metastore/sqlite` 与根 HTTP 包。HTTP 由同一 checks 作业的后续步骤完整执行，其理由由[HTTP race 调度决定](2026-10-12-isolate-http-race-ci.md)持有。`sqlite-race` 在独立 Ubuntu runner 上只对根 SQLite 包执行 `assert-every-test-ran.sh -race -count=1 -timeout 10m ./packages/metastore/sqlite`。SQLite 的内部子包仍由 `checks` 运行，不能在这些包集合之间丢包。`mounted` 保持 FUSE／端到端 race、卸载检查及整个模块的 package-local 覆盖率门禁；覆盖率调用仍包含根 SQLite 包。Windows 作业独立。
 
 SQLite race 作业上限为二十分钟，但 Go 的十分钟 watchdog 仍约束该包二进制的累计执行。strict script 继续拒绝 skip、无测试、缺失 verdict 与测试进程失败；`-count=1` 禁止缓存结果替代执行。独立 runner 去掉同作业其它 Go 包与 SQLite race 的并行资源竞争，不降低测试断言，也不放宽测试本身的完成期限。受保护分支的现有必需状态是 `checks`，不是新增 `sqlite-race`：workflow 令 `checks` 依赖它，并以 `always()` 使 checks 在依赖失败或跳过后仍运行；最后一步显式核对 `needs.sqlite-race.result == success`，其它结果使原必需检查失败。该作业没有 Blob 依赖；`checks` 与 `mounted` 继续各自启动 Azurite 供它们的 Blob 用例使用。
 

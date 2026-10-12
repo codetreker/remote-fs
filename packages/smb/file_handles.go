@@ -64,6 +64,7 @@ type fileHandle struct {
 	contentEffects  []storage.ContentMetadataEffect
 	pendingWrite    *mutationOwner
 	pendingFlush    *flushOwner
+	directory       *directoryCursor
 }
 
 func (t *tree) beginFileWork(s *session) bool {
@@ -188,6 +189,7 @@ func (t *tree) findFileHandle(id wire.FileID) *fileHandle {
 }
 
 func (t *tree) releaseFileHandle(handle *fileHandle) {
+	handle.releaseDirectoryEnumeration()
 	t.fileMu.Lock()
 	if t.handles[handle.id] == handle {
 		delete(t.handles, handle.id)
@@ -264,10 +266,12 @@ func (t *tree) closeFileHandle(ctx context.Context, handle *fileHandle) (closeEr
 }
 
 func (t *tree) closeFileHandleLocked(ctx context.Context, handle *fileHandle) (closeErr error) {
+	handle.releaseDirectoryEnumeration()
 	return t.closeFileHandlePrepared(ctx, handle, settlePendingFileIO(ctx, handle))
 }
 
 func (t *tree) closeFileHandlePrepared(ctx context.Context, handle *fileHandle, pendingIOErr error) (closeErr error) {
+	handle.releaseDirectoryEnumeration()
 	if handle.terminal {
 		return handle.terminalErr
 	}
