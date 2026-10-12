@@ -45,6 +45,7 @@ type openIntent struct {
 	attributes                     uint32
 	contentEffects                 []storage.ContentMetadataEffect
 	queryOnDiskID                  bool
+	deleteOnClose                  bool
 }
 
 func normalizeAccess(access uint32) (uint32, error) {
@@ -79,7 +80,7 @@ func classifyCreate(request wire.CreateRequest) (openIntent, error) {
 	// Backup intent grants no privilege here; normal host authorization and
 	// storage rights still decide whether the requested open is allowed.
 	// https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-smb2/e8fb45c1-a03d-44ca-b7ae-47385cfd7997
-	if request.Options&(createDeleteOnClose|createOpenByFileID) != 0 || request.Options&^(createDirectory|createNonDirectory|createSyncAlert|createSyncNonAlert|createBackupIntent) != 0 {
+	if request.Options&createOpenByFileID != 0 || request.Options&^(createDirectory|createNonDirectory|createSyncAlert|createSyncNonAlert|createBackupIntent|createDeleteOnClose) != 0 {
 		return intent, syscall.EOPNOTSUPP
 	}
 	if request.OplockLevel != 0 && request.OplockLevel != 1 && request.OplockLevel != 8 && request.OplockLevel != 9 && request.OplockLevel != 0xff || request.Impersonation > 3 {
@@ -102,6 +103,10 @@ func classifyCreate(request wire.CreateRequest) (openIntent, error) {
 		return intent, syscall.EINVAL
 	}
 	if request.Options&(createSyncAlert|createSyncNonAlert) != 0 && access&accessSync == 0 {
+		return intent, syscall.EACCES
+	}
+	intent.deleteOnClose = request.Options&createDeleteOnClose != 0
+	if intent.deleteOnClose && access&accessDelete == 0 {
 		return intent, syscall.EACCES
 	}
 	intent.access = access
@@ -175,6 +180,9 @@ func (c *connection) authorizeOpen(ctx context.Context, t *tree, operation stora
 			return err
 		}
 	}
+	if intent.deleteOnClose {
+		return authorize(storage.OpFileSetPendingUnlink, storage.OpenAccess{}, nil)
+	}
 	return nil
 }
 
@@ -186,6 +194,12 @@ func (c *connection) createFile(ctx context.Context, s *session, t *tree, reques
 	intent, err := classifyCreate(parsed)
 	if err != nil {
 		return nil, createStatusError(err), wire.FileID{}
+	}
+	if intent.deleteOnClose {
+		if err := t.export.admitDeleteOpen(); err != nil {
+			return nil, createStatusError(err), wire.FileID{}
+		}
+		defer t.export.endDeleteOpen()
 	}
 	if !t.beginFileWork(s) {
 		return nil, statusNetworkDeleted, wire.FileID{}
@@ -205,6 +219,10 @@ func (c *connection) createFile(ctx context.Context, s *session, t *tree, reques
 		return nil, namespaceStatus(err), wire.FileID{}
 	}
 	if resolved.Root {
+		if intent.deleteOnClose {
+			releaseReservation()
+			return nil, createStatusError(syscall.EACCES), wire.FileID{}
+		}
 		if intent.exclusive {
 			releaseReservation()
 			return nil, createStatusError(syscall.EEXIST), wire.FileID{}
@@ -240,6 +258,10 @@ func (c *connection) createFile(ctx context.Context, s *session, t *tree, reques
 		intent.use.Uses &^= storage.ReadData
 		intent.use.Uses |= storage.ReadEntries
 	}
+	if intent.deleteOnClose && intent.attributes&dosReadOnly != 0 && (resolved.Attr == nil || intent.reset) {
+		releaseReservation()
+		return nil, createStatusError(syscall.EACCES), wire.FileID{}
+	}
 	initial := storage.InitialState{}
 	if intent.create {
 		attributes := intent.attributes
@@ -259,7 +281,7 @@ func (c *connection) createFile(ctx context.Context, s *session, t *tree, reques
 			releaseReservation()
 			return nil, createStatusError(projectionErr), wire.FileID{}
 		}
-		if !isDirectory && attributes&dosReadOnly != 0 && intent.write {
+		if attributes&dosReadOnly != 0 && (intent.deleteOnClose || !isDirectory && intent.write) {
 			releaseReservation()
 			return nil, createStatusError(syscall.EACCES), wire.FileID{}
 		}
@@ -305,6 +327,20 @@ func (c *connection) createFile(ctx context.Context, s *session, t *tree, reques
 		releaseReservation()
 		return nil, createStatusError(err), wire.FileID{}
 	}
+	var closeIntent *storage.CloseIntent
+	if intent.deleteOnClose {
+		id, err := storage.NewDeleteIntentID()
+		if err != nil {
+			releaseReservation()
+			return nil, createStatusError(err), wire.FileID{}
+		}
+		condition := storage.UnlinkFile
+		if isDirectory {
+			condition = storage.UnlinkIfEmpty
+		}
+		closeIntent = &storage.CloseIntent{ID: id, Owner: t.export.share.DeleteIntentOwner, Trigger: storage.OnReferenceClose, Condition: condition}
+		handle.deleteAttempt = &deleteIntentAttempt{id: id}
+	}
 	handle.action, handle.access = action, intent.access
 	handle.contentEffects = storage.CloneContentMetadataEffects(intent.contentEffects)
 	handle.recordOpenDiagnostic()
@@ -314,7 +350,7 @@ func (c *connection) createFile(ctx context.Context, s *session, t *tree, reques
 	if resolved.Root || isDirectory || intent.metadataOnly {
 		references := t.authority.raw.(storage.NodeReferences)
 		options := storage.NodeRefOptions{Kind: storage.NodeRegular, Target: resolved.Condition, Action: action, Use: intent.use,
-			MetadataAccess: intent.metadata, Create: intent.create, Exclusive: intent.exclusive, InitialState: initial}
+			MetadataAccess: intent.metadata, Create: intent.create, Exclusive: intent.exclusive, InitialState: initial, CloseIntent: closeIntent}
 		if isDirectory {
 			options.Kind = storage.NodeDirectory
 		}
@@ -334,7 +370,7 @@ func (c *connection) createFile(ctx context.Context, s *session, t *tree, reques
 		}
 	} else {
 		options := storage.OpenAtOptions{Read: intent.read, Write: intent.write, MetadataAccess: intent.metadata, Create: intent.create, Exclusive: intent.exclusive,
-			Target: resolved.Condition, Action: action, Use: intent.use, Existing: storage.Keep, Initial: initial, ContentMetadataEffects: storage.CloneContentMetadataEffects(intent.contentEffects)}
+			Target: resolved.Condition, Action: action, Use: intent.use, Existing: storage.Keep, Initial: initial, CloseIntent: closeIntent, ContentMetadataEffects: storage.CloneContentMetadataEffects(intent.contentEffects)}
 		if intent.reset {
 			options.Existing = storage.ResetContent
 		}
@@ -347,6 +383,9 @@ func (c *connection) createFile(ctx context.Context, s *session, t *tree, reques
 		}
 	}
 	attr, outcome, err = open(ctx)
+	if closeIntent != nil {
+		t.export.logDeleteIntent("open-result", closeIntent.ID, action, 0, err)
+	}
 	if handle.file == nil && handle.node == nil {
 		handle.pendingOpen = c.pendingOpenRecovery(t, handle, operation, open)
 	}

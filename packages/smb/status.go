@@ -34,16 +34,17 @@ func statusError(err error) uint32 {
 }
 
 const (
-	statusNoSuchFile       uint32 = 0xc000000f
-	statusNoMoreFiles      uint32 = 0x80000006
-	statusSharingViolation uint32 = 0xc0000043
-	statusRetry            uint32 = 0xc000022d
-	statusDeletePending    uint32 = 0xc0000056
-	statusNameNotFound     uint32 = 0xc0000034
-	statusNameCollision    uint32 = 0xc0000035
-	statusFileIsDirectory  uint32 = 0xc00000ba
-	statusNotADirectory    uint32 = 0xc0000103
-	statusInvalidHandle    uint32 = 0xc0000008
+	statusDirectoryNotEmpty uint32 = 0xc0000101
+	statusNoSuchFile        uint32 = 0xc000000f
+	statusNoMoreFiles       uint32 = 0x80000006
+	statusSharingViolation  uint32 = 0xc0000043
+	statusRetry             uint32 = 0xc000022d
+	statusDeletePending     uint32 = 0xc0000056
+	statusNameNotFound      uint32 = 0xc0000034
+	statusNameCollision     uint32 = 0xc0000035
+	statusFileIsDirectory   uint32 = 0xc00000ba
+	statusNotADirectory     uint32 = 0xc0000103
+	statusInvalidHandle     uint32 = 0xc0000008
 )
 
 func createStatusError(err error) uint32 {
@@ -86,6 +87,9 @@ func createStatusError(err error) uint32 {
 }
 
 func closeStatusError(err error) uint32 {
+	if errors.Is(err, syscall.ENOTEMPTY) {
+		return statusDirectoryNotEmpty
+	}
 	if errors.Is(err, syscall.EIO) {
 		return statusIO
 	}

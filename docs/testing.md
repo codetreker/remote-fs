@@ -20,7 +20,7 @@
 
 ## CI 工具链与缓存
 
-四个作业使用[共享 setup action](../.github/actions/setup-go/action.yml)固定 Go 1.26.8，并按作业、工具链、依赖和源码 SHA 保存 module／编译缓存；同作业前缀及经校验的旧快照可作为种子。三个 Linux 作业分别运行非挂载包、根 SQLite 包、挂载与端到端包；非挂载作业先运行其它包的并行 race suite，再单独运行完整根 HTTP 包。Windows 作业运行 native SSPI 的 race／vet，以及 SMB／wire 的严格 race suite，包含 native 名字比较与目录 API 用例。缓存复用编译工作，`-count=1` 仍使每次调用实际执行测试。SQLite 与 HTTP 的单独调度不缩小 race、严格 verdict 或 module-wide 覆盖率门禁。缓存上传也消耗时间与空间，净收益须看完整作业；原因与兼容边界见[缓存决定](../.agents/notes/implemented/process/2026-09-09-refresh-ci-go-build-caches.md)。
+四个作业使用[共享 setup action](../.github/actions/setup-go/action.yml)固定 Go 1.26.8，并按作业、工具链、依赖和源码 SHA 保存 module／编译缓存；同作业前缀及经校验的旧快照可作为种子。三个 Linux 作业分别运行非挂载包、根 SQLite 包、挂载与端到端包；非挂载作业先运行其它包的并行 race suite，再单独运行完整根 HTTP 包。Windows 作业运行 native SSPI 的 race／vet，以及 SMB／wire 的严格 race suite，包含 native 名字比较、目录 API 和关闭删除用例。缓存复用编译工作，`-count=1` 仍使每次调用实际执行测试。SQLite 与 HTTP 的单独调度不缩小 race、严格 verdict 或 module-wide 覆盖率门禁。缓存上传也消耗时间与空间，净收益须看完整作业；原因与兼容边界见[缓存决定](../.agents/notes/implemented/process/2026-09-09-refresh-ci-go-build-caches.md)。
 
 ## CI 执行预算
 
@@ -173,6 +173,8 @@ Handler.Close 的 cleanup-attempt 回归在首轮已经排空后、第二次显�
 [local store 关闭用例](../packages/storage/localstore/files_test.go)在关闭 durable storage 前退役 retained 引用，重开后核对无名字对象已清理、Used 已释放且旧名字没有重建。最后引用的记账拒绝必须使 Close 保留原错误，第二个 opener 仍以 `EBUSY` 失败；移除故障后重新 Close 才能释放物理所有权。
 
 [pending deletion 用例](../packages/metastore/sqlite/identity_capabilities_test.go)覆盖 armed、pending、completed、明确未执行与带 errno 的 cleanup-failed，rename 后随原关联、unlink/replacement 后不碰同名替代物、目录非空、generation 清除竞争、多个 intent、最后 pin 与重启恢复。终态在显式 acknowledge 前持续占用有界历史；ACK 带自己的 FileActionID，可重放且不重复释放，成功后删除记录、回收容量，后续查询为 unknown。用例还须证明 authority 不保留 tombstone，调用方不会复用已 ACK 的 ID。localstore crash 用例在接受 intent 后终止子进程，重开后从 durable ID 查询并继续清理；恢复使用 maintenance accounting，既不重复返还配额，也不携带原授权、Scope 或 Strong proof。
+
+[旧 Armed 与 shared discard 用例](../packages/metastore/sqlite/delete_intent_recovery_test.go)用真实 CloseIntent 和 native authority 验证 EnableLocks 的共同启动入口：既有 pending 占满 reclaim batch 后，全部上一进程 Armed 仍先完成 trigger 分类；超过 publication 两目标上限的历史按节点分类，普通 pin／名字效果不能越过。Strong Recovering 保留同一 acquisition／原恢复窗口，Conflict 真实失败，startup context 取消释放该私有尝试；没有旧 Armed 不新增等待，普通 maintenance 不触发当前 live Armed。非空目录旧义务进入 NotExecuted。Remove、NameRemove、replacement 和原子打开的无 pin discard 先 terminalize Armed，再物理 DELETE，重开仍通过严格 integrity；仍有 pin 只 detached，原发起引用关闭后才结算。shared link 的 SDK Write／Commit／Mkdir／原子打开都必须拒绝 pending 父目录，不能只测 identity namespace。
 
 [retained integrity 用例](../packages/metastore/sqlite/internal/integration/integrity_test.go)将可见 rooted tree 与 detached regular file 分开验证：后者不进入目录快照，仍引用合法对象并计入 quota 与 integrity work；具名却标为 detached、非法标记、revision 或错误用量均失败。detached 空目录的有效状态和 exact scoped read 由前述 SQLite 名字观察用例覆盖。[恢复用例](../packages/metastore/sqlite/internal/integration/files_test.go)在独占打开时清理数据库内每个 volume 的遗留 detached 对象，即使 pending admission 已满仍完成必要清理并报告实际 OverLimit；损坏图在清理前拒绝，失败事务保持节点、对象、用量和 durable generation。[迁移用例](../packages/metastore/sqlite/internal/integration/schema_test.go)从受见证保护的旧 schema 前滚，核对已有节点与 accepted state，并在旧 schema 损坏或预算不足时保持原数据。
 
@@ -430,6 +432,20 @@ mutation_owner用例涵盖原Attr／Metadata／Data／token／effect深复制、
 [签名目录 transcript](../packages/smb/protocol_directory_linux_test.go)区分正常 warning 与结束状态：related CREATE→partial QUERY_DIRECTORY→CLOSE 对每项检查 body、extent、签名、最后引用及费用归还；NO_SUCH_FILE／NO_MORE_FILES 抑制 related CLOSE 时，ownership 和 cache charge 保留，随后独立 CLOSE 或正常 shutdown 确认释放。协议错误不能通过任意 warning 绕过前驱失败判定。
 
 [Windows 目录用例](../packages/smb/protocol_directory_windows_test.go)通过真实 SSPI、loopback 映射、Win32 FindFirstFile 与 NT QueryDirectory／QueryDirectoryEx 发起请求，观察实际 QUERY_DIRECTORY classes／flags／expression／buffer 和分页结果。native FILE_NAMES_INFORMATION 的 C ABI 大小为 16 字节，FileName offset 为 12。15-byte 与 16-byte 场景分别打开独立 FileObject，在各自首次查询上断言：15-byte application buffer 返回 INFO_LENGTH_MISMATCH 且无数据；16-byte buffer 返回 STATUS_SUCCESS 且无数据。零数据不结算 EOF；在同一 handle 上把 buffer 扩至 4096、不 restart 且不再提供 expression，要求只输出 `long*` 匹配的完整长名，随后返回 NO_MORE_FILES。再显式 restart、保持 expression 缺席，要求输出同一完整长名并再次到达 EOF。SMB wire 的 12-byte Names header、完整声明长度与原始奇数字节 partial，以及保留当前项的 continuation 由 wire、命令和签名用例分别验证；native redirector 的 application buffer／cursor 适配不替代这些断言。测试使用[专用只读 backend](../packages/smb/native_directory_fixture_test.go)，其字段与能力为本协议夹具提供真实数据，不承担 native SQLite 持久性或 Windows 11 普通用户发布资格。它由既有 Windows root SMB strict suite 收集；实际执行 verdict、协议 receipt 与映射清理由当次 CI 证据给出，不能用 Go／wire 模拟推导 native PASS。
+
+### SMB 关闭删除、有限发现与进程恢复
+
+[关闭删除单元用例](../packages/smb/delete_intent_test.go)核对规范化 DELETE、共享字段、owner 配置、准入、恢复预留、原 diagnostic 保留及 pending 信息。CREATE 的原名字 guards、metadata CAS、原 action 结果、未知打开及 frame 预算仍由前述 CREATE/CLOSE 用例覆盖；关闭删除的 READONLY／reset、root、file／directory 与删除授权由真实 direct／HTTP 用例核对。缺少 DELETE 为 INVALID_PARAMETER；请求自身不共享 DELETE 仍可合法独占打开。owner 为空保持普通 I/O，关闭删除不支持；非法或重复绑定在 Publish 拒绝，初次完整恢复前 CREATE 无效果失败。发布预留来自既有 unresolved／diagnostic 额度，普通 handle 和 write 饱和不能偷用它；FileId 退休而 query／ACK 未结算时，同一原 owner 继续以 delete-intent-only 计费。
+
+[恢复用例](../packages/smb/delete_intent_recovery_test.go)覆盖当前 Principal／AuthorizeIdentity 和每项实际 Operation；query、ACK、identity、session、关闭授权或网络失败均保留真实错误。恢复先 fence 新关闭删除并 drain 已准入 CREATE，partial／EAGAIN／错误间保持 gate，每次按 MaxUnresolvedOwners、每页最多 256、context／CleanupTimeout 有界执行。local retained attempts 先于 durable pages，并在空页重查迟到责任；页内失败不越过记录，完整后游标归零并重新核对早期 pending。已知 authority Armed／Pending 可 ready，CleanupFailed、Unknown ACK 或当前 session 未 settlement 不可冒充完成。
+
+ACK 用例分别丢失执行前与执行后响应，保留固定 owner／intent、terminal outcome、原 action 和 issued witness。当前 Query 仍终态时，过期／Unknown 原回执允许幂等的新 ACK action；原未知 ID 保留。只有终态观察和 issued ACK 共同存在，后续缺失才能证明该记录回收；无 witness 缺失拒绝，未知 CREATE 不因此变成未接受。当前 session settlement 与旧 incarnation 责任分别核对，最多两份 session、额外槽属于原全局预算，无第三份。新发现 ready 不抹去旧 cleanup error，Stop 不能丢掉 issued Unknown ACK 或以 ESTALE 宣称释放。
+
+[真实 direct／HTTP 用例](../packages/smb/delete_intent_integration_linux_test.go)从 SMB CREATE 接入真实 authority，覆盖当前五种 disposition、metadata-only 与目录打开。发起引用关闭后 pending，另一 SMB／SDK 相容引用继续读写原对象，新引用和冲突名字效果拒绝；最后引用结束才删除。SDK rename 跟随原关联，unlink／replacement 让原义务明确未执行，替代物身份和内容不变。非空目录触发返回实际错误；pending 后 SDK Write／Mkdir 不能加子项。当前策略撤销不取消已接受固定删除，新 query／ACK 仍拒绝；Standard 信息用真实 PendingUnlink 返回 links0，Armed 未触发为非 pending。有限扫描中持续新建关闭删除被 gate 阻挡，早期 pending 在下一轮重查。真实 HTTP MaxSessions 饱和返回 EAGAIN，configured owner 保持未就绪，普通 SDK I/O 可用；其它调用方 session 关闭释放 enrollment 后原 Export 恢复就绪，不能用本地恢复预留冒充远端 session 保留。
+
+[进程 kill 用例](../packages/smb/delete_intent_restart_integration_linux_test.go)运行独立 SMB 宿主及 HTTP authority 子进程，authority 使用公开 localstore.Open、真实持久 backend 与 lock evidence，宿主配置保存同一 owner。矩阵在 Armed、Pending、已提交且 ACK 响应丢失三个边界分别 SIGKILL 宿主、authority 或两者，并 wait／reap；重新打开用此前接受的 NodeID／intent 和原 owner 查询，核对未 ACK 义务的原对象身份、最终名字及查询／ACK 回收；ACK-lost 的已回收记录允许为 Unknown。ACK-lost 的 HTTP fault receipt 证明真实提交后响应丢失，CLOSE 可凭原 terminal witness 与后续缺失确认回收，不要求制造 I/O 错误。authority-only 场景先让旧宿主观察失效引用，再结束旧宿主并以原配置恢复；它不证明退役旧 HTTP session 可以无条件完成 adapter settlement。
+
+[Windows 原生关闭删除用例](../packages/smb/protocol_delete_windows_test.go)复用实际 SSPI、loopback 映射和 Win32 CreateFile／CloseHandle，使用[窄 mutable fixture](../packages/smb/native_delete_fixture_test.go)实现现有中立打开／intent 能力。覆盖新文件 ShareAccess=0、metadata-only 文件、空目录、两个相容句柄、缺少 DELETE 拒绝，以及实际 TCP 连接中断后的原义务完成。相容 survivor 用 Standard 信息核对 pending／links0，继续读取，冲突新打开拒绝，最后关闭后名字消失。非空目录分别记录应用 CloseHandle 结果、要求签名 SMB CLOSE 为 STATUS_DIRECTORY_NOT_EMPTY，并核对 authority NotExecuted 和原 child；应用返回值不能冒充 wire 状态。fixture 使用内存 authority，不承担 SQLite 跨重启证明；实际 Windows execution verdict 与清理由当次 CI 回执给出，cross-build 或 wire 模拟不代替原生执行，也不证明 Windows 11 Home／Pro 普通用户资格。
 
 ### SMB 与 FUSE 的同 volume 联合验收
 

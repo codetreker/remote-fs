@@ -511,6 +511,9 @@ func (s *Store) link(ctx context.Context, tx *sql.Tx, parent int64, name []byte,
 	if err := storage.CheckLeaf(name); err != nil {
 		return err
 	}
+	if err := s.checkNameAddition(ctx, tx, parent); err != nil {
+		return err
+	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO entries (volume, parent, name, node) VALUES (?, ?, ?, ?)`,
 		s.volume, parent, name, node); err != nil {
 		if sqlerr.IsUniqueViolation(err) {
@@ -690,6 +693,12 @@ func (s *Store) discard(ctx context.Context, tx *sql.Tx, node metastore.Node, at
 }
 
 func (s *Store) discardNode(ctx context.Context, tx *sql.Tx, node metastore.Node) error {
+	now := time.Now()
+	if _, err := tx.ExecContext(ctx, `UPDATE delete_intents SET outcome=?,failure=NULL,updated_sec=?,updated_nsec=?
+		WHERE volume=? AND node=? AND outcome=?`, storage.DeleteIntentNotExecuted, now.Unix(), now.Nanosecond(),
+		s.volume, node.ID, storage.DeleteIntentArmed); err != nil {
+		return err
+	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM nodes WHERE id = ?`, node.ID); err != nil {
 		return err
 	}

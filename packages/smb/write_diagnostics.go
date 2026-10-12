@@ -101,7 +101,7 @@ func (s *Server) reserveIORecord(t *tree, h *fileHandle, bytes int, flush bool) 
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	limits := s.config.Limits
-	if len(l.records) >= limits.MaxWriteOwners || len(l.records)+len(s.handleOwners) >= limits.MaxDiagnosticBytes/diagnosticOwnerBytes || bytes > limits.MaxRetainedWriteBytes-l.bytes {
+	if len(l.records) >= limits.MaxWriteOwners || len(l.records)+len(s.handleOwners)+s.deleteRecoverySlots >= limits.MaxDiagnosticBytes/diagnosticOwnerBytes || bytes > limits.MaxRetainedWriteBytes-l.bytes {
 		return WriteOwnerID{}, syscall.ENOMEM
 	}
 	exportCount, exportBytes := 0, 0

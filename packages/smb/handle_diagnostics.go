@@ -8,14 +8,16 @@ import (
 const diagnosticOwnerBytes = 256
 
 type HandleOwnerStatus struct {
-	FileID       wire.FileID
-	SessionID    uint64
-	TreeID       uint32
-	NodeID       uint64
-	OpenAction   storage.FileActionID
-	CloseAttempt storage.CloseAttempt
-	State        string
-	LastStatus   uint32
+	FileID        wire.FileID
+	SessionID     uint64
+	TreeID        uint32
+	NodeID        uint64
+	OpenAction    storage.FileActionID
+	DeleteIntent  storage.DeleteIntentID
+	DeleteOutcome storage.DeleteIntentOutcome
+	CloseAttempt  storage.CloseAttempt
+	State         string
+	LastStatus    uint32
 }
 
 func (h *fileHandle) recordOpenDiagnostic() {
@@ -25,6 +27,7 @@ func (h *fileHandle) recordOpenDiagnostic() {
 	}
 	current := *prior
 	current.OpenAction = h.action
+	current.DeleteIntent = h.deleteIntentID()
 	h.diagnostic.Store(&current)
 }
 
@@ -60,6 +63,9 @@ func (s *Server) HandleOwners() []HandleOwnerStatus {
 			owner.State = "cleanup-only"
 		case handleBarrierOnly:
 			owner.State = "barrier-only"
+		}
+		if owner.DeleteIntent != "" && h.deleteRefSettled.Load() {
+			owner.State = "delete-intent-only"
 		}
 		result = append(result, owner)
 	}

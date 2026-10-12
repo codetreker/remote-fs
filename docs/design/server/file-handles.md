@@ -100,7 +100,7 @@ SQLite authority schema v11 在 v7 的符号链接目标、节点 pending genera
 
 `SQLiteOptions.MaxRetainedFiles` 默认 65536，按 volume 共享。退役引用仍占物理名额，直到最后释放完成。满额时创建并打开必须在产生 volume 副作用之前拒绝。多个 objectstore 包装同一 volume 时使用同一份引用、Use 与 range 预算，不能借另建包装器绕过上限。
 
-拥有数据库原生 EX 锁的启动过程先有界验证所有 volume，包括 detached/pending 节点、delete intent、对象关系和配额。没有 durable obligation 的旧 epoch 无主引用可以回收；armed 或 pending 删除责任保留到 Strong 恢复屏障建立后，经正常发布门重试。使用量、垃圾记录和提交代际通过同一个 Commit/Accept 结果生效。验证失败不先回收一部分；普通共享 opener 不执行恢复清理。持久见证、数据库所有权和关闭失败的处理见[本地持久对象存储](local-disk-object-store.md)。
+拥有数据库原生 EX 锁的启动过程先有界验证所有 volume，包括 detached/pending 节点、delete intent、对象关系和配额。没有 durable obligation 的旧 epoch 无主引用可以回收；公开 EnableLocks 在同一私有 native acquisition 内，先按节点经受 Strong／publication guard 保护的 activation transaction 分类全部旧 Armed，再开放普通准入；OpenLocking 与 localstore.Open 共用该入口。Recovering 按真实 RecoveryRemainingMillis 与原 startup context 等待，重试不重置 Strong window，Conflict 或取消使构造失败；没有旧 Armed 不增加等待。旧 pending 的物理回收继续采用 bounded maintenance，分类不受 reclaim batch 限制。使用量、垃圾记录和提交代际通过同一个 Commit/Accept 结果生效。验证失败不先回收一部分；普通共享 opener 不执行恢复清理。持久见证、数据库所有权和关闭失败的处理见[本地持久对象存储](local-disk-object-store.md)。
 
 ### 身份 namespace
 
@@ -136,9 +136,9 @@ File 与 NodeReference 的 `ReferenceNameObserver` 复用既有 session、引用
 
 ### pending deletion 与 durable intent
 
-`CloseIntent` 在打开事务中接受，携带由 `NewDeleteIntentID` 生成的 128-bit 小写十六进制 durable ID 与调用方持久保存的 `DeleteIntentOwner`，并绑定原 NodeID、名字关联、metadata 条件、Use 与文件／空目录条件。owner 是 1 至 128 字节、有效 UTF-8 且不含 NUL 的发现命名空间，不是授权凭据。它仍处于 armed 时不等于节点已经 pending；引用显式关闭、session 清理或 authority 接管旧责任时才触发。触发时名字已经 unlink/replacement 分离，或目录非空，则该 intent 进入明确未执行终态，不能作用于同名替代物。
+`CloseIntent` 在打开事务中接受，携带由 `NewDeleteIntentID` 生成的 128-bit 小写十六进制 durable ID 与调用方持久保存的 `DeleteIntentOwner`，并绑定原 NodeID、名字关联、metadata 条件、Use 与文件／空目录条件。owner 是 1 至 128 字节、有效 UTF-8 且不含 NUL 的发现命名空间，不是授权凭据。它仍处于 armed 时不等于节点已经 pending；引用显式关闭、session 清理或 authority 接管旧责任时才触发。触发时名字已经 unlink/replacement 分离，或目录非空，则该 intent 进入明确未执行终态，不能作用于同名替代物。shared discardNode 物理删除无 pin 节点时，在同一 transaction 先将其 Armed 置为 NotExecuted，再删除节点；仍有 pin 只 detached，保持 live Armed 到发起引用关闭。
 
-`SetPendingUnlink` 立即在同一事务中核对引用、metadata、Use/share、节点种类与目录为空条件，再推进非零 pending generation。`ClearPendingUnlink` 必须给出当前 generation；竞争或旧 generation 返回 `ErrConditionConflict`，且清除一个节点状态不会删除其它 armed intent。pending 节点拒绝冲突的新打开和名字操作，已有相容引用继续按其权限访问。
+`SetPendingUnlink` 立即在同一事务中核对引用、metadata、Use/share、节点种类与目录为空条件，再推进非零 pending generation。`ClearPendingUnlink` 必须给出当前 generation；竞争或旧 generation 返回 `ErrConditionConflict`，且清除一个节点状态不会删除其它 armed intent。pending 节点拒绝冲突的新打开和名字操作，已有相容引用继续按其权限访问。shared tree.link 在 INSERT 前复用 checkNameAddition，使 SDK Write／Commit 和 identity namespace 同样不能向 pending 目录新增名字。
 
 delete intent 持久记录 armed、pending、completed、not-executed 或 cleanup-failed；失败记录携带封闭 errno 分类。每条记录在同一 volume 内取得持久、单调递增的序号。`FileActions.ListDeleteIntents(ctx, owner, after, limit)` 只返回该 owner 在排他游标之后的记录，最多 256 条，按序号排列；`DeleteIntentCursor` 不超过 `MaxInt64`，页面的 `Next` 是最后返回的序号，空页则保持输入游标。ACK 删除记录后序号不复用，分页不会因删除早先记录而跳过后续义务。`QueryDeleteIntent(ctx, owner, id)` 和 `AcknowledgeDeleteIntent` 都核对 owner；错误 owner 的查询返回 Unknown，ACK 是幂等零效果。
 

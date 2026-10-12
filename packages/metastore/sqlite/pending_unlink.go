@@ -760,8 +760,68 @@ func (s *Store) finalizePendingUnlinkLocked(ctx context.Context, id int64, closi
 	return errors.Join(classified, sqlerr.Failure(markErr))
 }
 
-// RetryPendingUnlinks performs one bounded recovery pass. A previous process's
-// armed close intent is interpreted as its reference having closed.
+// The exclusive opener retires the previous file domain before exposing the
+// Store. Classifying all of its armed obligations closes admission independently
+// of the bounded physical reclamation pass and any subsequently acquired pin.
+func (s *Store) recoverArmedDeleteIntents(ctx context.Context) error {
+	if err := s.coordinator.commit.acquire(ctx); err != nil {
+		return err
+	}
+	defer s.coordinator.commit.release()
+	var nodes []int64
+	if err := s.inspect(ctx, func(tx *sql.Tx) error {
+		rows, err := tx.QueryContext(ctx, `SELECT DISTINCT node FROM delete_intents
+			WHERE volume=? AND outcome=? ORDER BY node`, s.volume, storage.DeleteIntentArmed)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var id int64
+			if err := rows.Scan(&id); err != nil {
+				return err
+			}
+			nodes = append(nodes, id)
+		}
+		return rows.Err()
+	}); err != nil {
+		return sqlerr.Failure(err)
+	}
+	if len(nodes) == 0 {
+		return nil
+	}
+	cleanupCtx := pendingUnlinkCleanupContext(ctx, s.fileDomain.maintenanceAccounting)
+	for _, id := range nodes {
+		for {
+			err := s.activateRecoveredIntentsLocked(cleanupCtx, id)
+			if err == nil {
+				break
+			}
+			if ctx.Err() != nil {
+				return errors.Join(sqlerr.Failure(err), ctx.Err())
+			}
+			if locking.CodeOf(err) != locking.Recovering {
+				return sqlerr.Failure(err)
+			}
+			status, err := s.locks.Status(ctx)
+			if err != nil {
+				return err
+			}
+			wait := time.Duration(status.RecoveryRemainingMillis)*time.Millisecond + time.Millisecond
+			timer := time.NewTimer(wait)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return ctx.Err()
+			case <-timer.C:
+			}
+		}
+	}
+	return ctx.Err()
+}
+
+// RetryPendingUnlinks performs one bounded physical reclamation pass. Live
+// armed obligations remain attached to their initiating references.
 func (s *Store) RetryPendingUnlinks(ctx context.Context, limit int) error {
 	if limit < 1 {
 		return syscall.EINVAL

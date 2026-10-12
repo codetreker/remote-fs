@@ -169,7 +169,7 @@ func (c *connection) queryFileInfo(ctx context.Context, s *session, t *tree, req
 				return nil, ioStatusError(err)
 			}
 			links := uint32(1)
-			if result.Detached {
+			if result.Detached || result.PendingUnlink {
 				links = 0
 			}
 			eof := int64(0)

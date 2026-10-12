@@ -1,0 +1,430 @@
+package smb_test
+
+import (
+	"context"
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/codetreker/remote-fs/packages/authz"
+	"github.com/codetreker/remote-fs/packages/smb"
+	"github.com/codetreker/remote-fs/packages/smb/internal/wire"
+	smbwindows "github.com/codetreker/remote-fs/packages/smb/windows"
+	"github.com/codetreker/remote-fs/packages/storage"
+	win "golang.org/x/sys/windows"
+)
+
+func TestNativeWindowsDeleteOnClose(t *testing.T) {
+	identity, err := smbwindows.CurrentIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy, err := smbwindows.AllowIdentity(identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	limits := smb.DefaultLimits()
+	limits.RequestTimeout, limits.CleanupTimeout = 10*time.Second, 10*time.Second
+	server, err := smb.New(smb.Config{Authenticator: smbwindows.NewAuthenticator(), AuthorizeIdentity: policy,
+		Authorize: authz.AuthorizerFunc(func(context.Context, authz.AccessRequest) error { return nil }),
+		Limits:    limits, Logger: slog.New(slog.NewTextHandler(nativeProbeLog{t}, nil))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend := smb.NewNativeDeleteProbeBackend()
+	owner, err := storage.NewDeleteIntentOwner()
+	if err != nil {
+		t.Fatal(err)
+	}
+	share := fmt.Sprintf("rfsdelete%x", time.Now().UnixNano())
+	export, err := server.Publish(smb.Share{Name: share, Volume: share, BackendVolume: "test-volume", RootNodeID: 1, Backend: backend, DeleteIntentOwner: owner})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := export.RecoverDeleteIntents(smb.WithPrincipal(t.Context(), identity)); err != nil {
+		t.Fatal(err)
+	}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipts := &nativeDeleteReceipts{}
+	transport := &nativeDeleteListener{Listener: listener, receipts: receipts}
+	ctx, cancel := context.WithCancel(context.Background())
+	served := make(chan error, 1)
+	go func() { served <- server.Serve(ctx, transport) }()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case err := <-served:
+			if err != nil {
+				t.Error(err)
+			}
+		case <-time.After(15 * time.Second):
+			t.Error("native delete server did not stop")
+		}
+		stop, release := context.WithTimeout(smb.WithPrincipal(context.Background(), identity), 15*time.Second)
+		defer release()
+		if err := server.Shutdown(stop); err != nil {
+			t.Error(err)
+		}
+		receipts.report(t)
+	})
+	drive, remote := nativeUnusedDrive(t), `\\127.0.0.1\`+share
+	port := listener.Addr().(*net.TCPAddr).Port
+	t.Cleanup(func() { nativeMappingCommand(t, drive, remote, port, true) })
+	nativeMappingCommand(t, drive, remote, port, false)
+
+	t.Run("new-file-exclusive-share", func(t *testing.T) {
+		path := drive + `\exclusive.txt`
+		h := nativeDeleteOpen(t, path, win.GENERIC_READ|0x10000, 0, win.CREATE_NEW, win.FILE_FLAG_DELETE_ON_CLOSE)
+		var data [1]byte
+		var read uint32
+		if err := win.ReadFile(h.Handle, data[:], &read, nil); err != nil || read != 0 {
+			t.Fatalf("empty file read=%d error=%v", read, err)
+		}
+		if err := h.Close(); err != nil {
+			t.Fatal(err)
+		}
+		nativeDeleteAbsent(t, path)
+	})
+	t.Run("metadata-only-file", func(t *testing.T) {
+		path := drive + `\alpha.txt`
+		h := nativeDeleteOpen(t, path, win.FILE_READ_ATTRIBUTES|0x10000, 7, win.OPEN_EXISTING, win.FILE_FLAG_DELETE_ON_CLOSE)
+		if err := h.Close(); err != nil {
+			t.Fatal(err)
+		}
+		nativeDeleteAbsent(t, path)
+	})
+	t.Run("empty-directory", func(t *testing.T) {
+		path := drive + `\empty`
+		h := nativeDeleteOpen(t, path, win.FILE_READ_ATTRIBUTES|0x10000, 7, win.OPEN_EXISTING, win.FILE_FLAG_DELETE_ON_CLOSE|win.FILE_FLAG_BACKUP_SEMANTICS)
+		if err := h.Close(); err != nil {
+			t.Fatal(err)
+		}
+		nativeDeleteAbsent(t, path)
+	})
+	t.Run("two-compatible-handles", func(t *testing.T) {
+		path := drive + `\beta.bin`
+		survivor := nativeDeleteOpen(t, path, win.GENERIC_READ, 7, win.OPEN_EXISTING, 0)
+		initiator := nativeDeleteOpen(t, path, win.FILE_READ_ATTRIBUTES|0x10000, 7, win.OPEN_EXISTING, win.FILE_FLAG_DELETE_ON_CLOSE)
+		if err := initiator.Close(); err != nil {
+			t.Fatal(err)
+		}
+		var standard [24]byte
+		if err := win.GetFileInformationByHandleEx(survivor.Handle, win.FileStandardInfo, &standard[0], uint32(len(standard))); err != nil {
+			t.Fatal(err)
+		}
+		if links := binary.LittleEndian.Uint32(standard[16:]); links != 0 || standard[20] != 1 {
+			t.Fatalf("pending standard info links=%d pending=%d", links, standard[20])
+		}
+		var data [1]byte
+		var read uint32
+		if err := win.ReadFile(survivor.Handle, data[:], &read, nil); err != nil || read != 0 {
+			t.Fatalf("pending survivor read=%d error=%v", read, err)
+		}
+		name, err := win.UTF16PtrFromString(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		unexpected, err := win.CreateFile(name, win.FILE_READ_ATTRIBUTES, 7, nil, win.OPEN_EXISTING, 0, 0)
+		if err == nil {
+			_ = win.CloseHandle(unexpected)
+			t.Fatal("new native open admitted during delete-pending")
+		}
+		if !errors.Is(err, win.ERROR_DELETE_PENDING) && !errors.Is(err, win.ERROR_ACCESS_DENIED) {
+			t.Fatalf("pending native open: %v", err)
+		}
+		if err := survivor.Close(); err != nil {
+			t.Fatal(err)
+		}
+		nativeDeleteAbsent(t, path)
+	})
+	t.Run("nonempty-directory-close-results", func(t *testing.T) {
+		path := drive + `\folder`
+		h := nativeDeleteOpen(t, path, win.FILE_READ_ATTRIBUTES|0x10000, 7, win.OPEN_EXISTING, win.FILE_FLAG_DELETE_ON_CLOSE|win.FILE_FLAG_BACKUP_SEMANTICS)
+		start := receipts.closeCount()
+		appErr := h.Close()
+		t.Logf("Win32 CloseHandle(nonempty directory): %v", appErr)
+		if status := receipts.waitClose(t, start, 0xc0000101); status != 0xc0000101 {
+			t.Fatalf("SMB CLOSE(nonempty directory)=%#x", status)
+		}
+		found := false
+		for _, outcome := range backend.ProbeDeleteOutcomes() {
+			if outcome.NodeID == 2 && outcome.Outcome == storage.DeleteIntentNotExecuted {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatal("authority did not retain nonempty directory NotExecuted result")
+		}
+		nativeFindNames(t, path+`\*`, []string{"nested.txt"})
+	})
+	t.Run("missing-delete-access", func(t *testing.T) {
+		name, err := win.UTF16PtrFromString(drive + `\long-😀-name.txt`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		h, err := win.CreateFile(name, win.FILE_READ_ATTRIBUTES, 7, nil, win.OPEN_EXISTING, win.FILE_FLAG_DELETE_ON_CLOSE, 0)
+		if err == nil {
+			_ = win.CloseHandle(h)
+			t.Fatal("delete-on-close accepted without DELETE access")
+		}
+		if !errors.Is(err, win.ERROR_ACCESS_DENIED) && !errors.Is(err, win.ERROR_INVALID_PARAMETER) {
+			t.Fatal(err)
+		}
+		if _, err := win.GetFileAttributes(name); err != nil {
+			t.Fatalf("rejected native open changed its original name: %v", err)
+		}
+		for _, intent := range backend.ProbeDeleteOutcomes() {
+			if intent.NodeID == 5 {
+				t.Fatal("missing DELETE access established an authority intent")
+			}
+		}
+	})
+	t.Run("connection-loss", func(t *testing.T) {
+		path := drive + `\disconnect.txt`
+		h := nativeDeleteOpen(t, path, win.FILE_READ_ATTRIBUTES|0x10000, 7, win.CREATE_NEW, win.FILE_FLAG_DELETE_ON_CLOSE)
+		var intent storage.DeleteIntentStatus
+		for _, candidate := range backend.ProbeDeleteOutcomes() {
+			if candidate.Outcome == storage.DeleteIntentArmed {
+				intent = candidate
+			}
+		}
+		if intent.ID == "" {
+			t.Fatal("native open established no Armed intent")
+		}
+		transport.disconnect(t)
+		deadline := time.NewTimer(10 * time.Second)
+		defer deadline.Stop()
+		for {
+			for _, candidate := range backend.ProbeDeleteOutcomes() {
+				if candidate.ID == intent.ID && candidate.Outcome == storage.DeleteIntentCompleted {
+					t.Logf("Win32 CloseHandle(disconnected reference): %v", h.Close())
+					return
+				}
+			}
+			select {
+			case <-deadline.C:
+				t.Fatal("connection loss did not complete accepted delete obligation")
+			case <-time.After(10 * time.Millisecond):
+			}
+		}
+	})
+}
+
+type nativeDeleteHandle struct {
+	win.Handle
+	closed bool
+}
+
+func (h *nativeDeleteHandle) Close() error {
+	if h.closed {
+		return nil
+	}
+	h.closed = true
+	return win.CloseHandle(h.Handle)
+}
+
+func nativeDeleteOpen(t *testing.T, path string, access, share, disposition, flags uint32) *nativeDeleteHandle {
+	t.Helper()
+	name, err := win.UTF16PtrFromString(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, err := win.CreateFile(name, access, share, nil, disposition, flags, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	owned := &nativeDeleteHandle{Handle: h}
+	t.Cleanup(func() {
+		if err := owned.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	return owned
+}
+func nativeDeleteAbsent(t *testing.T, path string) {
+	t.Helper()
+	name, err := win.UTF16PtrFromString(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = win.GetFileAttributes(name)
+	if !errors.Is(err, win.ERROR_FILE_NOT_FOUND) && !errors.Is(err, win.ERROR_PATH_NOT_FOUND) {
+		t.Fatalf("deleted native path %q error=%v", path, err)
+	}
+}
+
+type nativeDeleteReceipts struct {
+	mu      sync.Mutex
+	creates []wire.CreateRequest
+	closes  []uint32
+	err     error
+}
+
+func (r *nativeDeleteReceipts) fail(err error) { r.mu.Lock(); defer r.mu.Unlock(); r.err = err }
+func (r *nativeDeleteReceipts) request(packet []byte) {
+	if string(packet[:4]) != "\xfeSMB" {
+		return
+	}
+	requests, err := wire.ParseFrame(packet, wire.Limits{MaxBytes: 2 << 20, MaxCommands: 32, MaxContexts: 16})
+	if err != nil {
+		r.fail(err)
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, request := range requests {
+		if request.Header.Command != wire.Create && request.Header.Command != wire.Close {
+			continue
+		}
+		if request.Header.Flags&wire.FlagSigned == 0 {
+			r.err = fmt.Errorf("native delete request is unsigned")
+			return
+		}
+		if request.Header.Command == wire.Create {
+			create, err := request.Create()
+			if err != nil {
+				r.err = err
+				return
+			}
+			if create.Options&0x1000 != 0 {
+				if len(r.creates) >= 32 {
+					r.err = fmt.Errorf("native close-delete trace exceeds 32 opens")
+					return
+				}
+				create.Name, create.Contexts = "", nil
+				r.creates = append(r.creates, create)
+			}
+		}
+	}
+}
+func (r *nativeDeleteReceipts) response(packet []byte) {
+	if string(packet[:4]) != "\xfeSMB" {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for commands := 0; commands < 32; commands++ {
+		header, err := wire.ParseHeader(packet)
+		if err != nil {
+			r.err = err
+			return
+		}
+		if header.Command == wire.Close {
+			if len(r.closes) >= 128 {
+				r.err = fmt.Errorf("native close-delete trace exceeds 128 closes")
+				return
+			}
+			if header.Flags&(wire.FlagResponse|wire.FlagSigned) != (wire.FlagResponse | wire.FlagSigned) {
+				r.err = fmt.Errorf("native CLOSE response lacks signed response flags")
+				return
+			}
+			r.closes = append(r.closes, header.Status)
+		}
+		if header.NextCommand == 0 {
+			return
+		}
+		if header.NextCommand < wire.HeaderSize || uint64(header.NextCommand)+wire.HeaderSize > uint64(len(packet)) {
+			r.err = wire.ErrMalformed
+			return
+		}
+		packet = packet[header.NextCommand:]
+	}
+	r.err = fmt.Errorf("native close-delete response exceeds compound bound")
+}
+func (r *nativeDeleteReceipts) closeCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.closes)
+}
+func (r *nativeDeleteReceipts) waitClose(t *testing.T, start int, expected uint32) uint32 {
+	t.Helper()
+	deadline := time.NewTimer(10 * time.Second)
+	defer deadline.Stop()
+	for {
+		r.mu.Lock()
+		err := r.err
+		for _, status := range r.closes[start:] {
+			if status == expected {
+				r.mu.Unlock()
+				if err != nil {
+					t.Fatal(err)
+				}
+				return status
+			}
+		}
+		r.mu.Unlock()
+		if err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case <-deadline.C:
+			t.Fatalf("native close emitted no SMB CLOSE with status %#x", expected)
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+}
+func (r *nativeDeleteReceipts) report(t *testing.T) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.err != nil {
+		t.Error(r.err)
+	}
+	if len(r.creates) == 0 {
+		t.Error("native probe emitted no signed delete-on-close CREATE")
+	}
+	for _, create := range r.creates {
+		t.Logf("native delete CREATE: access=%#x share=%#x disposition=%d options=%#x", create.DesiredAccess, create.ShareAccess, create.Disposition, create.Options)
+	}
+}
+
+type nativeDeleteListener struct {
+	net.Listener
+	receipts    *nativeDeleteReceipts
+	mu          sync.Mutex
+	connections []net.Conn
+}
+
+func (l *nativeDeleteListener) Accept() (net.Conn, error) {
+	c, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	l.mu.Lock()
+	l.connections = append(l.connections, c)
+	l.mu.Unlock()
+	return &nativeDeleteConnection{Conn: c, input: nativeFrameStream{record: l.receipts.request, fail: l.receipts.fail}, output: nativeFrameStream{record: l.receipts.response, fail: l.receipts.fail}}, nil
+}
+func (l *nativeDeleteListener) disconnect(t *testing.T) {
+	l.mu.Lock()
+	connections := append([]net.Conn(nil), l.connections...)
+	l.mu.Unlock()
+	for _, c := range connections {
+		if err := c.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			t.Fatal(err)
+		}
+	}
+}
+
+type nativeDeleteConnection struct {
+	net.Conn
+	input, output nativeFrameStream
+}
+
+func (c *nativeDeleteConnection) Read(p []byte) (int, error) {
+	n, err := c.Conn.Read(p)
+	c.input.capture(p[:n])
+	return n, err
+}
+func (c *nativeDeleteConnection) Write(p []byte) (int, error) {
+	n, err := c.Conn.Write(p)
+	c.output.capture(p[:n])
+	return n, err
+}
