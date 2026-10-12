@@ -6,19 +6,16 @@ import {
   FileText,
   Folder,
   HardDrive,
-  LayoutGrid,
   LockKeyhole,
   MoreHorizontal,
   Plus,
   Search,
-  Settings2,
   Terminal,
   Trash2,
 } from "lucide-react";
 import {
-  APIError,
   ManagementClient,
-  OutcomeUnknown,
+  MutationOutcomeUnknown,
   publicError,
 } from "../api/management";
 import { Empty, Failure, Loading } from "../components/States";
@@ -61,23 +58,21 @@ export const VolumeBadge = ({ volume }: { volume: Volume }) => {
   );
 };
 type Dialog = {
-  type: "create" | "rename" | "quota" | "delete";
+  type: "create" | "rename" | "delete";
   volume?: Volume;
 } | null;
 export const Volumes = ({
   api,
   onOpen,
   onNotice,
-  onAction,
+  onChanged,
   revision,
-  onInspectOperation,
 }: {
   api: ManagementClient;
   onOpen: (volume: Volume) => void;
   onNotice: (message: string) => void;
-  onAction: () => void;
+  onChanged: () => void;
   revision: number;
-  onInspectOperation: (id: string) => void;
 }) => {
   const generation = useRef(0);
   const [volumes, setVolumes] = useState<Volume[]>([]);
@@ -320,16 +315,6 @@ export const Volumes = ({
                       </td>
                       <td>
                         <VolumeBadge volume={volume} />
-                        {volume.lastOperationId && (
-                          <button
-                            className="operation-link"
-                            onClick={() =>
-                              onInspectOperation(volume.lastOperationId!)
-                            }
-                          >
-                            查看操作
-                          </button>
-                        )}
                       </td>
                       <td>
                         {volume.summary ? (
@@ -435,17 +420,6 @@ export const Volumes = ({
                                   <FileText size={15} />
                                   改名
                                 </button>
-                                <button
-                                  disabled={
-                                    volume.state !== "active" || !volume.summary
-                                  }
-                                  onClick={() =>
-                                    openDialog({ type: "quota", volume })
-                                  }
-                                >
-                                  <Settings2 size={15} />
-                                  调整配额
-                                </button>
                                 <div className="dropdown-divider" />
                                 <button
                                   className="danger"
@@ -508,7 +482,7 @@ export const Volumes = ({
         </div>
         <div>
           <strong>从终端连接你的文件空间</strong>
-          <p>CLI 使用同一套访问权限，适合挂载和自动化工作流。</p>
+          <p>CLI 使用同一套访问权限，适合自动化工作流。</p>
         </div>
         <code>remote-fs volume list</code>
       </div>
@@ -518,7 +492,7 @@ export const Volumes = ({
           api={api}
           onClose={() => setDialog(null)}
           onNotice={onNotice}
-          onAction={onAction}
+          onChanged={onChanged}
         />
       )}
     </>
@@ -529,48 +503,31 @@ const VolumeDialog = ({
   api,
   onClose,
   onNotice,
-  onAction,
+  onChanged,
 }: {
   dialog: NonNullable<Dialog>;
   api: ManagementClient;
   onClose: () => void;
   onNotice: (message: string) => void;
-  onAction: () => void;
+  onChanged: () => void;
 }) => {
   const current = dialog.volume;
-  const existingQuota = current?.summary?.quotaBytes;
-  const defaultUnit =
-    existingQuota !== undefined && existingQuota % 1024n ** 3n === 0n
-      ? "GiB"
-      : "B";
-  const [value, setValue] = useState(
-    dialog.type === "create"
-      ? "20"
-      : existingQuota !== undefined
-        ? (defaultUnit === "GiB"
-            ? existingQuota / 1024n ** 3n
-            : existingQuota
-          ).toString()
-        : "",
-  );
-  const [unit, setUnit] = useState(
-    dialog.type === "create" ? "GiB" : defaultUnit,
-  );
-  const [confirmed, setConfirmed] = useState(false);
+  const [value, setValue] = useState("20");
+  const [unit, setUnit] = useState("GiB");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [outcomeUnknown, setOutcomeUnknown] = useState(false);
   let parsedQuota: bigint | undefined;
   try {
-    if (dialog.type === "create" || dialog.type === "quota")
-      parsedQuota = quotaInput(value, unit);
+    if (dialog.type === "create") parsedQuota = quotaInput(value, unit);
   } catch {}
-  const lowering =
-    dialog.type === "quota" &&
-    parsedQuota !== undefined &&
-    existingQuota !== undefined &&
-    parsedQuota < existingQuota;
+  const close = () => {
+    if (outcomeUnknown) onChanged();
+    onClose();
+  };
   const submit = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
+    if (busy || outcomeUnknown) return;
     setError("");
     const data = new FormData(event.currentTarget);
     setBusy(true);
@@ -583,22 +540,26 @@ const VolumeDialog = ({
         const name = String(data.get("name"));
         if (!name.trim()) throw new Error("请输入 volume 名称。");
         await api.renameVolume(current, name);
-      } else if (dialog.type === "quota" && current) {
-        if (lowering && !confirmed) throw new Error("请确认降低配额的影响。");
-        await api.setQuota(current, quotaInput(value, unit));
       } else if (dialog.type === "delete" && current) {
         if (data.get("confirmation") !== current.name)
           throw new Error("输入的名称与目标 volume 不一致。");
         await api.deleteVolume(current);
       } else throw new Error("操作缺少目标。");
-      onAction();
+      onChanged();
       onClose();
-      onNotice("服务已接收操作，请查看持久操作进度。");
+      onNotice(
+        dialog.type === "create"
+          ? "Volume 已创建。"
+          : dialog.type === "rename"
+            ? "Volume 名称已修改。"
+            : "Volume 已删除。",
+      );
     } catch (error) {
-      if (error instanceof OutcomeUnknown) {
-        onAction();
-        onClose();
-        onNotice(error.message);
+      if (error instanceof MutationOutcomeUnknown) {
+        setOutcomeUnknown(true);
+        setError(
+          "请求结果未知。请刷新 volumes 列表核对当前状态；刷新不能保证确认该请求是否已完成，请勿直接重复提交。",
+        );
       } else setError(errorMessage(error));
     } finally {
       setBusy(false);
@@ -607,11 +568,10 @@ const VolumeDialog = ({
   const titles = {
     create: "创建 volume",
     rename: "修改 volume 名称",
-    quota: "调整容量配额",
     delete: "删除 volume",
   };
   return (
-    <Modal title={titles[dialog.type]} onClose={onClose} busy={busy}>
+    <Modal title={titles[dialog.type]} onClose={close} busy={busy}>
       <form onSubmit={(event) => void submit(event)}>
         <div className="modal-body">
           {dialog.type === "create" && (
@@ -646,16 +606,8 @@ const VolumeDialog = ({
               </label>
             </>
           )}
-          {(dialog.type === "create" || dialog.type === "quota") && (
+          {dialog.type === "create" && (
             <>
-              {current?.summary && (
-                <div className="quota-current">
-                  <span>当前已使用空间</span>
-                  <strong title={exactBytes(current.summary.usedBytes)}>
-                    {formatBytes(current.summary.usedBytes)}
-                  </strong>
-                </div>
-              )}
               <label>
                 容量配额
                 <div className="quota-form-row">
@@ -663,19 +615,13 @@ const VolumeDialog = ({
                     name="quota"
                     inputMode="decimal"
                     value={value}
-                    onChange={(event) => {
-                      setValue(event.target.value);
-                      setConfirmed(false);
-                    }}
+                    onChange={(event) => setValue(event.target.value)}
                     required
                   />
                   <select
                     aria-label="容量单位"
                     value={unit}
-                    onChange={(event) => {
-                      setUnit(event.target.value);
-                      setConfirmed(false);
-                    }}
+                    onChange={(event) => setUnit(event.target.value)}
                   >
                     <option value="B">字节</option>
                     <option value="MiB">MiB</option>
@@ -688,33 +634,6 @@ const VolumeDialog = ({
                 <div className="form-note">
                   确切容量：{exactBytes(parsedQuota)}
                 </div>
-              )}
-              {lowering && (
-                <>
-                  <div className="alert warning">
-                    <CircleAlert size={17} />
-                    <div>
-                      <strong>降低 {current!.name} 的配额</strong>
-                      <p>
-                        配额从 {formatBytes(existingQuota!)} 降为{" "}
-                        {formatBytes(parsedQuota!)}。
-                        {current?.summary &&
-                        parsedQuota! < current.summary.usedBytes
-                          ? "已有内容保留，可继续读取和释放空间，增加占用的操作会被拒绝。"
-                          : "可用空间将相应减少。"}
-                      </p>
-                    </div>
-                  </div>
-                  <label className="checkbox-label">
-                    <input
-                      type="checkbox"
-                      checked={confirmed}
-                      onChange={(event) => setConfirmed(event.target.checked)}
-                      required
-                    />
-                    我确认以上目标和容量影响
-                  </label>
-                </>
               )}
             </>
           )}
@@ -748,27 +667,35 @@ const VolumeDialog = ({
           )}
         </div>
         <div className="modal-footer">
-          <button
-            className="button secondary"
-            type="button"
-            disabled={busy}
-            onClick={onClose}
-          >
-            取消
-          </button>
-          <button
-            className={`button ${dialog.type === "delete" ? "danger-button" : "primary"}`}
-            disabled={busy || (lowering && !confirmed)}
-            type="submit"
-          >
-            {busy
-              ? "正在提交…"
-              : dialog.type === "create"
-                ? "创建 volume"
-                : dialog.type === "delete"
-                  ? "确认删除"
-                  : "提交操作"}
-          </button>
+          {!outcomeUnknown && (
+            <button
+              className="button secondary"
+              type="button"
+              disabled={busy}
+              onClick={close}
+            >
+              取消
+            </button>
+          )}
+          {outcomeUnknown ? (
+            <button className="button primary" type="button" onClick={close}>
+              刷新列表并关闭
+            </button>
+          ) : (
+            <button
+              className={`button ${dialog.type === "delete" ? "danger-button" : "primary"}`}
+              disabled={busy}
+              type="submit"
+            >
+              {busy
+                ? "正在提交…"
+                : dialog.type === "create"
+                  ? "创建 volume"
+                  : dialog.type === "delete"
+                    ? "确认删除"
+                    : "保存名称"}
+            </button>
+          )}
         </div>
       </form>
     </Modal>

@@ -1,27 +1,7 @@
 {
 	admin off
-	servers {
-		timeouts {
-			read_header 5s
-			read_body 30m
-			write 30m
-			idle 1m
-		}
-		max_header_size 32KB
-	}
 }
 
 {$RFS_SITE} {
-	request_body {
-		max_size 2GB
-	}
-	reverse_proxy 127.0.0.1:8080 {
-		flush_interval -1
-		transport http {
-			dial_timeout 5s
-			response_header_timeout 30s
-			read_timeout 30m
-			write_timeout 30m
-		}
-	}
+	reverse_proxy 127.0.0.1:8080
 }

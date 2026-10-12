@@ -160,9 +160,6 @@ func retainedReferencePresent(value retainedReference) bool {
 
 func (h *Handler) openReference(ctx context.Context, session *servedFileSession, request fileRequest) (fileResponse, error) {
 	response := fileResponse{}
-	if err := storage.RequireAccessBinding(ctx, session.binding); err != nil {
-		return response, err
-	}
 	session.mu.Lock()
 	if len(session.files) >= session.options.MaxFiles {
 		session.mu.Unlock()

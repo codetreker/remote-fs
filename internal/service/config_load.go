@@ -67,8 +67,6 @@ func ParseConfig(reader io.Reader) (Config, error) {
 			err = configurationDecode(name, node, &config.Listen)
 		case "trusted_proxy_cidrs":
 			err = configurationDecode(name, node, &config.TrustedProxyCIDRs)
-		case "runtime_idle_timeout":
-			err = configurationDuration(name, node, &config.IdleRuntimeTimeout)
 		case "shutdown_timeout":
 			err = configurationDuration(name, node, &config.ShutdownTimeout)
 		default:

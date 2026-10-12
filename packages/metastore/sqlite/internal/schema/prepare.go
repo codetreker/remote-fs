@@ -30,8 +30,7 @@ import (
 // 0008_directory_revisions.sql adds persistent directory name-set revisions;
 // 0009_delete_intent_owners.sql adds owner-scoped intent discovery;
 // 0010_virtual_allocation.sql records virtual allocation and its volume total;
-// 0011_volume_creation.sql stores the independent volume creation instant;
-// 0012_service_authority.sql stores named-node counters, quota and durable actions.
+// 0011_volume_creation.sql stores the independent volume creation instant.
 //
 // packages/sqliteschema documents what a numbered set of files buys and what rule they are kept
 // under: a file that has landed is never edited, and a schema change is a new file.

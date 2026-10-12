@@ -376,8 +376,8 @@ func checkTypedJSONValue(decoder *json.Decoder, typ reflect.Type, maxElements in
 		if err != nil || end != json.Delim('}') {
 			return errors.New("JSON map is incomplete")
 		}
-	case reflect.Slice, reflect.Array:
-		if typ.Kind() == reflect.Slice && typ.Elem().Kind() == reflect.Uint8 {
+	case reflect.Slice:
+		if typ.Elem().Kind() == reflect.Uint8 {
 			encoded, ok := token.(string)
 			if !ok {
 				return errors.New("lock JSON byte strings require base64 text")
@@ -411,9 +411,6 @@ func checkTypedJSONValue(decoder *json.Decoder, typ reflect.Type, maxElements in
 		}
 		count := 0
 		limit := maxElements
-		if typ.Kind() == reflect.Array {
-			limit = typ.Len()
-		}
 		fixedBytes := int64(0)
 		if guardBudget != nil {
 			switch typ {
@@ -442,9 +439,6 @@ func checkTypedJSONValue(decoder *json.Decoder, typ reflect.Type, maxElements in
 		end, err := decoder.Token()
 		if err != nil || end != json.Delim(']') {
 			return errors.New("lock JSON array is incomplete")
-		}
-		if typ.Kind() == reflect.Array && count != typ.Len() {
-			return errors.New("JSON fixed array has the wrong length")
 		}
 	default:
 		if _, nested := token.(json.Delim); nested {

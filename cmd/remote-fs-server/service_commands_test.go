@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -45,7 +46,7 @@ func TestServiceOfflineAdministratorResetRetainsIdentityAndAnchor(t *testing.T) 
 	}
 	var output bytes.Buffer
 	command := func(arguments ...string) error {
-		return runServiceCommand(ctx, append(arguments, "--config", path), nil, &output)
+		return run(append(arguments, "--config", path), &output)
 	}
 	if err := command("init"); err != nil {
 		t.Fatal(err)
@@ -143,4 +144,42 @@ func writeServiceCommandConfiguration(t *testing.T, state, listen string) string
 		t.Fatal(err)
 	}
 	return path
+}
+
+func TestServiceRunRejectsInvalidCommandsWithoutCreatingState(t *testing.T) {
+	state := filepath.Join(t.TempDir(), "not-created")
+	config := writeServiceCommandConfiguration(t, state, "127.0.0.1:0")
+	for _, test := range []struct {
+		name string
+		args []string
+		want string
+	}{
+		{"missing admin action", []string{"admin"}, "admin requires"},
+		{"unknown command", []string{"unknown", "--config", config}, "unknown service command"},
+		{"missing configuration", []string{"serve"}, "--config is required"},
+		{"positional argument", []string{"init", "--config", config, "unexpected"}, "positional arguments"},
+		{"admin flags on serve", []string{"serve", "--config", config, "--login", "admin"}, "administrator flags"},
+		{"missing display name", []string{"admin", "create", "--config", config, "--login", "admin"}, "--display-name"},
+		{"absent password file", []string{"admin", "create", "--config", config, "--login", "admin", "--display-name", "Administrator", "--password-file", filepath.Join(t.TempDir(), "absent")}, "no such file"},
+		{"absent configuration", []string{"init", "--config", filepath.Join(t.TempDir(), "absent")}, "no such file"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			err := run(test.args, io.Discard)
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("command error = %v, expected %q", err, test.want)
+			}
+			if _, err := os.Stat(state); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("invalid command created state: %v", err)
+			}
+		})
+	}
+	for _, args := range [][]string{{"serve", "--help"}, {"reference", "--help"}} {
+		var output bytes.Buffer
+		if err := run(args, &output); err != nil || !strings.Contains(strings.ToLower(output.String()), "usage") {
+			t.Fatalf("help result = %v, output = %q", err, output.String())
+		}
+	}
+	if err := run([]string{"serve", "--unknown"}, io.Discard); !errors.Is(err, errUsage) {
+		t.Fatalf("invalid flags did not report usage: %v", err)
+	}
 }

@@ -1,8 +1,10 @@
 package serviceapi
 
 import (
+	"encoding/base64"
 	"errors"
 	"reflect"
+	"strings"
 )
 
 func requirePositive(value Decimal) error {
@@ -46,7 +48,7 @@ func validateSummary(summary *VolumeSummary, problem *ErrorDetail) error {
 			return err
 		}
 	}
-	return requirePositive(summary.QuotaRevision)
+	return nil
 }
 
 func validateVolume(volume Volume) error {
@@ -58,11 +60,6 @@ func validateVolume(volume Volume) error {
 	}
 	if err := validateID(volume.OwnerUserID); err != nil {
 		return err
-	}
-	if volume.LastOperationID != "" {
-		if err := validateID(volume.LastOperationID); err != nil {
-			return err
-		}
 	}
 	if err := requirePositive(volume.Revision); err != nil {
 		return err
@@ -79,78 +76,6 @@ func validateVolume(volume Volume) error {
 		return errors.New("invalid volume state")
 	}
 	return validateSummary(volume.Summary, volume.SummaryError)
-}
-
-func validateOperation(operation Operation) error {
-	if err := validateID(operation.ID); err != nil {
-		return err
-	}
-	if err := validateID(operation.VolumeID); err != nil {
-		return err
-	}
-	if err := requirePositive(operation.Revision); err != nil {
-		return err
-	}
-	if _, err := operation.Revision.Int64(); err != nil {
-		return err
-	}
-	if operation.CreatedAt.IsZero() || operation.UpdatedAt.IsZero() {
-		return errors.New("missing operation timestamp")
-	}
-	switch operation.Kind {
-	case "create", "rename", "quota", "delete":
-	default:
-		return errors.New("invalid operation kind")
-	}
-	switch operation.State {
-	case "pending", "running", "succeeded", "failed":
-	default:
-		return errors.New("invalid operation state")
-	}
-	switch operation.Phase {
-	case "accepted", "initializing", "bound", "applying", "frozen", "verified-close", "quarantined", "reclaiming", "completed":
-	default:
-		return errors.New("invalid operation phase")
-	}
-	if operation.State == "succeeded" && !operation.Settled {
-		return errors.New("successful operation has unsettled responsibility")
-	}
-	if operation.State == "succeeded" && operation.Phase != "completed" {
-		return errors.New("terminal operation has incomplete phase")
-	}
-	if operation.Phase == "completed" && operation.State != "succeeded" {
-		return errors.New("incomplete operation claims completed phase")
-	}
-	if operation.State != "failed" && operation.Error != nil {
-		return errors.New("nonfailed operation contains an error")
-	}
-	if operation.State == "failed" && operation.Error == nil {
-		return errors.New("failed operation omits its error")
-	}
-	if operation.Settled && operation.State != "failed" && operation.State != "succeeded" {
-		return errors.New("nonterminal operation claims settlement")
-	}
-	if operation.State == "pending" && operation.Phase != "accepted" {
-		return errors.New("pending operation claims an advanced phase")
-	}
-	allowed := false
-	switch operation.Kind {
-	case "create":
-		allowed = operation.Phase == "accepted" || operation.Phase == "initializing" || operation.Phase == "bound" || operation.Phase == "completed"
-	case "rename":
-		allowed = operation.Phase == "completed"
-	case "quota":
-		allowed = operation.Phase == "accepted" || operation.Phase == "applying" || operation.Phase == "completed"
-	case "delete":
-		allowed = operation.Phase == "accepted" || operation.Phase == "frozen" || operation.Phase == "verified-close" || operation.Phase == "quarantined" || operation.Phase == "reclaiming" || operation.Phase == "completed"
-	}
-	if !allowed {
-		return errors.New("operation phase is invalid for its kind")
-	}
-	if operation.Error != nil && !validErrorCode(operation.Error.Code) {
-		return errors.New("invalid operation error")
-	}
-	return nil
 }
 
 func validateCredential(credential CredentialInfo) error {
@@ -213,14 +138,6 @@ func validateCredential(credential CredentialInfo) error {
 
 func validateResponse(value any) error {
 	switch result := value.(type) {
-	case *Capabilities:
-		if _, err := result.FileSession.NativeOptions(); err != nil {
-			return err
-		}
-		if _, err := result.MaxTransferBytes.Int64(); err != nil {
-			return err
-		}
-		return requirePositive(result.MaxTransferBytes)
 	case *CredentialLogin:
 		if err := validateCredential(result.Credential); err != nil {
 			return err
@@ -228,21 +145,8 @@ func validateResponse(value any) error {
 		return validateUser(result.User)
 	case *CredentialInfo:
 		return validateCredential(*result)
-	case *ActionNamespace:
-		if err := validateID(result.SubjectID); err != nil {
-			return err
-		}
-		if result.AcceptUntil.IsZero() {
-			return errors.New("missing action acceptance expiry")
-		}
-		if _, err := result.Namespace.Int64(); err != nil {
-			return err
-		}
-		return requirePositive(result.Namespace)
 	case *Volume:
 		return validateVolume(*result)
-	case *Operation:
-		return validateOperation(*result)
 	case *VolumeList:
 		if result.Volumes == nil {
 			return errors.New("volume list is missing")
@@ -250,6 +154,33 @@ func validateResponse(value any) error {
 		for _, volume := range result.Volumes {
 			if err := validateVolume(volume); err != nil {
 				return err
+			}
+		}
+	case *FileDirectory:
+		if _, err := base64.StdEncoding.Strict().DecodeString(result.PathBase64); err != nil {
+			return err
+		}
+		if result.Entries == nil {
+			return errors.New("directory entries are missing")
+		}
+		for _, entry := range result.Entries {
+			if err := requirePositive(entry.NodeID); err != nil {
+				return err
+			}
+			if _, err := entry.SizeBytes.Int64(); err != nil {
+				return err
+			}
+			name, err := base64.StdEncoding.Strict().DecodeString(entry.NameBase64)
+			if err != nil || base64.StdEncoding.EncodeToString(name) != entry.NameBase64 || len(name) == 0 || string(name) == "." || string(name) == ".." || strings.ContainsAny(string(name), "/\x00") {
+				return errors.New("invalid directory entry name")
+			}
+			switch entry.Kind {
+			case "directory", "file", "symlink":
+			default:
+				return errors.New("invalid file kind")
+			}
+			if entry.ModifiedAt.IsZero() {
+				return errors.New("missing file modification time")
 			}
 		}
 	case *UserList:

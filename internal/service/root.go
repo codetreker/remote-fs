@@ -23,8 +23,6 @@ type stateRoot struct {
 	DataPath       string
 	ManagementPath string
 	VolumesPath    string
-	QuarantinePath string
-	TransfersPath  string
 	AnchorID       management.ID
 	DatabaseID     management.ID
 	root           *os.File
@@ -54,8 +52,6 @@ func openRoot(ctx context.Context, config Config, create bool) (_ *stateRoot, re
 	r := &stateRoot{Path: config.StateRoot, DataPath: filepath.Join(config.StateRoot, "data")}
 	r.ManagementPath = filepath.Join(r.DataPath, "management.sqlite")
 	r.VolumesPath = filepath.Join(r.DataPath, "volumes")
-	r.QuarantinePath = filepath.Join(r.DataPath, "quarantine")
-	r.TransfersPath = filepath.Join(r.DataPath, "transfers")
 	defer func() {
 		if returned != nil {
 			returned = errors.Join(returned, r.Close())
@@ -112,7 +108,7 @@ func (r *stateRoot) openData(create bool) error {
 		return err
 	}
 	r.directories = append(r.directories, r.data)
-	for _, name := range []string{"volumes", "quarantine", "transfers"} {
+	for _, name := range []string{"volumes"} {
 		directory, err := openPrivateDirectory(r.data, name, create)
 		if err != nil {
 			return err
@@ -276,11 +272,11 @@ func (r *stateRoot) requireFresh() error {
 	if err != nil {
 		return err
 	}
-	if len(entries) != 3 {
+	if len(entries) != 1 {
 		return errors.New("initialization requires an empty data root; existing state requires maintenance")
 	}
 	for _, entry := range entries {
-		if entry.Name() != "volumes" && entry.Name() != "quarantine" && entry.Name() != "transfers" {
+		if entry.Name() != "volumes" {
 			return errors.New("initialization cannot adopt existing or unknown data")
 		}
 	}
@@ -290,7 +286,7 @@ func (r *stateRoot) requireFresh() error {
 			return err
 		}
 		if len(entries) != 0 {
-			return errors.New("initialization cannot adopt existing volume or transfer state")
+			return errors.New("initialization cannot adopt existing volume state")
 		}
 	}
 	return nil
@@ -446,34 +442,4 @@ func (r *stateRoot) validateAnchor() (returned error) {
 		return fmt.Errorf("stable service anchor identity was modified: %w", management.ErrCorrupt)
 	}
 	return nil
-}
-
-func (r *stateRoot) dataView() (_ *stateRoot, returned error) {
-	view := &stateRoot{Path: r.Path, DataPath: r.DataPath, ManagementPath: r.ManagementPath, AnchorID: r.AnchorID, DatabaseID: r.DatabaseID,
-		VolumesPath: r.VolumesPath, QuarantinePath: r.QuarantinePath, TransfersPath: r.TransfersPath}
-	defer func() {
-		if returned != nil {
-			returned = errors.Join(returned, view.Close())
-		}
-	}()
-	var err error
-	view.data, err = openPrivateDirectory(r.root, "data", false)
-	if err != nil {
-		return nil, err
-	}
-	view.directories = append(view.directories, view.data)
-	for _, leaf := range []string{"volumes", "quarantine", "transfers"} {
-		directory, err := openPrivateDirectory(view.data, leaf, false)
-		if err != nil {
-			return nil, err
-		}
-		view.directories = append(view.directories, directory)
-	}
-	if err := view.readProof(); err != nil {
-		return nil, err
-	}
-	if view.DatabaseID != r.DatabaseID {
-		return nil, fmt.Errorf("service data belongs to another management database: %w", management.ErrCorrupt)
-	}
-	return view, nil
 }

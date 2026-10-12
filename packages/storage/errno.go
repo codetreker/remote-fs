@@ -29,7 +29,6 @@ var errnoNames = map[syscall.Errno]string{
 	syscall.EAGAIN:       "EAGAIN",
 	syscall.EBADF:        "EBADF",
 	syscall.EBUSY:        "EBUSY",
-	syscall.ECANCELED:    "ECANCELED",
 	syscall.EDEADLK:      "EDEADLK",
 	syscall.EDQUOT:       "EDQUOT",
 	syscall.EEXIST:       "EEXIST",

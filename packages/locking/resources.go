@@ -17,7 +17,7 @@ func (a *Authority) Resolve(ctx context.Context, ref OwnerRef, path string) (Res
 	err := a.healthyLocked(ctx, false)
 	if err == nil {
 		a.expireSessionsLocked(a.clock.Now())
-		_, err = a.ownerLocked(ctx, ref)
+		_, err = a.ownerLocked(ref)
 	}
 	a.mu.Unlock()
 	if err != nil {
@@ -31,7 +31,7 @@ func (a *Authority) Resolve(ctx context.Context, ref OwnerRef, path string) (Res
 			return false, err
 		}
 		a.expireSessionsLocked(a.clock.Now())
-		o, err := a.ownerLocked(ctx, ref)
+		o, err := a.ownerLocked(ref)
 		if err != nil {
 			return false, err
 		}

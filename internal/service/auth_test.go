@@ -18,8 +18,6 @@ import (
 	"time"
 
 	"github.com/codetreker/remote-fs/internal/management"
-	"github.com/codetreker/remote-fs/packages/authz"
-	"github.com/codetreker/remote-fs/packages/storage"
 	"github.com/codetreker/remote-fs/packages/storage/limited"
 )
 
@@ -274,14 +272,10 @@ func TestLoginRejectsCrossOriginDuplicateKeysAndAmbiguousCredentials(t *testing.
 	readAuthResponse(t, f.request(f.client, "GET", "/session", nil, credentialHeader(credential.ID, secret)), http.StatusUnauthorized, nil)
 }
 
-func TestCredentialRotationReplayGraceStableBindingAndRevocation(t *testing.T) {
+func TestCredentialRotationReplayGraceStableIdentityAndRevocation(t *testing.T) {
 	f := newAuthFixture(t, func(options *management.Options, _ *AuthConfig) { options.RotationGrace = 200 * time.Millisecond })
 	credential, secret := f.cliLogin()
 	p := f.bearerPrincipal(credential.ID, secret)
-	originalBinding, err := f.auth.AccessBinding(WithPrincipal(context.Background(), p))
-	if err != nil {
-		t.Fatal(err)
-	}
 	output, cancel, err := f.auth.OutputContext(context.Background(), p)
 	if err != nil {
 		t.Fatal(err)
@@ -330,9 +324,8 @@ func TestCredentialRotationReplayGraceStableBindingAndRevocation(t *testing.T) {
 		}
 	}
 	newPrincipal := f.bearerPrincipal(credential.ID, pending)
-	newBinding, err := f.auth.AccessBinding(WithPrincipal(context.Background(), newPrincipal))
-	if err != nil || newBinding != originalBinding {
-		t.Fatalf("rotation changed access binding: %v, %+v", err, newBinding)
+	if newPrincipal.UserID != p.UserID || newPrincipal.AuthenticationID != p.AuthenticationID {
+		t.Fatal("rotation changed subject or authentication identity")
 	}
 	select {
 	case <-output.Done():
@@ -391,37 +384,33 @@ func TestAdminRoleCannotAccessAnotherOwnersFiles(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	namespace, err := issueServiceFixtureNamespace(context.Background(), f.store, other.ID)
+	privateVolume, err := f.store.CreateVolume(context.Background(), other.ID, "Private", limited.MinLimit)
 	if err != nil {
 		t.Fatal(err)
 	}
-	operation, err := f.store.CreateVolume(context.Background(), other.ID, management.ActionKey{Namespace: namespace.Sequence, Nonce: "create"}, "Private", limited.MinLimit)
+	privateVolume, err = f.store.SetVolumeState(context.Background(), other.ID, privateVolume.ID, privateVolume.ManagementRevision, management.VolumeActive, "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	credential, secret := f.cliLogin()
 	p := f.bearerPrincipal(credential.ID, secret)
-	if err := f.auth.CheckFileAccess(context.Background(), p, operation.VolumeID); !errors.Is(err, ErrForbidden) {
+	if err := f.auth.CheckFileAccess(context.Background(), p, privateVolume.ID); !errors.Is(err, ErrForbidden) {
 		t.Fatalf("admin file access: %v", err)
 	}
-	authorizer := f.auth.Authorizer(operation.VolumeID)
-	if err := authorizer.Authorize(WithPrincipal(context.Background(), p), authz.AccessRequest{Volume: string(operation.VolumeID), Operation: storage.OpVolumeList}); !errors.Is(err, authz.ErrDenied) {
-		t.Fatalf("semantic admin access: %v", err)
-	}
-	ownNamespace, err := issueServiceFixtureNamespace(context.Background(), f.store, f.admin.ID)
+	own, err := f.store.CreateVolume(context.Background(), f.admin.ID, "Own", limited.MinLimit)
 	if err != nil {
 		t.Fatal(err)
 	}
-	own, err := f.store.CreateVolume(context.Background(), f.admin.ID, management.ActionKey{Namespace: ownNamespace.Sequence, Nonce: "own"}, "Own", limited.MinLimit)
+	own, err = f.store.SetVolumeState(context.Background(), f.admin.ID, own.ID, own.ManagementRevision, management.VolumeActive, "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := f.auth.CheckFileAccess(context.Background(), p, own.VolumeID); err != nil {
+	if err := f.auth.CheckFileAccess(context.Background(), p, own.ID); err != nil {
 		t.Fatal(err)
 	}
 	p.AllOwnedVolumes = false
-	p.VolumeIDs = []management.ID{operation.VolumeID}
-	if err := f.auth.CheckFileAccess(context.Background(), p, own.VolumeID); !errors.Is(err, ErrForbidden) {
+	p.VolumeIDs = []management.ID{privateVolume.ID}
+	if err := f.auth.CheckFileAccess(context.Background(), p, own.ID); !errors.Is(err, ErrForbidden) {
 		t.Fatalf("scope did not fence owned runtime admission: %v", err)
 	}
 }
@@ -671,9 +660,6 @@ func TestMalformedAuthenticationAndMiddlewareNeverInventIdentity(t *testing.T) {
 		t.Fatalf("duplicate cookies: %v", err)
 	}
 	request.Header.Del("Cookie")
-	if _, err := f.auth.AccessBinding(context.Background()); !errors.Is(err, ErrUnauthenticated) || !errors.Is(err, authz.ErrDenied) {
-		t.Fatalf("binding without identity: %v", err)
-	}
 	handler := f.auth.Middleware(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { t.Error("unauthenticated middleware invoked handler") }))
 	recorder := httptest.NewRecorder()
 	handler.ServeHTTP(recorder, request)

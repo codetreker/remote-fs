@@ -8,11 +8,6 @@ CREATE TABLE users (
     role TEXT NOT NULL CHECK(role IN ('admin','user')),
     display_name TEXT NOT NULL CHECK(length(display_name) BETWEEN 1 AND 128),
     auth_epoch INTEGER NOT NULL CHECK(auth_epoch>=1),
-    next_action_namespace INTEGER NOT NULL CHECK(next_action_namespace>=1),
-    retired_before_namespace INTEGER NOT NULL CHECK(retired_before_namespace>=0 AND retired_before_namespace<next_action_namespace),
-    logical_time_high_water INTEGER NOT NULL CHECK(logical_time_high_water>=0),
-    retired_native_revision INTEGER NOT NULL DEFAULT 0 CHECK(retired_native_revision>=0),
-    retired_native_proof BLOB NOT NULL DEFAULT X'',
     created_at INTEGER NOT NULL CHECK(created_at>=0)
 ) STRICT;
 
@@ -82,23 +77,6 @@ CREATE TABLE credential_volumes (
     PRIMARY KEY(credential_id,volume_id)
 ) STRICT;
 
-CREATE TABLE action_namespaces (
-    actor_user_id TEXT NOT NULL,
-    sequence INTEGER NOT NULL CHECK(sequence>=1),
-    accept_until INTEGER NOT NULL CHECK(accept_until>=0),
-    retired_at INTEGER CHECK(retired_at>=0),
-    PRIMARY KEY(actor_user_id,sequence)
-) STRICT;
-
-CREATE TABLE namespace_volume_participants (
-    actor_user_id TEXT NOT NULL,
-    sequence INTEGER NOT NULL CHECK(sequence>=1),
-    volume_id TEXT NOT NULL,
-    created_at INTEGER NOT NULL CHECK(created_at>=0),
-    PRIMARY KEY(actor_user_id,sequence,volume_id)
-) STRICT;
-CREATE INDEX participant_volume ON namespace_volume_participants(volume_id);
-
 CREATE TABLE volumes (
     id TEXT PRIMARY KEY CHECK(length(id)=32 AND id NOT GLOB '*[^0-9a-f]*'),
     owner_user_id TEXT NOT NULL,
@@ -106,41 +84,14 @@ CREATE TABLE volumes (
     storage_name TEXT NOT NULL UNIQUE CHECK(storage_name=id),
     state TEXT NOT NULL CHECK(state IN ('creating','active','deleting','deleted','failed')),
     management_revision INTEGER NOT NULL CHECK(management_revision>=1),
-    last_operation_id TEXT NOT NULL,
+    initial_quota_bytes INTEGER NOT NULL CHECK(initial_quota_bytes>=4096),
+    error_code TEXT NOT NULL,
     created_at INTEGER NOT NULL CHECK(created_at>=0),
     updated_at INTEGER NOT NULL CHECK(updated_at>=created_at)
 ) STRICT;
 CREATE UNIQUE INDEX volume_owner_name ON volumes(owner_user_id,display_name) WHERE state<>'deleted';
 CREATE INDEX volume_owner ON volumes(owner_user_id,id);
 
-CREATE TRIGGER immutable_volume_identity BEFORE UPDATE OF id,owner_user_id,storage_name ON volumes
-WHEN NEW.id<>OLD.id OR NEW.owner_user_id<>OLD.owner_user_id OR NEW.storage_name<>OLD.storage_name
+CREATE TRIGGER immutable_volume_identity BEFORE UPDATE OF id,owner_user_id,storage_name,initial_quota_bytes ON volumes
+WHEN NEW.id<>OLD.id OR NEW.owner_user_id<>OLD.owner_user_id OR NEW.storage_name<>OLD.storage_name OR NEW.initial_quota_bytes<>OLD.initial_quota_bytes
 BEGIN SELECT RAISE(ABORT,'volume identity and ownership are immutable'); END;
-
-CREATE TABLE operations (
-    id TEXT PRIMARY KEY CHECK(length(id)=32 AND id NOT GLOB '*[^0-9a-f]*'),
-    actor_user_id TEXT NOT NULL,
-    volume_id TEXT NOT NULL,
-    kind TEXT NOT NULL CHECK(kind IN ('create','rename','quota','delete')),
-    action_namespace INTEGER NOT NULL CHECK(action_namespace>=1),
-    action_nonce TEXT NOT NULL,
-    fingerprint BLOB NOT NULL CHECK(length(fingerprint)=32),
-    expected_revision INTEGER NOT NULL CHECK(expected_revision>=0),
-    payload BLOB NOT NULL,
-    state TEXT NOT NULL CHECK(state IN ('pending','running','succeeded','failed')),
-    phase TEXT NOT NULL CHECK(phase IN ('accepted','initializing','bound','applying','frozen','verified-close','quarantined','reclaiming','completed')),
-    revision INTEGER NOT NULL CHECK(revision>=1),
-    verified_root_proof BLOB,
-    planned_reclaim_proof BLOB,
-    quarantine_leaf TEXT NOT NULL,
-    reclaiming_proof BLOB,
-    result BLOB,
-    error_code TEXT NOT NULL,
-    settled INTEGER NOT NULL DEFAULT 0 CHECK(settled IN (0,1)),
-    settlement_proof BLOB,
-    created_at INTEGER NOT NULL CHECK(created_at>=0),
-    updated_at INTEGER NOT NULL CHECK(updated_at>=created_at),
-    UNIQUE(actor_user_id,action_namespace,action_nonce),
-    CHECK(settled=0 OR state IN ('succeeded','failed'))
-) STRICT;
-CREATE INDEX operation_pending ON operations(state,id);

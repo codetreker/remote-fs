@@ -5,20 +5,13 @@ export type Session = {
   idleExpiresAt: string;
   absoluteExpiresAt: string;
 };
-export type ActionKey = { namespace: string; nonce: string };
-export type DurableAction = {
-  subjectId: string;
-  namespace: bigint;
-  nonce: string;
-};
 export type Summary = {
   fileCount: bigint;
   directoryCount: bigint;
   usedBytes: bigint;
   quotaBytes: bigint;
-  quotaRevision: bigint;
 };
-export type PublicSummary = Omit<Summary, "quotaRevision">;
+export type PublicSummary = Summary;
 export type ErrorDetail = { code: string };
 export type Volume = {
   id: string;
@@ -26,7 +19,6 @@ export type Volume = {
   name: string;
   state: string;
   revision: bigint;
-  lastOperationId?: string;
   createdAt: string;
   updatedAt: string;
   summary?: Summary;
@@ -37,19 +29,17 @@ export type UserVolume = {
   summary?: PublicSummary;
   summaryError?: ErrorDetail;
 };
-export type Operation = {
-  id: string;
-  volumeId: string;
-  kind: string;
-  state: string;
-  phase: string;
-  revision: bigint;
-  settled: boolean;
-  error?: ErrorDetail;
-  createdAt: string;
-  updatedAt: string;
-};
 export type Page<T> = { items: T[]; nextAfter?: string };
+export type FileEntry = {
+  name: string;
+  nameBase64: string;
+  pathBase64: string;
+  nodeId: bigint;
+  kind: "directory" | "file" | "symlink";
+  sizeBytes: bigint;
+  modifiedAt: string;
+};
+export type FileDirectory = { pathBase64: string; entries: FileEntry[] };
 export const formatCount = (count: bigint) =>
   new Intl.NumberFormat("zh-CN").format(count);
 export const formatBytes = (bytes: bigint) => {
@@ -94,21 +84,4 @@ export const quotaInput = (value: string, unit: string) => {
   if (bytes <= 0n || bytes > 9223372036854775807n)
     throw new Error("容量必须大于零且不超过 int64 字节上限。");
   return bytes;
-};
-export type FileSessionPolicy = {
-  leaseNanoseconds: bigint;
-  historyNanoseconds: bigint;
-  maxFileSize: bigint;
-  maxFiles: bigint;
-  maxOperations: bigint;
-  maxWaiters: bigint;
-  maxLockOwners: bigint;
-  maxLockRanges: bigint;
-  maxPendingLocks: bigint;
-  maxLockActions: bigint;
-  maxCloseActions: bigint;
-};
-export type ServiceCapabilities = {
-  fileSession: FileSessionPolicy;
-  maxTransferBytes: bigint;
 };

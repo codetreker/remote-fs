@@ -1,68 +1,60 @@
-# 独立多用户服务
+# 独立 volume 管理服务
 
-`internal/service` 将现有单 volume 文件能力组合为 Linux 服务、同源 Console 和 CLI 管理入口。服务持有用户、登录、immutable owner 和管理动作；文件 packages 保持嵌入方提供身份的单 volume 契约。对应 R-SVC-1 至 R-SVC-8。
+服务提供 Console/CLI volume 管理和只读文件元数据，复用现有 localstore、List、Stat 和 Space。文件 packages 的接口、SQLite schema、objectstore、localdisk、HTTP 文件协议和 locking 保持原有实现。
 
-## 组件和数据
+## 代码归属
 
 | 位置 | 职责 |
 |---|---|
-| `cmd/remote-fs-server` | serve、init、离线 admin create/reset 与既有 reference 入口 |
-| `cmd/remote-fs` | 登录、volume/user/operation/file 命令和 foreground mount |
-| `internal/service` | 认证、HTTP 路由、runtime 选择、create/quota/delete 和停止 |
-| `internal/management` | 具体 SQLite store，保存用户、credential、owner、volume 配置与操作状态 |
-| `internal/serviceapi` | 管理 wire 类型和 HTTP client，不持有 store 或权限 |
-| `internal/console` | TypeScript UI 与 Go embed，浏览器只访问同源 API |
-| `packages/` | 原生文件、日志、锁、summary/quota 和 import/export，不读取服务角色 |
+| `cmd/remote-fs-server` | serve、init、离线 admin create/reset 与 reference 入口 |
+| `cmd/remote-fs` | 登录、volume/user 管理及只读目录/元数据命令 |
+| `internal/service` | 认证、owner 校验、volume 选择、管理 API 与 store 生命周期 |
+| `internal/management` | 具体 SQLite store，保存用户、credential、owner 和 volume 配置 |
+| `internal/serviceapi` | 管理 wire 类型与 HTTP client |
+| `internal/console` | TypeScript UI 和 Go embed |
 
-`cmd → service/serviceapi`，`service → management + console + packages`。service 的 auth/runtime/lifecycle/routes 是同一个 package 的文件组。Console 先由 pnpm 构建，再嵌入 Go binary；部署和命令见[仓库 README](../../../README.md)。
+单 Go module。`cmd → service/serviceapi`，`service → management + console + packages`，packages 不导入 internal。Console 由 pnpm 构建后嵌入 Go binary；构建与部署见[仓库 README](../../../README.md)。
 
 ```text
-state_root/
-  service.lock
-  data/
-    root.json
-    management.sqlite
-    volumes/<volume-id>/
-    quarantine/<volume-id>-<operation-id>/
-    transfers/
+cmd/{remote-fs-server,remote-fs}/
+cmd/internal/password/
+internal/
+  service/          # auth、HTTP、store 选择与 volume CRUD
+  management/       # SQLite store 和 migrations
+  serviceapi/       # 管理/元数据 DTO 与 client
+  console/          # Go embed、TS src、lockfile、dist
+deployments/service/
+packages/           # 既有文件系统库
 ```
 
-server 与离线管理员命令竞争同一个私有 root 的 exclusive lock。root.json 和管理数据库身份匹配，native 根沿用 localstore 的持久绑定校验。volume ID 不复用，owner 和 storage name 不变，显示名可以改且不进入路径。管理库不复制文件树或有效 quota。
+私有 state root 保存管理 SQLite 和各 volume 的内部目录。server 与离线管理员命令竞争同一个独占锁。volume 的随机 ID、owner 和内部 storage name 不随显示名变化；目录路径由内部标识组成。native 根使用既有 localstore binding，管理库不复制文件树。
 
-## 身份与权限
+## 登录与授权
 
-本地管理员由离线命令建立/重设，密码保存 Argon2id hash。browser cookie 为 Secure、HttpOnly、SameSite Strict；cookie mutation 检查配置的 Origin 和独立 CSRF token，GET auth/session 供 reload 恢复当前 session/token。CLI 使用自己的有期限 credential，secret 保存在项目私有文件，服务仅保存 verifier；轮换保留用户和 credential identity。
+管理员通过离线命令创建/重设账号，密码保存 Argon2id hash。browser 使用 Secure/HttpOnly/SameSite cookie，mutation 检查同源 Origin 与 CSRF token；GET auth/session 恢复当前登录。CLI secret 保存在项目私有文件，服务保存 verifier。普通用户登录等待外部身份系统接入，没有生产临时登录入口。
 
-文件/mount/transfer 入口先认证并核对实际 immutable owner，再激活 runtime。管理员访问自己的文件同样经过 owner 检查，额外权限只有普通用户列表及五项 volume 摘要。summary 目标必须是 ordinary user，检查在目标 runtime 打开前完成；DTO 不含他人 volume ID、quota revision、文件 API 或文件事实。
+每个管理或文件元数据请求先认证、读取实际 owner，再取得 store。管理员对自己的资源使用相同 owner 检查；额外只读权限是 ordinary-user 列表和 volume 名称/文件数/目录数/Used/配额摘要。目标 role 和当前 admin 权限在摘要扫描前检查。他人文件路径、属性、内容和文件 API 不进入摘要 DTO，隐藏页面入口不代替 API 拒绝。
 
-Handler 的可选 AccessBinding 从可信 context 取得 opaque SubjectID/AccessID，附着到现有 file session/reference、locking session/enrollment/grant 与 volatile terminal history，不建立第二份 registry。同 owner 的不同 access 不能继承这些状态，credential 轮换保持 access。所有调用仍执行 Authorizer；持续输出检查当前身份，logout/revoke/到期停止其输出。replication cursor 只是历史 selector，新的有效同 owner 入口可以 resubscribe，输出继续按当前身份授权。
+身份响应 no-store，注销或切换身份清空 Console 私有页面状态。服务不挂载原 `/v5/` 文件 handler，也不签发远端文件或锁 capability。
 
-durable management/quota/import action 归稳定 subject 和固定 action key；同 subject 的新有效 credential 可以查询或续作原责任，不能继承旧 volatile capability。普通用户外部登录尚未接入，fresh 服务没有普通用户注册入口。
+## volume 和文件事实
 
-## 管理 API 和 Console
+创建使用现有 localstore 配置初始化唯一 volume 根，容量上限在此时指定。reopen 使用管理库中相同配置。显示名可以改，在线 quota 修改入口不存在。
 
-管理 prefix 为 `/api/service/v1`，身份响应 no-store。own-volume 入口提供 GET/POST volumes、GET/PATCH/DELETE volumes/{id} 和 PUT volumes/{id}/quota；auth 提供 login/logout/session 与自身 CLI credential 管理；action-namespaces/operations 提供原动作查询；admin/users 及 admin/users/{id}/volumes 仅提供只读 ordinary-user 信息。GET capabilities 返回实际文件 session/transfer 限制。
+文件浏览通过既有 List/Stat 取得路径、种类、大小和可用元数据，不读取内容。服务 DTO 用 decimal strings 保存整数，raw 名字与显示转义分开；显示字符串不替代实际请求路径。Console 文件页只有目录浏览和元数据。
 
-管理计数、字节和 revision 使用 decimal strings。管理员 volume 行只有 name/files/directories/used/quota 或固定安全 error，分页使用 actor/target 绑定的 opaque cursor。统计不可用不能返回零或旧缓存；quota CAS 使用 native quota revision，rename/delete 使用 management revision。
+摘要遍历现有 Log.Snapshot/Next 的元数据行计数，非目录（包括 symlink）各计一个文件，symlink target 不展开；root 不计目录。Used 与总量单独读取现有 Space，文件树不用于估算字节用量。snapshot 读取/关闭或 Space 失败返回明确安全错误，不返回零或旧结果。服务不新增原生计数器，也不承诺计数和 Space 的跨调用原子性。
 
-Console 页面为 Login、自己的 Volumes/Files 和管理员 Users。文件选择保留原始叶名字节和 NodeID，显示转义不进入请求 identity；raw leaf 使用 canonical padded standard base64。v5 numeric JSON 经 patched lossless codec 精确解析/序列化，大整数不经过 JS Number。注销或切换身份清空私有页面状态。文件页没有预览或在线编辑器。
+## 创建、改名和删除
 
-## 原生统计、配额和文件传输
+管理 SQLite 保存 owner、配置和 state。创建和改名完成后才返回成功；存储故障直接报告。删除先关闭服务持有的现有 store，再对可信 volume 根执行整目录 RemoveAll，确认成功后更新管理状态；这是删除整份存储，不是逐文件 mutation。close 或删除失败保留错误，不宣称成功，不引入 quarantine、native proof 或 action namespace 框架。
 
-VolumeSummary 在同一 healthy snapshot 返回 named file/directory counters、allocation Used、effective quota 和 revision。regular 与 symlink 各计一个文件，目录不计 root；脱名节点不进入个数，仍被引用的 allocation 进入 Used。strong-lock recovery 允许健康统计和读取，冲突 grant/mutation 继续受保护。
+正常重启读取已有管理行和 localstore，缺绑定或残存数据不初始化为空 volume。Stop 停止新请求，Close 排空并关闭服务拥有的 store，失败保留实际错误。
 
-服务显式选择 durable quota，首次初始化后 reopen 读取原 policy；构造器不能覆盖它。SetQuota 的策略、revision 和 exact receipt 在原 publication transaction 提交；quota 下调到 Used 以下允许，后续增长受 EDQUOT 约束。embedded/reference fixed allowance 保持既有模式。
+管理 prefix 为 `/api/service/v1`。POST volumes `{name,quotaBytes}` 创建并返回 201 active Volume；PATCH volumes/{id} `{name}` 改名返回 200；DELETE volumes/{id} 没有 body，完成 close/RemoveAll/catalog 更新后返回 204。GET volumes/{id}/files 的 path query 是 raw relative path 的 base64，返回只读目录 DTO：目录级 pathBase64 和 entries 的 nameBase64、name、nodeId、kind、sizeBytes、modifiedAt。CLI/Console 由目录 raw path 和条目 raw leaf 拼接子路径 token，wire 不逐项重复完整路径；显示 name 不作为请求路径。
 
-import 接收固定 child condition、长度、digest 和 action。未发布内容不具名；sealed 后 Publish 原子创建或 replace-name 为新 regular node，提交 allocation/counters/log/receipt。被选 symlink 本身可替换，不跟随 target；目录拒绝，旧引用保留旧节点。下载同时 pin node 与 exact immutable key，完整验证 private spool 后才发送成功内容；旧历史 key 不重复计入 quota Used。
+Console 和 CLI 通过同一管理 API 执行 owner 校验，提供自己的 volume 列表/创建/改名/删除、文件元数据查询和管理员摘要。创建中或删除中的管理行在 Open 时通过同一同步流程继续处理，没有 operation journal 或后台 action worker。认证、输入错误、越权和存储不可用各自报告。
 
-transfer 与原文件 handler 共用授权、scope/share/strong guard、commit/barrier/publisher。file-transfer 提供 begin/export，file-transfer-control 提供 query/resume/publish/cancel/detach/cancel-action/close-export；data 和 verified export 使用 bound token。sealed import 可以 Detach 后重启续作；unsealed work 的稳定 action cancellation 不继承旧 receive handle。未知 native result/cleanup 保留责任，不能误报成功。
+## 部署
 
-## 生命周期与正常重启
-
-管理 operation 保存固定输入与原 key，区分 pending/running/succeeded/failed。accepted 不表示 completed；丢响应查询同一个动作，未知结果不换新 key 重执行。原生 quota/import receipt 裁定实际结果，management 保存 intent 和已观察状态。
-
-创建先保存 owner 和意图，初始化唯一根并验证 binding/父目录持久结果后 active。runtime 按稳定 ID 去重，cold summary 与已有 data runtime 共用同一 authority。永久删除在同一 admission gate 封住新工作，核对 live pins、Handler/locking retirement 和原生 CheckDeletionReady；Busy 在 Stop 前撤销未提交预留，mount 继续可用。pending durable import/action 阻止删除，terminal receipt 不长期 pin runtime；普通 Close 可以移交 sealed import 供 reopen，不是删除证明。
-
-确认 close 后，delete 使用绑定根、operation proof 和 quarantine 回收；部分清理继续由原动作持有，未知路径禁止删除。正常停止/异常退出后按原管理状态和 native receipt 续作，缺失 SQLite/Witness/lease evidence 不初始化为空 volume。Service.Stop 关闭新 admission，Close 按原 owner 排空并保留错误；原有文件锁恢复保证继续成立。
-
-配置字段为 listen、external_origin、state_root、trusted_proxy_cidrs、runtime_idle_timeout 和 shutdown_timeout。存储、文件 session、传输和管理状态保留各自既有有限上限；client 使用 capabilities。health/live 表示进程存活，health/ready 在停止或协调工作未解决失败时报告不可接受工作。配置错误、独占冲突和存储故障明确失败。
+Compose/systemd 使用 listen、external_origin、state_root、trusted_proxy_cidrs、shutdown_timeout。一个进程使用本机私有持久目录，同源 TLS proxy 提供 HTTPS。server 不需要 FUSE 权限。健康入口仅报告进程/服务状态；reference 模式仍提供既有单 volume 文件服务，权限由其部署方负责。

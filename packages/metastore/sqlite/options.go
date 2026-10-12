@@ -45,22 +45,8 @@ const (
 	MinIntegrityRecords int64 = 3
 )
 
-// QuotaPolicyMode selects a constructor policy independently of stored schema.
-type QuotaPolicyMode uint8
-
-const (
-	FixedAllowancePolicy QuotaPolicyMode = iota
-	DurableQuotaPolicy
-)
-
 // Options configures the serving resources of one Store.
 type Options struct {
-	// Durable policy is seeded only by an explicit initialization. Reopening reads
-	// the native policy; constructor allowance cannot overwrite it.
-	QuotaPolicy         QuotaPolicyMode
-	InitializeQuota     bool
-	MaxAuthorityActions int
-
 	leaseRecoveryOwner    bool
 	leaseOwner            *nativelease.Database
 	requireExistingVolume bool
@@ -110,7 +96,6 @@ type Options struct {
 // DefaultOptions returns the default serving configuration.
 func DefaultOptions() Options {
 	return Options{
-		MaxAuthorityActions:          65536,
 		Window:                       DefaultWindow(),
 		ObjectLimits:                 DefaultObjectLimits(),
 		MaxRetainedFiles:             DefaultMaxRetainedFiles,
@@ -128,16 +113,6 @@ func DefaultOptions() Options {
 
 // Effective resolves zero-valued defaults and validates Options without opening a database.
 func (o Options) Effective() (Options, error) {
-	if o.QuotaPolicy > DurableQuotaPolicy || o.InitializeQuota && o.QuotaPolicy != DurableQuotaPolicy {
-		return Options{}, syscall.EINVAL
-	}
-	if o.MaxAuthorityActions == 0 {
-		o.MaxAuthorityActions = 65536
-	}
-	if o.MaxAuthorityActions < 1 || o.MaxAuthorityActions == math.MaxInt {
-		return Options{}, syscall.EINVAL
-	}
-
 	if o.Advisory == (advisory.Config{}) {
 		o.Advisory = advisory.DefaultConfig()
 	}

@@ -80,10 +80,7 @@ type Store struct {
 	// the volume is being served, and because the contract makes it unchanging for the
 	// life of the value: one that answers Space answers always, and one that refuses never
 	// starts.
-	allowance           int64
-	quotaPolicy         QuotaPolicyMode
-	maxAuthorityActions int
-	exportPins          int
+	allowance int64
 
 	// window is how much of the change log this Store keeps. It belongs here for the same
 	// reason the allowance does: it says how the volume is being served rather than what it
@@ -449,8 +446,7 @@ func openConfiguredWithHooks(
 		volume: id, root: root,
 		databasePath: database,
 		leaseOwner:   owner,
-		quotaPolicy:  options.QuotaPolicy, maxAuthorityActions: options.MaxAuthorityActions,
-		allowance: allowance, window: options.Window, objectLimits: options.ObjectLimits,
+		allowance:    allowance, window: options.Window, objectLimits: options.ObjectLimits,
 		maxIntegrityRecords: options.MaxIntegrityRecords,
 		maxIntegrityBytes:   options.MaxIntegrityBytes,
 		maxMetadataBytes:    options.MaxMetadataBytes,
@@ -469,10 +465,7 @@ func openConfiguredWithHooks(
 	if err := coordinator.commit.acquire(ctx); err != nil {
 		return nil, cleanup(err, openPoolHandle{"snapshot reader pool", snapshotRead}, openPoolHandle{"reader pool", read}, openPoolHandle{"writer pool", write})
 	}
-	err = store.openQuotaPolicy(ctx, options)
-	if err == nil {
-		err = store.attachFileDomain(options)
-	}
+	err = store.attachFileDomain(options)
 	coordinator.commit.release()
 	if err != nil {
 		return nil, cleanup(err, openPoolHandle{"snapshot reader pool", snapshotRead}, openPoolHandle{"reader pool", read}, openPoolHandle{"writer pool", write})
@@ -625,8 +618,8 @@ func (s *Store) CloseContext(ctx context.Context) error {
 	if err := s.coordinator.commit.acquire(ctx); err != nil {
 		return err
 	}
-	if len(s.files) != 0 || s.exportPins != 0 {
-		count := len(s.files) + s.exportPins
+	if len(s.files) != 0 {
+		count := len(s.files)
 		s.coordinator.commit.release()
 		return fmt.Errorf("the SQLite store still owns %d retained file references: %w", count, syscall.EBUSY)
 	}
@@ -754,14 +747,26 @@ func (s *Store) finishPoolClosure(poolErr, authorityErr error) error {
 // zero — an allowance lowered underneath content already written leaves Used above Total,
 // and a negative Avail arrives in a kernel reply's unsigned field as room no disk holds.
 func (s *Store) Space(ctx context.Context) (storage.Space, error) {
-	summary, err := s.Summary(ctx)
-	if err != nil {
+	if err := s.beginHealthyRead(ctx); err != nil {
 		return storage.Space{}, err
 	}
-	if s.quotaPolicy == FixedAllowancePolicy && summary.QuotaBytes == 0 {
-		return storage.Space{}, syscall.ENOSYS
+	defer s.coordinator.endHealthyRead()
+	if s.allowance == 0 {
+		return storage.Space{}, fmt.Errorf("this volume is held under no allowance: %w", syscall.ENOSYS)
 	}
-	return storage.Space{Total: summary.QuotaBytes, Used: summary.AllocationUsed, Avail: max(summary.QuotaBytes-summary.AllocationUsed, 0)}, nil
+	var used int64
+	if err := s.read.QueryRowContext(ctx, `SELECT allocated_used FROM volumes WHERE id = ?`, s.volume).Scan(&used); err != nil {
+		return storage.Space{}, fmt.Errorf("reading what the volume holds: %w", sqlerr.ReadFailure(ctx, err))
+	}
+	space := storage.Space{Total: s.allowance, Used: used, Avail: max(s.allowance-used, 0)}
+	// The counter is exact, so a figure that could not be true of anything is this package
+	// having lost count rather than a number to repair. Reporting it anyway would put a
+	// fabricated quantity in front of a caller as measured fact (R-ERR-2).
+	if !space.Coherent() {
+		return storage.Space{}, fmt.Errorf("the volume is recorded as holding %d bytes of its %d byte allowance, which cannot be true: %w",
+			used, s.allowance, syscall.EIO)
+	}
+	return space, nil
 }
 
 // mutate runs f inside a write transaction, committing it if f succeeds and rolling it back
@@ -960,11 +965,7 @@ func beginOwnedTransaction(ctx context.Context, pool *sql.DB, options *sql.TxOpt
 // the potentially long scan and caller-owned result accounting then proceed without delaying
 // a writer's commit boundary.
 func (s *Store) beginReadSnapshot(ctx context.Context, pool *sql.DB) (*ownedTransaction, error) {
-	return s.beginReadSnapshotChecked(ctx, pool, s.beginHealthyRead)
-}
-
-func (s *Store) beginReadSnapshotChecked(ctx context.Context, pool *sql.DB, beginHealthy func(context.Context) error) (*ownedTransaction, error) {
-	if err := beginHealthy(ctx); err != nil {
+	if err := s.beginHealthyRead(ctx); err != nil {
 		return nil, err
 	}
 	tx, err := beginOwnedTransaction(ctx, pool, &sql.TxOptions{ReadOnly: true})

@@ -989,12 +989,6 @@ nav button.active svg {
   align-items: center;
   gap: 9px;
 }
-.download-button {
-  opacity: 0.4;
-}
-.file-table tr:hover .download-button {
-  opacity: 1;
-}
 .table-footer {
   padding: 13px 20px;
   display: flex;
@@ -1667,89 +1661,6 @@ nav button.active svg {
 .dialog-error svg {
   margin-top: 1px;
 }
-.upload-zone {
-  position: relative;
-  display: flex !important;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  padding: 27px 15px;
-  border: 1px dashed #b8cbed;
-  border-radius: 8px;
-  background: #f8fbff;
-  cursor: pointer;
-  color: #687fa5 !important;
-}
-.upload-zone input {
-  position: absolute;
-  inset: 0;
-  opacity: 0;
-  cursor: pointer;
-  margin: 0 !important;
-  min-height: 100% !important;
-}
-.upload-icon {
-  width: 42px;
-  height: 42px;
-  border-radius: 10px;
-  background: #edf3ff;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  margin-bottom: 12px;
-  color: #6881aa;
-}
-.upload-zone strong {
-  font-size: 13px;
-  color: #5a7092;
-  font-weight: 550;
-}
-.upload-zone > span {
-  font-size: 11px;
-  color: #818da1;
-  font-weight: 400;
-  margin-top: 6px;
-}
-.upload-selection {
-  border: 1px solid #e9edf4;
-  border-radius: 6px;
-  padding: 4px 10px;
-  margin-top: 13px;
-  max-height: 126px;
-  overflow: auto;
-}
-.upload-selection > div {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 8px 0;
-  font-size: 12px;
-  color: #708096;
-}
-.upload-selection span {
-  max-width: 245px;
-  text-overflow: ellipsis;
-  overflow: hidden;
-  white-space: nowrap;
-}
-.upload-selection small {
-  margin-left: auto;
-  font-size: 11px;
-  color: #818c9b;
-}
-.upload-progress {
-  margin-top: 16px;
-  display: flex;
-  gap: 12px;
-  align-items: center;
-}
-.upload-progress .usage-track {
-  flex: 1;
-}
-.upload-progress > span {
-  font-size: 11px;
-  color: #71839e;
-}
 .toast {
   position: fixed;
   bottom: 64px;
@@ -2388,59 +2299,6 @@ nav button.active svg {
   margin: 3px 0 0 !important;
   flex-shrink: 0;
 }
-.operation-panel {
-  margin-bottom: 24px;
-  overflow: hidden;
-}
-.operation-panel-heading {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 11px 18px;
-  border-bottom: 1px solid var(--border);
-  font-size: 12px;
-  color: #71829c;
-}
-.operation-row {
-  display: flex;
-  align-items: flex-start;
-  gap: 10px;
-  padding: 16px 18px;
-  border-bottom: 1px solid #edf1f6;
-  color: #7890b3;
-}
-.operation-row:last-child {
-  border-bottom: 0;
-}
-.operation-row > svg {
-  margin-top: 1px;
-  flex-shrink: 0;
-}
-.operation-row strong {
-  font-size: 12px;
-  font-weight: 550;
-}
-.operation-row p {
-  font-size: 11px;
-  color: #8798b0;
-  margin-top: 4px;
-}
-.operation-row small {
-  font-size: 9px;
-  color: #a2afc1;
-  display: block;
-  margin-top: 4px;
-  word-break: break-all;
-}
-.operation-row .button {
-  margin-left: auto;
-}
-.operation-ok {
-  color: #6ba88a;
-}
-.operation-fail {
-  color: #bd7b84;
-}
 .user-load-more {
   display: block;
   margin: 12px auto;
@@ -2467,9 +2325,6 @@ nav button.active svg {
 .badge.deleted {
   background: #edf1f6;
   color: #8d9cad;
-}
-.operation-panel .operation-row > div {
-  min-width: 0;
 }
 .stat-value {
   overflow-wrap: anywhere;
@@ -2499,43 +2354,11 @@ nav button.active svg {
   background: #f8fafc;
 }
 @media (max-width: 760px) {
-  .operation-row {
-    padding: 13px;
-    gap: 8px;
-  }
-  .operation-row .button {
-    font-size: 10px;
-    padding: 6px 8px;
-  }
-  .operation-row p {
-    font-size: 10px;
-  }
-  .operation-row strong {
-    font-size: 11px;
-  }
-  .operation-row small {
-    font-size: 8px;
-  }
-  .operation-panel-heading {
-    padding: 10px 13px;
-  }
   .stat-value {
     font-size: 24px;
   }
-  .operation-panel {
-    margin-bottom: 20px;
-  }
 }
 @media (max-width: 460px) {
-  .operation-row {
-    flex-wrap: wrap;
-  }
-  .operation-row > div {
-    flex: 1;
-  }
-  .operation-row > .button {
-    margin-left: 25px;
-  }
   .stat-value {
     font-size: 21px;
   }
@@ -2549,26 +2372,4 @@ nav button.active svg {
   .file-name.passive {
     max-width: 280px;
   }
-}
-.operation-link {
-  display: block;
-  font-size: 10px;
-  color: #7e98bd;
-  margin-top: 6px;
-  padding: 0;
-}
-.operation-link:hover {
-  color: var(--blue);
-}
-.operation-detail {
-  padding: 20px 0 5px;
-  color: #7d90ae;
-}
-.operation-detail strong {
-  font-size: 14px;
-  color: #617897;
-}
-.operation-detail p {
-  font-size: 12px;
-  margin-top: 10px;
 }

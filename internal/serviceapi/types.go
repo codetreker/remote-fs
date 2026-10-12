@@ -90,36 +90,23 @@ type Session struct {
 	AbsoluteExpiresAt time.Time `json:"absoluteExpiresAt"`
 }
 
-type Action struct {
-	Namespace Decimal `json:"namespace"`
-	Nonce     string  `json:"nonce"`
-}
-
-type ActionNamespace struct {
-	SubjectID   string    `json:"subjectId"`
-	Namespace   Decimal   `json:"namespace"`
-	AcceptUntil time.Time `json:"acceptUntil"`
-}
-
 type VolumeSummary struct {
 	FileCount      Decimal `json:"fileCount"`
 	DirectoryCount Decimal `json:"directoryCount"`
 	UsedBytes      Decimal `json:"usedBytes"`
 	QuotaBytes     Decimal `json:"quotaBytes"`
-	QuotaRevision  Decimal `json:"quotaRevision"`
 }
 
 type Volume struct {
-	ID              string         `json:"id"`
-	OwnerUserID     string         `json:"ownerUserId"`
-	Name            string         `json:"name"`
-	State           string         `json:"state"`
-	Revision        Decimal        `json:"revision"`
-	LastOperationID string         `json:"lastOperationId,omitempty"`
-	CreatedAt       time.Time      `json:"createdAt"`
-	UpdatedAt       time.Time      `json:"updatedAt"`
-	Summary         *VolumeSummary `json:"summary,omitempty"`
-	SummaryError    *ErrorDetail   `json:"summaryError,omitempty"`
+	ID           string         `json:"id"`
+	OwnerUserID  string         `json:"ownerUserId"`
+	Name         string         `json:"name"`
+	State        string         `json:"state"`
+	Revision     Decimal        `json:"revision"`
+	CreatedAt    time.Time      `json:"createdAt"`
+	UpdatedAt    time.Time      `json:"updatedAt"`
+	Summary      *VolumeSummary `json:"summary,omitempty"`
+	SummaryError *ErrorDetail   `json:"summaryError,omitempty"`
 }
 
 type UserVolumeStats struct {
@@ -148,39 +135,28 @@ type UserVolumeList struct {
 	NextAfter string              `json:"nextAfter,omitempty"`
 }
 
-type Operation struct {
-	ID        string       `json:"id"`
-	VolumeID  string       `json:"volumeId"`
-	Kind      string       `json:"kind"`
-	State     string       `json:"state"`
-	Phase     string       `json:"phase"`
-	Revision  Decimal      `json:"revision"`
-	Settled   bool         `json:"settled"`
-	Error     *ErrorDetail `json:"error,omitempty"`
-	CreatedAt time.Time    `json:"createdAt"`
-	UpdatedAt time.Time    `json:"updatedAt"`
-}
-
 type CreateVolumeRequest struct {
-	Action     Action  `json:"action"`
 	Name       string  `json:"name"`
 	QuotaBytes Decimal `json:"quotaBytes"`
 }
+
 type RenameVolumeRequest struct {
-	Action           Action  `json:"action"`
-	ExpectedRevision Decimal `json:"expectedRevision"`
-	Name             string  `json:"name"`
+	Name string `json:"name"`
 }
-type SetQuotaRequest struct {
-	Action Action `json:"action"`
-	// ExpectedRevision selects the native quota policy, independently of the
-	// volume's management revision advanced by rename and lifecycle actions.
-	ExpectedRevision Decimal `json:"expectedRevision"`
-	QuotaBytes       Decimal `json:"quotaBytes"`
+
+type FileEntry struct {
+	Name       string    `json:"name"`
+	NameBase64 string    `json:"nameBase64"`
+	PathBase64 string    `json:"-"`
+	NodeID     Decimal   `json:"nodeId"`
+	Kind       string    `json:"kind"`
+	SizeBytes  Decimal   `json:"sizeBytes"`
+	ModifiedAt time.Time `json:"modifiedAt"`
 }
-type DeleteVolumeRequest struct {
-	Action           Action  `json:"action"`
-	ExpectedRevision Decimal `json:"expectedRevision"`
+
+type FileDirectory struct {
+	PathBase64 string      `json:"pathBase64"`
+	Entries    []FileEntry `json:"entries"`
 }
 
 type CredentialInfo struct {

@@ -155,8 +155,7 @@ func TestValidateRejectsSequenceAndSurvivingIdentityCorruption(t *testing.T) {
 		{"change predecessor scalar", `UPDATE changes SET previous_position='bad'`},
 		{"log scalar", `UPDATE logs SET trimmed_through='bad'`},
 		{"volume identity above high-water", `UPDATE volumes SET root=5`},
-		// Disable summary enforcement so the identity validator observes the dangling entry.
-		{"entry identity above high-water", `DROP TRIGGER entries_summary_update; UPDATE entries SET node=5`},
+		{"entry identity above high-water", `UPDATE entries SET node=5`},
 		{"retained node above high-water", `UPDATE changes SET from_parent=5`},
 		{"retained predecessor above high-water", `UPDATE changes SET previous_position=7`},
 		{"log position above high-water", `UPDATE logs SET committed_position=7`},

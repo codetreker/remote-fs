@@ -2,14 +2,15 @@ package service
 
 import (
 	"context"
+	"io"
 	"net/http"
 	"sort"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/codetreker/remote-fs/internal/management"
 	"github.com/codetreker/remote-fs/internal/serviceapi"
-	"github.com/codetreker/remote-fs/packages/storage"
 )
 
 func (h *managementRoutes) owner(r *http.Request, scope string) (Principal, management.ID, error) {
@@ -28,7 +29,7 @@ func (h *managementRoutes) owner(r *http.Request, scope string) (Principal, mana
 }
 
 func volumeDTO(volume management.Volume) serviceapi.Volume {
-	return serviceapi.Volume{ID: string(volume.ID), OwnerUserID: string(volume.OwnerUserID), Name: volume.DisplayName, State: string(volume.State), Revision: serviceapi.DecimalFromInt64(volume.ManagementRevision), LastOperationID: string(volume.LastOperationID), CreatedAt: volume.CreatedAt, UpdatedAt: volume.UpdatedAt}
+	return serviceapi.Volume{ID: string(volume.ID), OwnerUserID: string(volume.OwnerUserID), Name: volume.DisplayName, State: string(volume.State), Revision: serviceapi.DecimalFromInt64(volume.ManagementRevision), CreatedAt: volume.CreatedAt, UpdatedAt: volume.UpdatedAt}
 }
 
 func (h *managementRoutes) volumeSummaries(ctx context.Context, volumes []management.Volume) []serviceapi.Volume {
@@ -61,18 +62,18 @@ func (h *managementRoutes) volumeSummaries(ctx context.Context, volumes []manage
 					} else {
 						err = h.auth.CheckCurrent(ctx, p)
 					}
-					var summary storage.VolumeSummaryResult
+					var summary VolumeSummary
 					if err == nil {
 						summary, err = h.summary(ctx, volume)
 					}
 					<-h.summaryWorkers
-					if err == nil {
-						err = summary.Check()
+					if err == nil && (summary.UsedBytes < 0 || summary.QuotaBytes < 4096) {
+						err = syscall.EIO
 					}
 					if err != nil {
 						value.SummaryError = &serviceapi.ErrorDetail{Code: "metadata_unavailable"}
 					} else {
-						value.Summary = &serviceapi.VolumeSummary{FileCount: serviceapi.DecimalFromUint64(summary.FileCount), DirectoryCount: serviceapi.DecimalFromUint64(summary.DirectoryCount), UsedBytes: serviceapi.DecimalFromInt64(summary.AllocationUsed), QuotaBytes: serviceapi.DecimalFromInt64(summary.QuotaBytes), QuotaRevision: serviceapi.DecimalFromUint64(summary.QuotaRevision)}
+						value.Summary = &serviceapi.VolumeSummary{FileCount: serviceapi.DecimalFromUint64(summary.FileCount), DirectoryCount: serviceapi.DecimalFromUint64(summary.DirectoryCount), UsedBytes: serviceapi.DecimalFromInt64(summary.UsedBytes), QuotaBytes: serviceapi.DecimalFromInt64(summary.QuotaBytes)}
 					}
 				}
 				result[index] = value
@@ -167,13 +168,8 @@ func (h *managementRoutes) createVolume(w http.ResponseWriter, r *http.Request) 
 		writeManagementError(w, err)
 		return
 	}
-	action, err := managementAction(request.Action)
-	if err != nil {
-		writeManagementError(w, err)
-		return
-	}
 	quota, err := request.QuotaBytes.Int64()
-	if err != nil {
+	if err != nil || quota < 4096 {
 		writeManagementError(w, errAuthRequest)
 		return
 	}
@@ -181,8 +177,18 @@ func (h *managementRoutes) createVolume(w http.ResponseWriter, r *http.Request) 
 		writeManagementError(w, err)
 		return
 	}
-	operation, err := h.store.CreateVolume(r.Context(), p.UserID, action, request.Name, quota)
-	h.acceptOperation(w, r, p, operation, err)
+	volume, err := h.store.CreateVolume(r.Context(), p.UserID, request.Name, quota)
+	if err != nil {
+		writeManagementError(w, err)
+		return
+	}
+	volume, err = h.process(r.Context(), volume)
+	if err != nil {
+		writeManagementError(w, err)
+		return
+	}
+	w.Header().Set("Location", serviceapi.Prefix+"/volumes/"+string(volume.ID))
+	h.respond(w, r, p, http.StatusCreated, h.volumeSummaries(r.Context(), []management.Volume{volume})[0])
 }
 
 func (h *managementRoutes) renameVolume(w http.ResponseWriter, r *http.Request) {
@@ -199,59 +205,21 @@ func (h *managementRoutes) renameVolume(w http.ResponseWriter, r *http.Request) 
 		writeManagementError(w, err)
 		return
 	}
-	action, err := managementAction(request.Action)
-	if err != nil {
-		writeManagementError(w, err)
-		return
-	}
-	revision, err := request.ExpectedRevision.Int64()
-	if err != nil {
-		writeManagementError(w, errAuthRequest)
-		return
-	}
 	if err := h.auth.CheckCurrent(r.Context(), p); err != nil {
 		writeManagementError(w, err)
 		return
 	}
-	operation, err := h.store.RenameVolume(r.Context(), p.UserID, action, id, revision, request.Name)
-	h.acceptOperation(w, r, p, operation, err)
-}
-
-func (h *managementRoutes) setQuota(w http.ResponseWriter, r *http.Request) {
-	p, id, err := h.owner(r, ScopeVolumesWrite)
-	if err == nil {
-		err = noManagementQuery(r)
-	}
+	current, err := h.store.GetVolume(r.Context(), p.UserID, id)
 	if err != nil {
 		writeManagementError(w, err)
 		return
 	}
-	var request serviceapi.SetQuotaRequest
-	if err := decodeManagementRequest(w, r, &request); err != nil {
-		writeManagementError(w, err)
-		return
-	}
-	action, err := managementAction(request.Action)
+	volume, err := h.store.RenameVolume(r.Context(), p.UserID, id, current.ManagementRevision, request.Name)
 	if err != nil {
 		writeManagementError(w, err)
 		return
 	}
-	revision, err := request.ExpectedRevision.Int64()
-	if err != nil {
-		writeManagementError(w, errAuthRequest)
-		return
-	}
-	quota, err := request.QuotaBytes.Int64()
-	if err != nil {
-		writeManagementError(w, errAuthRequest)
-		return
-	}
-	if err := h.auth.CheckCurrent(r.Context(), p); err != nil {
-		writeManagementError(w, err)
-		return
-	}
-	operation, err := h.store.ChangeQuota(r.Context(), p.UserID, action, id, revision, quota)
-	h.acceptOperation(w, r, p, operation, err)
+	h.respond(w, r, p, http.StatusOK, h.volumeSummaries(r.Context(), []management.Volume{volume})[0])
 }
 
 func (h *managementRoutes) deleteVolume(w http.ResponseWriter, r *http.Request) {
@@ -263,25 +231,34 @@ func (h *managementRoutes) deleteVolume(w http.ResponseWriter, r *http.Request) 
 		writeManagementError(w, err)
 		return
 	}
-	var request serviceapi.DeleteVolumeRequest
-	if err := decodeManagementRequest(w, r, &request); err != nil {
+	if r.Body != nil {
+		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 1))
+		if err != nil || len(body) != 0 {
+			writeManagementError(w, errAuthRequest)
+			return
+		}
+	}
+	if err := h.auth.CheckCurrent(r.Context(), p); err != nil {
 		writeManagementError(w, err)
 		return
 	}
-	action, err := managementAction(request.Action)
+	current, err := h.store.GetVolume(r.Context(), p.UserID, id)
 	if err != nil {
 		writeManagementError(w, err)
 		return
 	}
-	revision, err := request.ExpectedRevision.Int64()
+	volume, err := h.store.DeleteVolume(r.Context(), p.UserID, id, current.ManagementRevision)
 	if err != nil {
-		writeManagementError(w, errAuthRequest)
+		writeManagementError(w, err)
+		return
+	}
+	if _, err = h.process(r.Context(), volume); err != nil {
+		writeManagementError(w, err)
 		return
 	}
 	if err := h.auth.CheckCurrent(r.Context(), p); err != nil {
 		writeManagementError(w, err)
 		return
 	}
-	operation, err := h.store.DeleteVolume(r.Context(), p.UserID, action, id, revision)
-	h.acceptOperation(w, r, p, operation, err)
+	w.WriteHeader(http.StatusNoContent)
 }

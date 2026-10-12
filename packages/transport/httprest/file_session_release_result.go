@@ -29,9 +29,6 @@ func (h *Handler) sessionReleaseResult(ctx context.Context, id string) (fileResp
 	if terminal == nil {
 		return fileResponse{}, syscall.ESTALE
 	}
-	if err := storage.RequireAccessBinding(ctx, terminal.binding); err != nil {
-		return fileResponse{}, err
-	}
 	terminal.mu.Lock()
 	valid := time.Now().Before(terminal.expires)
 	confirmed, epoch, releaseErr := terminal.releaseFact, terminal.epoch, terminal.releaseErr

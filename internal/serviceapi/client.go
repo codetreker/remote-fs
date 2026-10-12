@@ -13,10 +13,10 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
-	"time"
 )
 
 const maxResponseBytes = 8 << 20
+const maxDirectoryResponseBytes = 64 << 20
 
 type Credential struct{ ID, Secret string }
 
@@ -105,7 +105,7 @@ func (t credentialTransport) RoundTrip(request *http.Request) (*http.Response, e
 	return t.transport.RoundTrip(clone)
 }
 
-// HTTPClient supplies the same origin-bound identity to the existing v5 client.
+// HTTPClient keeps credentials bound to this service origin.
 func (c *Client) HTTPClient() *http.Client {
 	clone := *c.http
 	transport := clone.Transport
@@ -116,14 +116,11 @@ func (c *Client) HTTPClient() *http.Client {
 	return &clone
 }
 
-func (c *Client) VolumeURL(id string) (string, error) {
-	if err := validateID(id); err != nil {
-		return "", err
-	}
-	return c.base.String() + "/api/volumes/" + id, nil
+func (c *Client) exchange(ctx context.Context, method, path string, input, output any) error {
+	return c.exchangeWithLimit(ctx, method, path, input, output, maxResponseBytes)
 }
 
-func (c *Client) exchange(ctx context.Context, method, path string, input, output any) error {
+func (c *Client) exchangeWithLimit(ctx context.Context, method, path string, input, output any, maximum int64) error {
 	var body io.Reader
 	if input != nil {
 		data, err := json.Marshal(input)
@@ -146,11 +143,11 @@ func (c *Client) exchange(ctx context.Context, method, path string, input, outpu
 		return fmt.Errorf("service request failed: %w", err)
 	}
 	defer response.Body.Close()
-	data, err := io.ReadAll(io.LimitReader(response.Body, maxResponseBytes+1))
+	data, err := io.ReadAll(io.LimitReader(response.Body, maximum+1))
 	if err != nil {
 		return err
 	}
-	if len(data) > maxResponseBytes {
+	if int64(len(data)) > maximum {
 		return errors.New("service response exceeds size limit")
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
@@ -204,36 +201,6 @@ func (c *Client) RevokeCredential(ctx context.Context, id string) error {
 	return c.exchange(ctx, http.MethodDelete, "/auth/cli-credentials/"+id, nil, nil)
 }
 
-func (c *Client) PrepareRotation(ctx context.Context, id string, input PrepareRotationRequest) (CredentialInfo, error) {
-	var result CredentialInfo
-	if err := validateID(id); err != nil {
-		return result, err
-	}
-	err := c.exchange(ctx, http.MethodPost, "/auth/cli-credentials/"+id+"/rotation/prepare", input, &result)
-	if err == nil && result.ID != id {
-		err = errors.New("rotation response selected another identity")
-	}
-	return result, err
-}
-
-func (c *Client) ActivateRotation(ctx context.Context, id string, input ActivateRotationRequest) (CredentialInfo, error) {
-	var result CredentialInfo
-	if err := validateID(id); err != nil {
-		return result, err
-	}
-	err := c.exchange(ctx, http.MethodPost, "/auth/cli-credentials/"+id+"/rotation/activate", input, &result)
-	if err == nil && result.ID != id {
-		err = errors.New("rotation response selected another identity")
-	}
-	return result, err
-}
-
-func (c *Client) IssueNamespace(ctx context.Context) (ActionNamespace, error) {
-	var result ActionNamespace
-	err := c.exchange(ctx, http.MethodPost, "/action-namespaces", struct{}{}, &result)
-	return result, err
-}
-
 func (c *Client) GetVolume(ctx context.Context, id string) (Volume, error) {
 	var result Volume
 	if err := validateID(id); err != nil {
@@ -246,88 +213,58 @@ func (c *Client) GetVolume(ctx context.Context, id string) (Volume, error) {
 	return result, err
 }
 
-func (c *Client) CreateVolume(ctx context.Context, input CreateVolumeRequest) (Operation, error) {
-	var result Operation
+func (c *Client) CreateVolume(ctx context.Context, input CreateVolumeRequest) (Volume, error) {
+	var result Volume
 	err := c.exchange(ctx, http.MethodPost, "/volumes", input, &result)
 	return result, err
 }
 
-func (c *Client) RenameVolume(ctx context.Context, id string, input RenameVolumeRequest) (Operation, error) {
-	var result Operation
+func (c *Client) RenameVolume(ctx context.Context, id string, input RenameVolumeRequest) (Volume, error) {
+	var result Volume
 	if err := validateID(id); err != nil {
 		return result, err
 	}
 	err := c.exchange(ctx, http.MethodPatch, "/volumes/"+id, input, &result)
-	if err == nil && result.VolumeID != id {
+	if err == nil && result.ID != id {
 		err = errors.New("rename response selected another volume")
 	}
 	return result, err
 }
 
-func (c *Client) SetQuota(ctx context.Context, id string, input SetQuotaRequest) (Operation, error) {
-	var result Operation
+func (c *Client) DeleteVolume(ctx context.Context, id string) error {
+	if err := validateID(id); err != nil {
+		return err
+	}
+	return c.exchange(ctx, http.MethodDelete, "/volumes/"+id, nil, nil)
+}
+
+func (c *Client) ListFiles(ctx context.Context, id, pathBase64 string) (FileDirectory, error) {
+	var result FileDirectory
 	if err := validateID(id); err != nil {
 		return result, err
 	}
-	err := c.exchange(ctx, http.MethodPut, "/volumes/"+id+"/quota", input, &result)
-	if err == nil && result.VolumeID != id {
-		err = errors.New("quota response selected another volume")
+	path, err := base64.StdEncoding.Strict().DecodeString(pathBase64)
+	if err != nil || base64.StdEncoding.EncodeToString(path) != pathBase64 {
+		return result, errors.New("invalid directory path token")
 	}
-	return result, err
-}
-
-func (c *Client) DeleteVolume(ctx context.Context, id string, input DeleteVolumeRequest) (Operation, error) {
-	var result Operation
-	if err := validateID(id); err != nil {
+	query := url.Values{"path": {pathBase64}}
+	err = c.exchangeWithLimit(ctx, http.MethodGet, "/volumes/"+id+"/files?"+query.Encode(), nil, &result, maxDirectoryResponseBytes)
+	if err != nil {
 		return result, err
 	}
-	err := c.exchange(ctx, http.MethodDelete, "/volumes/"+id, input, &result)
-	if err == nil && result.VolumeID != id {
-		err = errors.New("delete response selected another volume")
+	if result.PathBase64 != pathBase64 {
+		return result, errors.New("directory response selected another path")
 	}
-	return result, err
-}
-
-func (c *Client) Operation(ctx context.Context, id string) (Operation, error) {
-	var result Operation
-	if err := validateID(id); err != nil {
-		return result, err
+	prefix := string(path)
+	if prefix != "" {
+		prefix += "/"
 	}
-	err := c.exchange(ctx, http.MethodGet, "/operations/"+id, nil, &result)
-	if err == nil && result.ID != id {
-		err = errors.New("operation response selected another identity")
-	}
-	return result, err
-}
-
-func (c *Client) FindOperation(ctx context.Context, action Action) (Operation, error) {
-	var result Operation
-	if _, err := action.Namespace.Uint64(); err != nil {
-		return result, err
-	}
-	query := url.Values{"namespace": {string(action.Namespace)}, "nonce": {action.Nonce}}
-	err := c.exchange(ctx, http.MethodGet, "/operations?"+query.Encode(), nil, &result)
-	return result, err
-}
-
-func (c *Client) WaitOperation(ctx context.Context, id string, interval time.Duration) (Operation, error) {
-	if interval <= 0 {
-		return Operation{}, errors.New("poll interval must be positive")
-	}
-	for {
-		result, err := c.Operation(ctx, id)
+	for index := range result.Entries {
+		name, err := base64.StdEncoding.Strict().DecodeString(result.Entries[index].NameBase64)
 		if err != nil {
 			return result, err
 		}
-		if result.State == "succeeded" || (result.State == "failed" && result.Settled) {
-			return result, nil
-		}
-		timer := time.NewTimer(interval)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return result, ctx.Err()
-		case <-timer.C:
-		}
+		result.Entries[index].PathBase64 = base64.StdEncoding.EncodeToString([]byte(prefix + string(name)))
 	}
+	return result, nil
 }

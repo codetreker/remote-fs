@@ -349,7 +349,7 @@ func authTestOrdinaryUser(t *testing.T, s *Store, name string) User {
 	}
 	now := s.now()
 	err = s.writeTx(context.Background(), func(tx *sql.Tx) error {
-		_, err := tx.Exec("INSERT INTO users(id,role,display_name,auth_epoch,next_action_namespace,retired_before_namespace,logical_time_high_water,created_at) VALUES(?,'user',?,1,1,0,0,?)", id, name, unixMillis(now))
+		_, err := tx.Exec("INSERT INTO users(id,role,display_name,auth_epoch,created_at) VALUES(?,'user',?,1,?)", id, name, unixMillis(now))
 		return err
 	})
 	if err != nil {
@@ -396,21 +396,22 @@ func TestAuthOrdinaryUserProjectionAndCredentialRestrictions(t *testing.T) {
 	if _, err := s.CreateCredential(ctx, base); !errors.Is(err, ErrConflict) {
 		t.Fatalf("duplicate scope: %v", err)
 	}
-	volume, err := NewID()
+	volume, err := s.CreateVolume(ctx, ordinary.ID, "workspace", 4096)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.write.ExecContext(ctx, "INSERT INTO volumes(id,owner_user_id,display_name,storage_name,state,management_revision,last_operation_id,created_at,updated_at) VALUES(?,?,?,?,'active',1,'',?,?)", volume, ordinary.ID, "workspace", volume, unixMillis(s.now()), unixMillis(s.now())); err != nil {
+	volume, err = s.SetVolumeState(ctx, ordinary.ID, volume.ID, volume.ManagementRevision, VolumeActive, "")
+	if err != nil {
 		t.Fatal(err)
 	}
 	base.Scopes = []string{"files"}
 	base.AllOwnedVolumes = false
-	base.VolumeIDs = []ID{volume}
+	base.VolumeIDs = []ID{volume.ID}
 	owned, err := s.CreateCredential(ctx, base)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(owned.VolumeIDs) != 1 || owned.VolumeIDs[0] != volume {
+	if len(owned.VolumeIDs) != 1 || owned.VolumeIDs[0] != volume.ID {
 		t.Fatalf("owned restriction missing: %+v", owned)
 	}
 	base.UserID = admin.ID

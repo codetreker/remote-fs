@@ -28,7 +28,7 @@ func checkAuthorizationOptions(authorizer authz.Authorizer, volume string) error
 }
 
 func (h *Handler) authorizationContext(parent context.Context) (context.Context, func()) {
-	if h.authorizer == nil && h.accessBinding == nil && h.transfers == nil {
+	if h.authorizer == nil {
 		return parent, func() {}
 	}
 	ctx, cancel := context.WithCancelCause(parent)

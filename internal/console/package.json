@@ -8,14 +8,12 @@
     "build": "tsc --noEmit && vite build && node scripts/assets.mjs write",
     "test": "vitest run",
     "check:dist": "node scripts/assets.mjs check",
-    "format:check": "prettier --check src scripts tests vite.config.ts tsconfig.json package.json index.html"
+    "format:check": "prettier --check src scripts vite.config.ts tsconfig.json package.json index.html"
   },
   "dependencies": {
     "react": "19.3.0",
     "react-dom": "19.3.0",
-    "lucide-react": "0.545.0",
-    "lossless-json": "4.3.1",
-    "@noble/hashes": "2.4.0"
+    "lucide-react": "0.545.0"
   },
   "devDependencies": {
     "@types/react": "19.3.0",
@@ -24,13 +22,7 @@
     "typescript": "5.9.3",
     "vite": "7.3.7",
     "vitest": "3.2.4",
-    "playwright": "1.64.0",
     "prettier": "3.9.10"
   },
-  "packageManager": "pnpm@10.34.5",
-  "pnpm": {
-    "patchedDependencies": {
-      "lossless-json@4.3.1": "patches/lossless-json.patch"
-    }
-  }
+  "packageManager": "pnpm@10.34.5"
 }

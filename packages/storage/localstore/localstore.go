@@ -76,9 +76,6 @@ type Config struct {
 	Root                         string
 	Volume                       string
 	Quota                        int64
-	QuotaPolicy                  sqlite.QuotaPolicyMode
-	InitializeQuota              bool
-	MaxAuthorityActions          int
 	Window                       sqlite.Window
 	ObjectLimits                 sqlite.ObjectLimits
 	MaxReaderConnections         int
@@ -421,7 +418,6 @@ func open(ctx context.Context, config Config, hooks openHooks) (*Store, error) {
 
 func (config Config) sqliteOptions() (sqlite.Options, error) {
 	return (sqlite.Options{
-		QuotaPolicy: config.QuotaPolicy, InitializeQuota: config.InitializeQuota, MaxAuthorityActions: config.MaxAuthorityActions,
 		MaxRetainedFiles:             config.MaxRetainedFiles,
 		Advisory:                     config.Advisory,
 		Window:                       config.Window,
@@ -456,11 +452,7 @@ func validate(config Config) (string, error) {
 		return "", fmt.Errorf("the local store volume name is %d bytes; the largest is %d: %w",
 			len(config.Volume), MaxVolumeBytes, syscall.ENAMETOOLONG)
 	}
-	if config.QuotaPolicy == sqlite.DurableQuotaPolicy {
-		if config.Quota < 0 {
-			return "", fmt.Errorf("a durable quota cannot be negative: %w", syscall.EINVAL)
-		}
-	} else if config.Quota < limited.MinLimit {
+	if config.Quota < limited.MinLimit {
 		return "", fmt.Errorf("a local store quota of %d bytes is below the minimum of %d: %w",
 			config.Quota, limited.MinLimit, syscall.EINVAL)
 	}
@@ -758,9 +750,6 @@ func (s *Store) MaintenanceStatus() objectstore.MaintenanceStatus {
 // Close stops maintenance, closes SQLite before releasing the local-disk lifetime lock,
 // and gives concurrent callers the same result.
 func (s *Store) Close() error {
-	if err := s.volume.FenceTransferAdmission(); err != nil {
-		return err
-	}
 	s.closeMu.Lock()
 	if s.closed {
 		err := s.lastCloseErr

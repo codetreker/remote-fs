@@ -166,14 +166,15 @@ run that went wrong, confirm `/proc/self/mounts` holds no `fuse.remote-fs` line,
 `/sys/fs/fuse/connections/` is back to what it was, and that no `fusermount` process
 survived.
 
-Relative links in Markdown are mechanically checkable, and CI checks them; check them
-yourself after moving or renaming anything:
+Relative links in tracked Markdown are mechanically checkable, and CI checks them;
+check them yourself after moving or renaming anything. Stage new documents before
+running the check:
 
 ```
-while IFS= read -r f; do d=$(dirname "$f"); \
+while IFS= read -r -d '' f; do d=$(dirname "$f"); \
   grep -oP '\]\(\K[^)#]+(?=[)#])' "$f" | grep -v '^https\?://' | \
-  while read -r l; do [ -e "$d/$l" ] || echo "BROKEN $f -> $l"; done; \
-done < <(find . -name '*.md' -not -path './.git/*')
+  while IFS= read -r l; do [ -e "$d/$l" ] || echo "BROKEN $f -> $l"; done; \
+done < <(git ls-files -z -- '*.md')
 ```
 
 ## Two rules learned the hard way

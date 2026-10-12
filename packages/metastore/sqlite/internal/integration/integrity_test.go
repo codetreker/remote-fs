@@ -845,9 +845,7 @@ func TestOpenRefusesInconsistentVolumeIntegrity(t *testing.T) {
 				f.volume, "copy")
 		}},
 		{"a node has a negative id", func(t *testing.T, f objectIntegrityFixture) {
-			// Disable summary enforcement while the node and its entry are moved together.
 			damageDatabase(t, f.path, `
-				DROP TRIGGER entries_summary_update;
 				UPDATE nodes SET id = -1 WHERE `+nodeNamed+`;
 				UPDATE entries SET node = -1 WHERE volume = ? AND name = CAST('copy' AS BLOB)`,
 				f.volume, "copy", f.volume)

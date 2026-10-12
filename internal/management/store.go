@@ -5,7 +5,6 @@ package management
 import (
 	"context"
 	"crypto/rand"
-	"crypto/sha256"
 	"database/sql"
 	"embed"
 	"encoding/hex"
@@ -48,14 +47,13 @@ func NewID() (ID, error) {
 }
 
 var (
-	ErrNotFound       = errors.New("management record not found")
-	ErrDenied         = errors.New("management access denied")
-	ErrConflict       = errors.New("management condition conflict")
-	ErrExpired        = errors.New("management acceptance window expired")
-	ErrHistoryExpired = errors.New("management action history expired")
-	ErrCapacity       = errors.New("management resource capacity exhausted")
-	ErrCorrupt        = errors.New("management state is inconsistent")
-	ErrClosed         = errors.New("management store is closed")
+	ErrNotFound = errors.New("management record not found")
+	ErrDenied   = errors.New("management access denied")
+	ErrConflict = errors.New("management condition conflict")
+	ErrExpired  = errors.New("management acceptance window expired")
+	ErrCapacity = errors.New("management resource capacity exhausted")
+	ErrCorrupt  = errors.New("management state is inconsistent")
+	ErrClosed   = errors.New("management store is closed")
 )
 
 // CommitUnknownError preserves the accepted responsibility when SQLite cannot
@@ -66,32 +64,23 @@ func (e *CommitUnknownError) Error() string { return "management transaction out
 func (e *CommitUnknownError) Unwrap() error { return e.Cause }
 
 type Options struct {
-	Create                   bool
-	ExpectedDatabaseID       ID
-	MaxReaders               int
-	MaxUsers                 int
-	MaxSessions              int
-	MaxSessionsPerUser       int
-	MaxCredentials           int
-	MaxCredentialsPerUser    int
-	MaxCredentialVolumes     int
-	MaxVolumes               int
-	MaxOperations            int
-	MaxTerminalReceipts      int
-	MaxNamespaces            int
-	MaxNamespacesPerUser     int
-	MaxNamespaceParticipants int
-	MaxPayloadBytes          int
-	MaxProofBytes            int
-	MaxPageSize              int
-	BusyTimeout              time.Duration
-	SessionIdleTTL           time.Duration
-	SessionAbsoluteTTL       time.Duration
-	CredentialMaxTTL         time.Duration
-	RotationPendingTTL       time.Duration
-	RotationGrace            time.Duration
-	NamespaceLifetime        time.Duration
-	ReceiptRetention         time.Duration
+	Create                bool
+	ExpectedDatabaseID    ID
+	MaxReaders            int
+	MaxUsers              int
+	MaxSessions           int
+	MaxSessionsPerUser    int
+	MaxCredentials        int
+	MaxCredentialsPerUser int
+	MaxCredentialVolumes  int
+	MaxVolumes            int
+	MaxPageSize           int
+	BusyTimeout           time.Duration
+	SessionIdleTTL        time.Duration
+	SessionAbsoluteTTL    time.Duration
+	CredentialMaxTTL      time.Duration
+	RotationPendingTTL    time.Duration
+	RotationGrace         time.Duration
 }
 
 func DefaultOptions() Options {
@@ -99,40 +88,32 @@ func DefaultOptions() Options {
 		MaxReaders: 4, MaxUsers: 10000,
 		MaxSessions: 1024, MaxSessionsPerUser: 8,
 		MaxCredentials: 1024, MaxCredentialsPerUser: 32, MaxCredentialVolumes: 128,
-		MaxVolumes: 10000, MaxOperations: 1024, MaxTerminalReceipts: 100000,
-		MaxNamespaces: 4096, MaxNamespacesPerUser: 64,
-		MaxNamespaceParticipants: 65536,
-		MaxPayloadBytes:          64 << 10, MaxProofBytes: 8 << 10, MaxPageSize: 50,
+		MaxVolumes:     10000,
+		MaxPageSize:    50,
 		BusyTimeout:    2 * time.Second,
 		SessionIdleTTL: 30 * time.Minute, SessionAbsoluteTTL: 12 * time.Hour,
 		CredentialMaxTTL:   90 * 24 * time.Hour,
 		RotationPendingTTL: 10 * time.Minute, RotationGrace: time.Minute,
-		NamespaceLifetime: 24 * time.Hour, ReceiptRetention: 7 * 24 * time.Hour,
 	}
 }
 
 func (o Options) check() error {
 	for _, n := range []int{o.MaxReaders, o.MaxUsers, o.MaxSessions, o.MaxSessionsPerUser,
 		o.MaxCredentials, o.MaxCredentialsPerUser, o.MaxCredentialVolumes, o.MaxVolumes,
-		o.MaxOperations, o.MaxTerminalReceipts, o.MaxNamespaces, o.MaxNamespacesPerUser,
-		o.MaxNamespaceParticipants, o.MaxPayloadBytes, o.MaxProofBytes, o.MaxPageSize} {
+		o.MaxPageSize} {
 		if n <= 0 || n == math.MaxInt {
-			return fmt.Errorf("management count and payload limits must be positive and bounded")
+			return fmt.Errorf("management count limits must be positive and bounded")
 		}
 	}
 	for _, d := range []time.Duration{o.BusyTimeout, o.SessionIdleTTL, o.SessionAbsoluteTTL,
-		o.CredentialMaxTTL, o.RotationPendingTTL, o.RotationGrace, o.NamespaceLifetime,
-		o.ReceiptRetention} {
+		o.CredentialMaxTTL, o.RotationPendingTTL, o.RotationGrace} {
 		if d < time.Millisecond {
 			return errors.New("management durations must be at least one millisecond")
 		}
 	}
 	if o.SessionIdleTTL > o.SessionAbsoluteTTL || o.MaxSessionsPerUser > o.MaxSessions ||
-		o.MaxCredentialsPerUser > o.MaxCredentials || o.MaxNamespacesPerUser > o.MaxNamespaces {
+		o.MaxCredentialsPerUser > o.MaxCredentials {
 		return errors.New("management per-user and idle limits exceed their enclosing limits")
-	}
-	if o.MaxProofBytes < sha256.Size+1 {
-		return errors.New("management proof limit cannot hold native retirement evidence")
 	}
 	return nil
 }
@@ -369,9 +350,6 @@ func validateIntegrity(ctx context.Context, tx *sql.Tx) error {
 		"SELECT EXISTS(SELECT 1 FROM cli_credentials c LEFT JOIN users u ON u.id=c.user_id WHERE u.id IS NULL OR c.auth_epoch>u.auth_epoch)",
 		"SELECT EXISTS(SELECT 1 FROM volumes v LEFT JOIN users u ON u.id=v.owner_user_id WHERE u.id IS NULL)",
 		"SELECT EXISTS(SELECT 1 FROM credential_volumes b LEFT JOIN cli_credentials c ON c.id=b.credential_id LEFT JOIN volumes v ON v.id=b.volume_id WHERE c.id IS NULL OR v.id IS NULL OR v.owner_user_id<>c.user_id)",
-		"SELECT EXISTS(SELECT 1 FROM action_namespaces n LEFT JOIN users u ON u.id=n.actor_user_id WHERE u.id IS NULL OR n.sequence>=u.next_action_namespace OR n.sequence<=u.retired_before_namespace)",
-		"SELECT EXISTS(SELECT 1 FROM operations o LEFT JOIN volumes v ON v.id=o.volume_id LEFT JOIN action_namespaces n ON n.actor_user_id=o.actor_user_id AND n.sequence=o.action_namespace WHERE v.id IS NULL OR v.owner_user_id<>o.actor_user_id OR n.sequence IS NULL)",
-		"SELECT EXISTS(SELECT 1 FROM namespace_volume_participants p LEFT JOIN volumes v ON v.id=p.volume_id LEFT JOIN action_namespaces n ON n.actor_user_id=p.actor_user_id AND n.sequence=p.sequence WHERE v.id IS NULL OR v.owner_user_id<>p.actor_user_id OR n.sequence IS NULL)",
 	} {
 		var invalid bool
 		if err := tx.QueryRowContext(ctx, query).Scan(&invalid); err != nil {
@@ -380,17 +358,6 @@ func validateIntegrity(ctx context.Context, tx *sql.Tx) error {
 		if invalid {
 			return fmt.Errorf("management record relationships are inconsistent: %w", ErrCorrupt)
 		}
-	}
-	return nil
-}
-
-func (s *Store) receiptCapacityTx(ctx context.Context, tx *sql.Tx) error {
-	var count int64
-	if err := tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM operations").Scan(&count); err != nil {
-		return err
-	}
-	if count >= int64(s.options.MaxTerminalReceipts) {
-		return ErrCapacity
 	}
 	return nil
 }

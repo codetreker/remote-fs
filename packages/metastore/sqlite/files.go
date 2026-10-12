@@ -367,9 +367,6 @@ func (s *Store) replaceNodeContent(ctx context.Context, tx *sql.Tx, node metasto
 }
 
 func (s *Store) replaceNodeContentFields(ctx context.Context, tx *sql.Tx, node metastore.Node, object metastore.Object, at time.Time) error {
-	if err := s.checkOrdinaryObjectKey(ctx, tx, object.Key); err != nil {
-		return err
-	}
 	if object.Key == "" {
 		if object.Size != 0 {
 			return syscall.EINVAL

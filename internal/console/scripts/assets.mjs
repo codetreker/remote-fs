@@ -8,7 +8,6 @@ const sourceRoots = [
   "tsconfig.json",
   "vite.config.ts",
   "src",
-  "patches",
   "scripts",
 ];
 const collect = async (path) => {
@@ -24,7 +23,7 @@ const collect = async (path) => {
 };
 const sourceFiles = [];
 for (const path of sourceRoots) {
-  if (["src", "patches", "scripts"].includes(path))
+  if (["src", "scripts"].includes(path))
     sourceFiles.push(...(await collect(path)));
   else sourceFiles.push(path);
 }

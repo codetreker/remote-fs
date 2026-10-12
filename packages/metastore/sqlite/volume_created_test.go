@@ -72,9 +72,6 @@ func TestVolumeCreatedAtHistoricalVersionTenRemainsUnknown(t *testing.T) {
 	for _, statement := range []string{
 		`ALTER TABLE volumes DROP COLUMN created_nsec`,
 		`ALTER TABLE volumes DROP COLUMN created_sec`,
-		`DROP TRIGGER entries_summary_insert`, `DROP TRIGGER entries_summary_delete`, `DROP TRIGGER entries_summary_update`, `DROP TRIGGER nodes_summary_kind`,
-		`DROP TABLE imports`, `DROP TABLE authority_actions`, `DROP TABLE action_namespaces`, `DROP TABLE action_subjects`,
-		`ALTER TABLE volumes DROP COLUMN named_files`, `ALTER TABLE volumes DROP COLUMN named_directories`, `ALTER TABLE volumes DROP COLUMN quota_bytes`, `ALTER TABLE volumes DROP COLUMN quota_revision`,
 		`UPDATE schema_version SET version=10`,
 	} {
 		if _, err := db.ExecContext(t.Context(), statement); err != nil {

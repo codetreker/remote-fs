@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -151,10 +152,41 @@ func TestStateRootDetectsAnchorReplacement(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer r.Close()
+	if err := r.validateAnchor(); err != nil {
+		t.Fatalf("pristine uninitialized anchor: %v", err)
+	}
 	if err := r.BindDatabase(rootTestIdentity(t)); err != nil {
 		t.Fatal(err)
 	}
 	anchor := filepath.Join(c.StateRoot, "service.lock")
+	if err := r.validateAnchor(); err != nil {
+		t.Fatalf("unchanged bound anchor: %v", err)
+	}
+	content, err := os.ReadFile(anchor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var proof rootProof
+	if err := json.Unmarshal(content, &proof); err != nil {
+		t.Fatal(err)
+	}
+	proof.DatabaseID = rootTestIdentity(t)
+	changed, err := json.Marshal(proof)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(anchor, append(changed, '\n'), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.validateAnchor(); !errors.Is(err, management.ErrCorrupt) {
+		t.Fatalf("same-inode anchor identity mutation: %v", err)
+	}
+	if err := os.WriteFile(anchor, content, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.validateAnchor(); err != nil {
+		t.Fatalf("restored canonical anchor: %v", err)
+	}
 	if err := os.Rename(anchor, anchor+".old"); err != nil {
 		t.Fatal(err)
 	}

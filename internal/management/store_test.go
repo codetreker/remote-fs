@@ -105,7 +105,7 @@ func TestManagementOpenRejectsSymlinksAndInvalidOptions(t *testing.T) {
 	}
 	for _, change := range []func(*Options){
 		func(o *Options) { o.MaxReaders = 0 },
-		func(o *Options) { o.MaxNamespaceParticipants = 0 },
+		func(o *Options) { o.MaxVolumes = 0 },
 		func(o *Options) { o.BusyTimeout = 0 },
 		func(o *Options) { o.MaxSessionsPerUser = o.MaxSessions + 1 },
 		func(o *Options) { o.SessionIdleTTL = o.SessionAbsoluteTTL + time.Second },
@@ -129,7 +129,7 @@ func TestManagementRollbackAndCancellationRemainFailures(t *testing.T) {
 	}
 	refusal := errors.New("failure after account insert")
 	err = store.writeTx(t.Context(), func(tx *sql.Tx) error {
-		_, err := tx.ExecContext(t.Context(), "INSERT INTO users(id,role,display_name,auth_epoch,next_action_namespace,retired_before_namespace,logical_time_high_water,created_at) VALUES(?,'user','example',1,1,0,0,0)", id)
+		_, err := tx.ExecContext(t.Context(), "INSERT INTO users(id,role,display_name,auth_epoch,created_at) VALUES(?,'user','example',1,0)", id)
 		if err != nil {
 			return err
 		}
@@ -186,11 +186,7 @@ func TestManagementDatabaseConstraintsProtectAccountAndVolumeIdentities(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
-	namespace, err := store.IssueNamespace(t.Context(), user.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	operation, err := store.CreateVolume(t.Context(), user.ID, ActionKey{Namespace: namespace.Sequence, Nonce: "create"}, "example", 4096)
+	volume, err := store.CreateVolume(t.Context(), user.ID, "example", 4096)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -200,13 +196,13 @@ func TestManagementDatabaseConstraintsProtectAccountAndVolumeIdentities(t *testi
 		"UPDATE volumes SET management_revision=0 WHERE id=?",
 	} {
 		if err := store.writeTx(t.Context(), func(tx *sql.Tx) error {
-			_, err := tx.ExecContext(t.Context(), statement, operation.VolumeID)
+			_, err := tx.ExecContext(t.Context(), statement, volume.ID)
 			return err
 		}); err == nil {
 			t.Fatalf("accepted invalid write: %s", statement)
 		}
 	}
-	volume, err := store.GetVolume(t.Context(), user.ID, operation.VolumeID)
+	volume, err = store.GetVolume(t.Context(), user.ID, volume.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -235,26 +231,5 @@ func TestManagementIDsRejectUnsafeStorageNames(t *testing.T) {
 		if id.Valid() {
 			t.Fatalf("accepted unsafe identity %q", id)
 		}
-	}
-}
-
-func TestManagementReopenRefusesMismatchedNamespaceParticipants(t *testing.T) {
-	store, path := managementFixture(t)
-	owner := authTestAdmin(t, store, "owner")
-	other := authTestAdmin(t, store, "other")
-	namespace := actionTestNamespace(t, store, owner.ID)
-	operation, err := store.CreateVolume(t.Context(), owner.ID, ActionKey{Namespace: namespace.Sequence, Nonce: "create"}, "files", 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	otherNamespace := actionTestNamespace(t, store, other.ID)
-	if _, err := store.write.ExecContext(t.Context(), "INSERT INTO namespace_volume_participants(actor_user_id,sequence,volume_id,created_at) VALUES(?,?,?,?)", other.ID, otherNamespace.Sequence, operation.VolumeID, time.Now().UnixMilli()); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if reopened, err := Open(t.Context(), path, DefaultOptions()); reopened != nil || !errors.Is(err, ErrCorrupt) {
-		t.Fatalf("foreign owner participant passed startup integrity: store=%v error=%v", reopened, err)
 	}
 }

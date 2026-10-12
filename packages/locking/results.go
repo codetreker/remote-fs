@@ -46,7 +46,7 @@ func (a *Authority) QueryAction(ctx context.Context, ref OwnerRef, request Reque
 			return ActionResult{}, err
 		}
 		a.expireSessionsLocked(a.clock.Now())
-		o, err := a.ownerLocked(ctx, ref)
+		o, err := a.ownerLocked(ref)
 		if err != nil {
 			a.mu.Unlock()
 			return ActionResult{}, err
@@ -88,7 +88,7 @@ func (a *Authority) QueryGrant(ctx context.Context, ref OwnerRef, grant GrantRef
 			return GrantStatus{}, err
 		}
 		a.expireSessionsLocked(a.clock.Now())
-		o, err := a.ownerLocked(ctx, ref)
+		o, err := a.ownerLocked(ref)
 		if err != nil {
 			a.mu.Unlock()
 			return GrantStatus{}, err
@@ -123,7 +123,7 @@ func (a *Authority) Release(ctx context.Context, ref OwnerRef, grant GrantRef) (
 			return ReleaseResult{}, err
 		}
 		a.expireSessionsLocked(a.clock.Now())
-		o, err := a.ownerLocked(ctx, ref)
+		o, err := a.ownerLocked(ref)
 		if err != nil {
 			a.mu.Unlock()
 			return ReleaseResult{}, err
@@ -167,7 +167,7 @@ func (a *Authority) Cancel(ctx context.Context, ref OwnerRef, request RequestID)
 			return CancelResult{}, err
 		}
 		a.expireSessionsLocked(a.clock.Now())
-		o, err := a.ownerLocked(ctx, ref)
+		o, err := a.ownerLocked(ref)
 		if err != nil {
 			a.mu.Unlock()
 			return CancelResult{}, err

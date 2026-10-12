@@ -3,10 +3,9 @@ package service
 import (
 	"path/filepath"
 	"testing"
-	"time"
 )
 
-func TestConfigDeploymentAndLifecyclePolicies(t *testing.T) {
+func TestConfigDeploymentPolicies(t *testing.T) {
 	base := DefaultConfig(filepath.Join(t.TempDir(), "state"), "https://files.example.test")
 	if err := base.Validate(); err != nil {
 		t.Fatalf("default policy: %v", err)
@@ -24,11 +23,6 @@ func TestConfigDeploymentAndLifecyclePolicies(t *testing.T) {
 		{"different-auth-origin", func(c *Config) { c.Auth.Origin = "https://other.example.test" }},
 		{"missing-listen-port", func(c *Config) { c.Listen = "localhost" }},
 		{"invalid-proxy", func(c *Config) { c.TrustedProxyCIDRs = []string{"loopback"} }},
-		{"zero-workers", func(c *Config) { c.MaxLifecycleWorkers = 0 }},
-		{"oversized-workers", func(c *Config) { c.MaxLifecycleWorkers = 65537 }},
-		{"zero-authority-actions", func(c *Config) { c.MaxAuthorityActions = 0 }},
-		{"oversized-authority-actions", func(c *Config) { c.MaxAuthorityActions = 1<<20 + 1 }},
-		{"invalid-idle-timeout", func(c *Config) { c.IdleRuntimeTimeout = time.Nanosecond }},
 		{"invalid-shutdown-timeout", func(c *Config) { c.ShutdownTimeout = 0 }},
 		{"missing-auth-policy", func(c *Config) { c.Auth.LoginBuckets = 0 }},
 		{"management-no-reader", func(c *Config) { c.Management.MaxReaders = 0 }},

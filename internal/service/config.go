@@ -15,25 +15,21 @@ import (
 )
 
 type Config struct {
-	Listen              string
-	ExternalOrigin      string
-	StateRoot           string
-	TrustedProxyCIDRs   []string
-	MaxLifecycleWorkers int
-	MaxAuthorityActions int
-	IdleRuntimeTimeout  time.Duration
-	ShutdownTimeout     time.Duration
-	Auth                AuthConfig
-	Management          management.Options
+	Listen            string
+	ExternalOrigin    string
+	StateRoot         string
+	TrustedProxyCIDRs []string
+	ShutdownTimeout   time.Duration
+	Auth              AuthConfig
+	Management        management.Options
 }
 
 func DefaultConfig(stateRoot, origin string) Config {
 	return Config{
 		Listen: "127.0.0.1:8080", ExternalOrigin: origin, StateRoot: stateRoot,
-		TrustedProxyCIDRs:   []string{"127.0.0.1/32", "::1/128"},
-		MaxLifecycleWorkers: 4, MaxAuthorityActions: 100000,
-		IdleRuntimeTimeout: 10 * time.Minute, ShutdownTimeout: 30 * time.Second,
-		Auth: DefaultAuthConfig(origin), Management: management.DefaultOptions(),
+		TrustedProxyCIDRs: []string{"127.0.0.1/32", "::1/128"},
+		ShutdownTimeout:   30 * time.Second,
+		Auth:              DefaultAuthConfig(origin), Management: management.DefaultOptions(),
 	}
 }
 
@@ -62,10 +58,7 @@ func (c Config) Validate() error {
 			return fmt.Errorf("invalid trusted proxy CIDR: %w", err)
 		}
 	}
-	if c.MaxLifecycleWorkers < 1 || c.MaxLifecycleWorkers > 65536 || c.MaxAuthorityActions < 1 || c.MaxAuthorityActions > 1<<20 {
-		return errors.New("lifecycle worker and authority action limits exceed supported bounds")
-	}
-	if c.IdleRuntimeTimeout < time.Millisecond || c.ShutdownTimeout < time.Millisecond {
+	if c.ShutdownTimeout < time.Millisecond {
 		return errors.New("service durations must be at least one millisecond")
 	}
 	if c.Auth.VerificationWait <= 0 || c.Auth.LoginRateWindow <= 0 || c.Auth.LoginAttempts < 1 || c.Auth.LoginBuckets < 2 || c.Auth.OutputCheckInterval <= 0 || c.Auth.OutputWriteTimeout <= 0 || c.Auth.MaxOutputContexts < 1 || c.Auth.MaxOutputsPerAccess < 1 || c.Auth.MaxOutputsPerAccess > c.Auth.MaxOutputContexts {

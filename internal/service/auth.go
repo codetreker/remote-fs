@@ -7,7 +7,6 @@ import (
 	"crypto/subtle"
 	"encoding/base64"
 	"errors"
-	"fmt"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -18,8 +17,6 @@ import (
 	"unicode/utf8"
 
 	"github.com/codetreker/remote-fs/internal/management"
-	"github.com/codetreker/remote-fs/packages/authz"
-	"github.com/codetreker/remote-fs/packages/storage"
 	"golang.org/x/crypto/argon2"
 )
 
@@ -186,24 +183,6 @@ func authStateError(err error) error {
 	return err
 }
 
-// Authorizer reads persistent ownership on every semantic operation. An admin
-// role confers no permission over another user's files.
-func (a *Authenticator) Authorizer(volumeID management.ID) authz.Authorizer {
-	return authz.AuthorizerFunc(func(ctx context.Context, _ authz.AccessRequest) error {
-		p, ok := CurrentPrincipal(ctx)
-		if !ok {
-			return authz.ErrDenied
-		}
-		if err := a.CheckFileAccess(ctx, p, volumeID); err != nil {
-			if errors.Is(err, ErrUnauthenticated) || errors.Is(err, ErrForbidden) {
-				return fmt.Errorf("%w: %w", authz.ErrDenied, err)
-			}
-			return err
-		}
-		return nil
-	})
-}
-
 // CheckVolumeOwner checks current authentication and immutable ownership.
 // Callers additionally enforce the operation scope and selected volume IDs.
 func (a *Authenticator) CheckVolumeOwner(ctx context.Context, p Principal, volumeID management.ID) error {
@@ -239,22 +218,6 @@ func (a *Authenticator) RequireScope(ctx context.Context, p Principal, scope str
 		return ErrForbidden
 	}
 	return nil
-}
-
-// AccessBinding adapts the authenticated service identity to core capability ownership.
-func (a *Authenticator) AccessBinding(ctx context.Context) (storage.AccessBinding, error) {
-	p, ok := CurrentPrincipal(ctx)
-	if !ok {
-		return storage.AccessBinding{}, fmt.Errorf("%w: %w", authz.ErrDenied, ErrUnauthenticated)
-	}
-	if err := a.CheckCurrent(ctx, p); err != nil {
-		if errors.Is(err, ErrUnauthenticated) || errors.Is(err, ErrForbidden) {
-			return storage.AccessBinding{}, fmt.Errorf("%w: %w", authz.ErrDenied, err)
-		}
-		return storage.AccessBinding{}, err
-	}
-	binding := storage.AccessBinding{SubjectID: string(p.UserID), AccessID: string(p.AuthenticationID)}
-	return binding, binding.Check()
 }
 
 func parseBearer(header string) (management.ID, string, error) {

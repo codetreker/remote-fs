@@ -1,6 +1,7 @@
 package serviceapi
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -8,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -21,11 +23,7 @@ func testCredential() Credential {
 }
 func testVolume() Volume {
 	now := time.Date(2026, 10, 12, 0, 0, 0, 0, time.UTC)
-	return Volume{ID: testID, OwnerUserID: secondID, Name: "files", State: "active", Revision: "9007199254740993", CreatedAt: now, UpdatedAt: now, Summary: &VolumeSummary{FileCount: "9007199254740993", DirectoryCount: "0", UsedBytes: "4096", QuotaBytes: "9223372036854775807", QuotaRevision: "1"}}
-}
-func testOperation() Operation {
-	now := time.Date(2026, 10, 12, 0, 0, 0, 0, time.UTC)
-	return Operation{ID: testID, VolumeID: secondID, Kind: "create", State: "succeeded", Phase: "completed", Revision: "1", Settled: true, CreatedAt: now, UpdatedAt: now}
+	return Volume{ID: testID, OwnerUserID: secondID, Name: "files", State: "active", Revision: "9007199254740993", CreatedAt: now, UpdatedAt: now, Summary: &VolumeSummary{FileCount: "9007199254740993", DirectoryCount: "0", UsedBytes: "4096", QuotaBytes: "9223372036854775807"}}
 }
 func testCredentialInfo() CredentialInfo {
 	return CredentialInfo{ID: testID, Label: "cli", Scopes: []string{"files"}, AllOwnedVolumes: true, Generation: "1", ExpiresAt: time.Now().Add(time.Hour)}
@@ -82,40 +80,7 @@ func TestDecodeRejectsAmbiguityAndUnknownFields(t *testing.T) {
 	}
 }
 
-func TestClientRejectsFalseTerminalOperations(t *testing.T) {
-	for _, mutate := range []func(*Operation){
-		func(o *Operation) { o.Phase = "accepted" },
-		func(o *Operation) { o.Error = &ErrorDetail{Code: "storage_unavailable"} },
-		func(o *Operation) { o.State = "failed" },
-		func(o *Operation) { o.State = "pending"; o.Phase = "accepted" },
-		func(o *Operation) { o.Kind = "quota"; o.Phase = "bound"; o.State = "running"; o.Settled = false },
-	} {
-		operation := testOperation()
-		mutate(&operation)
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _ = json.NewEncoder(w).Encode(operation) }))
-		client, _ := NewClient(server.URL, server.Client(), Credential{})
-		if _, err := client.WaitOperation(context.Background(), testID, time.Millisecond); err == nil {
-			t.Fatalf("false terminal %+v accepted", operation)
-		}
-		server.Close()
-	}
-	operation := testOperation()
-	operation.State = "failed"
-	operation.Phase = "initializing"
-	operation.Error = &ErrorDetail{Code: "storage_unavailable"}
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _ = json.NewEncoder(w).Encode(operation) }))
-	defer server.Close()
-	client, _ := NewClient(server.URL, server.Client(), Credential{})
-	got, err := client.WaitOperation(context.Background(), testID, time.Millisecond)
-	if err != nil || got.State != "failed" {
-		t.Fatalf("settled failure rejected: %+v %v", got, err)
-	}
-	if _, err := client.WaitOperation(context.Background(), testID, 0); err == nil {
-		t.Fatal("zero interval accepted")
-	}
-}
-
-func TestClientRequiresExplicitListTruthAndCredentialRotationMetadata(t *testing.T) {
+func TestClientRequiresExplicitListTruth(t *testing.T) {
 	for _, body := range []string{`{}`, `{"volumes":null}`, `{"volumes":[],"nextAfter":"invalid"}`} {
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = io.WriteString(w, body) }))
 		client, _ := NewClient(server.URL, server.Client(), Credential{})
@@ -123,18 +88,6 @@ func TestClientRequiresExplicitListTruthAndCredentialRotationMetadata(t *testing
 			t.Fatalf("accepted %s", body)
 		}
 		server.Close()
-	}
-	credential := testCredentialInfo()
-	expires := time.Now().Add(time.Minute)
-	credential.PendingActionID = secondID
-	credential.PendingExpiresAt = &expires
-	credential.RotationActionID = secondID
-	credential.RotationGeneration = "1"
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _ = json.NewEncoder(w).Encode(credential) }))
-	defer server.Close()
-	client, _ := NewClient(server.URL, server.Client(), Credential{})
-	if _, err := client.Credential(context.Background(), testID); err != nil {
-		t.Fatal(err)
 	}
 }
 
@@ -185,13 +138,6 @@ func TestClientPinsOriginAndNeverFollowsRedirects(t *testing.T) {
 	if _, err := client.WithCredential(Credential{ID: testID, Secret: "bad"}); err == nil {
 		t.Fatal("bad credential")
 	}
-	if _, err := client.VolumeURL("../escape"); err == nil {
-		t.Fatal("bad volume ID")
-	}
-	volumeURL, err := client.VolumeURL(testID)
-	if err != nil || volumeURL != server.URL+"/api/volumes/"+testID {
-		t.Fatalf("%s %v", volumeURL, err)
-	}
 }
 
 func TestClientManagementMethodsAndLosslessDTO(t *testing.T) {
@@ -212,8 +158,6 @@ func TestClientManagementMethodsAndLosslessDTO(t *testing.T) {
 				return
 			}
 			result = testCredentialInfo()
-		case r.URL.Path == Prefix+"/action-namespaces":
-			result = ActionNamespace{SubjectID: secondID, Namespace: "9007199254740993", AcceptUntil: time.Now().Add(time.Hour)}
 		case r.URL.Path == Prefix+"/volumes" && r.Method == http.MethodGet:
 			if r.URL.Query().Get("after") == "" {
 				result = VolumeList{Volumes: []Volume{testVolume()}, NextAfter: testID}
@@ -229,12 +173,11 @@ func TestClientManagementMethodsAndLosslessDTO(t *testing.T) {
 		case strings.HasPrefix(r.URL.Path, Prefix+"/volumes/") && r.Method == http.MethodGet:
 			result = testVolume()
 		default:
-			result = testOperation()
-			if strings.HasPrefix(r.URL.Path, Prefix+"/volumes/") {
-				operation := testOperation()
-				operation.VolumeID = testID
-				result = operation
+			if r.Method == http.MethodDelete {
+				w.WriteHeader(http.StatusNoContent)
+				return
 			}
+			result = testVolume()
 		}
 		if err := json.NewEncoder(w).Encode(result); err != nil {
 			t.Error(err)
@@ -252,18 +195,8 @@ func TestClientManagementMethodsAndLosslessDTO(t *testing.T) {
 	if _, err := client.Credential(ctx, testID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := client.PrepareRotation(ctx, testID, PrepareRotationRequest{ActionID: secondID, ExpectedGeneration: "1", Secret: testCredential().Secret}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := client.ActivateRotation(ctx, testID, ActivateRotationRequest{ActionID: secondID, ExpectedGeneration: "1"}); err != nil {
-		t.Fatal(err)
-	}
 	if err := client.RevokeCredential(ctx, testID); err != nil {
 		t.Fatal(err)
-	}
-	namespace, err := client.IssueNamespace(ctx)
-	if err != nil || namespace.Namespace != "9007199254740993" {
-		t.Fatalf("%+v %v", namespace, err)
 	}
 	volumes, err := client.ListVolumes(ctx)
 	if err != nil || len(volumes) != 2 || volumes[0].Revision != "9007199254740993" {
@@ -272,23 +205,13 @@ func TestClientManagementMethodsAndLosslessDTO(t *testing.T) {
 	if _, err := client.GetVolume(ctx, testID); err != nil {
 		t.Fatal(err)
 	}
-	action := Action{Namespace: "1", Nonce: "nonce"}
-	if _, err := client.CreateVolume(ctx, CreateVolumeRequest{Action: action, Name: "private", QuotaBytes: "4096"}); err != nil {
+	if _, err := client.CreateVolume(ctx, CreateVolumeRequest{Name: "private", QuotaBytes: "4096"}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := client.RenameVolume(ctx, testID, RenameVolumeRequest{Action: action, ExpectedRevision: "1", Name: "new"}); err != nil {
+	if _, err := client.RenameVolume(ctx, testID, RenameVolumeRequest{Name: "new"}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := client.SetQuota(ctx, testID, SetQuotaRequest{Action: action, ExpectedRevision: "1", QuotaBytes: "8192"}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := client.DeleteVolume(ctx, testID, DeleteVolumeRequest{Action: action, ExpectedRevision: "1"}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := client.FindOperation(ctx, action); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := client.WaitOperation(ctx, testID, time.Millisecond); err != nil {
+	if err := client.DeleteVolume(ctx, testID); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := client.ListUsers(ctx); err != nil {
@@ -297,7 +220,7 @@ func TestClientManagementMethodsAndLosslessDTO(t *testing.T) {
 	if _, err := client.ListUserVolumes(ctx, testID); err != nil {
 		t.Fatal(err)
 	}
-	if len(methods) != 17 {
+	if len(methods) != 11 {
 		t.Fatalf("exchanges %d %+v", len(methods), methods)
 	}
 }
@@ -334,5 +257,155 @@ func TestClientRejectsUnknownTruthAndReturnsClosedErrors(t *testing.T) {
 			t.Fatal("raw diagnostics exposed")
 		}
 		server.Close()
+	}
+}
+
+func TestClientReadOnlyDirectoryPreservesOpaqueBytePaths(t *testing.T) {
+	token := base64.StdEncoding.EncodeToString([]byte("dir\xff"))
+	directory := FileDirectory{PathBase64: token, Entries: []FileEntry{{Name: "file", NameBase64: "ZmlsZQ==", PathBase64: base64.StdEncoding.EncodeToString([]byte("dir\xff/file")), NodeID: "9007199254740993", Kind: "file", SizeBytes: "1", ModifiedAt: time.Now()}}}
+	calls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if r.Method != "GET" || r.URL.Path != Prefix+"/volumes/"+testID+"/files" || r.URL.Query().Get("path") != token {
+			t.Error("directory identity or readonly method changed")
+		}
+		json.NewEncoder(w).Encode(directory)
+	}))
+	defer server.Close()
+	client, err := NewClient(server.URL, server.Client(), testCredential())
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := client.ListFiles(t.Context(), testID, token)
+	if err != nil || result.PathBase64 != token || result.Entries[0].NodeID != "9007199254740993" || result.Entries[0].PathBase64 != directory.Entries[0].PathBase64 {
+		t.Fatalf("directory identity changed: %+v %v", result, err)
+	}
+	for _, input := range []struct{ id, path string }{{"../escape", token}, {testID, "not base64"}, {testID, token + "\n"}} {
+		if _, err := client.ListFiles(t.Context(), input.id, input.path); err == nil {
+			t.Fatal("invalid directory request accepted")
+		}
+	}
+	if calls != 1 {
+		t.Fatal("invalid request reached server")
+	}
+	directory.PathBase64 = ""
+	if _, err := client.ListFiles(t.Context(), testID, token); err == nil {
+		t.Fatal("another directory was substituted")
+	}
+	directory.PathBase64 = token
+	directory.Entries = nil
+	if _, err := client.ListFiles(t.Context(), testID, token); err == nil {
+		t.Fatal("unknown directory reported as empty")
+	}
+}
+
+func TestDirectoryResponseExceedsManagementLimitWithoutTruncation(t *testing.T) {
+	const count = 25000
+	const firstNode = uint64(9007199254740993)
+	parent := strings.Repeat(strings.Repeat("d", 200)+"/", 10) + "raw\xff"
+	directory := FileDirectory{PathBase64: base64.StdEncoding.EncodeToString([]byte(parent)), Entries: make([]FileEntry, count)}
+	modified := time.Date(2026, 10, 12, 0, 0, 0, 0, time.UTC)
+	for index := range directory.Entries {
+		name := strings.Repeat("f", 220) + strconv.Itoa(index)
+		path := base64.StdEncoding.EncodeToString([]byte(name))
+		directory.Entries[index] = FileEntry{Name: name, NameBase64: path, PathBase64: base64.StdEncoding.EncodeToString([]byte(parent + "/" + name)), NodeID: DecimalFromUint64(firstNode + uint64(index)), Kind: "file", SizeBytes: "1", ModifiedAt: modified}
+	}
+	body, err := json.Marshal(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(body) <= maxResponseBytes || len(body) >= maxDirectoryResponseBytes {
+		t.Fatalf("directory fixture has inappropriate size: %d", len(body))
+	}
+	if bytes.Count(body, []byte(`"pathBase64"`)) != 1 || bytes.Contains(body, []byte(directory.Entries[count-1].PathBase64)) {
+		t.Fatal("directory wire repeated full child paths")
+	}
+	if len(body)+count*len(directory.PathBase64) <= maxDirectoryResponseBytes {
+		t.Fatal("fixture did not exercise a deep directory whose repeated paths exceed the response limit")
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != Prefix+"/volumes/"+testID+"/files" || r.URL.Query().Get("path") != directory.PathBase64 {
+			t.Error("unexpected directory request")
+		}
+		if _, err := w.Write(body); err != nil {
+			t.Error(err)
+		}
+	}))
+	defer server.Close()
+	client, err := NewClient(server.URL, server.Client(), testCredential())
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := client.ListFiles(t.Context(), testID, directory.PathBase64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Entries) != count {
+		t.Fatalf("directory truncated: %d", len(result.Entries))
+	}
+	expected := directory.Entries[count-1]
+	actual := result.Entries[count-1]
+	if actual != expected || result.PathBase64 != directory.PathBase64 {
+		t.Fatalf("directory identity or metadata changed: %+v", actual)
+	}
+}
+
+func TestCredentialStatusValidatesCurrentAndPendingMetadata(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*CredentialInfo)
+		valid  bool
+	}{
+		{name: "current", valid: true},
+		{name: "pending metadata", valid: true, mutate: func(info *CredentialInfo) {
+			expiry := time.Now().Add(time.Minute)
+			info.PendingActionID = secondID
+			info.PendingExpiresAt = &expiry
+			info.RotationActionID = secondID
+			info.RotationGeneration = "1"
+		}},
+		{name: "missing pending expiry", mutate: func(info *CredentialInfo) { info.PendingActionID = secondID }},
+		{name: "zero generation", mutate: func(info *CredentialInfo) { info.Generation = "0" }},
+		{name: "overflow generation", mutate: func(info *CredentialInfo) { info.Generation = "9223372036854775808" }},
+		{name: "missing current expiry", mutate: func(info *CredentialInfo) { info.ExpiresAt = time.Time{} }},
+		{name: "duplicate scope", mutate: func(info *CredentialInfo) { info.Scopes = []string{"files", "files"} }},
+		{name: "unknown scope", mutate: func(info *CredentialInfo) { info.Scopes = []string{"unknown"} }},
+		{name: "different credential", mutate: func(info *CredentialInfo) { info.ID = secondID }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			status := testCredentialInfo()
+			if test.mutate != nil {
+				test.mutate(&status)
+			}
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodGet || r.URL.Path != Prefix+"/auth/cli-credentials/"+testID {
+					t.Error("status lookup changed credential identity or method")
+				}
+				if err := json.NewEncoder(w).Encode(status); err != nil {
+					t.Error(err)
+				}
+			}))
+			defer server.Close()
+			client, err := NewClient(server.URL, server.Client(), testCredential())
+			if err != nil {
+				t.Fatal(err)
+			}
+			result, err := client.Credential(t.Context(), testID)
+			if !test.valid {
+				if err == nil {
+					t.Fatal("untrustworthy credential status reported success")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result.ID != status.ID || result.Generation != status.Generation || !result.ExpiresAt.Equal(status.ExpiresAt) || result.PendingActionID != status.PendingActionID || result.RotationActionID != status.RotationActionID || result.RotationGeneration != status.RotationGeneration {
+				t.Fatalf("credential status metadata changed: %+v", result)
+			}
+			if status.PendingExpiresAt != nil && (result.PendingExpiresAt == nil || !result.PendingExpiresAt.Equal(*status.PendingExpiresAt)) {
+				t.Fatal("pending expiry metadata was lost")
+			}
+		})
 	}
 }

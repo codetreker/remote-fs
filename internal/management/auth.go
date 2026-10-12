@@ -138,7 +138,7 @@ func (s *Store) addAdmin(ctx context.Context, loginName, displayName, passwordHa
 			return ErrConflict
 		}
 		now := s.now().UTC()
-		if _, err := tx.ExecContext(ctx, "INSERT INTO users(id,role,display_name,auth_epoch,next_action_namespace,retired_before_namespace,logical_time_high_water,created_at) VALUES(?,'admin',?,1,1,0,0,?)", id, displayName, unixMillis(now)); err != nil {
+		if _, err := tx.ExecContext(ctx, "INSERT INTO users(id,role,display_name,auth_epoch,created_at) VALUES(?,'admin',?,1,?)", id, displayName, unixMillis(now)); err != nil {
 			return err
 		}
 		if _, err := tx.ExecContext(ctx, "INSERT INTO local_admin_credentials(user_id,login_name,password_hash,password_version,changed_at) VALUES(?,?,?,1,?)", id, loginName, passwordHash, unixMillis(now)); err != nil {

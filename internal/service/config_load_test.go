@@ -19,9 +19,6 @@ func TestParseConfigKeepsExplicitPolicyAndDefaults(t *testing.T) {
 	if config.Listen != "127.0.0.1:9191" || config.ShutdownTimeout != 17*time.Second {
 		t.Fatalf("explicit configuration was changed: %+v", config)
 	}
-	if config.IdleRuntimeTimeout != DefaultConfig(config.StateRoot, config.ExternalOrigin).IdleRuntimeTimeout {
-		t.Fatal("omitted runtime timeout did not retain its default")
-	}
 }
 
 func TestParseConfigRejectsAmbiguousAndInvalidPolicy(t *testing.T) {

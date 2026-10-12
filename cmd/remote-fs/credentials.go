@@ -8,31 +8,22 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
-	"time"
 
 	"golang.org/x/sys/unix"
 )
 
 const defaultCredentialFile = ".remote-fs/credentials.json"
 
-type pendingRotation struct {
-	Secret             string `json:"secret"`
-	ActionID           string `json:"actionId"`
-	ExpectedGeneration string `json:"expectedGeneration"`
-}
 type credentialRecord struct {
-	Version    int              `json:"version"`
-	Server     string           `json:"server"`
-	ID         string           `json:"id"`
-	Secret     string           `json:"secret"`
-	SubjectID  string           `json:"subjectId"`
-	Generation string           `json:"generation"`
-	Pending    *pendingRotation `json:"pending,omitempty"`
+	Version   int    `json:"version"`
+	Server    string `json:"server"`
+	ID        string `json:"id"`
+	Secret    string `json:"secret"`
+	SubjectID string `json:"subjectId"`
 }
 
 func privateDirectory(name string, create bool) (*os.File, string, error) {
@@ -203,7 +194,7 @@ func loadCredential(name string) (credentialRecord, error) {
 	if err := readPrivate(name, &record); err != nil {
 		return record, err
 	}
-	if record.Version != 1 || len(record.ID) != 32 || len(record.SubjectID) != 32 || record.Generation == "" {
+	if record.Version != 1 || len(record.ID) != 32 || len(record.SubjectID) != 32 {
 		return record, errors.New("invalid credential record")
 	}
 	if _, err := hex.DecodeString(record.ID); err != nil {
@@ -223,14 +214,6 @@ func randomHex() (string, error) {
 	}
 	return hex.EncodeToString(b[:]), nil
 }
-func randomSecret() (string, error) {
-	var b [32]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		return "", err
-	}
-	return base64.RawURLEncoding.EncodeToString(b[:]), nil
-}
-
 func validateServiceURL(raw string, insecure bool) (string, error) {
 	u, err := url.Parse(raw)
 	if err != nil || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || u.Path != "" && u.Path != "/" {
@@ -240,42 +223,4 @@ func validateServiceURL(raw string, insecure bool) (string, error) {
 		return "", errors.New("service credentials require HTTPS; -allow-insecure-http permits an explicit development connection")
 	}
 	return strings.TrimSuffix(u.String(), "/"), nil
-}
-
-type fileCredentialTransport struct {
-	path, origin string
-	base         http.RoundTripper
-}
-
-func (t fileCredentialTransport) RoundTrip(r *http.Request) (*http.Response, error) {
-	c, err := loadCredential(t.path)
-	if err != nil {
-		return nil, errors.New("cannot load private credential file")
-	}
-	u, err := url.Parse(c.Server)
-	if err != nil {
-		return nil, errors.New("invalid credential server")
-	}
-	if r.URL.Scheme != u.Scheme || r.URL.Host != u.Host || r.URL.User != nil || r.URL.Opaque != "" || r.Host != "" && r.Host != u.Host || c.Server != t.origin {
-		return nil, errors.New("credential server does not match the request origin")
-	}
-	copy := r.Clone(r.Context())
-	copy.Header = r.Header.Clone()
-	copy.Header.Del("Cookie")
-	copy.Header.Set("Authorization", "Bearer "+c.ID+"."+c.Secret)
-	return t.base.RoundTrip(copy)
-}
-func credentialHTTPClient(file, server string, timeout time.Duration) (*http.Client, error) {
-	c, err := loadCredential(file)
-	if err != nil {
-		return nil, err
-	}
-	u, err := url.Parse(server)
-	if err != nil || u.User != nil || u.Scheme+"://"+u.Host != c.Server {
-		return nil, errors.New("mount URL does not match credential server")
-	}
-	client := callerClient(timeout)
-	client.Transport = fileCredentialTransport{file, c.Server, client.Transport}
-	client.CheckRedirect = func(*http.Request, []*http.Request) error { return errors.New("authenticated redirects are refused") }
-	return client, nil
 }

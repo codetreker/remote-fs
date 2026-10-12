@@ -2,9 +2,7 @@ package management
 
 import (
 	"context"
-	"crypto/sha256"
 	"database/sql"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -14,18 +12,18 @@ import (
 	"unicode/utf8"
 )
 
-const volumeColumns = "id,owner_user_id,display_name,storage_name,state,management_revision,last_operation_id,created_at,updated_at"
+const volumeColumns = "id,owner_user_id,display_name,storage_name,initial_quota_bytes,state,management_revision,error_code,created_at,updated_at"
 
 func scanVolume(row rowScanner) (Volume, error) {
 	var volume Volume
 	var created, updated int64
-	if err := row.Scan(&volume.ID, &volume.OwnerUserID, &volume.DisplayName, &volume.StorageName, &volume.State, &volume.ManagementRevision, &volume.LastOperationID, &created, &updated); err != nil {
+	if err := row.Scan(&volume.ID, &volume.OwnerUserID, &volume.DisplayName, &volume.StorageName, &volume.InitialQuotaBytes, &volume.State, &volume.ManagementRevision, &volume.ErrorCode, &created, &updated); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return Volume{}, ErrNotFound
 		}
 		return Volume{}, err
 	}
-	if !validID(volume.ID) || !validID(volume.OwnerUserID) || !validID(volume.LastOperationID) || volume.StorageName != string(volume.ID) || volume.ManagementRevision < 1 || validateVolumeName(volume.DisplayName) != nil || !validVolumeState(volume.State) {
+	if !validID(volume.ID) || !validID(volume.OwnerUserID) || volume.StorageName != string(volume.ID) || volume.InitialQuotaBytes < 4096 || volume.ManagementRevision < 1 || validateVolumeName(volume.DisplayName) != nil || !validVolumeState(volume.State) {
 		return Volume{}, ErrCorrupt
 	}
 	volume.CreatedAt, volume.UpdatedAt = time.UnixMilli(created).UTC(), time.UnixMilli(updated).UTC()
@@ -58,17 +56,6 @@ func requireOwnedVolumeTx(ctx context.Context, tx *sql.Tx, actor, id ID) (Volume
 	}
 	if volume.OwnerUserID != actor {
 		return Volume{}, ErrDenied
-	}
-	return volume, nil
-}
-
-func requireActiveVolumeTx(ctx context.Context, tx *sql.Tx, actor, id ID) (Volume, error) {
-	volume, err := requireOwnedVolumeTx(ctx, tx, actor, id)
-	if err != nil {
-		return Volume{}, err
-	}
-	if volume.State != VolumeActive {
-		return Volume{}, ErrConflict
 	}
 	return volume, nil
 }
@@ -126,163 +113,115 @@ func (s *Store) ListCatalogVolumes(ctx context.Context, after ID, limit int) ([]
 	return volumes, rows.Err()
 }
 
-func (s *Store) CreateVolume(ctx context.Context, actor ID, key ActionKey, name string, quotaBytes int64) (Operation, error) {
-	return s.mutateVolume(ctx, actor, OperationCreate, VolumeMutation{Action: key, Name: name, QuotaBytes: quotaBytes})
-}
-
-func (s *Store) RenameVolume(ctx context.Context, actor ID, key ActionKey, volume ID, revision int64, name string) (Operation, error) {
-	return s.mutateVolume(ctx, actor, OperationRename, VolumeMutation{Action: key, VolumeID: volume, ExpectedRevision: revision, Name: name})
-}
-
-func (s *Store) ChangeQuota(ctx context.Context, actor ID, key ActionKey, volume ID, nativeRevision, quotaBytes int64) (Operation, error) {
-	return s.mutateVolume(ctx, actor, OperationQuota, VolumeMutation{Action: key, VolumeID: volume, ExpectedRevision: nativeRevision, QuotaBytes: quotaBytes})
-}
-
-func (s *Store) DeleteVolume(ctx context.Context, actor ID, key ActionKey, volume ID, revision int64) (Operation, error) {
-	return s.mutateVolume(ctx, actor, OperationDelete, VolumeMutation{Action: key, VolumeID: volume, ExpectedRevision: revision})
-}
-
-func validateMutation(kind OperationKind, request VolumeMutation) error {
-	if err := validateActionKey(request.Action); err != nil {
-		return err
+func (s *Store) CreateVolume(ctx context.Context, actor ID, name string, quotaBytes int64) (Volume, error) {
+	if err := validateVolumeName(name); err != nil {
+		return Volume{}, err
 	}
-	if kind == OperationCreate || kind == OperationRename {
-		if err := validateVolumeName(request.Name); err != nil {
-			return err
-		}
+	if quotaBytes < 4096 {
+		return Volume{}, fmt.Errorf("initial quota must be at least 4096 bytes: %w", syscall.EINVAL)
 	}
-	if kind == OperationCreate || kind == OperationQuota {
-		if request.QuotaBytes < 0 {
-			return fmt.Errorf("quota must be nonnegative: %w", syscall.EINVAL)
-		}
-	}
-	if kind != OperationCreate && (request.VolumeID == "" || request.ExpectedRevision < 1 || request.ExpectedRevision == math.MaxInt64) {
-		return fmt.Errorf("invalid volume or revision: %w", syscall.EINVAL)
-	}
-	return nil
-}
-
-func mutationPayload(actor ID, kind OperationKind, request VolumeMutation) ([]byte, []byte, error) {
-	payload, err := json.Marshal(struct {
-		Actor   ID
-		Kind    OperationKind
-		Request VolumeMutation
-	}{actor, kind, request})
+	id, err := NewID()
 	if err != nil {
-		return nil, nil, err
+		return Volume{}, err
 	}
-	fingerprint := sha256.Sum256(payload)
-	return payload, fingerprint[:], nil
-}
-
-func (s *Store) mutateVolume(ctx context.Context, actor ID, kind OperationKind, request VolumeMutation) (Operation, error) {
-	if err := validateMutation(kind, request); err != nil {
-		return Operation{}, err
-	}
-	payload, fingerprint, err := mutationPayload(actor, kind, request)
-	if err != nil {
-		return Operation{}, err
-	}
-	if len(payload) > s.options.MaxPayloadBytes {
-		return Operation{}, ErrCapacity
-	}
-	var operation Operation
-	var refused error
+	var volume Volume
 	err = s.writeTx(ctx, func(tx *sql.Tx) error {
 		if _, err := requireUserTx(ctx, tx, actor); err != nil {
 			return err
 		}
-		known, err := operationByKeyTx(ctx, tx, actor, request.Action)
-		if err == nil {
-			if !equalFingerprint(known.Fingerprint, fingerprint) {
-				return ErrConflict
-			}
-			operation = known
-			return nil
-		}
-		if !errors.Is(err, ErrNotFound) {
+		var count int
+		if err := tx.QueryRowContext(ctx, "SELECT count(*) FROM volumes").Scan(&count); err != nil {
 			return err
 		}
-		now, err := s.checkNamespaceTx(ctx, tx, actor, request.Action.Namespace)
-		if err != nil {
-			if errors.Is(err, ErrExpired) || errors.Is(err, ErrHistoryExpired) || errors.Is(err, ErrNotFound) {
-				refused = err
-				return nil
-			}
+		if count >= s.options.MaxVolumes {
+			return ErrCapacity
+		}
+		if err := requireAvailableVolumeName(ctx, tx, actor, id, name); err != nil {
 			return err
 		}
-		if err := s.operationCapacityTx(ctx, tx, kind == OperationRename); err != nil {
+		now := s.now().UTC()
+		volume = Volume{ID: id, OwnerUserID: actor, DisplayName: name, StorageName: string(id), InitialQuotaBytes: quotaBytes, State: VolumeCreating, ManagementRevision: 1, CreatedAt: now, UpdatedAt: now}
+		_, err := tx.ExecContext(ctx, "INSERT INTO volumes("+volumeColumns+") VALUES(?,?,?,?,?,?,?,?,?,?)", volume.ID, volume.OwnerUserID, volume.DisplayName, volume.StorageName, volume.InitialQuotaBytes, volume.State, volume.ManagementRevision, volume.ErrorCode, unixMillis(now), unixMillis(now))
+		return err
+	})
+	return volume, err
+}
+
+func requireAvailableVolumeName(ctx context.Context, tx *sql.Tx, actor, id ID, name string) error {
+	var duplicate bool
+	if err := tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM volumes WHERE owner_user_id=? AND display_name=? AND state<>'deleted' AND id<>?)", actor, name, id).Scan(&duplicate); err != nil {
+		return err
+	}
+	if duplicate {
+		return ErrConflict
+	}
+	return nil
+}
+
+func (s *Store) RenameVolume(ctx context.Context, actor, id ID, revision int64, name string) (Volume, error) {
+	if err := validateVolumeName(name); err != nil {
+		return Volume{}, err
+	}
+	return s.updateVolume(ctx, actor, id, revision, func(tx *sql.Tx, volume *Volume) error {
+		if volume.State != VolumeActive {
+			return ErrConflict
+		}
+		if err := requireAvailableVolumeName(ctx, tx, actor, id, name); err != nil {
 			return err
 		}
-		var volume Volume
-		if kind == OperationCreate {
-			var count int
-			if err := tx.QueryRowContext(ctx, "SELECT count(*) FROM volumes").Scan(&count); err != nil {
-				return err
-			}
-			if count >= s.options.MaxVolumes {
-				return ErrCapacity
-			}
-			id, err := NewID()
-			if err != nil {
-				return err
-			}
-			volume = Volume{ID: id, OwnerUserID: actor, StorageName: string(id), DisplayName: request.Name, State: VolumeCreating, ManagementRevision: 1, CreatedAt: now, UpdatedAt: now}
-		} else {
-			volume, err = requireActiveVolumeTx(ctx, tx, actor, request.VolumeID)
-			if err != nil {
-				return err
-			}
-			if kind != OperationQuota && volume.ManagementRevision != request.ExpectedRevision {
-				return ErrConflict
-			}
-			var pending int
-			if err := tx.QueryRowContext(ctx, "SELECT count(*) FROM operations WHERE volume_id=? AND state IN ('pending','running')", volume.ID).Scan(&pending); err != nil {
-				return err
-			}
-			if pending > 0 {
-				return ErrConflict
-			}
+		volume.DisplayName = name
+		return nil
+	})
+}
+
+func (s *Store) DeleteVolume(ctx context.Context, actor, id ID, revision int64) (Volume, error) {
+	return s.updateVolume(ctx, actor, id, revision, func(_ *sql.Tx, volume *Volume) error {
+		if volume.State != VolumeActive && volume.State != VolumeFailed {
+			return ErrConflict
 		}
-		if kind == OperationCreate || kind == OperationRename {
-			var duplicate int
-			if err := tx.QueryRowContext(ctx, "SELECT count(*) FROM volumes WHERE owner_user_id=? AND display_name=? AND state<>'deleted' AND id<>?", actor, request.Name, volume.ID).Scan(&duplicate); err != nil {
-				return err
-			}
-			if duplicate > 0 {
-				return ErrConflict
-			}
+		volume.State, volume.ErrorCode = VolumeDeleting, ""
+		return nil
+	})
+}
+
+func (s *Store) SetVolumeState(ctx context.Context, actor, id ID, revision int64, state VolumeState, errorCode string) (Volume, error) {
+	if len(errorCode) > 128 || (state != VolumeFailed && errorCode != "") || (state == VolumeFailed && errorCode == "") {
+		return Volume{}, fmt.Errorf("invalid volume outcome: %w", syscall.EINVAL)
+	}
+	return s.updateVolume(ctx, actor, id, revision, func(_ *sql.Tx, volume *Volume) error {
+		allowed := volume.State == VolumeCreating && (state == VolumeActive || state == VolumeFailed) || volume.State == VolumeDeleting && (state == VolumeDeleted || state == VolumeFailed)
+		if !allowed {
+			return ErrConflict
 		}
-		operationID, err := NewID()
-		if err != nil {
-			return err
-		}
-		operation = Operation{ID: operationID, ActorUserID: actor, VolumeID: volume.ID, Kind: kind, Action: request.Action, Fingerprint: fingerprint, ExpectedRevision: request.ExpectedRevision, Payload: payload, State: OperationPending, Phase: PhaseAccepted, Revision: 1, CreatedAt: now, UpdatedAt: now}
-		if kind == OperationRename {
-			volume.DisplayName = request.Name
-			volume.ManagementRevision++
-			operation.State, operation.Phase, operation.Settled = OperationSucceeded, PhaseCompleted, true
-			operation.Result, err = json.Marshal(struct{ ManagementRevision int64 }{volume.ManagementRevision})
-			if err != nil {
-				return err
-			}
-		}
-		volume.LastOperationID, volume.UpdatedAt = operation.ID, now
-		if kind == OperationCreate {
-			_, err = tx.ExecContext(ctx, `INSERT INTO volumes(`+volumeColumns+`) VALUES(?,?,?,?,?,?,?,?,?)`, volume.ID, actor, volume.DisplayName, volume.StorageName, volume.State, volume.ManagementRevision, volume.LastOperationID, now.UnixMilli(), now.UnixMilli())
-		} else {
-			_, err = tx.ExecContext(ctx, "UPDATE volumes SET display_name=?,management_revision=?,last_operation_id=?,updated_at=? WHERE id=?", volume.DisplayName, volume.ManagementRevision, volume.LastOperationID, now.UnixMilli(), volume.ID)
-		}
+		volume.State, volume.ErrorCode = state, errorCode
+		return nil
+	})
+}
+
+func (s *Store) updateVolume(ctx context.Context, actor, id ID, revision int64, change func(*sql.Tx, *Volume) error) (Volume, error) {
+	if !validID(id) || revision < 1 || revision == math.MaxInt64 {
+		return Volume{}, fmt.Errorf("invalid volume identity or revision: %w", syscall.EINVAL)
+	}
+	var volume Volume
+	err := s.writeTx(ctx, func(tx *sql.Tx) error {
+		var err error
+		volume, err = requireOwnedVolumeTx(ctx, tx, actor, id)
 		if err != nil {
 			return err
 		}
-		return insertOperationTx(ctx, tx, operation)
+		if volume.ManagementRevision != revision {
+			return ErrConflict
+		}
+		if err := change(tx, &volume); err != nil {
+			return err
+		}
+		volume.ManagementRevision++
+		volume.UpdatedAt = s.now().UTC()
+		_, err = tx.ExecContext(ctx, "UPDATE volumes SET display_name=?,state=?,management_revision=?,error_code=?,updated_at=? WHERE id=?", volume.DisplayName, volume.State, volume.ManagementRevision, volume.ErrorCode, unixMillis(volume.UpdatedAt), volume.ID)
+		return err
 	})
 	if err != nil {
-		return Operation{}, err
+		return Volume{}, err
 	}
-	if refused != nil {
-		return Operation{}, refused
-	}
-	return operation, nil
+	return volume, nil
 }

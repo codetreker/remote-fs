@@ -23,9 +23,9 @@ type AccessRequest struct {
 
 [`HandlerOptions`](../../../packages/transport/httprest/limits.go) 的 Authorizer 与 Volume 成对配置。两者都缺省时没有库内策略检查；非空 volume 配 nil Authorizer、非 nil Authorizer 配空 volume，以及 interface 内含 typed nil 或 nil AuthorizerFunc，都在构造时拒绝。volume 是不透明名字，不 trim、不从 URL、body 或 backend 推断。业务方将该可信名字与 backing、change log 和锁服务正确配对。
 
-Authorizer 用业务自己的 context key 取得稳定访问身份，读取当前策略并同步返回。它必须支持并发、响应取消，不重入同一 handler。库不缓存策略、不重试 callback、不创建每次调用的后台 goroutine，也不记录原始策略错误。嵌入方管理认证、用户、角色、token 与 TLS；[独立服务](service.md)提供其本地管理员登录和 owner 策略，不能用管理员摘要权限放行他人文件。
+Authorizer 用业务自己的 context key 取得稳定访问身份，读取当前策略并同步返回。它必须支持并发、响应取消，不重入同一 handler。库不缓存策略、不重试 callback、不创建每次调用的后台 goroutine，也不记录原始策略错误。认证、用户、角色、token 签发／验证／刷新和 TLS 由嵌入方管理；独立二进制没有认证配置入口。
 
-授权对象是整个 volume 的语义操作。路径 ACL、逐节点过滤和部分目录／快照视图不在这个接口内。未配置 AccessBinding 的 Session、File、Owner 和 Grant 保持既有 bearer 模式；配置后，hook 从可信 context 返回 opaque SubjectID/AccessID，原有 stateful 记录的创建、使用、恢复与终态查询都比较 binding。不同 access 不能继承引用或 grant，轮换可保留 access；hook 不读取服务用户模型，也不增加第二套 registry。两种模式每个请求仍需 Authorizer。
+授权对象是整个 volume 的语义操作。路径 ACL、逐节点过滤和部分目录／快照视图不在这个接口内；Session、File、Owner 和 Grant 保持 bearer capability，使用它们的每个请求仍需授权。
 
 ## 二、操作映射
 

@@ -4,51 +4,77 @@ Status: proposed
 
 ## 问题
 
-volume 必须长期存在、能冷挂载，存在的数量可以远大于同时挂载的数量（R-WS-1 至 R-WS-4、R-SCALE-2）。需要明确一个 storage 实例持有什么、日志和锁如何隔离，以及谁把可信选择键映射到存储并持有生命周期责任。挂载地址不能自行保存长期存续事实。
+volume 必须长期存在、能冷挂载，而且存在的数量可以远大于同时挂载的数量（R-WS-1 至 R-WS-4、R-SCALE-2）。本提案提出时，设计没有说明 volume 的归属；这会留下三个影响接口的问题：
 
-当前[中心契约](../../../../docs/design/architecture.md)已经定义一个 storage 实例就是一个 volume，[元数据复制](../../implemented/architecture/2026-08-27-metadata-replication.md)和[显式文件锁](../../implemented/architecture/2026-09-07-file-locks.md)分别落实日志与 authority 隔离。实例内部归属和多个实例的服务管理是两项责任。
+- **storage 是一个 volume，还是按 volume 寻址的？** 这决定 R-INT-6 的第三方实现者到底要实现什么。
+- **变更日志的全序是每服务端还是每 volume？** 见[变更日志的身份](2026-08-19-change-log-identity.md)。
+- **谁创建、列举、销毁 volume？** R-WS-1 说它们长期存在于服务端、与是否挂载无关。而 CLI 按名字挂载，设计里没有任何东西解析这个名字。
+
+身份认证留在业务方，逐 volume 操作授权由[嵌入方操作授权](../../implemented/feature/2026-09-10-host-provided-authorization.md)拥有；本提案保留 volume 名称到实例的注册、选择与管理边界。
+
+当前[中心契约](../../../../docs/design/architecture.md)已经把一个 storage 实例定义为一个 volume，[元数据复制](../../implemented/architecture/2026-08-27-metadata-replication.md)按 volume 隔离日志。[显式文件锁](../../implemented/architecture/2026-09-07-file-locks.md)进一步将授权方与同一个 volume 配对，保存归属证据并隔离另一写入授权方。这些实现解决实例内部的状态归属；一台 server 按不透明名字提供多个实例的注册、选择与生命周期边界仍是本提案。
 
 ## 提案
 
-### 单实例归属
+[volume 术语决定](../../implemented/architecture/2026-09-10-use-volume-for-the-logical-file-tree.md)统一了现有名称；本提案仍拥有多实例注册、选择与管理边界。
 
-storage 数据操作不逐次携带 volume 参数；一个实例包含一份根、层级、内容和独立状态。第三方实现者只实现一个 volume，不必将跨 volume 用户或注册逻辑装进文件接口。发布方把可信选择键映射到正确实例，再执行其文件操作。
+### 一个 storage 实例 = 一个 volume
 
-日志有独立位置序列、化身和保留窗口，客户端只订阅所选实例。锁 authority 与 storage 配对，Session、Owner、Grant、资源和动作历史属于该 authority；FileSession、File、NodeReference、Scope 和 advisory owner 同样不能跨实例混用。同 volume 的多个挂载共享原生协调者，各自持有会话。[变更日志身份](2026-08-19-change-log-identity.md)拥有日志选择。
+`storage` 的数据操作不逐次携带 volume 参数；一个实例就是一个 volume，包含根节点、层级与内容。这项归属已经成立。
 
-外部 SQLite 的 Witness 与唯一活跃 owner 覆盖整份数据库，启动时换选其中另一 volume 仍须遵守数据库级恢复。localstore 保持单 volume 永久根绑定；这些 evidence 和 barrier 不构成多 volume 注册表。
+本提案要求 server 持有**一组具名的 storage 实例**，名字到实例的映射由部署方提供。客户端挂载时给出名字，server 据此选中一个实例；当前单个 volume 的发布入口尚未提供这组注册与选择操作。
 
-### 管理归属
+第三方实现者（R-INT-6）因此只需要实现「一个 volume」，不必承担跨 volume 注册与选择，也不必在每个操作里携带一个他们用不上的 volume 标识。
 
-embedding host 继续持有身份、注册、创建、销毁、计费和保留策略；packages 不要求使用内置账户或管理 SQLite。逐 volume 操作授权由[host Authorizer](../../implemented/feature/2026-09-10-host-provided-authorization.md)提供。
+发布实例还必须与约束该 volume 的强锁授权方配对。Session、Owner、Grant、逻辑资源与动作历史都属于这个授权方；不能把一个实例上的 proof 用到另一个实例，也不能仅凭同名 volume 重放旧动作。[实时文件句柄](../../implemented/architecture/2026-09-08-live-file-handles.md)另有 FileSession / File 与 advisory owner；每个挂载独立持有会话，同一 volume 共享原生协调者。引用退役不重开旧路径，强占有的历史窗口与重启保护仍独立成立。
 
-[独立多用户服务](../../implemented/feature/2026-10-12-standalone-volume-service.md)提供其部署形态的 SQLite 注册、稳定 owner、创建删除、管理员摘要和 Console/CLI。服务使用不复用 volume ID、immutable 内部存储名和根，显示名称可改；同一后端不能重复发布成两份独立 authority。部署方仍负责私有目录、配置和运维。
+### 每个 volume 一条变更日志
 
-选择键不承载授权。服务和 embedding host 都必须显式确认实际实例与当前身份，不从名字前缀推断 user/project/权限。host 可以自定义组织名称，仍不能把名称当作凭据。
+日志跟着 storage 实例走：独立的位置序列、独立的保留窗口、独立的化身。
 
-[容量上限](../../implemented/architecture/2026-08-21-space-limit.md)由 volume 自己计量、报告和拒绝超额增长；管理配置不能替代原生执行。embedding/reference fixed allowance 与服务的配额管理使用同一 Space 口径。
+一个客户端只订阅它所挂载的那个 volume，因此不会收到别人的事件，也不会因为别人的流量被挤出自己的窗口。
 
-挂载和卸载不创建或销毁 volume。卸载结束该挂载的会话、引用和 advisory 状态，EBUSY 不撤销仍在使用的会话。文件删除可脱名，detached allocation 在最后引用和清理完成前继续收费；这不是 volume 删除。backend 初始化只建立匹配意图的一份存储，不承担 owner 注册或整个 volume 删除恢复。
+文件锁的状态也不能跨实例混用。SQLite-backed 模式使用数据库与独立 Witness；外部 SQLite 的证据与唯一活跃拥有者覆盖整份数据库，后续启动选择另一个已有 volume 仍须执行数据库级恢复等待；localstore 保持单个 volume 的根绑定。[移除宿主目录后端](../../implemented/simplification/2026-09-08-remove-the-host-directory-backend.md)取消了单独的 StateRoot 配置。这些持久最大时长证据与恢复屏障不构成多个 volume 的管理注册表，也不改变日志位置的含义。
+
+### volume 的创建与销毁不由本系统负责
+
+本提案选择「按名字挂载一份已存在的 volume」。创建、列举、销毁 volume 的管理策略由部署方在自己的控制面完成，因为它们与计费、归属、保留策略绑在一起。随附 backend 的显式初始化与打开负责建立、验证一份存储，不代替这个管理控制面。
+
+配额只有取值这一半留在那里：**报出配额与执行配额是本系统的事**，见 [volume 的容量上限](../../implemented/architecture/2026-08-21-space-limit.md)。volume 的逻辑用量不等于 Blob container 或底层磁盘的剩余容量；持有 volume 的 storage 负责计量并拒绝越限修改。
+
+R-WS-1（volume 长期存在于服务端，与是否挂载无关）在这个提案中的边界是：挂载与卸载不销毁 volume，volume 的存续由部署方掌握。成功卸载结束该挂载的 FileSession、引用与 advisory 状态；EBUSY 不撤销仍在使用的会话。文件删除可以移除名字，仍被有效引用持有的 detached 文件继续占用配额，直到引用结束并完成清理；这些对象生命周期不构成 volume 管理操作。
+
+**这是一个范围决定，需要写进 `docs/spec/`**，因为它划的是系统边界，不是实现方式。
+
+### 名字是不透明的
+
+server 不解释 volume 名称的结构。它是一个查找键，映射由部署方配置。
+
+不规定命名规则，是为了不预设部署方的组织方式（按用户、按任务、按项目都可以）。
 
 ## 备选方案
 
-**每次 storage 操作携带 volume 标识。** 对多个 volumes 放同一数据库的实现自然，但让每个实现自行处理隔离和额外日志作用域，多数实现重复接收不用的参数。单实例归属将可信选择集中在发布方。
+**storage 按 volume 寻址：每个操作携带 volume 标识。** 一个实现即可服务全部 volume，对「所有 volume 都在同一个数据库里」的集成方最自然。输在三点：第三方实现者必须自己处理隔离，而隔离写错是静默的越权；日志作用域从「自然按实例分」变成「必须额外声明并强制执行」；以及每个操作都携带一个多数实现用不上的参数。
 
-**只按挂载地址取得目录树，不规定管理归属。** 文件接口可以工作，却没有主体保存长期存续和冷挂载事实；可信选择和生命周期必须由 host 或 service 持有。
+**只按挂载地址取得目录树，不规定 volume 的管理边界。** 最小改动，且 storage 契约完全不变。输在 R-WS-1 无人负责 —— 「长期存在、偶尔挂回来」需要有东西记得它存在，而「地址」这个说法把这件事推给了不存在的第三方。它实际上是把问题改名，不是解决。
 
-**把账号和创建销毁放进文件 packages。** 一个入口可闭环，却强迫 embedding 实现接受同一用户、计费和保留模型。独立 service 提供这些功能，文件 packages 保留中立语义。
+**本系统负责 volume 的创建与销毁。** 自成闭环，CLI 可以直接建一个 volume 开始用。输在它把配额、归属、计费、保留策略拖进来 —— 而这些必然与部署方已有的系统冲突。且「销毁」意味着删除整份 volume，与由部署方掌握其存续的边界相悖。
 
-**所有部署都由外部控制面管理。** 适合已有身份和计费系统的 embedding host，但不能交付 R-SVC 的独立 Console/CLI。服务承担该产品形态，host 保留自有控制面。
-
-**名字使用 `用户/项目` 结构。** 可以辅助组织，却预设业务模型并容易被误用为授权。不透明选择键允许 host 自定义名称，权限仍显式检查。
+**名字带结构（例如 `用户/项目`）。** 便于按前缀做隔离与鉴权。输在它预设了部署方的组织方式，而我们没有依据这么预设。不透明的名字不阻止部署方在自己那侧使用结构化名字。
 
 ## 验收标准
 
-- 数据契约保持单 volume；日志、锁、会话、proof 和引用不能跨实例混用。
-- 发布方在实际操作前选择可信实例并授权，不从名称推断权限。
-- embedding host 不被迫使用独立服务用户或数据库；服务按[独立服务决定](../../implemented/feature/2026-10-12-standalone-volume-service.md)保持 owner、管理和 Console/CLI 的归属。
-- 挂载、卸载、backend 初始化、文件删除和 volume 删除分别报告真实结果。
+- `docs/design/architecture.md` 出现 volume，并写明「一个 storage 实例 = 一个 volume」。
+- `storage` 契约中不含任何 volume 参数。
+- server 侧写明它持有一组具名 storage 实例，名字到实例的映射由部署方提供。
+- 变更日志按 volume 分，与[变更日志的身份](2026-08-19-change-log-identity.md)一致。
+- volume 管理策略由部署方负责、挂载与卸载不销毁 volume 的边界在 `docs/spec/` 中确定，不与 backend 初始化或文件删除混淆。
+- 挂载流程写明：CLI 给出名字 → server 解析为实例。
 
 ## 风险
 
-volume 管理不能绕过原生初始化与恢复。缺失 WAL、锁状态或根绑定不能被当作新空 volume，未知路径不能被自动发布或删除。ID 本身不是凭据，可信选择与当前身份授权始终属于发布方。
+**volume 生命周期与存储初始化不能混淆。** 解除挂载不销毁 volume，显式初始化只建立一份存储，文件删除仍会删除其中的数据。多实例控制面必须分别表达这些动作；缺失的锁状态或 volume 证据不能被管理入口当作新实例重新初始化。
+
+**名字不透明意味着 server 无法从名字结构推断权限。** 「谁能访问哪个 volume」由业务方的身份与策略决定，注册表仍须把可信名称正确映射到实例。[嵌入方操作授权](../../implemented/feature/2026-09-10-host-provided-authorization.md)使用业务 context 和配置的 volume，不接管这里的注册、选择、计费或生命周期策略。
+
+**多实例的全局资源限制仍未定。** 强锁授权方和文件服务分别限制会话、引用、owner、范围、动作与等待，并对会话再设内部上限；这不等于一台 server 的多个 volume 的总量已有约束。日志保留窗口按实例隔离，新增注册表时仍须定义跨实例的入站并发、内存与状态总量，不能让每实例有界掩盖实例数无界。
