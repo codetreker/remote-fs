@@ -18,7 +18,7 @@ SMB frame、compound request、authentication token、connection、session、tre
 
 Direct TCP payload 在分配前受 byte bound 限制。SMB2 header、compound offset/alignment、command count、negotiate context、UTF-16 和变长字段使用严格 decoder；解析结果借用一份被请求生命周期持有的 bounded frame。compound request 保留每个 command 的原始 bytes、MessageId、SessionId、TreeId 与 related 关系，协议层不把后续文件命令压成一个无上下文 callback。
 
-端点只协商 SMB 3.1.1、SHA-512 preauthentication integrity 与 AES-CMAC signing。preauthentication transcript 使用实际收发的 wire bytes；SSPI session key 通过 SMB 3.1.1 KDF 派生 signing key。携带 SessionId 的 request 必须先验签；unsigned session request 的拒绝保持 unsigned，带 signed flag 但 MAC 错误或已建立 session 的 malformed reauthentication 得到 signed 拒绝。replay／DFS flag 不被静默接受。session retirement 等到所有已经登记的 response 完成签名后才销毁 key。
+端点只协商 SMB 3.1.1、SHA-512 preauthentication integrity 与 AES-CMAC signing。SESSION_SETUP 的 header priority bits `0x70` 作为提示在初始、continuation 与 signed reauthentication 的本地语义判断中忽略；原 Header／Packet 不改写。preauthentication transcript 使用实际收发的 wire bytes；SSPI session key 通过 SMB 3.1.1 KDF 派生 signing key。携带 SessionId 的 request 必须先验签；unsigned session request 的拒绝保持 unsigned，带 signed flag 但 MAC 错误或已建立 session 的 malformed reauthentication 得到 signed 拒绝。replay／DFS flag 不被静默接受。session retirement 等到所有已经登记的 response 完成签名后才销毁 key。
 
 ### SSPI 身份同时绑定用户与登录会话
 

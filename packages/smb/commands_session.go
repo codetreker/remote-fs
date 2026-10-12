@@ -242,7 +242,7 @@ func (c *connection) negotiate(request wire.Request) ([]byte, uint32) {
 }
 
 func (c *connection) sessionSetup(ctx context.Context, request wire.Request, header *wire.Header) (body []byte, status uint32, key *signing.Session) {
-	flags := request.Header.Flags
+	flags := request.Header.Flags &^ wire.FlagPriorityMask
 	var verifiedSigner *signing.Session
 	if request.Header.SessionID == 0 {
 		if flags&(wire.FlagReplay|wire.FlagDFS) != 0 {
@@ -361,7 +361,7 @@ func (c *connection) sessionSetup(ctx context.Context, request wire.Request, hea
 		if request.Header.Flags&(wire.FlagReplay|wire.FlagDFS) != 0 {
 			return nil, statusUnsupported, existing
 		}
-		if request.Header.Flags != wire.FlagSigned {
+		if flags != wire.FlagSigned {
 			return nil, statusInvalid, existing
 		}
 		if s.authExpired && s.auth != nil {
@@ -375,7 +375,7 @@ func (c *connection) sessionSetup(ctx context.Context, request wire.Request, hea
 				return nil, statusResources, existing
 			}
 		}
-	} else if request.Header.Flags != 0 {
+	} else if flags != 0 {
 		return nil, statusInvalid, nil
 	}
 	closeAttempted := false
