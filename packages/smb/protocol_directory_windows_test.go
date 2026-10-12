@@ -1,6 +1,7 @@
 package smb_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"fmt"
@@ -54,6 +55,7 @@ func TestNativeWindowsDirectoryEnumeration(t *testing.T) {
 		t.Fatal(err)
 	}
 	receipts := &nativeDirectoryReceipts{}
+	t.Cleanup(func() { receipts.report(t) })
 	ctx, cancel := context.WithCancel(context.Background())
 	served := make(chan error, 1)
 	go func() { served <- server.Serve(ctx, nativeDirectoryListener{listener, receipts}) }()
@@ -163,9 +165,6 @@ func TestNativeWindowsDirectoryEnumeration(t *testing.T) {
 	}
 	if len(facts) == 0 {
 		t.Fatal("native APIs issued no QUERY_DIRECTORY requests")
-	}
-	for _, fact := range facts {
-		t.Logf("native QUERY_DIRECTORY: class=%d flags=%#x output=%d pattern=%q", fact.class, fact.flags, fact.output, fact.pattern)
 	}
 	// Application information classes may be projected by the redirector from
 	// another wire class; the receipts state precisely which classes reached SMB.
@@ -424,14 +423,43 @@ type nativeDirectoryFact struct {
 	pattern      string
 }
 type nativeDirectoryReceipts struct {
-	mu    sync.Mutex
-	facts []nativeDirectoryFact
-	err   error
+	mu          sync.Mutex
+	facts       []nativeDirectoryFact
+	headers     []nativeProtocolFact
+	connections uint32
+	err         error
 }
 
-func (r *nativeDirectoryReceipts) record(packet []byte) {
+type nativeProtocolFact struct {
+	connection      uint32
+	response        bool
+	protocol        string
+	command         uint16
+	status, flags   uint32
+	charge, credits uint16
+	message         uint64
+	length          int
+	detail          string
+}
+
+func (r *nativeDirectoryReceipts) record(connection uint32, response bool, packet []byte) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if len(packet) >= 4 && string(packet[:4]) != "\xfeSMB" {
+		if len(r.headers) >= 1024 {
+			r.err = fmt.Errorf("native protocol trace exceeds 1024 commands")
+			return
+		}
+		fact := nativeProtocolFact{connection: connection, response: response, protocol: fmt.Sprintf("%x", packet[:4]), length: len(packet)}
+		if string(packet[:4]) == "\xffSMB" && len(packet) >= 35 {
+			fact.command = uint16(packet[4])
+			if packet[4] == 0x72 {
+				fact.detail = fmt.Sprintf("wildcard=%v dialect002=%v", bytes.Contains(packet[35:], []byte("SMB 2.???\x00")), bytes.Contains(packet[35:], []byte("SMB 2.002\x00")))
+			}
+		}
+		r.headers = append(r.headers, fact)
+		return
+	}
 	for offset, commands := 0, 0; offset <= len(packet)-64; commands++ {
 		if commands >= 32 {
 			r.err = fmt.Errorf("native compound trace exceeds 32 commands")
@@ -450,7 +478,39 @@ func (r *nativeDirectoryReceipts) record(packet []byte) {
 			}
 			end = offset + next
 		}
-		if binary.LittleEndian.Uint16(h[12:]) == 14 {
+		if len(r.headers) >= 1024 {
+			r.err = fmt.Errorf("native protocol trace exceeds 1024 commands")
+			return
+		}
+		fact := nativeProtocolFact{connection: connection, response: response, protocol: "SMB2",
+			command: binary.LittleEndian.Uint16(h[12:]), status: binary.LittleEndian.Uint32(h[8:]), flags: binary.LittleEndian.Uint32(h[16:]),
+			charge: binary.LittleEndian.Uint16(h[6:]), credits: binary.LittleEndian.Uint16(h[14:]), message: binary.LittleEndian.Uint64(h[24:]), length: end - offset}
+		body := packet[offset+64 : end]
+		if fact.command == 0 {
+			if response && len(body) >= 64 {
+				fact.detail = fmt.Sprintf("dialect=%#x security=%#x token-offset=%d token-length=%d contexts=%d context-offset=%d", binary.LittleEndian.Uint16(body[4:]), binary.LittleEndian.Uint16(body[2:]), binary.LittleEndian.Uint16(body[56:]), binary.LittleEndian.Uint16(body[58:]), binary.LittleEndian.Uint16(body[6:]), binary.LittleEndian.Uint32(body[60:]))
+			}
+			if !response && len(body) >= 36 {
+				count := int(binary.LittleEndian.Uint16(body[2:]))
+				var dialects []uint16
+				if count <= 16 && len(body) >= 36+2*count {
+					for i := 0; i < count; i++ {
+						dialects = append(dialects, binary.LittleEndian.Uint16(body[36+2*i:]))
+					}
+				}
+				fact.detail = fmt.Sprintf("dialects=%x security=%#x contexts=%d context-offset=%d", dialects, binary.LittleEndian.Uint16(body[4:]), binary.LittleEndian.Uint16(body[32:]), binary.LittleEndian.Uint32(body[28:]))
+			}
+		}
+		if fact.command == 1 {
+			if response && len(body) >= 8 {
+				fact.detail = fmt.Sprintf("token-offset=%d token-length=%d", binary.LittleEndian.Uint16(body[4:]), binary.LittleEndian.Uint16(body[6:]))
+			}
+			if !response && len(body) >= 24 {
+				fact.detail = fmt.Sprintf("token-offset=%d token-length=%d", binary.LittleEndian.Uint16(body[12:]), binary.LittleEndian.Uint16(body[14:]))
+			}
+		}
+		r.headers = append(r.headers, fact)
+		if !response && fact.command == 14 {
 			if len(r.facts) >= 512 {
 				r.err = fmt.Errorf("native directory trace exceeds 512 requests")
 				return
@@ -487,6 +547,21 @@ func (r *nativeDirectoryReceipts) record(packet []byte) {
 	}
 }
 
+func (r *nativeDirectoryReceipts) report(t *testing.T) {
+	t.Helper()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.err != nil {
+		t.Error(r.err)
+	}
+	for _, fact := range r.headers {
+		t.Logf("native SMB: connection=%d response=%v protocol=%s command=%d status=%#x flags=%#x charge=%d credits=%d message=%d bytes=%d %s", fact.connection, fact.response, fact.protocol, fact.command, fact.status, fact.flags, fact.charge, fact.credits, fact.message, fact.length, fact.detail)
+	}
+	for _, fact := range r.facts {
+		t.Logf("native QUERY_DIRECTORY: class=%d flags=%#x output=%d pattern=%q", fact.class, fact.flags, fact.output, fact.pattern)
+	}
+}
+
 func (r *nativeDirectoryReceipts) snapshot() ([]nativeDirectoryFact, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -503,19 +578,45 @@ func (l nativeDirectoryListener) Accept() (net.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &nativeDirectoryConnection{Conn: c, receipts: l.receipts}, nil
+	l.receipts.mu.Lock()
+	l.receipts.connections++
+	id := l.receipts.connections
+	l.receipts.mu.Unlock()
+	return &nativeDirectoryConnection{Conn: c,
+		input:  nativeProtocolStream{receipts: l.receipts, connection: id},
+		output: nativeProtocolStream{receipts: l.receipts, connection: id, response: true}}, nil
 }
 
 type nativeDirectoryConnection struct {
 	net.Conn
-	receipts *nativeDirectoryReceipts
-	frame    []byte
-	length   int
+	input, output nativeProtocolStream
+}
+
+type nativeProtocolStream struct {
+	receipts   *nativeDirectoryReceipts
+	connection uint32
+	response   bool
+	frame      []byte
+	length     int
+	disabled   bool
 }
 
 func (c *nativeDirectoryConnection) Read(p []byte) (int, error) {
 	n, err := c.Conn.Read(p)
-	input := p[:n]
+	c.input.capture(p[:n])
+	return n, err
+}
+
+func (c *nativeDirectoryConnection) Write(p []byte) (int, error) {
+	n, err := c.Conn.Write(p)
+	c.output.capture(p[:n])
+	return n, err
+}
+
+func (c *nativeProtocolStream) capture(input []byte) {
+	if c.disabled {
+		return
+	}
 	for len(input) > 0 {
 		needed := 4 - len(c.frame)
 		if len(c.frame) >= 4 {
@@ -527,14 +628,18 @@ func (c *nativeDirectoryConnection) Read(p []byte) (int, error) {
 		if len(c.frame) == 4 && c.length == 0 {
 			c.length = int(c.frame[1])<<16 | int(c.frame[2])<<8 | int(c.frame[3])
 			if c.frame[0] != 0 || c.length < 4 || c.length > 2<<20 {
-				return n, fmt.Errorf("invalid native SMB frame length: %d", c.length)
+				c.receipts.mu.Lock()
+				c.receipts.err = fmt.Errorf("invalid native SMB trace frame length: %d", c.length)
+				c.receipts.mu.Unlock()
+				clear(c.frame)
+				c.frame, c.disabled = nil, true
+				return
 			}
 		}
 		if c.length != 0 && len(c.frame) == c.length+4 {
-			c.receipts.record(c.frame[4:])
+			c.receipts.record(c.connection, c.response, c.frame[4:])
 			clear(c.frame)
 			c.frame, c.length = c.frame[:0], 0
 		}
 	}
-	return n, err
 }
