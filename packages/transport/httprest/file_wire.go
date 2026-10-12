@@ -212,6 +212,8 @@ type FileSessionWithBarrier interface {
 }
 
 type fileCapabilities struct {
+	VolumeCreatedAt     *Time          `json:"volumeCreatedAt,omitempty"`
+	VolumeCreationError *ErrorResponse `json:"volumeCreationError,omitempty"`
 	AllocationUnitBytes *uint64        `json:"allocationUnitBytes,omitempty"`
 	AllocationUnitError *ErrorResponse `json:"allocationUnitError,omitempty"`
 	OpenContentMetadata bool           `json:"openContentMetadata"`

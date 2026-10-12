@@ -1869,6 +1869,18 @@ func (r *fileRegistry) enroll(ctx context.Context, options storage.FileSessionOp
 			capabilities.AllocationUnitBytes = &unit
 		}
 	}
+	if capabilities.SessionIdentity {
+		created, failure := storage.VolumeCreatedAt(ctx, native)
+		if failure == nil {
+			instant := TimeOf(created)
+			if failure = checkWireTime("volume creation", instant); failure == nil {
+				capabilities.VolumeCreatedAt = &instant
+			}
+		}
+		if failure != nil {
+			capabilities.VolumeCreationError = &ErrorResponse{Errno: storage.ErrnoNameOf(failure), Message: boundedRetainedFileDetail(failure.Error()), CapabilityCode: capabilityErrorCode(failure)}
+		}
+	}
 	session := &servedFileSession{authority: status.Epoch, revision: status.Revision, native: native, files: make(map[string]*servedFile), actions: make(map[storage.LockRequestID]*servedFileAction), options: options, started: started, expires: started.Add(status.Remaining), sessionCloseReserve: 2, cleanupReserved: 2, recoverable: capabilities.CloseRecovery, stableIdentity: capabilities.StableIdentity}
 	if inline, ok := native.(storage.InlineCloseSettlement); ok {
 		session.inlineSettlement = inline.CheckInlineCloseSettlement() == nil

@@ -29,7 +29,8 @@ import (
 // symbolic-link data and durable, restart-queryable deletion obligations;
 // 0008_directory_revisions.sql adds persistent directory name-set revisions;
 // 0009_delete_intent_owners.sql adds owner-scoped intent discovery;
-// 0010_virtual_allocation.sql records virtual allocation and its volume total.
+// 0010_virtual_allocation.sql records virtual allocation and its volume total;
+// 0011_volume_creation.sql stores the independent volume creation instant.
 //
 // packages/sqliteschema documents what a numbered set of files buys and what rule they are kept
 // under: a file that has landed is never edited, and a schema change is a new file.
@@ -54,6 +55,8 @@ const firstDirectoryRevisionSchemaVersion = 8
 const firstDeleteIntentOwnerSchemaVersion = 9
 
 const firstVirtualAllocationSchemaVersion = 10
+
+const firstVolumeCreationSchemaVersion = 11
 
 // VolumeOpenMode decides whether preparation may create the named volume.
 type VolumeOpenMode uint8
@@ -401,10 +404,13 @@ func bindBackingStore(ctx context.Context, tx *sql.Tx, storeID string) error {
 // createVolume makes a volume, the root directory it starts life with, and the log it
 // will record its changes in.
 //
-// The root is inserted first because volumes.root names it, and the placeholder that
-// stands in for the id until it is known never outlives this transaction.
+// The root placeholder never outlives this transaction. Its initial common times
+// and the independent volume creation fact share one creation instant.
 func createVolume(ctx context.Context, tx *sql.Tx, volume string) (id, root int64, err error) {
-	result, err := tx.ExecContext(ctx, `INSERT INTO volumes (name, root, used) VALUES (?, 0, 0)`, volume)
+	sec, nsec := sqlvalue.StoredTime(time.Now())
+	result, err := tx.ExecContext(ctx, `
+		INSERT INTO volumes (name, root, used, created_sec, created_nsec)
+		VALUES (?, 0, 0, ?, ?)`, volume, sec, nsec)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -412,9 +418,6 @@ func createVolume(ctx context.Context, tx *sql.Tx, volume string) (id, root int6
 		return 0, 0, err
 	}
 
-	// The root is a directory nobody made, so it gets the moment the volume came into being.
-	now := time.Now()
-	sec, nsec := sqlvalue.StoredTime(now)
 	root, err = dbstate.AllocateNodeID(ctx, tx)
 	if err != nil {
 		return 0, 0, err

@@ -168,7 +168,10 @@ func validateAllocationUnitCapability(caps *fileCapabilities, session bool) erro
 		}
 		return nil
 	}
-	failure := caps.AllocationUnitError
+	return validateCapabilityFactError(caps.AllocationUnitError)
+}
+
+func validateCapabilityFactError(failure *ErrorResponse) error {
 	errno, known := storage.ErrnoByName(failure.Errno)
 	if !known || len(failure.Message) > 4096 || !utf8.ValidString(failure.Message) {
 		return syscall.EIO
@@ -183,4 +186,20 @@ func validateAllocationUnitCapability(caps *fileCapabilities, session bool) erro
 		return syscall.EIO
 	}
 	return nil
+}
+
+func validateVolumeCreationCapability(caps *fileCapabilities, session bool) error {
+	if !session || !caps.SessionIdentity {
+		if caps.VolumeCreatedAt != nil || caps.VolumeCreationError != nil {
+			return syscall.EIO
+		}
+		return nil
+	}
+	if (caps.VolumeCreatedAt == nil) == (caps.VolumeCreationError == nil) {
+		return syscall.EIO
+	}
+	if caps.VolumeCreatedAt != nil {
+		return checkWireTime("volume creation", *caps.VolumeCreatedAt)
+	}
+	return validateCapabilityFactError(caps.VolumeCreationError)
 }

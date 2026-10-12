@@ -103,7 +103,7 @@ func TestHTTPUnitFailureDoesNotBlockSessionOrFileAccess(t *testing.T) {
 }
 
 func TestHTTPUnitErrorFitsCompleteSessionEnvelope(t *testing.T) {
-	response := fileResponse{Epoch: 1, Session: strings.Repeat("a", 64), Data: []byte{}, Status: &storage.FileSessionStatus{Epoch: "authority", Revision: 1, ActionEpoch: 1}, SessionIdentity: fileSessionIdentityOf(storage.FileSessionIdentityResult{Backend: storage.BackendIdentityResult{Volume: "volume", Authority: "authority", RootNodeID: 1}, SessionEpoch: "authority"}), Capabilities: &fileCapabilities{SessionIdentity: true, Allocation: true, AllocationUnitError: &ErrorResponse{Errno: "EOPNOTSUPP", Message: strings.Repeat("\x01", 4096)}}}
+	response := fileResponse{Epoch: 1, Session: strings.Repeat("a", 64), Data: []byte{}, Status: &storage.FileSessionStatus{Epoch: "authority", Revision: 1, ActionEpoch: 1}, SessionIdentity: fileSessionIdentityOf(storage.FileSessionIdentityResult{Backend: storage.BackendIdentityResult{Volume: "volume", Authority: "authority", RootNodeID: 1}, SessionEpoch: "authority"}), Capabilities: &fileCapabilities{SessionIdentity: true, VolumeCreationError: &ErrorResponse{Errno: "EOPNOTSUPP"}, Allocation: true, AllocationUnitError: &ErrorResponse{Errno: "EOPNOTSUPP", Message: strings.Repeat("\x01", 4096)}}}
 	bounded, err := boundedFileSessionResponse(response, 8192)
 	if err != nil {
 		t.Fatal(err)

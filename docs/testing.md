@@ -393,6 +393,22 @@ Basic SET 组合在 File、directory 和 metadata-only 上一次提交 AttrChang
 
 mutation_owner用例涵盖原Attr／Metadata／Data／token／effect深复制、唯一result budget、保留bytes计费、cancel／CLOSE排空与同action恢复。directory／metadata-only 使用同一 gate 及 owner；reconcile 失败仍继续 exactclose，只有 Released 加全链 settlement 释放保留 payload，原 failurefacts 保持可查询。HTTP 显式 Truncate／Attributes 恢复与 WRITE 相同地按 exactfilecapability／nestedAction 隔离，Unknown 不阻塞 sibling State 查询、Renew／Status 或 cleanup。正常／错误、fullresultbudget、signedrelatedcompound 与必要 race 分别提供 package-local 证据。
 
+### Volume 信息与容量局部失败
+
+[wire filesystem 信息用例](../packages/smb/internal/wire/file_info_test.go)对 Volume、Size、Device、Attribute、FullSize 逐字段比较完整黄金字节；保留位、UTF-16 字节长度、固定结构与最大有符号 count 单独核对。[SMB volume 命令用例](../packages/smb/commands_volume_info_test.go)核对 Volume 最小请求 24／实际 prefix 18、Attribute prefix 12，以及固定类完整长度。短请求在 authority 工作前失败，变长结果以正常 QUERY_INFO body 携带 BUFFER_OVERFLOW，长度字段保持完整值，payload 为可容纳的原始 byte prefix，包括奇数或半个 surrogate；不通过字符取整暗改协议结果。响应预留覆盖 32 个 UTF-16 unit label 的最大 82 字节 payload／160 字节对齐 frame。
+
+[真实 volume 查询](../packages/smb/commands_volume_info_integration_linux_test.go)在 direct 与 HTTP 上分别使用原 File／NodeReference。zero-access、READ、WRITE 与 WRITE_ATTRIBUTES 句柄查询五类不增加 Stat／ReadMetadata 权限；当前 principal、策略撤销、原 scope／对象与生命期仍检查。写入 4097 字节后下一次容量查询看到真实分配量，EOF 缩短后看到真实释放；另用受控 Space 验证 caller Avail 小于 actual free 时两个字段分别保留。rename、unlink、同名 replacement 后原引用的 volume context 与 retained allocation 保持。
+
+容量错误用例分别注入 ENOSYS、EOPNOTSUPP、EIO、非法／缺席单位、不能整除与不自洽 Space，Size／FullSize 失败而其它类依自身事实继续。创建事实错误只失败 Volume，label 缺席返回该类不支持；同一 tree／FileId 仍能 READ、缩短和 CLOSE。真实 native fixture 先以 8192 allowance 保存内容，再重开为 4096，确认 `Space{Total:4096,Used:8192,Avail:0}`；两个容量类都返回 I/O 错误，原已打开文件仍可读，EOF 缩短成功后下一次容量查询恢复精确值，关闭不遗留引用。
+
+[签名 volume transcript](../packages/smb/protocol_volume_info_linux_test.go)执行 related CREATE→部分 Volume／Attribute QUERY_INFO→CLOSE，逐项检查 warning body、extent、签名与最后引用释放，证明 BUFFER_OVERFLOW 不压制 related CLOSE。最大 label 的完整 response 是 154 字节且纳入 160 字节预算；TREE_DISCONNECT／重连后 native creation、label、32-bit serial、原 64-bit FileId serial 与对象身份保持一致。32-bit serial 只验证同源低位，不要求唯一性。
+
+[native 创建时间用例](../packages/metastore/sqlite/volume_created_test.go)验证真实创建时钟、UTC、root BirthTime 修改与重开不改变 volume 创建事实；v10 迁移保留 NULL，重复查询不 backfill。[schema 创建字段用例](../packages/metastore/sqlite/internal/schema/volume_creation_test.go)及 native getter 的损坏矩阵拒绝混合 presence、错误 storage class、非法纳秒与超大损坏值；publication、取消、authority 健康和退休错误返回零结果。已知 year-1 以 nil error 保留，不用 Go 零值判断缺席；SMB 的 FILETIME 可表达范围独立检查。
+
+[HTTP 创建事实用例](../packages/transport/httprest/file_volume_creation_test.go)核对 enrollment 恰好捕获一次已知时间或原错误、严格二选一 envelope、无额外 getter RPC、known year-1、取消与 cached fact 不证明当前引用生命期。完整 session response 在 allocation／creation 任一或两份诊断很大时保留错误分类并限制总字节；固定 envelope 自身超预算仍失败。objectstore、locked、limited 与 replicated 的 package-local 用例验证 optional getter 不扩大原身份 preflight，真实来源、context／health、原错误与规范 UTC 沿包装链转送；没有新 geometry／容量账本。
+
+这些用例验证五类查询、授权、数值表达、持久事实和容量局部失败，不构成 Windows redirector／WNet 或私有缓存资格。执行 verdict 与资源清理由当次验证收据给出。
+
 ### SMB 与 FUSE 的同 volume 联合验收
 
 [`mountacceptance`](../packages/smb/internal/mountacceptance/cross_entry_linux_test.go) 使用真实签名 SMB 3.1.1 TCP 请求与实际 FUSE 挂载，各自持有独立 FileSession；direct 与 HTTP 两种路径都指向同一 native volume。Linux fd 从创建起持续打开，SMB FileId 也持续保留，不以重新打开掩盖身份或可见性问题。

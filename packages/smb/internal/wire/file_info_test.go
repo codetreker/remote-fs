@@ -4,8 +4,108 @@ import (
 	"bytes"
 	"encoding/hex"
 	"errors"
+	"math"
+	"strings"
 	"testing"
 )
+
+func TestFilesystemInformationGoldenBodies(t *testing.T) {
+	tests := []struct {
+		name string
+		body func() ([]byte, error)
+		want string
+	}{
+		{"volume", func() ([]byte, error) {
+			return FileFsVolumeInformationBody(FileFsVolumeInfo{CreationTime: 0x0807060504030201, Serial: 0x0c0b0a09, Label: "A😀"})
+		}, "0102030405060708090a0b0c06000000000041003dd800de"},
+		{"unlabeled volume", func() ([]byte, error) {
+			return FileFsVolumeInformationBody(FileFsVolumeInfo{})
+		}, "000000000000000000000000000000000000"},
+		{"size", func() ([]byte, error) {
+			return FileFsSizeInformationBody(FileFsSizeInfo{TotalAllocationUnits: 0x100000001, AvailableAllocationUnits: 0x100000000, SectorsPerAllocationUnit: 1, BytesPerSector: 4096})
+		}, "010000000100000000000000010000000100000000100000"},
+		{"device", func() ([]byte, error) {
+			return FileFsDeviceInformationBody(FileFsDeviceInfo{DeviceType: 7, Characteristics: 0x10}), nil
+		}, "0700000010000000"},
+		{"attributes", func() ([]byte, error) {
+			return FileFsAttributeInformationBody(FileFsAttributeInfo{Attributes: 6, MaximumComponentNameLength: 255, FileSystemName: "RFS"})
+		}, "06000000ff00000006000000520046005300"},
+		{"full size", func() ([]byte, error) {
+			return FileFsFullSizeInformationBody(FileFsFullSizeInfo{TotalAllocationUnits: 0x100000002, CallerAvailableAllocationUnits: 0x100000000, ActualAvailableAllocationUnits: 0x100000001, SectorsPerAllocationUnit: 1, BytesPerSector: 4096})
+		}, "0200000001000000000000000100000001000000010000000100000000100000"},
+		{"unsigned geometry", func() ([]byte, error) {
+			return FileFsSizeInformationBody(FileFsSizeInfo{SectorsPerAllocationUnit: math.MaxUint32, BytesPerSector: math.MaxUint32})
+		}, "00000000000000000000000000000000ffffffffffffffff"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := test.body()
+			if err != nil || hex.EncodeToString(got) != test.want {
+				t.Fatalf("body = %x, %v; want %s", got, err, test.want)
+			}
+			response, err := QueryInfoResponseBody(got)
+			if err != nil || le.Uint32(response[4:8]) != uint32(len(got)) || !bytes.Equal(response[8:], got) {
+				t.Fatalf("QUERY_INFO response = %x, %v", response, err)
+			}
+		})
+	}
+}
+
+func TestFilesystemInformationRejectsInvalidNamesAndCreationTime(t *testing.T) {
+	for _, label := range []string{"nul\x00label", "bad\xffutf8"} {
+		if body, err := FileFsVolumeInformationBody(FileFsVolumeInfo{Label: label}); body != nil || !errors.Is(err, ErrMalformed) {
+			t.Fatalf("volume label %q = %x, %v", label, body, err)
+		}
+	}
+	if body, err := FileFsVolumeInformationBody(FileFsVolumeInfo{CreationTime: -1}); body != nil || !errors.Is(err, ErrMalformed) {
+		t.Fatalf("negative creation time = %x, %v", body, err)
+	}
+	for _, name := range []string{"", "nul\x00name", "bad\xffutf8"} {
+		if body, err := FileFsAttributeInformationBody(FileFsAttributeInfo{MaximumComponentNameLength: 255, FileSystemName: name}); body != nil || !errors.Is(err, ErrMalformed) {
+			t.Fatalf("filesystem name %q = %x, %v", name, body, err)
+		}
+	}
+	for _, maximum := range []int32{0, -1} {
+		if body, err := FileFsAttributeInformationBody(FileFsAttributeInfo{MaximumComponentNameLength: maximum, FileSystemName: "RFS"}); body != nil || !errors.Is(err, ErrMalformed) {
+			t.Fatalf("maximum name length %d = %x, %v", maximum, body, err)
+		}
+	}
+	name := strings.Repeat("A", (maxDirectTCPPayload-HeaderSize-8-12)/2+1)
+	if body, err := FileFsAttributeInformationBody(FileFsAttributeInfo{MaximumComponentNameLength: 255, FileSystemName: name}); body != nil || !errors.Is(err, ErrMalformed) {
+		t.Fatalf("oversized filesystem name = %d bytes, %v", len(body), err)
+	}
+}
+
+func TestFilesystemSizeInformationRejectsInvalidCountsAndGeometry(t *testing.T) {
+	for _, info := range []FileFsSizeInfo{
+		{TotalAllocationUnits: -1, SectorsPerAllocationUnit: 1, BytesPerSector: 4096},
+		{AvailableAllocationUnits: -1, SectorsPerAllocationUnit: 1, BytesPerSector: 4096},
+		{TotalAllocationUnits: 1, AvailableAllocationUnits: 2, SectorsPerAllocationUnit: 1, BytesPerSector: 4096},
+		{BytesPerSector: 4096},
+		{SectorsPerAllocationUnit: 1},
+	} {
+		if body, err := FileFsSizeInformationBody(info); body != nil || !errors.Is(err, ErrMalformed) {
+			t.Fatalf("size %+v = %x, %v", info, body, err)
+		}
+	}
+	for _, info := range []FileFsFullSizeInfo{
+		{TotalAllocationUnits: -1, SectorsPerAllocationUnit: 1, BytesPerSector: 4096},
+		{CallerAvailableAllocationUnits: -1, SectorsPerAllocationUnit: 1, BytesPerSector: 4096},
+		{ActualAvailableAllocationUnits: -1, SectorsPerAllocationUnit: 1, BytesPerSector: 4096},
+		{TotalAllocationUnits: 1, ActualAvailableAllocationUnits: 2, SectorsPerAllocationUnit: 1, BytesPerSector: 4096},
+		{TotalAllocationUnits: 2, CallerAvailableAllocationUnits: 2, ActualAvailableAllocationUnits: 1, SectorsPerAllocationUnit: 1, BytesPerSector: 4096},
+		{BytesPerSector: 4096},
+		{SectorsPerAllocationUnit: 1},
+	} {
+		if body, err := FileFsFullSizeInformationBody(info); body != nil || !errors.Is(err, ErrMalformed) {
+			t.Fatalf("full size %+v = %x, %v", info, body, err)
+		}
+	}
+	info := FileFsFullSizeInfo{TotalAllocationUnits: math.MaxInt64, CallerAvailableAllocationUnits: math.MaxInt64, ActualAvailableAllocationUnits: math.MaxInt64, SectorsPerAllocationUnit: 1, BytesPerSector: 4096}
+	if body, err := FileFsFullSizeInformationBody(info); err != nil || le.Uint64(body[:8]) != math.MaxInt64 || le.Uint64(body[8:16]) != math.MaxInt64 || le.Uint64(body[16:24]) != math.MaxInt64 {
+		t.Fatalf("maximum signed counts = %x, %v", body, err)
+	}
+}
 
 func queryInfoPacket() []byte {
 	packet := requestPacket(QueryInfo, 41, 40)

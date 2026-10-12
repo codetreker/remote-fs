@@ -3,6 +3,7 @@ package replicated
 import (
 	"context"
 	"syscall"
+	"time"
 
 	"github.com/codetreker/remote-fs/packages/storage"
 )
@@ -61,6 +62,22 @@ func (s *fileSession) FileSessionIdentity(ctx context.Context) (storage.FileSess
 			return storage.FileSessionIdentityResult{}, err
 		}
 		return result, nil
+	})
+}
+
+func (s *fileSession) VolumeCreatedAt(ctx context.Context) (time.Time, error) {
+	return fileCall(ctx, s, true, func(ctx context.Context) (time.Time, error) {
+		created, err := storage.VolumeCreatedAt(ctx, s.remote)
+		if err != nil {
+			return time.Time{}, err
+		}
+		if err := s.base.usable("file", ""); err != nil {
+			return time.Time{}, err
+		}
+		if err := ctx.Err(); err != nil {
+			return time.Time{}, err
+		}
+		return created, nil
 	})
 }
 

@@ -1,5 +1,10 @@
 package wire
 
+import (
+	"strings"
+	"unicode/utf8"
+)
+
 const (
 	InfoFile       byte = 1
 	InfoFilesystem byte = 2
@@ -13,6 +18,14 @@ const (
 	FileEndOfFileInformation   byte = 20
 	FileNetworkOpenInformation byte = 34
 	FileIdInformation          byte = 59
+)
+
+const (
+	FileFsVolumeInformation    byte = 1
+	FileFsSizeInformation      byte = 3
+	FileFsDeviceInformation    byte = 4
+	FileFsAttributeInformation byte = 5
+	FileFsFullSizeInformation  byte = 7
 )
 
 type QueryInfoRequest struct {
@@ -179,4 +192,116 @@ func ParseFileEndOfFileInformation(data []byte) (int64, error) {
 		return 0, ErrMalformed
 	}
 	return int64(le.Uint64(data)), nil
+}
+
+type FileFsVolumeInfo struct {
+	CreationTime int64
+	Serial       uint32
+	Label        string
+}
+
+func FileFsVolumeInformationBody(info FileFsVolumeInfo) ([]byte, error) {
+	if info.CreationTime < 0 {
+		return nil, ErrMalformed
+	}
+	label, err := filesystemInformationName(info.Label, 18)
+	if err != nil {
+		return nil, err
+	}
+	body := make([]byte, 18+len(label))
+	le.PutUint64(body[:8], uint64(info.CreationTime))
+	le.PutUint32(body[8:12], info.Serial)
+	le.PutUint32(body[12:16], uint32(len(label)))
+	copy(body[18:], label)
+	return body, nil
+}
+
+type FileFsSizeInfo struct {
+	TotalAllocationUnits, AvailableAllocationUnits int64
+	SectorsPerAllocationUnit, BytesPerSector       uint32
+}
+
+func FileFsSizeInformationBody(info FileFsSizeInfo) ([]byte, error) {
+	if info.TotalAllocationUnits < 0 || info.AvailableAllocationUnits < 0 ||
+		info.AvailableAllocationUnits > info.TotalAllocationUnits ||
+		info.SectorsPerAllocationUnit == 0 || info.BytesPerSector == 0 {
+		return nil, ErrMalformed
+	}
+	body := make([]byte, 24)
+	le.PutUint64(body[:8], uint64(info.TotalAllocationUnits))
+	le.PutUint64(body[8:16], uint64(info.AvailableAllocationUnits))
+	le.PutUint32(body[16:20], info.SectorsPerAllocationUnit)
+	le.PutUint32(body[20:24], info.BytesPerSector)
+	return body, nil
+}
+
+type FileFsDeviceInfo struct {
+	DeviceType, Characteristics uint32
+}
+
+func FileFsDeviceInformationBody(info FileFsDeviceInfo) []byte {
+	body := make([]byte, 8)
+	le.PutUint32(body[:4], info.DeviceType)
+	le.PutUint32(body[4:8], info.Characteristics)
+	return body
+}
+
+type FileFsAttributeInfo struct {
+	Attributes                 uint32
+	MaximumComponentNameLength int32
+	FileSystemName             string
+}
+
+func FileFsAttributeInformationBody(info FileFsAttributeInfo) ([]byte, error) {
+	if info.MaximumComponentNameLength <= 0 || info.FileSystemName == "" {
+		return nil, ErrMalformed
+	}
+	name, err := filesystemInformationName(info.FileSystemName, 12)
+	if err != nil {
+		return nil, err
+	}
+	body := make([]byte, 12+len(name))
+	le.PutUint32(body[:4], info.Attributes)
+	le.PutUint32(body[4:8], uint32(info.MaximumComponentNameLength))
+	le.PutUint32(body[8:12], uint32(len(name)))
+	copy(body[12:], name)
+	return body, nil
+}
+
+type FileFsFullSizeInfo struct {
+	TotalAllocationUnits, CallerAvailableAllocationUnits, ActualAvailableAllocationUnits int64
+	SectorsPerAllocationUnit, BytesPerSector                                             uint32
+}
+
+func FileFsFullSizeInformationBody(info FileFsFullSizeInfo) ([]byte, error) {
+	if info.TotalAllocationUnits < 0 || info.CallerAvailableAllocationUnits < 0 ||
+		info.ActualAvailableAllocationUnits < 0 || info.ActualAvailableAllocationUnits > info.TotalAllocationUnits ||
+		info.CallerAvailableAllocationUnits > info.ActualAvailableAllocationUnits ||
+		info.SectorsPerAllocationUnit == 0 || info.BytesPerSector == 0 {
+		return nil, ErrMalformed
+	}
+	body := make([]byte, 32)
+	le.PutUint64(body[:8], uint64(info.TotalAllocationUnits))
+	le.PutUint64(body[8:16], uint64(info.CallerAvailableAllocationUnits))
+	le.PutUint64(body[16:24], uint64(info.ActualAvailableAllocationUnits))
+	le.PutUint32(body[24:28], info.SectorsPerAllocationUnit)
+	le.PutUint32(body[28:32], info.BytesPerSector)
+	return body, nil
+}
+
+func filesystemInformationName(value string, prefix int) ([]byte, error) {
+	if !utf8.ValidString(value) || strings.ContainsRune(value, 0) {
+		return nil, ErrMalformed
+	}
+	units := 0
+	for _, character := range value {
+		units++
+		if character > 0xffff {
+			units++
+		}
+		if units > (maxDirectTCPPayload-HeaderSize-8-prefix)/2 {
+			return nil, ErrMalformed
+		}
+	}
+	return EncodeUTF16(value), nil
 }

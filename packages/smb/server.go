@@ -101,6 +101,13 @@ func (s *Server) Publish(share Share) (*Export, error) {
 	if err != nil || key == "IPC$" || share.Volume == "" || share.BackendVolume == "" || share.RootNodeID == 0 || interfaceNil(share.Backend) {
 		return nil, ErrConfig
 	}
+	if share.VolumeLabel != nil {
+		label := *share.VolumeLabel
+		if len(label) > 4*maxVolumeLabelUnits || !utf8.ValidString(label) || strings.ContainsRune(label, '\x00') || utf16Length(label) > maxVolumeLabelUnits {
+			return nil, ErrConfig
+		}
+		share.VolumeLabel = &label
+	}
 	volumeSerial, err := stableVolumeSerial(share.BackendVolume)
 	if err != nil {
 		return nil, fmt.Errorf("SMB backend volume identity: %w", errors.Join(ErrConfig, err))

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"syscall"
+	"time"
 
 	"github.com/codetreker/remote-fs/packages/storage"
 )
@@ -57,6 +58,25 @@ func (s *remoteFileSession) FileSessionIdentity(ctx context.Context) (storage.Fi
 		return storage.FileSessionIdentityResult{}, err
 	}
 	return s.identity, nil
+}
+
+// VolumeCreatedAt returns the fact captured with this session's identity.
+// Cached identity facts do not establish current health or reference lifetime.
+func (s *remoteFileSession) VolumeCreatedAt(ctx context.Context) (time.Time, error) {
+	if err := ctx.Err(); err != nil {
+		return time.Time{}, err
+	}
+	if err := s.CheckFileSessionIdentity(); err != nil {
+		return time.Time{}, err
+	}
+	if err := validateVolumeCreationCapability(&s.capabilities, true); err != nil {
+		return time.Time{}, unreachable(Request{Op: OpFileControl}, err)
+	}
+	if failure := s.capabilities.VolumeCreationError; failure != nil {
+		errno, _ := storage.ErrnoByName(failure.Errno)
+		return time.Time{}, &operationError{req: Request{Op: OpFileControl}, errno: errno, detail: failure.Message, capability: capabilityErrors[failure.CapabilityCode]}
+	}
+	return s.capabilities.VolumeCreatedAt.Time(), nil
 }
 
 func (s *remoteFileSession) CheckStableReferenceIdentity() error {

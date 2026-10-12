@@ -201,7 +201,7 @@ server 通过配对的 volume 与锁服务访问 volume。集成方注入具有�
 
 Azure 形态依赖部署方分别提供和运维 Blob container、数据库及其相邻的 lease 证据，两类存储可以各自失败（R-INT-12、R-ERR-6）。`sqlite.OpenLocking` 对整份数据库取得 lifetime ownership，数据库及确定位置的证据保存数据库级最大 lease 时长。后续启动可以选择另一个已有 volume，但同一时刻只有一份活跃锁服务拥有该数据库，恢复等待仍覆盖整份数据库。`localstore` 则拥有一个私有本地目录下的对象、SQLite、WAL 外部见证、恢复状态与独占锁；它的完整设计见 [`local-disk-object-store.md`](local-disk-object-store.md)。
 
-基础 storage 的十一个操作、路径规则与错误词汇见顶层设计第四节。`FileStorage` 的保留对象、身份 namespace、directory revision/observation、action/delete-intent、metadata、Uses 与 range 是独立能力，原生 EX 所有权、共享预算、schema v10 和最终释放见[文件句柄设计](file-handles.md)。
+基础 storage 的十一个操作、路径规则与错误词汇见顶层设计第四节。`FileStorage` 的保留对象、身份 namespace、directory revision/observation、action/delete-intent、metadata、Uses 与 range 是独立能力，原生 EX 所有权、共享预算、schema v11 和最终释放见[文件句柄设计](file-handles.md)。
 
 ### 配额住在 storage 这一侧
 
@@ -227,7 +227,7 @@ SQLite metastore 还给 reserved、unresolved 与 garbage object records 的合�
 
 SQLite 打开与 `ObjectStatus` 验证每个 volume 的 named 节点形成 rooted tree：root 没有 incoming entry，其余 named 节点恰有一个同 volume 的名字且从 root 可达。detached 可以是非 root 的保留节点，但不得有 incoming entry 或作为目录边的 parent/child；detached 目录因此为空。dangling edge、具名却标为 detached 的 child、其它孤儿、cycle 与跨 volume entry 以 `EIO` 拒绝。每个目录的 revision 必须是八字节非零值，非目录必须为空；Node 与 retained change 的 kind/revision 组合一致。`volumes.used` 必须等于全部 regular-file size 的 overflow-checked 精确长度之和；`volumes.allocated_used` 必须等于全部 regular-file allocation_size 的 overflow-checked sum，包含 detached 节点。authority 节点与 retained change 的分配量按种类、长度和 4096 对齐验证；replica 保留来源已知值或未知，不强加 4096；`metadata_used` 必须等于当前、detached 和 retained change 的规范 metadata、link target 与 directory revision 长度。动态 storage class、NodeKind、可选时间、content revision、metadata envelope、trigger 定义与历史 nullable groups 都在暴露 volume、完整 listing 或 history 前验证；损坏不能被 coercion 成缺行、Detached 或可信零值。
 
-schema v8 迁移不能为旧 retained changes 补造 directory revision。迁移事务保留当前树与身份，为现有目录建立初始 revision，清空旧 changes，并为每个 log 生成新 incarnation、归零 committed／trimmed 窗口。旧 replica 因 incarnation mismatch 重新取 snapshot；server 不允许它沿已经删除且缺少 revision 的历史续读。schema v10 迁移从当前、detached 节点与可保留的历史 change 计算各自的分配量，并重建 `allocated_used`；它保留精确 `used`，所有回填、额度与完整性校验在暴露 volume 前完成。
+schema v8 迁移不能为旧 retained changes 补造 directory revision。迁移事务保留当前树与身份，为现有目录建立初始 revision，清空旧 changes，并为每个 log 生成新 incarnation、归零 committed／trimmed 窗口。旧 replica 因 incarnation mismatch 重新取 snapshot；server 不允许它沿已经删除且缺少 revision 的历史续读。schema v10 迁移从当前、detached 节点与可保留的历史 change 计算各自的分配量，并重建 `allocated_used`；它保留精确 `used`，所有回填、额度与完整性校验在暴露 volume 前完成。schema v11 独立保存新 volume 的实际创建时间，历史 volume 保持未知，不从 root 属性或打开时间推断；相关提交仍由原持久见证确认。
 
 SQLite 的 `database_state` 另持有数据库 identity、提交 generation，以及 node ID 与全局 change position 的持久高水位。ID 从高水位显式分配，`sqlite_sequence` 是同事务推进的冗余记录。durable-state validation 通过 expression indexes 的类型 discriminator 与最大 identity 边界读取全数据库 surviving references，打开、checkpoint 与每个 `Since` page 都要求 sequence 一致且任一 volume 的引用不超过高水位；每次分配也重新核对 sequence，change append 还要求当前 committed tail 严格小于新位置。每条 retained change 另保存同 volume 的 `previous_position`：第一条指向 `trimmed_through`，相邻记录逐条相连，最后一条等于 `committed_position`。位置是全数据库分配的，volume 内允许被其它 volume 留下空洞，完整性因此检查前驱链而不检查算术连续。`Open`、`Snapshot` 与 `ObjectStatus` 在暴露 volume 前验证受 `MaxIntegrityRecords` 限制的完整链；`Since` 用索引锚定 page 起点并执行 O(page) predecessor validation，缺口所在页整体失败，stream error 使 consumer 作废副本。同一 incarnation/position 的续订会在该缺口持续失败，直到持久日志被带外修复或出现合法 rebuild boundary。断链、tail 不一致或高水位回退都不生成新 incarnation 掩盖损坏。
 

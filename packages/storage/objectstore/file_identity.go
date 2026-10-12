@@ -3,7 +3,9 @@ package objectstore
 import (
 	"context"
 	"syscall"
+	"time"
 
+	"github.com/codetreker/remote-fs/packages/metastore"
 	"github.com/codetreker/remote-fs/packages/storage"
 )
 
@@ -111,4 +113,29 @@ func (fs *fileSession) CheckOpenMetadataAccess() error {
 		return syscall.EOPNOTSUPP
 	}
 	return native.CheckOpenMetadataAccess()
+}
+
+func (fs *fileSession) VolumeCreatedAt(ctx context.Context) (time.Time, error) {
+	ctx, cancel := fs.operationContext(ctx)
+	defer cancel()
+	ctx = metastore.WithFilePublicationGuard(ctx, fs.publicationAllowed)
+	done, err := fs.begin(ctx, true)
+	if err != nil {
+		return time.Time{}, err
+	}
+	defer done()
+	if _, err := fs.FileSessionIdentity(ctx); err != nil {
+		return time.Time{}, err
+	}
+	created, err := storage.VolumeCreatedAt(ctx, fs.native)
+	if err != nil {
+		return time.Time{}, err
+	}
+	if err := fs.publicationAllowed(); err != nil {
+		return time.Time{}, err
+	}
+	if err := ctx.Err(); err != nil {
+		return time.Time{}, err
+	}
+	return created, nil
 }

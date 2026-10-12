@@ -384,6 +384,9 @@ func validateFileResponse(req fileRequest, r fileResponse) error {
 		if err := validateAllocationUnitCapability(r.Capabilities, true); err != nil {
 			return err
 		}
+		if err := validateVolumeCreationCapability(r.Capabilities, true); err != nil {
+			return err
+		}
 		if err := validateSessionIdentity(r); err != nil {
 			return err
 		}
@@ -424,6 +427,9 @@ func validateFileResponse(req fileRequest, r fileResponse) error {
 		if err := validateAllocationUnitCapability(r.Capabilities, false); err != nil {
 			return err
 		}
+		if err := validateVolumeCreationCapability(r.Capabilities, false); err != nil {
+			return err
+		}
 		if (r.Capabilities.ReferenceName || r.Capabilities.State) != (r.Node != 0) {
 			return errors.New("file open identity does not match name observation capability")
 		}
@@ -438,6 +444,9 @@ func validateFileResponse(req fileRequest, r fileResponse) error {
 			return errors.New("atomic open response is incomplete")
 		}
 		if err := validateAllocationUnitCapability(r.Capabilities, false); err != nil {
+			return err
+		}
+		if err := validateVolumeCreationCapability(r.Capabilities, false); err != nil {
 			return err
 		}
 		if req.Op == storage.OpFileOpenNodeRef && r.Attr.ID != req.Node {

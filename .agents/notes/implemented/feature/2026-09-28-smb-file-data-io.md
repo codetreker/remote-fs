@@ -8,7 +8,7 @@ Windows 程序取得 SMB FileId 后，需要通过该句柄读取、范围写入
 
 ## 决定
 
-SMB 3.1.1 的 regular-file READ、flags=0 WRITE 和 FLUSH 使用[有界 CREATE/CLOSE](2026-09-28-smb-bounded-create-close.md)保存的 typed FileId 与同一 authority。字节内容、固定派生 metadata、句柄排序、原 action 恢复、清理证明和有界失败状态共同构成一条内容访问路径。文件信息／EOF 由[文件信息](2026-09-28-smb-file-information.md)拥有，volume 信息由[volume 信息提案](../../proposed/feature/2026-09-28-smb-file-data-information.md)保留，范围锁、名字、通知／缓存与原生资格仍为独立能力。
+SMB 3.1.1 的 regular-file READ、flags=0 WRITE 和 FLUSH 使用[有界 CREATE/CLOSE](2026-09-28-smb-bounded-create-close.md)保存的 typed FileId 与同一 authority。字节内容、固定派生 metadata、句柄排序、原 action 恢复、清理证明和有界失败状态共同构成一条内容访问路径。文件信息／EOF 由[文件信息](2026-09-28-smb-file-information.md)拥有，volume 信息由[volume 信息](2026-09-28-smb-volume-information.md)拥有，范围锁、名字、通知／缓存与原生资格仍为独立能力。
 
 该决定服务 R-FS-6 至 R-FS-8、R-CON-1、R-ERR-1 至 R-ERR-4、R-SEC-5、R-INT-8、R-WIN-2、R-WIN-5 和 R-WIN-10。实际结构见[SMB 端点设计](../../../../docs/design/client/smb-endpoint.md)与[文件契约](../../../../docs/design/server/file-handles.md)，错误与竞争验证见[测试策略](../../../../docs/testing.md)。这些命令的交付不宣布完整 Windows drive 或私有缓存资格完成。
 

@@ -294,7 +294,7 @@ func TestHTTPBackendIdentityRejectsMalformedWireDescriptors(t *testing.T) {
 func TestHTTPSessionIdentityRejectsMalformedWireAndCapabilityDisagreement(t *testing.T) {
 	response := fileResponse{Epoch: 1, Data: []byte{}, Session: strings.Repeat("a", 64),
 		Status:          &storage.FileSessionStatus{Epoch: "session-epoch", ActionEpoch: 1, Revision: 1, Remaining: time.Minute, HistoryRemaining: time.Minute},
-		Capabilities:    &fileCapabilities{SessionIdentity: true, StableIdentity: true, OpenMetadata: true},
+		Capabilities:    &fileCapabilities{SessionIdentity: true, StableIdentity: true, OpenMetadata: true, VolumeCreationError: &ErrorResponse{Errno: "EOPNOTSUPP"}},
 		SessionIdentity: fileSessionIdentityOf(storage.FileSessionIdentityResult{Backend: storage.BackendIdentityResult{Volume: "volume", Authority: "authority", RootNodeID: 7}, SessionEpoch: "session-epoch"}),
 	}
 	encoded, err := json.Marshal(response)

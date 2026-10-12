@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"syscall"
+	"time"
 )
 
 const MaxFileIdentityBytes = 128
@@ -74,4 +75,30 @@ func (r FileSessionIdentityResult) Check() error {
 func canonicalFileIdentity(value string) bool {
 	return len(value) > 0 && len(value) <= MaxFileIdentityBytes &&
 		strings.Trim(value, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._:/-") == ""
+}
+
+// VolumeCreatedAt discovers the optional immutable creation fact without changing
+// identity capabilities. The source must report its recorded volume creation,
+// not a root attribute or an estimate; historical unknown facts fail explicitly.
+// A successful result is canonical UTC; a nil error distinguishes a known year-1
+// value from an unknown fact. Current session health and retained-reference
+// liveness are checked by the caller.
+func VolumeCreatedAt(ctx context.Context, source any) (time.Time, error) {
+	if err := ctx.Err(); err != nil {
+		return time.Time{}, err
+	}
+	getter, ok := source.(interface {
+		VolumeCreatedAt(context.Context) (time.Time, error)
+	})
+	if !ok {
+		return time.Time{}, syscall.EOPNOTSUPP
+	}
+	created, err := getter.VolumeCreatedAt(ctx)
+	if err != nil {
+		return time.Time{}, err
+	}
+	if err := ctx.Err(); err != nil {
+		return time.Time{}, err
+	}
+	return created.UTC(), nil
 }

@@ -2,6 +2,7 @@ package locked
 
 import (
 	"context"
+	"time"
 
 	"github.com/codetreker/remote-fs/packages/storage"
 )
@@ -52,6 +53,10 @@ func (s *fileSession) FileSessionIdentity(ctx context.Context) (storage.FileSess
 		return storage.FileSessionIdentityResult{}, err
 	}
 	return result, nil
+}
+
+func (s *fileSession) VolumeCreatedAt(ctx context.Context) (time.Time, error) {
+	return storage.VolumeCreatedAt(readContext(ctx), s.FileSession)
 }
 
 func (s *fileSession) CheckStableReferenceIdentity() error {
