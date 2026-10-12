@@ -10,7 +10,7 @@ Windows 程序需要通过已打开的文件或目录查询信息，修改属性
 
 SMB 文件信息在[有界 CREATE/CLOSE](2026-09-28-smb-bounded-create-close.md)的 typed FileId 与[文件内容访问](2026-09-28-smb-file-data-io.md)的准入／恢复链上提供五种文件 QUERY_INFO 和 Basic／EOF SET_INFO。信息均来自原引用，本次查询验证当前生命期，不能用旧路径、打开时保存的属性或仅在退休后仍存在的固定 ID 回答。
 
-该决定服务 [R-FS-6 至 R-FS-9、R-ERR-1 至 R-ERR-4、R-INT-3、R-INT-8、R-INT-11、R-WIN-2、R-WIN-4、R-WIN-5、R-WS-5](../../../../docs/spec/requirements.md)。[volume 信息提案](../../proposed/feature/2026-09-28-smb-file-data-information.md)独立拥有 volume QUERY_INFO、label／creation fact、Space 与完整 presentation；本决定只建立文件信息必需的 identity／allocation 单位事实。结构见[SMB 端点设计](../../../../docs/design/client/smb-endpoint.md)与[文件契约](../../../../docs/design/server/file-handles.md)，验证归[测试策略](../../../../docs/testing.md)。
+该决定服务 [R-FS-6 至 R-FS-9、R-ERR-1 至 R-ERR-4、R-INT-3、R-INT-8、R-INT-11、R-WIN-2、R-WIN-4、R-WIN-5、R-WS-5](../../../../docs/spec/requirements.md)。[volume 信息](2026-09-28-smb-volume-information.md)独立拥有 volume QUERY_INFO、label／creation fact、当前 Space 与逻辑容量投影；本决定只建立文件信息必需的 identity／allocation 单位事实。结构见[SMB 端点设计](../../../../docs/design/client/smb-endpoint.md)与[文件契约](../../../../docs/design/server/file-handles.md)，验证归[测试策略](../../../../docs/testing.md)。
 
 ### 逐类信息源与权限
 
@@ -24,7 +24,7 @@ SMB 文件信息在[有界 CREATE/CLOSE](2026-09-28-smb-bounded-create-close.md)
 
 Basic／NetworkOpen 不能拼接多次 Stat 的字段。Standard／Internal／Id 不要求 FILE_READ_ATTRIBUTES，复用 `ReferenceStateAccess.State(ctx, StateScalars)` 返回同一 snapshot 的 Attr.ID／Kind／Size／AllocationSize／AllocationKnown 和 Detached／PendingUnlink；四类时间、opaque metadata、link target 与 pending generation 必须缺席，也不先载入完整 State 再裁字段。`StateFull` 保留完整结果并要求 ReadMetadata，FUSE 明确使用 Full。投影零值非法，当前业务授权携带实际投影，引用生命期和 NodeID 仍逐次验证。普通文件 Size 非负，目录 Size 未指定；Windows 按目录 kind 报告 EOF=0。
 
-NodeID 在同一 volume 内不可复用；128-bit ID 对 uint64 NodeID 做无损单射编码，不增加另一份持久 ID map。64-bit serial 从 canonical durable VolumeID 稳定投影，不同发布 volume 的投影碰撞在发布准入拒绝；SMB 每次打开的 FileId 只标识 capability，与对象 ID 分离。未来 32-bit volume serial 的投影与碰撞规则由 volume 信息独立决定。
+NodeID 在同一 volume 内不可复用；128-bit ID 对 uint64 NodeID 做无损单射编码，不增加另一份持久 ID map。64-bit serial 从 canonical durable VolumeID 稳定投影，不同发布 volume 的投影碰撞在发布准入拒绝；SMB 每次打开的 FileId 只标识 capability，与对象 ID 分离。[volume 信息](2026-09-28-smb-volume-information.md)使用该 serial 的低 32 位；该字段不承担唯一性保证，原 64-bit reservation 保留。
 
 AllocationKnown／AllocationSize 保留权威分配字节，单位是既有 AllocationReporting 的独立可选结果。Standard／NetworkOpen 需要会话内不变的可信非零单位验证整数倍，不能取整或从 EOF 推算。HTTP 在授权 session enrollment 中保留单位或原失败，不增加单位查询RPC；单位不可用不降低字节 capability 或使整个tree失败。需要该事实的文件类明确报告相应错误，当前访问授权和健康仍由本次 StateScalars／Stat保证。单位不依赖 Space allowance 或 host 物理 sector；SQLite 文件消费者复用原 exclusive authority身份路径。
 
@@ -58,7 +58,6 @@ QUERY_INFO／SET_INFO 的原签名字节不改写，related FileId 只在 frame-
 
 | 延后能力 | 延后代价与保持的结构 | 未交付请求的结果 |
 |---|---|---|
-| [7.4c volume 信息](../../proposed/feature/2026-09-28-smb-file-data-information.md) | 添加五个 volume 类、label／creation 事实与当前 Space 来源；不重写已建立 identity／分配单位事实 | volume QUERY_INFO 明确 unsupported |
 | [7.5 目录枚举](../../proposed/feature/2026-09-28-smb-directory-enumeration.md) | 添加有界冻结快照与 cursor；目录引用保留稳定 identity | QUERY_DIRECTORY 明确 unsupported |
 | [7.6 关闭删除](../../proposed/feature/2026-09-28-smb-close-delete-obligation.md)与[8.1 名字修改](../../proposed/feature/2026-09-28-smb-guarded-name-mutation.md) | 增加持久义务与 ancestryguards；旧 CREATE 名字不当作当前事实 | disposition、rename／link、当前名字类明确 unsupported |
 | [8.2 范围锁](../../proposed/feature/2026-09-28-smb-range-lock-cancel.md) | 增加跨入口范围保护；EOF／Basic 继续走受控 reference 和 authority 最终检查 | LOCK／asyncCANCEL 按未交付协议结果处理 |

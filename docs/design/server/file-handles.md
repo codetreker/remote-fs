@@ -41,6 +41,10 @@
 
 advisory session 的普通 `Status`／历史在退休后仍拒绝；仅 `WithCloseAdmission` 为已持有引用的清理保持递增 close epoch，并在同一临界区校验新动作与回执登记。File／NodeReference 的内部退休和显式关闭都使用它；旧 epoch ID 即使回执过期也不能形成新效果。该通道不恢复数据 I/O、普通锁控制或新引用准入。
 
+`storage.VolumeCreatedAt(ctx, source)` 在实际需要创建事实时结构性发现可选 `VolumeCreatedAt(context.Context) (time.Time, error)` getter；既有 BackendIdentity、FileSessionIdentity 的方法集合和 descriptor 不增加字段。成功值是记录的真实 volume 创建时间，规范化为 UTC；nil error 也可表示已知 year-1 值，不能用 Go 零时间判断未知。能力缺席或历史未知明确失败，来源错误返回零结果并保留错误链；缓存事实不证明当前 session 或引用生命期。
+
+SQLite schema v11 的 `volumes.created_sec`／`created_nsec` 必须同时为 NULL，或同时为合法 INTEGER 秒／纳秒；纳秒范围为 `[0,1e9)`。新 volume 在原创建事务中保存真实创建时点，历史行保持 NULL，查询不回填。该字段随数据库提交与外部见证持久确认；重开、根节点 BirthTime 修改及其它文件属性操作都不改变 volume 创建时间。objectstore 与 session wrappers 沿自己的 admission、health、publication 与 context 检查读取或转送该事实。
+
 `FileSessionOptions` 要显式选择有效值，调用方可从 `DefaultFileSessionOptions` 开始。默认 lease 为 30 秒、动作历史为 1 分钟、单文件大小为 1 GiB，每会话最多 4096 个引用、64 个活跃操作、256 个操作等待者、4096 个 use owner、65536 个范围、1024 个 pending range action、16384 个范围动作与 16384 个关闭动作槽。`MaxCloseActions` 至少覆盖每份 `MaxFiles` 引用的两次尝试和 session-close 保留位；已释放引用的终态回执仍按保留期占用容量，清除后才能把该名额交给新的 effectful open。会话上限还受 volume 与 HTTP registry 的共享上限约束。
 
 `Renew` 确认会话继续有效；`Status` 只观察，不续期。返回的 epoch、revision、剩余 lease 与 history 时间用于核对同一会话。client 从请求开始时刻计算保守的本地截止时间；旧响应、普通 I/O 成功、TCP 存活均不延长已确认期限。过期或旧 server epoch 的能力返回 `ESTALE`，未知结果返回 `EIO`，不会恢复到旧路径。底层发布检查仍是引用、Uses、range 与 Strong 权限的最终判定者。
@@ -90,7 +94,7 @@ HTTP 在已经授权的 session enrollment 中取得单位或原失败，和既�
 
 ## 二、保留节点、名字与回收
 
-SQLite authority schema v10 在 v7 的符号链接目标、节点 pending generation 和 durable delete intents，v8 的目录 revision，以及 v9 的义务 owner 与单调序号之外，保存节点分配量与 volume 分配总账。`Remove` 或覆盖目标的 `Rename` 移除节点名字时，有引用的对象成为 detached 并保留原 NodeID、分配量与状态；detached 目录必须为空，任何 detached 节点都不能继续出现在 entry 关系中。volume 日志、快照与普通目录遍历只包含仍有名字的节点，detached 对象的后续修改不制造虚构路径事件。
+SQLite authority schema v11 在 v7 的符号链接目标、节点 pending generation 和 durable delete intents、v8 的目录 revision、v9 的义务 owner 与单调序号、v10 的节点分配量与 volume 分配总账之外，保存独立的可缺席 volume 创建时间。`Remove` 或覆盖目标的 `Rename` 移除节点名字时，有引用的对象成为 detached 并保留原 NodeID、分配量与状态；detached 目录必须为空，任何 detached 节点都不能继续出现在 entry 关系中。volume 日志、快照与普通目录遍历只包含仍有名字的节点，detached 对象的后续修改不制造虚构路径事件。
 
 保留节点的内容仍属于 volume 的实际用量。普通文件的节点属性持有 4096 字节粒度的虚拟分配量；`AllocationKnown` 区分真实零值与未知，内置 authority 始终提供已知值。`AllocationReporting.CheckAllocationReporting()` 是 FileSession 的可选能力，验证完整包装链对所有返回 Attr 都提供已知分配量；SMB 在任何 CREATE 效果前要求此能力，并在收到原子打开结果后再次核验 Attr，缺失以 `EIO` 失败，不从 Size 推算。最后一个引用先退役，在最终发布门处禁止新的修改授权；已经接纳的 I/O 排空之后才物理释放。原 Use claim 保持安装，直到 SQLite 在 commit gate 内完成可能失败的 pending-unlink／detached 最终化并确认持久提交。pending-unlink 的发布以 `CheckCloseUnlink` 核对最后关闭引用的原 NodeID、Scope 与完整 claim，只排除该 Scope 自己的 DeleteName deny，其它 claim 仍参与冲突检查；已接受的删除义务不要求最后引用另具 DeleteName use。没有原引用的恢复使用普通匿名 `CheckUse`。同一会话的后续关闭尝试从 `finalizationDone` 继续。`DropUseExact` 核对原 NodeID、Scope 与完整 claim 后解除 Use，随后无失败地撤销 pin、引用和容量。明确未释放时原 claim 继续阻挡冲突打开；claim 缺失／不匹配或提交不确定时 authority fence 并报告未知，不以幂等 `DropUse` 的空成功证明释放。最后释放在事务内处理精确 payload 用量、分配总账、当前对象与待回收对象。已知未生效的容量拒绝保留引用供清理重试；结果不明时保留所有权并封锁后续使用，不能提前归还配额。
 
@@ -212,7 +216,7 @@ HTTP v5 统一转发基础 volume、中立 Attr、metadata、文件引用、目�
 
 OpenAt 的 `contentMetadataEffects` 与 mutation 的 `contentEffects` 使用独立 lower-camel DTO。descriptor 字段为 `namespace,payloadBytes,presentPrefix,absentPayload,clearMask,setMask`，字节字段 canonical base64；session 的 `openContentMetadata` 只在完整 checker 成立时宣告，固定效果保留原 enrollment 与 mutation digest。
 
-`file.backend-identity` 是 `/v5/file-control` 上不要求 session capability 的只读操作，先独立授权，再查询 handler 实际注册的 backend；成功响应携带 backend descriptor，transport epoch 固定为零。session-open 响应在 `sessionIdentity` capability 为 true 时携带独立 lower-camel DTO：`sessionIdentity{backend{volume,authority,rootNodeId},sessionEpoch}`；两端验证完整值，client 再核对 SessionEpoch 与 status epoch。该 descriptor 不回显 HandlerOptions.Volume，也不从 URL 推导存储身份。
+`file.backend-identity` 是 `/v5/file-control` 上不要求 session capability 的只读操作，先独立授权，再查询 handler 实际注册的 backend；成功响应携带 backend descriptor，transport epoch 固定为零。session-open 响应在 `sessionIdentity` capability 为 true 时携带独立 lower-camel DTO：`sessionIdentity{backend{volume,authority,rootNodeId},sessionEpoch}`；两端验证完整值，client 再核对 SessionEpoch 与 status epoch。该 descriptor 不回显 HandlerOptions.Volume，也不从 URL 推导存储身份。sessionIdentity=true 时，现有 capability envelope 必须恰好包含 `volumeCreatedAt{unix_sec,nanos}` 或 `volumeCreationError`；前者为合法规范时间，后者保留实际 errno／capability 分类与有界诊断。sessionIdentity=false 时二者都缺席。创建事实失败不改变 identity capability，也不使本来有效的 enrollment 失败。完整 session response 的结果预算可缩减 allocation／creation 错误的诊断文本，不能删掉错误分类、混淆已知与未知或突破固定 envelope 预算；remote getter 本地读取原封存值／错误，没有新的 RPC。后续查询继续在原 State／Stat 路径核对当前健康、scope 与授权。
 
 delete-intent query 使用顶层 `deleteOwner` 与 `deleteIntent`，list 使用 `deleteOwner`、`deleteAfter` 与 `deleteLimit`，ACK 命令携带 `owner`、`intent` 与 `action`。CloseIntent 的嵌套值也携带 `owner`。这些字段在访问持久账本前验证，HTTP 的 list、query 和 ACK 分别授权；同一个 owner 的页游标可跨 authority 重启继续使用。
 

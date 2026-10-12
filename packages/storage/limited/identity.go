@@ -2,6 +2,7 @@ package limited
 
 import (
 	"context"
+	"time"
 
 	"github.com/codetreker/remote-fs/packages/storage"
 )
@@ -60,6 +61,25 @@ func (s *fileSession) FileSessionIdentity(ctx context.Context) (storage.FileSess
 		return storage.FileSessionIdentityResult{}, err
 	}
 	return result, nil
+}
+
+func (s *fileSession) VolumeCreatedAt(ctx context.Context) (time.Time, error) {
+	s.storage.gate.RLock()
+	defer s.storage.gate.RUnlock()
+	if err := s.storage.healthy(); err != nil {
+		return time.Time{}, err
+	}
+	created, err := storage.VolumeCreatedAt(ctx, s.FileSession)
+	if err != nil {
+		return time.Time{}, err
+	}
+	if err := s.storage.healthy(); err != nil {
+		return time.Time{}, err
+	}
+	if err := ctx.Err(); err != nil {
+		return time.Time{}, err
+	}
+	return created, nil
 }
 
 func (s *fileSession) CheckStableReferenceIdentity() error {

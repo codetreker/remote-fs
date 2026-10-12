@@ -142,21 +142,33 @@ func boundedFileSessionResponse(response fileResponse, limit int64) (fileRespons
 	if int64(len(encoded)) <= limit {
 		return response, nil
 	}
-	if response.Capabilities == nil || response.Capabilities.AllocationUnitError == nil {
+	if response.Capabilities == nil || response.Capabilities.AllocationUnitError == nil && response.Capabilities.VolumeCreationError == nil {
 		return fileResponse{}, errBodyTooLarge
 	}
 	caps := *response.Capabilities
-	failure := *caps.AllocationUnitError
-	caps.AllocationUnitError = &failure
+
+	if caps.AllocationUnitError != nil {
+		failure := *caps.AllocationUnitError
+		caps.AllocationUnitError = &failure
+	}
+	if caps.VolumeCreationError != nil {
+		failure := *caps.VolumeCreationError
+		caps.VolumeCreationError = &failure
+	}
 	response.Capabilities = &caps
 	for _, message := range []string{boundedErrorDetail, ""} {
-		failure.Message = message
-		encoded, err = json.Marshal(response)
-		if err != nil {
-			return fileResponse{}, err
-		}
-		if int64(len(encoded)) <= limit {
-			return response, nil
+		for _, failure := range []*ErrorResponse{caps.AllocationUnitError, caps.VolumeCreationError} {
+			if failure == nil {
+				continue
+			}
+			failure.Message = message
+			encoded, err = json.Marshal(response)
+			if err != nil {
+				return fileResponse{}, err
+			}
+			if int64(len(encoded)) <= limit {
+				return response, nil
+			}
 		}
 	}
 	return fileResponse{}, errBodyTooLarge

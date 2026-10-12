@@ -72,6 +72,10 @@ type Share struct {
 	BackendVolume storage.VolumeID
 	RootNodeID    uint64
 	Backend       storage.FileStorage
+	// VolumeLabel is a trusted label of at most 32 UTF-16 units. Nil leaves
+	// volume-label information unavailable; a present empty string is a known
+	// empty label. Publish copies the value for the export's lifetime.
+	VolumeLabel *string
 }
 
 // Status reports resources still owned, including cleanup-only owners.

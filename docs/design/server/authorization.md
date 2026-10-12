@@ -48,7 +48,7 @@ storage.Operation 是覆盖路径、文件会话、复制和锁控制的 transpo
 | `replication.resubscribe` | `/v5/resubscribe` | 按游标续订及其后续输出 |
 | `replication.snapshot` | `/v5/snapshot` | 捕获快照及发送整份快照 |
 | `replication.checkpoint` | `/v5/checkpoint` | 读取日志化身与已提交位置 |
-| `file.backend-identity` | `/v5/file-control`，`file.backend-identity` | 在 session enrollment 前验证实际 backend 的 volume／authority／根身份 |
+| `file.backend-identity` | `/v5/file-control`，`file.backend-identity` | 验证实际 backend 的 volume／authority／根身份，并授权 SMB 的静态 volume 信息查询 |
 | `file.session-open` | `/v5/file`，`file.session-open` | 建立 FileSession |
 | `file.status` | `/v5/file-control`，`file.status` | 查询 FileSession 状态与历史边界 |
 | `file.renew` | `/v5/file-control`，`file.renew` | 续期 FileSession |
@@ -105,6 +105,8 @@ storage.Operation 是覆盖路径、文件会话、复制和锁控制的 transpo
 | `lock.query-action` | `/v5/lock-query-action` | 查询动作历史 |
 | `lock.query-grant` | `/v5/lock-query-grant` | 查询 grant 当前状态 |
 | `lock.status` | `/v5/lock-status` | 查询授权方状态 |
+
+SMB volume QUERY_INFO 每次授权原引用的 `file.state`，Size／FullSize 另授权 `volume.space`，Volume／Device／Attribute 另授权 `file.backend-identity`；入队前、取得 turn 后及结果编码前分别核对当前策略。已封存的单位或创建时间不构成新请求的授权，zero-access FileId 也不获得 ReadMetadata 或字节读权。HTTP 在已通过既有业务授权的 session enrollment 中取得可选创建时间／单位事实；错误 channel 不跳过原身份与生命期检查，也不引入独立事实 RPC。
 
 
 副本构建还需要 replication.checkpoint 的明确许可；允许订阅或快照不隐含这项权限。Checkpoint 是一次普通读取，遵循入口授权、通用传输预算和安全错误规则，不建立持续输出。

@@ -342,6 +342,7 @@ func (c *connection) process(requests []wire.Request) (processErr error) {
 	var inheritedSession uint64
 	var inheritedTree uint32
 	var previousStatus uint32
+	var previousFailed bool
 	var inheritedFile wire.FileID
 	for index, request := range requests {
 		original := request
@@ -375,13 +376,13 @@ func (c *connection) process(requests []wire.Request) (processErr error) {
 
 		var body []byte
 		var signer *signing.Session
-		if request.Header.Flags&wire.FlagRelated != 0 && previousStatus != 0 || ctx.Err() != nil ||
+		if request.Header.Flags&wire.FlagRelated != 0 && previousFailed || ctx.Err() != nil ||
 			responseBudget(request) > c.server.config.Limits.MaxFrameBytes-len(output)-80*(len(requests)-index-1) {
 			header.Status = statusResources
 			if ctx.Err() != nil {
 				header.Status = statusError(ctx.Err())
 			}
-			if request.Header.Flags&wire.FlagRelated != 0 && previousStatus != 0 {
+			if request.Header.Flags&wire.FlagRelated != 0 && previousFailed {
 				header.Status = previousStatus
 			}
 			c.mu.Lock()
@@ -409,6 +410,7 @@ func (c *connection) process(requests []wire.Request) (processErr error) {
 			body = wire.ErrorResponseBody()
 		}
 		inheritedSession, inheritedTree, previousStatus = header.SessionID, header.TreeID, header.Status
+		previousFailed = relatedOperationFailed(original, header.Status, body)
 		if header.Command == wire.Create {
 			inheritedFile = wire.FileID{}
 			if header.Status == statusOK && len(body) >= 80 {
@@ -586,6 +588,13 @@ func responseBudget(request wire.Request) int {
 		return 128
 	case wire.Write:
 		return 80
+	case wire.QueryInfo:
+		if parsed, err := request.QueryInfo(); err == nil && parsed.InfoType == wire.InfoFilesystem {
+			if _, maximum := volumeInfoLengths(parsed.FileInfoClass); maximum != 0 {
+				return max(80, (72+min(int(parsed.OutputBufferLength), maximum)+7)&^7)
+			}
+		}
+		return 128
 	case wire.SetInfo:
 		return 80
 	case wire.Flush:
@@ -593,6 +602,13 @@ func responseBudget(request wire.Request) int {
 	default:
 		return 128
 	}
+}
+
+func relatedOperationFailed(request wire.Request, status uint32, body []byte) bool {
+	return status != statusOK && !(status == statusBufferOverflow && request.Header.Command == wire.QueryInfo &&
+		len(request.Body) >= 3 && request.Body[2] == wire.InfoFilesystem && len(body) >= 8 &&
+		binary.LittleEndian.Uint16(body) == 9 && binary.LittleEndian.Uint16(body[2:]) == wire.HeaderSize+8 &&
+		binary.LittleEndian.Uint32(body[4:]) == uint32(len(body)-8))
 }
 
 // Session lookup and frame enrollment share c.mu, so retirement cannot remove

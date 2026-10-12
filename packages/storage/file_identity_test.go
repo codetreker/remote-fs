@@ -1,11 +1,64 @@
 package storage
 
 import (
+	"context"
 	"errors"
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 )
+
+type volumeCreationProbe struct {
+	created time.Time
+	err     error
+	calls   int
+	hook    func()
+}
+
+func (p *volumeCreationProbe) VolumeCreatedAt(context.Context) (time.Time, error) {
+	p.calls++
+	if p.hook != nil {
+		p.hook()
+	}
+	return p.created, p.err
+}
+
+func TestVolumeCreatedAtDiscoversOnlyRecordedOptionalFacts(t *testing.T) {
+	if got, err := VolumeCreatedAt(t.Context(), struct{}{}); !got.IsZero() || !errors.Is(err, syscall.EOPNOTSUPP) {
+		t.Fatalf("missing creation fact=%v, %v", got, err)
+	}
+	created := time.Date(2026, 10, 12, 9, 30, 0, 123, time.FixedZone("source", 3600))
+	probe := &volumeCreationProbe{created: created}
+	got, err := VolumeCreatedAt(t.Context(), probe)
+	if err != nil || !got.Equal(created) || got.Location() != time.UTC || probe.calls != 1 {
+		t.Fatalf("canonical creation fact=%v, %v; calls=%d", got, err, probe.calls)
+	}
+	probe.created = time.Time{}
+	if got, err := VolumeCreatedAt(t.Context(), probe); err != nil || !got.Equal(time.Time{}) || got.Location() != time.UTC {
+		t.Fatalf("known year-1 creation fact=%v, %v", got, err)
+	}
+	probe.created = created
+	probe.err = errors.New("creation observation refused")
+	if got, err := VolumeCreatedAt(t.Context(), probe); !got.IsZero() || err != probe.err {
+		t.Fatalf("failed creation fact=%v, %v", got, err)
+	}
+}
+
+func TestVolumeCreatedAtReturnsZeroWhenObservationIsCanceled(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	probe := &volumeCreationProbe{created: time.Now()}
+	cancel()
+	if got, err := VolumeCreatedAt(ctx, probe); !got.IsZero() || !errors.Is(err, context.Canceled) || probe.calls != 0 {
+		t.Fatalf("canceled creation fact=%v, %v; calls=%d", got, err, probe.calls)
+	}
+	ctx, cancel = context.WithCancel(t.Context())
+	defer cancel()
+	probe.hook = cancel
+	if got, err := VolumeCreatedAt(ctx, probe); !got.IsZero() || !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled completed observation=%v, %v", got, err)
+	}
+}
 
 func TestFileIdentityDescriptorsRejectMissingAndNoncanonicalFacts(t *testing.T) {
 	backend := BackendIdentityResult{Volume: "opaque-volume/1", Authority: "opaque-authority", RootNodeID: 1}

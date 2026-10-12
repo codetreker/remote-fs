@@ -186,7 +186,11 @@ CREATE TABLE volumes (
 	, metadata_used INTEGER NOT NULL DEFAULT 0
 	CHECK (typeof(metadata_used) = 'integer' AND metadata_used >= 0), delete_intent_high_water INTEGER NOT NULL DEFAULT 0
 	CHECK (delete_intent_high_water >= 0), allocated_used INTEGER NOT NULL DEFAULT 0
-	CHECK (typeof(allocated_used) = 'integer' AND allocated_used >= 0));
+	CHECK (typeof(allocated_used) = 'integer' AND allocated_used >= 0), created_sec INTEGER
+	CHECK (created_sec IS NULL OR typeof(created_sec) = 'integer'), created_nsec INTEGER
+	CHECK ((created_sec IS NULL AND created_nsec IS NULL) OR
+	(typeof(created_sec) = 'integer' AND typeof(created_nsec) = 'integer'
+	AND created_nsec >= 0 AND created_nsec < 1000000000)));
 
 CREATE TRIGGER changes_allocation_insert AFTER INSERT ON changes BEGIN
 	UPDATE changes SET allocation_size = CASE

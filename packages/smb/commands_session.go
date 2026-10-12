@@ -105,7 +105,7 @@ func (c *connection) dispatch(ctx context.Context, request, original wire.Reques
 		body, status, _ := c.createFile(ctx, s, tree, request)
 		return body, status, signer
 	case wire.QueryInfo:
-		body, status := c.queryFileInfo(ctx, s, tree, request)
+		body, status := c.queryInfo(ctx, s, tree, request)
 		return body, status, signer
 	case wire.SetInfo:
 		body, status := c.setFileInfo(ctx, s, tree, request)

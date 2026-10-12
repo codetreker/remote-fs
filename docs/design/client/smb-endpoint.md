@@ -2,13 +2,13 @@
 
 `packages/smb` 是 Windows client 进程内的本机呈现层。Windows 系统 SMB client 通过 loopback TCP 连接它；端点把认证后的 share 连接绑定到调用方提供的 `storage.FileStorage`。SMB 只存在于 client 与同机操作系统之间，client 到远端 authority 的边界仍是平台中立的 storage／HTTP 契约。
 
-端点支持 SMB 3.1.1 协商、认证、消息签名、share 连接、CREATE/CLOSE、regular-file READ／flags=0 WRITE／FLUSH、五类文件 QUERY_INFO、Basic／EOF SET_INFO 与会话清理。五种非 supersede disposition 建立稳定 FileId 和权威 share claim；volume 信息、目录、名字和锁命令返回明确的不支持结果。该命令集合不构成完整 Windows network drive。
+端点支持 SMB 3.1.1 协商、认证、消息签名、share 连接、CREATE/CLOSE、regular-file READ／flags=0 WRITE／FLUSH、五类文件 QUERY_INFO、Basic／EOF SET_INFO、五类 volume QUERY_INFO 与会话清理。五种非 supersede disposition 建立稳定 FileId 和权威 share claim；目录、名字和锁命令返回明确的不支持结果。该命令集合不构成完整 Windows network drive。
 
 ## 一、嵌入与发布
 
 `smb.New` 接受 `Config{Authenticator, AuthorizeIdentity, Authorize, Limits, Logger}`。构造函数先验证两个授权接口、认证 provider 和全部资源上限，不取得 Windows credential、不启动 goroutine，也不打开 listener。`packages/smb/windows` 提供 SSPI `Authenticator`、读取进程身份的 `CurrentIdentity` 和只允许该确切身份的 `AllowIdentity`；非 Windows 构建保留同一 API，并在实际取得平台能力时返回不支持。
 
-一个 `Server` 可以发布有限个 `Share`。每个 share 携带不区分大小写的 SMB 名字、业务授权 label `Volume`、实际存储 pin `BackendVolume storage.VolumeID`／`RootNodeID` 和一份调用方拥有的 `storage.FileStorage`。发布时验证这些配置及 `CheckFileStorage`，但不建立 FileSession，也不接管 backend 的关闭责任。名字为空、过长、含 SMB 分隔／保留字符、前后空白或与 `IPC$` 冲突时拒绝。
+一个 `Server` 可以发布有限个 `Share`。每个 share 携带不区分大小写的 SMB 名字、业务授权 label `Volume`、实际存储 pin `BackendVolume storage.VolumeID`／`RootNodeID` 、可选 `VolumeLabel *string` 和一份调用方拥有的 `storage.FileStorage`。发布时验证这些配置及 `CheckFileStorage`，但不建立 FileSession，也不接管 backend 的关闭责任。名字为空、过长、含 SMB 分隔／保留字符、前后空白或与 `IPC$` 冲突时拒绝。VolumeLabel 的 nil 表示来源缺席，已知空值表示无 label；已知值必须为无 NUL 的有效 UTF-8，最多 32 个 UTF-16 code unit。Export 独立复制 label，后续宿主修改原值不改变已发布事实。
 
 `Serve` 只接受已经绑定到 loopback TCP 地址的 listener，并在验证成功后取得其所有权。每条 accepted connection 还要再次核对 peer 是 loopback；其它来源在进入协议处理前关闭。Server 不创建 WNet 映射、不安装驱动、不修改防火墙、系统 SMB 配置或全局缓存策略。
 
@@ -32,7 +32,7 @@ Server ── connection ── authenticated session ── tree
 
 首包可以是 SMB1 形状的 wildcard negotiate，它只选择 SMB2 framing；随后必须进行真正的 SMB 3.1.1 `NEGOTIATE`。端点只接受 SHA-512 preauthentication integrity 和 AES-CMAC signing，返回的 `MaxTransactSize`、`MaxReadSize` 与 `MaxWriteSize` 都来自 `MaxIOBytes`。preauthentication hash 使用收到和发出的原始 wire bytes，不能从解码后的字段重建。
 
-SMB2 compound frame 在一个有界 payload 中解析。每项保存自己的 header、body 和用于签名的完整 command bytes；related compound 只继承同一 frame 中前一项的 SessionId、TreeId，以及成功 CREATE 产生的 FileId。继承值在解码后的执行上下文中传递，不改写用于验签的 command bytes。all-ones FileId 只可使用这一 frame 的前驱结果，半个 all-ones 值拒绝。混用 related 与 unrelated 风格、把 `NEGOTIATE` 或 `SESSION_SETUP` 放入 compound、非法 offset／alignment、非法 credit 或重复 MessageId 都拒绝。response 逐项保留对应状态，related 前项失败时后项不执行受控效果。
+SMB2 compound frame 在一个有界 payload 中解析。每项保存自己的 header、body 和用于签名的完整 command bytes；related compound 只继承同一 frame 中前一项的 SessionId、TreeId，以及成功 CREATE 产生的 FileId。继承值在解码后的执行上下文中传递，不改写用于验签的 command bytes。all-ones FileId 只可使用这一 frame 的前驱结果，半个 all-ones 值拒绝。混用 related 与 unrelated 风格、把 `NEGOTIATE` 或 `SESSION_SETUP` 放入 compound、非法 offset／alignment、非法 credit 或重复 MessageId 都拒绝。response 逐项保留对应状态，related 前项失败时后项不执行受控效果。QUERY_INFO 的 BUFFER_OVERFLOW 是携带正常结果 body 的 warning，不抑制其后 related CLOSE。
 
 认证完成后，每个携带 SessionId 的请求都必须使用该 session 的 AES-CMAC signing key 验证，合法请求及能够归属该 signer 的错误 response 也由同一 key 签名。unsigned session request 的拒绝保持 unsigned；带 signed flag 但 MAC 错误的请求得到 signed access-denied。已建立 session 的 reauthentication 在解码 token 前先验签，畸形或被篡改的 exchange 不能得到 unsigned 旁路。sessionless ECHO 可以在 negotiate 后使用，并且不继承其它 session 的 signer。未知或已经退役的 session、replay/DFS flag 与失效身份均在访问 tree 或 backing 前失败。session key 只用于派生 signing key，临时 token 与 key buffer 在使用后清零；日志不写入 token、key、SID 或显示名。
 
@@ -55,7 +55,7 @@ authentication exchange 受 `HandshakeTimeout` 约束，完成后的 identity �
 | `namespace.go` | 完整权威 sibling 观察、pinned root、revision/edge ancestry guards |
 | `tree_capabilities.go`、`authority_session.go` | backend/session identity、完整能力预检、共享 FileSession 与续期 |
 | `commands_file.go`、`windows_metadata.go`、`content_metadata.go` | CREATE 意图、访问／share／disposition、Windows metadata 与固定派生效果 |
-| `commands_file_io.go`、`commands_file_info.go`、`file_io_gate.go` | 内容／文件信息命令、File／NodeReference 共用 FIFO、授权／身份复核与关闭排空 |
+| `commands_file_io.go`、`commands_file_info.go`、`commands_volume_info.go`、`file_io_gate.go` | 内容／文件／volume 信息命令、File／NodeReference 共用 FIFO、授权／身份复核与关闭排空 |
 | `mutation_owner.go`、`flush_owner.go`、`write_diagnostics.go` | immutable WRITE／Basic／EOF 条件动作与 FLUSH confirmation、同动作恢复、有界失败事实与宿主责任转移 |
 | `file_handles.go`、`commands_close.go`、`authority_recovery.go`、`handle_diagnostics.go` | typed owner、准入／容量、恢复、关闭尝试与结算 |
 | `session_cleanup.go`、`connection.go`、`server.go` | tree/session/export 退休、compound 执行与 signer 所有权 |
@@ -108,7 +108,19 @@ Basic SET_INFO 要求 FILE_WRITE_ATTRIBUTES，严格40bytes；允许 READONLY／
 
 EOF SET_INFO 要求普通 File 的 FILE_WRITE_DATA，严格8bytes 且长度非负；APPEND-only／目录／metadata-only 明确拒绝。`MutateTruncate` 在最终 authority 事务中核对 READONLY 条件并同时提交长度、ARCHIVE、时间与日志；既有 scope／Use／配额继续参与最终许可。属性与 EOF 均使用 mutation_owner.go 保存完整不可变 command，Unknown 只核对／重投原 action，不能 remint。
 
-QUERY_INFO／SET_INFO 复用原签名 frame、typedFileId、response 预算与 CLOSE 排空。支持的五个文件 QUERY 类按协议忽略 Flags、AdditionalInformation 和 InputBufferLength／Offset，含不能描述有效 buffer 的输入；SET 非 securityAdditionalInformation 必须为零；SET payload 不得越过当前 compoundcommand。完整 response、条件 metadata／Attr 与诊断在 backing 前计费；SET 的 Attr 返回预算统一由原 mutation owner执行并用于原动作恢复。security／quota、volume、allocation、disposition、rename／link、EA／stream、compression／reparse 与 position／mode 类保持明确未支持；未支持 class 返回 NOT_SUPPORTED；畸形 length／flag 按各自 NTSTATUS 拒绝，backing 无部分效果。
+QUERY_INFO／SET_INFO 复用原签名 frame、typedFileId、response 预算与 CLOSE 排空。支持的五个文件 QUERY 类按协议忽略 Flags、AdditionalInformation 和 InputBufferLength／Offset，含不能描述有效 buffer 的输入；SET 非 securityAdditionalInformation 必须为零；SET payload 不得越过当前 compoundcommand。完整 response、条件 metadata／Attr 与诊断在 backing 前计费；SET 的 Attr 返回预算统一由原 mutation owner执行并用于原动作恢复。security／quota、allocation、disposition、rename／link、EA／stream、compression／reparse 与 position／mode 类保持明确未支持；未支持 class 返回 NOT_SUPPORTED；畸形 length／flag 按各自 NTSTATUS 拒绝，backing 无部分效果。
+
+### Volume 信息
+
+`InfoType=Filesystem` 支持 Volume `0x01`、Size `0x03`、Device `0x04`、Attribute `0x05` 与 FullSize `0x07`。所有类复用原 `admitInformation`，句柄 rights 为零；先在入队前及取得 turn 后授权 `file.state` 与实际查询，StateScalars 确认 exact live File／NodeReference 的对象、kind 和 scope。Size／FullSize 使用 `volume.space`，其它三类使用 `file.backend-identity`；不授予 Stat／StateFull／ReadMetadata 或字节读权。编码前再次核对当前授权和 context。
+
+Volume 使用原 session 的可选持久创建事实、Export 复制的可信 label，以及 `uint32(volumeSerial)`；32-bit 字段不承担唯一性，64-bit FileId reservation 保留。Device 仅设置 FILE_DEVICE_DISK=7 与 REMOTE_DEVICE=0x10。Attribute 的 filesystem name 为 `remote-fs`，flags 仅为 CASE_PRESERVED_NAMES=2 与 UNICODE_ON_DISK=4，component 上限为既有 255 code unit。
+
+Size／FullSize 每次调用实际 backend 的 Space，使用原 AllocationReporting 的不可变非零单位。逻辑 bytes-per-sector 等于该单位，sectors-per-unit 为 1；单位须可由 uint32 表示。Space 先验证 Coherent 与 Used<=Total，Total／Avail 须可整除；FullSize 还验证 Total−Used。Size 分别报告 Total 与 caller Avail；FullSize 另报告 actual free，不由 caller Avail 推测 Used。单位、Space 缺席或来源错误、超额与不可表达只失败相应容量类；缺席／不支持容量源也映射 I/O 错误，权限拒绝仍保留。tree 和原 FileId 不被容量 fence，读取、缩短与关闭按原契约继续。
+
+Volume 的最小输出请求为 24，但 serialized prefix 只有 18 字节；已知空 label 的完整 payload 可为 18 字节，不插入六字节 padding。Attribute 最小请求和 prefix 均为 12。Size／Device／FullSize 分别要求完整 24／8／32 字节，短请求在 authority 工作前失败。变长 label/name 不足时返回 BUFFER_OVERFLOW 与正常 QUERY_INFO body；声明完整 UTF-16 字节长度，复制可用容量的原始字节 prefix，包括奇数字节。最大 Volume payload 为 82 字节，完整对齐 response frame 为 160 字节，预留按真实最大类结果计算，不按任意声明 buffer 扩大。
+
+创建时间或 label 缺席只使 Volume 类失败，容量错误只使 Size／FullSize 失败。filesystem 类表中已定义未实现的类返回 NOT_SUPPORTED，未知类返回 INVALID_INFO_CLASS。该查询路径不建立 action／mutation owner、不产生修改效果，也不从旧路径或旧 Space 合成结果。
 
 ## 五、容量与 FileId owner
 
@@ -150,10 +162,10 @@ WriteFailure 保存 typed WriteOwnerID 的随机 incarnation／单调 generation
 
 ## 七、命令与需求边界
 
-可成功的命令为 NEGOTIATE、SESSION_SETUP、ECHO、TREE_CONNECT、TREE_DISCONNECT、LOGOFF、CREATE、CLOSE，以及 regular-file READ、flags=0 WRITE、FLUSH、五种文件 QUERY_INFO 和 Basic／EOF SET_INFO。未支持的信息类、LOCK、IOCTL、QUERY_DIRECTORY、CHANGE_NOTIFY 和 OPLOCK_BREAK 不执行 backing 操作并返回 STATUS_NOT_SUPPORTED。CANCEL 的 async 语义未建立，CANCEL、无法识别或畸形 command fail closed，终止连接而不执行受控效果。
+可成功的命令为 NEGOTIATE、SESSION_SETUP、ECHO、TREE_CONNECT、TREE_DISCONNECT、LOGOFF、CREATE、CLOSE，以及 regular-file READ、flags=0 WRITE、FLUSH、五种文件 QUERY_INFO、Basic／EOF SET_INFO 与五种 volume QUERY_INFO。未支持的信息类、LOCK、IOCTL、QUERY_DIRECTORY、CHANGE_NOTIFY 和 OPLOCK_BREAK 不执行 backing 操作并返回 STATUS_NOT_SUPPORTED。CANCEL 的 async 语义未建立，CANCEL、无法识别或畸形 command fail closed，终止连接而不执行受控效果。
 
 对象不存在、撞名、类型不符只有在权威条件已确定时映射相应文件错误；typed share 冲突映射 STATUS_SHARING_VIOLATION，不能被一般 EAGAIN 资源错误遮蔽。容量耗尽映射 STATUS_INSUFFICIENT_RESOURCES。无法证明的引用身份、allocation、时间、动作或 settlement 返回 I/O 错误，不能报告成功、缺席或旧值。
 
 文件 I/O 已确认的 EDQUOT 映射 STATUS_QUOTA_EXCEEDED，与底层 ENOSPC 区分；含 EIO 的未知结果优先保持 STATUS_IO_DEVICE_ERROR，不能凭 joined quota errno 宣称明确未执行。
 
-这套结构对应 R-FS-5 至 R-FS-9 的打开／引用部分，R-CC-14／R-WIN-6 的共享准入，R-INT-1 至 R-INT-3 的嵌入和资源，以及 R-ERR-1、R-ERR-2、R-WIN-9 的真实错误与安全准入。范围锁、volume 信息、目录枚举、持久关闭删除、名字修改、通知／缓存、WNet 和完整 Windows 资格仍由独立能力实现。取舍与依赖见[有界 CREATE/CLOSE](../../../.agents/notes/implemented/feature/2026-09-28-smb-bounded-create-close.md)、[文件内容访问](../../../.agents/notes/implemented/feature/2026-09-28-smb-file-data-io.md)及[文件信息](../../../.agents/notes/implemented/feature/2026-09-28-smb-file-information.md)。
+这套结构对应 R-FS-5 至 R-FS-9 的打开／引用部分，R-CC-14／R-WIN-6 的共享准入，R-INT-1 至 R-INT-3 的嵌入和资源，以及 R-ERR-1、R-ERR-2、R-WIN-9 的真实错误与安全准入。范围锁、目录枚举、持久关闭删除、名字修改、通知／缓存、WNet 和完整 Windows 资格仍由独立能力实现。取舍与依赖见[有界 CREATE/CLOSE](../../../.agents/notes/implemented/feature/2026-09-28-smb-bounded-create-close.md)、[文件内容访问](../../../.agents/notes/implemented/feature/2026-09-28-smb-file-data-io.md)、[文件信息](../../../.agents/notes/implemented/feature/2026-09-28-smb-file-information.md)及[volume 信息](../../../.agents/notes/implemented/feature/2026-09-28-smb-volume-information.md)。

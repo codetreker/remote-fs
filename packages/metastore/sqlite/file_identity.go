@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"strconv"
 	"syscall"
+	"time"
 
 	"github.com/codetreker/remote-fs/packages/metastore"
 	"github.com/codetreker/remote-fs/packages/metastore/sqlite/internal/dbstate"
@@ -68,6 +69,61 @@ func (s *Store) captureBackendIdentity(ctx context.Context, tx *sql.Tx) (storage
 	}
 	if err := result.Check(); err != nil {
 		return storage.BackendIdentityResult{}, err
+	}
+	return result, nil
+}
+
+func (s *Store) VolumeCreatedAt(ctx context.Context) (time.Time, error) {
+	if err := s.coordinator.commit.acquire(ctx); err != nil {
+		return time.Time{}, err
+	}
+	defer s.coordinator.commit.release()
+	if err := s.checkFileOwnership(); err != nil {
+		return time.Time{}, err
+	}
+	if s.fileDomain == nil || s.root <= 0 {
+		return time.Time{}, syscall.ESTALE
+	}
+	if err := metastore.CheckFilePublication(ctx); err != nil {
+		return time.Time{}, err
+	}
+	var result time.Time
+	known := false
+	err := s.inspect(ctx, func(tx *sql.Tx) error {
+		if _, err := s.captureBackendIdentity(ctx, tx); err != nil {
+			return err
+		}
+		var secondsClass, nanosecondsClass string
+		var seconds, nanoseconds sql.NullInt64
+		if err := tx.QueryRowContext(ctx, `SELECT typeof(created_sec),typeof(created_nsec),
+			CASE WHEN typeof(created_sec)='integer' THEN created_sec END,
+			CASE WHEN typeof(created_nsec)='integer' THEN created_nsec END
+			FROM volumes WHERE id=? AND root=?`, s.volume, s.root).
+			Scan(&secondsClass, &nanosecondsClass, &seconds, &nanoseconds); err != nil {
+			return err
+		}
+		if secondsClass == "null" && nanosecondsClass == "null" {
+			return nil
+		}
+		if secondsClass != "integer" || nanosecondsClass != "integer" || !seconds.Valid || !nanoseconds.Valid ||
+			nanoseconds.Int64 < 0 || nanoseconds.Int64 >= int64(time.Second) {
+			return syscall.EIO
+		}
+		result = time.Unix(seconds.Int64, nanoseconds.Int64).UTC()
+		known = true
+		return nil
+	})
+	if err == nil {
+		err = metastore.CheckFilePublication(ctx)
+	}
+	if err == nil {
+		err = ctx.Err()
+	}
+	if err != nil {
+		return time.Time{}, sqlerr.Failure(err)
+	}
+	if !known {
+		return time.Time{}, syscall.EOPNOTSUPP
 	}
 	return result, nil
 }
