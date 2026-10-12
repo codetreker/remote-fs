@@ -171,7 +171,7 @@ packages/metastore/sqlite/
 
 新增文件只拆分当前 SMB 内部职责；wire CREATE／CLOSE 编码、原 FileActions 和 wrapper 继续使用现有接口。原生 probe 的请求 frame 捕获与目录 probe 共用现有重组辅助；没有通用协议 telemetry、长期测试服务或 FUSE 删除机制。
 
-测试按[测试策略](../../../../docs/testing.md)固定原子 disposition、无效果拒绝、pending／最后引用、原关联变化、权限撤销、有界恢复及未知 ACK。真实 Linux authority 通过 direct 与 HTTP 测试；签名协议用例直接发送缺少 DELETE 的关闭删除 CREATE，核对拒绝签名、没有新名字、原对象及内容不变、没有 intent 或本地 owner。持久子进程在接受后、pending 和已提交／ACK 未确认处 SIGKILL 宿主、authority 或两者，使用同一 backend 与宿主配置重开，以名字、NodeID、内容和持久结果断言。
+测试按[测试策略](../../../../docs/testing.md)固定原子 disposition、无效果拒绝、pending／最后引用、原关联变化、权限撤销、有界恢复及未知 ACK。真实 Linux authority 通过 direct 与 HTTP 测试；普通命令夹具不启动续期 worker，Lease／History 都为有限 5 分钟，使场景在该窗口内不因 action 分配至 dispatch 之间的非预期 history 退役改测旧 epoch 拒绝；专用 2 秒 History 用例仍以真实 Status 轮换、旧 action 拒绝及续期后的新 action 成功验证该规则，产品默认值保持原形。签名协议用例直接发送缺少 DELETE 的关闭删除 CREATE，核对拒绝签名、没有新名字、原对象及内容不变、没有 intent 或本地 owner。持久子进程在接受后、pending 和已提交／ACK 未确认处 SIGKILL 宿主、authority 或两者，使用同一 backend 与宿主配置重开，以名字、NodeID、内容和持久结果断言。
 
 Windows Server 原生用例在应用未显式请求 DELETE 的 CreateFile 上，核对 redirector 实际发送的签名 CREATE 已包含 DELETE，再要求合法关闭删除成功；它不作为缺少 wire DELETE 的拒绝证明。两个相容句柄先确认发起引用的签名 CLOSE 和同节点 authority Pending，再观察 survivor 的原生 Standard API；API 错误、kind、EOF、allocation、原引用读取、冲突新打开拒绝及最后关闭后的原生／authority 名字缺席都保持必需断言。实际签名 TCP 的 class5 用例在同一 mutable fixture 上严格要求当前 DeletePending=true、links0，包括 Windows 执行；原生 getter 如产生 class5 response，同样必须核对签名、关联、状态和完整当前 body。未发生该 exchange 时，应用 links／pending 与零请求／响应分别记录，不充当当前 authority 投影。
 

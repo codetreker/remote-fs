@@ -51,11 +51,12 @@ type realSMBFixture struct {
 }
 
 // These fixtures exercise commands without starting the endpoint renewal worker.
-// Their finite lease covers the instrumented matrices; retirement tests fence
-// their authority explicitly.
+// Their finite lease and action history cover the instrumented matrices.
+// Retirement and history-rotation tests select their own lifetime conditions.
 func fixtureFileSessionOptions() storage.FileSessionOptions {
 	options := storage.DefaultFileSessionOptions()
 	options.Lease = 5 * time.Minute
+	options.History = options.Lease
 	return options
 }
 
