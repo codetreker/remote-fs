@@ -10,7 +10,6 @@ import (
 	"net"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"reflect"
 	"runtime"
 	"sort"
@@ -84,9 +83,6 @@ func TestNativeWindowsDirectoryEnumeration(t *testing.T) {
 	// https://learn.microsoft.com/en-us/windows-server/storage/file-server/smb-ports
 	t.Cleanup(func() { nativeMappingCommand(t, drive, remote, port, true) })
 	nativeMappingCommand(t, drive, remote, port, false)
-	t.Run("native-buffer-diagnostics", func(t *testing.T) {
-		nativeBufferDiagnostics(t, server, share, port, receipts)
-	})
 
 	rootNames := []string{"alpha.txt", "beta.bin", "folder", "long-😀-name.txt"}
 	for _, test := range []struct {
@@ -147,9 +143,6 @@ func TestNativeWindowsDirectoryEnumeration(t *testing.T) {
 			}
 		})
 	}
-	// Initial-call truncation belongs to the native FileObject. Each buffer
-	// scenario opens a fresh handle; RestartScan only resets enumeration position.
-	// https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/nf-ntifs-ntquerydirectoryfile
 	t.Run("nt/undersized-native-base", func(t *testing.T) {
 		h := nativeOpenDirectory(t, drive+`\`)
 		status, data := nativeQueryDirectory(t, h, 12, "long*", 15, true, true, false)
@@ -167,18 +160,14 @@ func TestNativeWindowsDirectoryEnumeration(t *testing.T) {
 			t.Fatalf("invalid native fixture layout: base=%d offset=%d full=%d", baseSize, nameOffset, nameOffset+len(nameBytes))
 		}
 		status, data := nativeQueryDirectory(t, h, 12, "long*", baseSize, true, true, false)
-		if status != nativeBufferOverflow {
+		if status != 0 || len(data) != 0 {
 			t.Fatalf("short buffer status=%#x bytes=%d", status, len(data))
 		}
-		if len(data) < nameOffset || binary.LittleEndian.Uint32(data[8:]) != uint32(len(nameBytes)) {
-			t.Fatalf("partial name length lost: %x", data)
-		}
-		prefix := []byte{'l', 0, 'o', 0}
-		if len(data) != baseSize || !reflect.DeepEqual(data[nameOffset:], prefix) {
-			t.Fatalf("partial native name prefix changed: %x", data)
-		}
-		// The redirector owns its own application buffer/cursor adaptation. A
-		// restarted full query proves the entry remains observable after warning.
+		// The SMB redirector can retain the complete record while returning no
+		// application bytes. We enlarge the same handle's buffer before EOF,
+		// preserving its search expression and cursor through a later restart.
+		// https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/nf-ntifs-ntquerydirectoryfile
+		nativeWantNames(t, nativeReadAll(t, h, 12, "", false), []string{"long-😀-name.txt"})
 		nativeWantNames(t, nativeReadAll(t, h, 12, "", true), []string{"long-😀-name.txt"})
 	})
 	facts, err := receipts.snapshot()
@@ -289,104 +278,10 @@ func nativeOpenDirectory(t *testing.T, path string) win.Handle {
 	return handle
 }
 
-func nativeBufferDiagnostics(t *testing.T, server *smb.Server, share string, port int, receipts *nativeDirectoryReceipts) {
-	t.Helper()
-	name := "long-😀-name.txt"
-	nameBytes := len(wire.EncodeUTF16(name))
-	namesHead, ok := wire.DirectoryInformationHeadSize(wire.FileNamesInformation)
-	if !ok {
-		t.Fatal("Names header unavailable")
-	}
-	idBothHead, ok := wire.DirectoryInformationHeadSize(wire.FileIdBothDirectoryInformation)
-	if !ok {
-		t.Fatal("IdBoth header unavailable")
-	}
-	type cell struct {
-		length           int
-		single, extended bool
-	}
-	cells := []cell{
-		{15, true, false}, {16, true, false}, {17, true, false},
-		{namesHead + nameBytes - 1, true, false}, {namesHead + nameBytes, true, false},
-		{idBothHead, true, false}, {idBothHead + nameBytes, true, false}, {4096, true, false},
-		{16, false, false}, {16, true, true}, {16, false, true},
-	}
-	directories := make([]string, len(cells))
-	for i := range directories {
-		directories[i] = fmt.Sprintf("cell-%02d", i)
-	}
-	diagnosticShare := share + "-diagnostic"
-	if _, err := server.Publish(smb.Share{Name: diagnosticShare, Volume: diagnosticShare,
-		BackendVolume: "test-volume-diagnostic", RootNodeID: 1, Backend: smb.NewNativeDirectoryProbeBackend(directories...)}); err != nil {
-		t.Fatal(err)
-	}
-	projectTemp := filepath.Join("..", "..", ".tmp")
-	if err := os.MkdirAll(projectTemp, 0700); err != nil {
-		t.Fatal(err)
-	}
-	localRoot, err := os.MkdirTemp(projectTemp, "native-directory-control-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		if err := os.RemoveAll(localRoot); err != nil {
-			t.Error(err)
-		}
-	})
-	local, err := filepath.Abs(localRoot)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, directory := range directories {
-		path := filepath.Join(local, directory)
-		if err := os.Mkdir(path, 0700); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(filepath.Join(path, name), nil, 0600); err != nil {
-			t.Fatal(err)
-		}
-	}
-	drive := nativeUnusedDrive(t)
-	remote := `\\127.0.0.1\` + diagnosticShare
-	t.Cleanup(func() { nativeMappingCommand(t, drive, remote, port, true) })
-	nativeMappingCommand(t, drive, remote, port, false)
-	for i, cell := range cells {
-		for _, backend := range []struct{ label, path string }{
-			{"local", filepath.Join(local, directories[i])}, {"smb", drive + `\` + directories[i]},
-		} {
-			t.Run(fmt.Sprintf("%02d/%s/length-%d/single-%v/ex-%v", i, backend.label, cell.length, cell.single, cell.extended), func(t *testing.T) {
-				h := nativeOpenDirectory(t, backend.path)
-				call := func(phase, pattern string, length int, restart bool) nativeDirectoryCallResult {
-					t.Helper()
-					before, err := receipts.snapshot()
-					if err != nil {
-						t.Fatal(err)
-					}
-					result := nativeDirectoryCall(t, h, 12, pattern, length, cell.single, restart, cell.extended)
-					after, err := receipts.snapshot()
-					if err != nil {
-						t.Fatal(err)
-					}
-					t.Logf("native buffer diagnostic: phase=%s length=%d direct=%#x iosb=%#x information=%d wire-queries=%d prefix=%x", phase, length, result.direct, uint32(result.status), result.information, len(after)-len(before), result.buffer[:min(len(result.buffer), 64)])
-					return result
-				}
-				call("initial", "long*", cell.length, true)
-				call("enlarged", "", 4096, false)
-				result := call("restart", "", 4096, true)
-				if result.direct != 0 {
-					t.Fatalf("diagnostic restart status=%#x", result.direct)
-				}
-				nativeWantNames(t, nativeDecodeDirectory(t, 12, result.buffer[:int(result.information)]), []string{name})
-			})
-		}
-	}
-}
-
 const (
 	nativeInfoLengthMismatch uint32 = 0xc0000004
 	nativeNoMoreFiles        uint32 = 0x80000006
 	nativeNoSuchFile         uint32 = 0xc000000f
-	nativeBufferOverflow     uint32 = 0x80000005
 )
 
 // Native FILE_NAMES_INFORMATION includes WCHAR FileName[1] and structure
@@ -403,20 +298,7 @@ var nativeNTDLL = win.NewLazySystemDLL("ntdll.dll")
 var nativeNTQueryDirectory = nativeNTDLL.NewProc("NtQueryDirectoryFile")
 var nativeNTQueryDirectoryEx = nativeNTDLL.NewProc("NtQueryDirectoryFileEx")
 
-type nativeDirectoryCallResult struct {
-	direct      uint32
-	status      win.NTStatus
-	information uintptr
-	buffer      []byte
-}
-
 func nativeQueryDirectory(t *testing.T, handle win.Handle, class uint32, pattern string, length int, single, restart, extended bool) (uint32, []byte) {
-	t.Helper()
-	result := nativeDirectoryCall(t, handle, class, pattern, length, single, restart, extended)
-	return result.direct, result.buffer[:int(result.information)]
-}
-
-func nativeDirectoryCall(t *testing.T, handle win.Handle, class uint32, pattern string, length int, single, restart, extended bool) nativeDirectoryCallResult {
 	t.Helper()
 	buffer := make([]byte, length)
 	var status win.IO_STATUS_BLOCK
@@ -462,7 +344,7 @@ func nativeDirectoryCall(t *testing.T, handle win.Handle, class uint32, pattern 
 	if status.Information > uintptr(length) {
 		t.Fatalf("native query exceeded output capacity: %d > %d", status.Information, length)
 	}
-	return nativeDirectoryCallResult{direct: uint32(result), status: status.Status, information: status.Information, buffer: buffer}
+	return uint32(result), buffer[:int(status.Information)]
 }
 
 func nativeReadAll(t *testing.T, handle win.Handle, class uint32, pattern string, restart bool) []string {

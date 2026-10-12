@@ -14,13 +14,13 @@ import (
 
 // NewNativeDirectoryProbeBackend supplies a controlled, read-only authority for
 // the native redirector probe. It intentionally uses no platform disk backend.
-func NewNativeDirectoryProbeBackend(diagnosticDirectories ...string) storage.FileStorage {
+func NewNativeDirectoryProbeBackend() storage.FileStorage {
 	instant := time.Unix(1700000000, 0).UTC()
 	attr := func(id uint64, kind storage.NodeKind, size int64) storage.Attr {
 		return storage.Attr{ID: id, Kind: kind, Size: size, AllocationKnown: true,
 			BirthTime: &instant, ChangeTime: &instant, AccessTime: instant, ModTime: instant}
 	}
-	backend := &nativeDirectoryBackend{views: map[uint64][]storage.Entry{
+	return &nativeDirectoryBackend{views: map[uint64][]storage.Entry{
 		1: {
 			{Name: "alpha.txt", Attr: attr(3, storage.NodeRegular, 0)},
 			{Name: "beta.bin", Attr: attr(4, storage.NodeRegular, 0)},
@@ -28,31 +28,13 @@ func NewNativeDirectoryProbeBackend(diagnosticDirectories ...string) storage.Fil
 			{Name: "long-😀-name.txt", Attr: attr(5, storage.NodeRegular, 0)},
 		},
 		2: {{Name: "nested.txt", Attr: attr(6, storage.NodeRegular, 0)}},
-	}, root: attr(1, storage.NodeDirectory, 0), identity: endpointBackendIdentity()}
-	if len(diagnosticDirectories) != 0 {
-		backend.identity.Volume = "test-volume-diagnostic"
-		backend.identity.Authority = "test-authority-diagnostic"
-		for i, name := range diagnosticDirectories {
-			id := uint64(100 + i)
-			backend.views[1] = append(backend.views[1], storage.Entry{Name: name, Attr: attr(id, storage.NodeDirectory, 0)})
-			backend.views[id] = []storage.Entry{{Name: "long-😀-name.txt", Attr: attr(uint64(200+i), storage.NodeRegular, 0)}}
-		}
-	}
-	return backend
+	}, root: attr(1, storage.NodeDirectory, 0)}
 }
 
 type nativeDirectoryBackend struct {
 	endpointStorage
-	views    map[uint64][]storage.Entry
-	root     storage.Attr
-	identity storage.BackendIdentityResult
-}
-
-func (b *nativeDirectoryBackend) BackendIdentity(ctx context.Context) (storage.BackendIdentityResult, error) {
-	if err := ctx.Err(); err != nil {
-		return storage.BackendIdentityResult{}, err
-	}
-	return b.identity, nil
+	views map[uint64][]storage.Entry
+	root  storage.Attr
 }
 
 func (b *nativeDirectoryBackend) Stat(ctx context.Context, path string) (storage.Attr, error) {
@@ -84,15 +66,6 @@ type nativeDirectorySession struct {
 	refMu      sync.Mutex
 	references map[string]*nativeDirectoryReference
 	sequence   uint64
-}
-
-func (s *nativeDirectorySession) FileSessionIdentity(ctx context.Context) (storage.FileSessionIdentityResult, error) {
-	if err := ctx.Err(); err != nil {
-		return storage.FileSessionIdentityResult{}, err
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return storage.FileSessionIdentityResult{Backend: s.backend.identity, SessionEpoch: s.status.Epoch}, nil
 }
 
 func (*nativeDirectorySession) CheckDirectoryRead() error { return nil }
