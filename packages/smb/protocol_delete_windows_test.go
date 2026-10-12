@@ -132,12 +132,23 @@ func TestNativeWindowsDeleteOnClose(t *testing.T) {
 		infoErr := win.GetFileInformationByHandleEx(survivor.Handle, win.FileStandardInfo, (*byte)(unsafe.Pointer(&standard)), uint32(unsafe.Sizeof(standard)))
 		receipts.mu.Lock()
 		receipts.standardActive = false
+		standardRequests := receipts.standardCount
 		receipts.mu.Unlock()
 		if infoErr != nil {
 			t.Fatal(infoErr)
 		}
-		if standard.NumberOfLinks != 0 || standard.DeletePending != 1 || standard.Directory != 0 || standard.EndOfFile != 0 || standard.AllocationSize != 0 {
-			t.Fatalf("pending standard info=%+v", standard)
+		if standard.Directory != 0 || standard.EndOfFile != 0 || standard.AllocationSize != 0 {
+			t.Fatalf("native standard info changed fixed file facts: %+v", standard)
+		}
+		t.Logf("Win32 StandardInfo after authority Pending: links=%d pending=%d class5Requests=%d", standard.NumberOfLinks, standard.DeletePending, standardRequests)
+		current := standard.NumberOfLinks == 0 && standard.DeletePending == 1
+		if standardRequests != 0 && !current {
+			t.Fatalf("fresh class5 exchange did not reach the native API: %+v", standard)
+		}
+		// Without a class5 exchange, this result has no current authority witness.
+		// https://github.com/codetreker/remote-fs/blob/e216ff791b2e88efad4b608c857ffdecb3259a80/docs/spec/requirements.md#L249
+		if standardRequests == 0 && !current && !(standard.NumberOfLinks == 1 && standard.DeletePending == 0) {
+			t.Fatalf("native StandardInfo is neither the opening nor current projection: %+v", standard)
 		}
 		var data [1]byte
 		var read uint32

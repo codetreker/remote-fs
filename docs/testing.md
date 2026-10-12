@@ -447,7 +447,11 @@ ACK 用例分别丢失执行前与执行后响应，保留固定 owner／intent�
 
 [签名缺少 DELETE 用例](../packages/smb/protocol_delete_linux_test.go)通过真实 TCP、签名 SMB CREATE 发送关闭删除但不携带 DELETE，分别尝试新建与清空已有文件。响应必须为签名 ACCESS_DENIED 且关联原 message／session／tree；新名字仍缺席，原身份、内容和 metadata 不变，没有持久 intent 或本地 owner。它直接证明 wire 请求的无效果拒绝，不依赖 Win32 权限转换。
 
-[Windows 原生关闭删除用例](../packages/smb/protocol_delete_windows_test.go)复用实际 SSPI、loopback 映射和 Win32 CreateFile／CloseHandle，使用[窄 mutable fixture](../packages/smb/native_delete_fixture_test.go)实现现有中立打开／intent 及字节打开预检需要的 ConditionalFileMutation 能力；只读 mutation 仍明确拒绝。覆盖新文件 ShareAccess=0、metadata-only 文件、空目录、两个相容句柄、实际 DELETE 权限转换，以及实际 TCP 连接中断后的原义务完成。Win32 CreateFile 未显式请求 DELETE 时，用例核对恰好一份捕获的签名关闭删除 CREATE 已携带 DELETE，再要求关闭成功和名字消失；该应用调用不作为缺少 wire DELETE 的拒绝场景。相容 survivor 用 Standard 信息核对 pending／links0，继续读取，冲突新打开拒绝，最后关闭后名字消失。
+[Windows 原生关闭删除用例](../packages/smb/protocol_delete_windows_test.go)复用实际 SSPI、loopback 映射和 Win32 CreateFile／CloseHandle，使用[窄 mutable fixture](../packages/smb/native_delete_fixture_test.go)实现现有中立打开／intent 及字节打开预检需要的 ConditionalFileMutation 能力；只读 mutation 仍明确拒绝。覆盖新文件 ShareAccess=0、metadata-only 文件、空目录、两个相容句柄、实际 DELETE 权限转换，以及实际 TCP 连接中断后的原义务完成。Win32 CreateFile 未显式请求 DELETE 时，用例核对恰好一份捕获的签名关闭删除 CREATE 已携带 DELETE，再要求关闭成功和名字消失；该应用调用不作为缺少 wire DELETE 的拒绝场景。
+
+两个相容句柄必须先确认发起引用的签名 CLOSE 成功及同节点 authority Pending，再调用 survivor 的原生 Standard API。API 错误仍失败，kind、EOF、allocation、原引用读取、冲突新打开拒绝，以及最后关闭后的原生名字与独立 authority 缺席都保持严格断言。原生 getter 的应用 links／pending 与 active class5 请求／响应分别记录；任何实际 class5 response 都必须签名正确、关联确切请求、状态成功且完整 body 为当前 pending1／links0。没有 exchange 时不得把应用字段当作当前 authority 投影。
+
+同一 fixture 的 `TestNativeDeleteProbeSignedPendingStandardInformation` 经真实认证／签名 TCP 发起 class5 查询，完整 body 必须为 pending1／links0，包括 Windows runner 上的执行，不能用原生 getter 的零 exchange 替代。Windows Server 观察到签名 CLOSE／authority Pending 后，原生 Standard API 仍返回 links1／pending0、active class5 请求／响应均为零；这一结果保留为 8.3／10 的应用信息刷新及缓存资格缺口，不认定 Windows 内部来源，也不宣称该原生资格已通过。
 
 非空目录在关闭前取得相容原生目录句柄并确认 FileIdInfo 和 child；发起关闭后要求签名 SMB CLOSE 为 STATUS_DIRECTORY_NOT_EMPTY、authority 为 NotExecuted，原相容句柄的 FileIdInfo 不变且同句柄 NtQueryDirectory 仍返回原 child。authority 完整有界观察另核对原目录及 child 身份。应用 CloseHandle 和重新按名 FindFirstFile 的结果分别记录，不由应用成功推断 wire 成功，也不为按名失败猜测原因或宣称缓存资格；同步应用错误与 fresh-name 资格由 8.3／10 继续验收。fixture 使用内存 authority，不承担 SQLite 跨重启证明；实际 Windows execution verdict 与清理由当次 CI 回执给出，cross-build 或 wire 模拟不代替原生执行，也不证明 Windows 11 Home／Pro 普通用户资格。
 

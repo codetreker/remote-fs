@@ -173,7 +173,9 @@ packages/metastore/sqlite/
 
 测试按[测试策略](../../../../docs/testing.md)固定原子 disposition、无效果拒绝、pending／最后引用、原关联变化、权限撤销、有界恢复及未知 ACK。真实 Linux authority 通过 direct 与 HTTP 测试；签名协议用例直接发送缺少 DELETE 的关闭删除 CREATE，核对拒绝签名、没有新名字、原对象及内容不变、没有 intent 或本地 owner。持久子进程在接受后、pending 和已提交／ACK 未确认处 SIGKILL 宿主、authority 或两者，使用同一 backend 与宿主配置重开，以名字、NodeID、内容和持久结果断言。
 
-Windows Server 原生用例在应用未显式请求 DELETE 的 CreateFile 上，核对 redirector 实际发送的签名 CREATE 已包含 DELETE，再要求合法关闭删除成功；它不作为缺少 wire DELETE 的拒绝证明。非空目录在关闭前保留相容原生句柄，要求签名 CLOSE 为 DIRECTORY_NOT_EMPTY、authority 为 NotExecuted，原句柄的 FileIdInfo 身份及同句柄 NtQueryDirectory 返回的 child 保持；另核对 authority 完整观察中的原目录及 child。应用 CloseHandle 和重新按名 FindFirstFile 的结果单独记录，不由 wire 错误推导应用同步错误或 fresh-name 资格。mutable fixture 实现现有 ConditionalFileMutation 能力以满足字节 CREATE 预检，保留只读 mutation 拒绝；fixture 不证明 SQLite 持久性。实际执行结果由当次 local／CI 回执给出，编译或 wire 模拟不代替原生 verdict。
+Windows Server 原生用例在应用未显式请求 DELETE 的 CreateFile 上，核对 redirector 实际发送的签名 CREATE 已包含 DELETE，再要求合法关闭删除成功；它不作为缺少 wire DELETE 的拒绝证明。两个相容句柄先确认发起引用的签名 CLOSE 和同节点 authority Pending，再观察 survivor 的原生 Standard API；API 错误、kind、EOF、allocation、原引用读取、冲突新打开拒绝及最后关闭后的原生／authority 名字缺席都保持必需断言。实际签名 TCP 的 class5 用例在同一 mutable fixture 上严格要求当前 DeletePending=true、links0，包括 Windows 执行；原生 getter 如产生 class5 response，同样必须核对签名、关联、状态和完整当前 body。未发生该 exchange 时，应用 links／pending 与零请求／响应分别记录，不充当当前 authority 投影。
+
+非空目录在关闭前保留相容原生句柄，要求签名 CLOSE 为 DIRECTORY_NOT_EMPTY、authority 为 NotExecuted，原句柄的 FileIdInfo 身份及同句柄 NtQueryDirectory 返回的 child 保持；另核对 authority 完整观察中的原目录及 child。应用 CloseHandle 和重新按名 FindFirstFile 的结果单独记录，不由 wire 错误推导应用同步错误或 fresh-name 资格。mutable fixture 实现现有 ConditionalFileMutation 能力以满足字节 CREATE 预检，保留只读 mutation 拒绝；fixture 不证明 SQLite 持久性。实际执行结果由当次 local／CI 回执给出，编译或 wire 模拟不代替原生 verdict。
 
 ## 备选方案
 
@@ -197,4 +199,6 @@ Windows Server 原生用例在应用未显式请求 DELETE 的 CreateFile 上，
 
 **延期：退役 HTTP session 的通用关闭收敛。** authority 重启后，旧 HTTP session 可能持续 ESTALE 且没有足够终态证据，不能证明 adapter settlement。本能力保留最多两份恢复 session 的责任、允许当前发现独立就绪，并使旧责任继续导致停止错误；没有无条件清理进展保证。修复需要独立的 adapter retirement／settlement 设计，不能把新 incarnation 或 Unknown 当释放证明。
 
-关闭删除不构成完整 Windows 删除工作流；普通 disposition、名字修改、锁、通知、WNet 和 Windows 11 普通用户资格按各自提案交付。Win32 CloseHandle 可在非空目录的 SMB CLOSE 报错时仍返回成功，重新按名枚举也可能失败；原生用例分别记录这两个结果，并通过原相容句柄和 authority 证明对象及 child 保留，不解释其原因或宣称客户端缓存资格。应用错误呈现、重新按名访问及缓存资格由 8.3／10 继续验收。原对象与可移动名字关联、跨入口 guard 和有界错误责任使这些延期保持为新增接入。
+关闭删除不构成完整 Windows 删除工作流；普通 disposition、名字修改、锁、通知、WNet 和 Windows 11 普通用户资格按各自提案交付。Windows Server 的原生 Standard API 在签名 CLOSE 和同节点 authority Pending 已确认后，观察到 links1／pending0，期间没有观察到 class5 请求或响应；它不是一次新的 endpoint class5 投影，也未证明 Windows 内部状态来源。实际签名 class5 的当前 pending／links 投影仍是必需正确性要求；原生应用信息刷新和缓存资格保持为 8.3／10 的未完成验收。
+
+Win32 CloseHandle 可在非空目录的 SMB CLOSE 报错时仍返回成功，重新按名枚举也可能失败；原生用例分别记录这两个结果，并通过原相容句柄和 authority 证明对象及 child 保留，不解释其原因或宣称客户端缓存资格。应用错误呈现与重新按名访问也由 8.3／10 继续验收。原对象与可移动名字关联、跨入口 guard 和有界错误责任使这些延期保持为新增接入。
