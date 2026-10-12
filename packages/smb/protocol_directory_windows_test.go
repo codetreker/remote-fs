@@ -143,12 +143,18 @@ func TestNativeWindowsDirectoryEnumeration(t *testing.T) {
 			}
 		})
 	}
-	t.Run("nt/application-short-buffer", func(t *testing.T) {
+	// Initial-call truncation belongs to the native FileObject. Each buffer
+	// scenario opens a fresh handle; RestartScan only resets enumeration position.
+	// https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/nf-ntifs-ntquerydirectoryfile
+	t.Run("nt/undersized-native-base", func(t *testing.T) {
 		h := nativeOpenDirectory(t, drive+`\`)
 		status, data := nativeQueryDirectory(t, h, 12, "long*", 15, true, true, false)
 		if status != nativeInfoLengthMismatch || len(data) != 0 {
 			t.Fatalf("undersized native structure status=%#x bytes=%d", status, len(data))
 		}
+	})
+	t.Run("nt/application-short-buffer", func(t *testing.T) {
+		h := nativeOpenDirectory(t, drive+`\`)
 		var names nativeFileNamesInformation
 		baseSize := int(unsafe.Sizeof(names))
 		nameOffset := int(unsafe.Offsetof(names.FileName))
@@ -156,7 +162,7 @@ func TestNativeWindowsDirectoryEnumeration(t *testing.T) {
 		if baseSize != 16 || nameOffset != 12 || baseSize >= nameOffset+len(nameBytes) {
 			t.Fatalf("invalid native fixture layout: base=%d offset=%d full=%d", baseSize, nameOffset, nameOffset+len(nameBytes))
 		}
-		status, data = nativeQueryDirectory(t, h, 12, "long*", baseSize, true, true, false)
+		status, data := nativeQueryDirectory(t, h, 12, "long*", baseSize, true, true, false)
 		if status != nativeBufferOverflow {
 			t.Fatalf("short buffer status=%#x bytes=%d", status, len(data))
 		}
