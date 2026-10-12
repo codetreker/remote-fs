@@ -20,11 +20,15 @@
 
 ## CI 工具链与缓存
 
-四个作业使用[共享 setup action](../.github/actions/setup-go/action.yml)固定 Go 1.26.8，并按作业、工具链、依赖和源码 SHA 保存 module／编译缓存；同作业前缀及经校验的旧快照可作为种子。三个 Linux 作业分别运行非挂载的普通包、根 SQLite 包、挂载与端到端包；Windows 作业只运行 native SSPI package 的 race test 与 vet。缓存复用编译工作，`-count=1` 仍使每次调用实际执行测试。根 SQLite 包的单独调度不缩小 race、严格 verdict 或 module-wide 覆盖率门禁。缓存上传也消耗时间与空间，净收益须看完整作业；原因与兼容边界见[缓存决定](../.agents/notes/implemented/process/2026-09-09-refresh-ci-go-build-caches.md)。
+四个作业使用[共享 setup action](../.github/actions/setup-go/action.yml)固定 Go 1.26.8，并按作业、工具链、依赖和源码 SHA 保存 module／编译缓存；同作业前缀及经校验的旧快照可作为种子。三个 Linux 作业分别运行非挂载包、根 SQLite 包、挂载与端到端包；非挂载作业先运行其它包的并行 race suite，再单独运行完整根 HTTP 包。Windows 作业运行 native SSPI 的 race／vet，以及 SMB／wire 的严格 race suite，包含 native 名字比较与目录 API 用例。缓存复用编译工作，`-count=1` 仍使每次调用实际执行测试。SQLite 与 HTTP 的单独调度不缩小 race、严格 verdict 或 module-wide 覆盖率门禁。缓存上传也消耗时间与空间，净收益须看完整作业；原因与兼容边界见[缓存决定](../.agents/notes/implemented/process/2026-09-09-refresh-ci-go-build-caches.md)。
 
 ## CI 执行预算
 
-checks 作业总上限为三十五分钟，`sqlite-race` 与 `mounted` 各有二十分钟作业上限。非挂载 race suite 在 `checks` 排除根 `./packages/metastore/sqlite`，它由 `sqlite-race` 单独通过 `assert-every-test-ran.sh -race -count=1 -timeout 10m ./packages/metastore/sqlite` 执行；SQLite 的内部子包仍随普通包运行。挂载包仍在 `mounted`。两个非挂载 race 调用与挂载 race 调用的每个测试二进制各有十分钟累计预算；独立 runner 不提高该 watchdog，也不允许跳过、无测试或缺失 verdict。受保护分支当前要求原有 `checks` 结果；workflow 让 `checks` 依赖 `sqlite-race`，在依赖失败或跳过时仍执行，并在最后明确核对依赖结果为 success，否则 `checks` 失败。新增作业的状态因此会进入现有必需检查，不依赖 ruleset 自动把新作业列为 required。`mounted` 的 module-wide coverage gate 继续测试整个模块，包含 SQLite。串行副本可见性验收在 `checks` 以 `-timeout 5m` 执行整个包；这一进程预算与单项的一秒可见性判据分别成立。作业隔离的理由见[SQLite race 调度决定](../.agents/notes/implemented/process/2026-09-29-isolate-sqlite-race-ci.md)；预算依据见[执行预算决定](../.agents/notes/implemented/process/2026-09-23-budget-ci-full-load-execution.md)与[原有整包 race 预算](../.agents/notes/implemented/process/2026-09-08-budget-ci-race-test-execution.md)。
+checks 作业总上限为三十五分钟，`sqlite-race` 与 `mounted` 各有二十分钟作业上限。`checks` 的并行非挂载 race suite 精确排除根 `./packages/metastore/sqlite` 和 `./packages/transport/httprest`。SQLite 根包由独立 `sqlite-race` 作业执行；HTTP 根包在同一 `checks` 作业的后续步骤单独执行。两者都使用 `assert-every-test-ran.sh -race -count=1 -timeout 10m`，不带测试过滤。SQLite 的内部子包仍随普通包运行，挂载包仍在 `mounted`；这四份包集合不重叠，也不遗漏整个模块的包。
+
+三个非挂载 race 调用与挂载 race 调用的每个测试二进制各有十分钟累计预算；调度隔离不提高该 watchdog，也不允许 skip、无测试或缺失 verdict。HTTP 步骤在前序并行 suite 成功后执行；`checks` 成功还要求该完整 HTTP 步骤成功。workflow 让 `checks` 依赖 `sqlite-race`，在依赖失败或跳过时仍执行，并在最后明确核对依赖结果为 success，否则 `checks` 失败。SQLite 与 HTTP 的结论都进入现有必需状态，不增加作业或 required status。
+
+`mounted` 的 module-wide coverage gate 继续测试整个模块，包含 SQLite 和 HTTP。串行副本可见性验收在 `checks` 以 `-timeout 5m` 执行整个包；这一进程预算与单项的一秒可见性判据分别成立。调度及成本见[SQLite race 调度决定](../.agents/notes/implemented/process/2026-09-29-isolate-sqlite-race-ci.md)与[HTTP race 调度决定](../.agents/notes/implemented/process/2026-10-12-isolate-http-race-ci.md)；预算依据见[执行预算决定](../.agents/notes/implemented/process/2026-09-23-budget-ci-full-load-execution.md)与[原有整包 race 预算](../.agents/notes/implemented/process/2026-09-08-budget-ci-race-test-execution.md)。
 
 ## 覆盖率是必要的，从来不是充分的
 
@@ -421,7 +425,7 @@ mutation_owner用例涵盖原Attr／Metadata／Data／token／effect深复制、
 
 每页、最后一页和 EOF 都要检查当前 SMB list／state 授权及实际 StateScalars。direct 用例撤销当前策略；HTTP 用例只使 State 请求失败而保留已成功 capture，断言 continuation／EOF 明确失败并实际发出 StateScalars，不能只检查缓存 Scope。每次新 capture／restart 的 Scope 来自原 NodeReference，并在读取前接受当前 `file.scope` 授权；ordinary continuation 不额外取 Scope。backend HTTP 独立授权它的实际请求，先前交给 SMB 的视图不被后来 backend list-policy 撤销收回，宿主 SMB Authorizer 仍控制新页面。
 
-[快照捕获与费用用例](../packages/smb/directory_snapshot_test.go)通过公开 `smb.New` 构造 Server，不注入比较器，验证四项正常捕获及 raw-name 顺序；加入最后一个不匹配的大小写等价名字后，完整捕获失败且 staging 费用退回，只保留 cursor 费用。资源矩阵检查 capture 前固定／HTTP staging reservation、entry callback 的累计费用、最终紧凑费用、Server／Export 同一归属、较小可用 L、collector 本地拒绝最后一项、authority 部分失败和 matcher 耗尽的完整退款。跨句柄累计饱和拒绝新 capture，但 restart／CLOSE／tree／session／断线／停止保留原清理进展；失败 restart 清除旧 entries 后只保留 1024-byte expression 状态，最终归零。受控 CLOSE 先 fence／drain，超时保留 state 和费用；排空后先于 pending Basic reconcile 释放已不可输出的本地 snapshot，即使原修改恢复或 native close 未知也不继续持有该 cache，不新增 mutation owner。该费用不是整个 Go heap 的精确测量。
+[快照捕获与费用用例](../packages/smb/directory_snapshot_test.go)通过公开 `smb.New` 构造 Server，不注入比较器，验证四项正常捕获及 raw-name 顺序；加入最后一个不匹配的大小写等价名字后，完整捕获失败且 staging 费用退回，只保留 cursor 费用。资源矩阵检查 capture 前固定／HTTP staging reservation、entry callback 的累计费用、最终紧凑费用、全局 `Status.RetainedDirectoryBytes`、较小可用 L、collector 本地拒绝最后一项、authority 部分失败和 matcher 耗尽的完整退款。不同 export 的 reservation 共同占满 Server 预算后，新 reservation 与 capture staging 都被拒绝；释放原句柄后只剩另一 export 的实际 reservation，全部释放后全局值归零。跨句柄累计饱和时 restart／CLOSE／tree／session／断线／停止保留原清理进展；失败 restart 清除旧 entries 后只保留 1024-byte expression 状态，最终清理归零。受控 CLOSE 先 fence／drain，超时保留 state 和费用；排空后先于 pending Basic reconcile 释放已不可输出的本地 snapshot，即使原修改恢复或 native close 未知也不继续持有该 cache，不新增 mutation owner。该费用不是整个 Go heap 的精确测量。
 
 [签名目录 transcript](../packages/smb/protocol_directory_linux_test.go)区分正常 warning 与结束状态：related CREATE→partial QUERY_DIRECTORY→CLOSE 对每项检查 body、extent、签名、最后引用及费用归还；NO_SUCH_FILE／NO_MORE_FILES 抑制 related CLOSE 时，ownership 和 cache charge 保留，随后独立 CLOSE 或正常 shutdown 确认释放。协议错误不能通过任意 warning 绕过前驱失败判定。
 

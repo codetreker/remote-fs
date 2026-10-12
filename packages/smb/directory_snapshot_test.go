@@ -113,8 +113,8 @@ func TestDirectorySnapshotCompleteCompactCapture(t *testing.T) {
 		t.Fatalf("kind projection: %+v", snapshot.entries)
 	}
 	want := directoryCursorBytes + snapshot.bytes
-	if got := tree.export.server.Status().RetainedDirectoryBytes; got != want || tree.export.directoryBytes != want {
-		t.Fatalf("compact charge: server %d export %d want %d", got, tree.export.directoryBytes, want)
+	if got := tree.export.server.Status().RetainedDirectoryBytes; got != want {
+		t.Fatalf("compact charge: got %d want %d", got, want)
 	}
 	source.entries[0].Attr.Metadata["other"].Data[0] = 'X'
 	source.observation.Revision[0] = 'X'
@@ -162,8 +162,8 @@ func TestDirectorySnapshotPublicConstructorComparer(t *testing.T) {
 	if snapshot != nil || !errors.Is(err, errNameAmbiguous) {
 		t.Fatalf("unmatched collision produced partial capture: %+v / %v", snapshot, err)
 	}
-	if got := server.Status().RetainedDirectoryBytes; got != directoryCursorBytes || tree.export.directoryBytes != directoryCursorBytes {
-		t.Fatalf("collision capture leaked charge: %d / %d", got, tree.export.directoryBytes)
+	if got := server.Status().RetainedDirectoryBytes; got != directoryCursorBytes || handle.directory.snapshot != nil {
+		t.Fatalf("collision capture retained charge or snapshot: %d / %+v", got, handle.directory)
 	}
 }
 
@@ -221,8 +221,8 @@ func TestDirectorySnapshotFailureRefundsEveryReservation(t *testing.T) {
 			}
 			handle.releaseDirectoryEnumeration()
 			handle.releaseDirectoryEnumeration()
-			if got := tree.export.server.Status().RetainedDirectoryBytes; got != 0 || tree.export.directoryBytes != 0 {
-				t.Fatalf("close charge: %d / %d", got, tree.export.directoryBytes)
+			if got := tree.export.server.Status().RetainedDirectoryBytes; got != 0 || handle.directory != nil {
+				t.Fatalf("close retained charge or cursor: %d / %+v", got, handle.directory)
 			}
 		})
 	}
@@ -302,7 +302,8 @@ func TestDirectorySnapshotAggregateBudgetAndRestart(t *testing.T) {
 	}
 	handle.directory.snapshot = snapshot
 	secondExport := &Export{server: tree.export.server}
-	if err := reserveDirectoryBytes(secondExport, limit-directoryCursorBytes-snapshot.bytes); err != nil {
+	foreign := limit - directoryCursorBytes - snapshot.bytes
+	if err := reserveDirectoryBytes(secondExport, foreign); err != nil {
 		t.Fatal(err)
 	}
 	if got := tree.export.server.Status().RetainedDirectoryBytes; got != limit {
@@ -314,10 +315,9 @@ func TestDirectorySnapshotAggregateBudgetAndRestart(t *testing.T) {
 	if _, err := captureDirectorySnapshot(context.Background(), tree, handle, directorySnapshotScope, handle.directory.pattern); !errors.Is(err, syscall.ENOMEM) {
 		t.Fatalf("staging denial: %v", err)
 	}
-	foreign := secondExport.directoryBytes
 	handle.releaseDirectoryEnumeration()
-	if got := tree.export.server.Status().RetainedDirectoryBytes; got != foreign || tree.export.directoryBytes != 0 {
-		t.Fatalf("saturated cleanup: %d, foreign %d", got, foreign)
+	if got := tree.export.server.Status().RetainedDirectoryBytes; got != foreign || handle.directory != nil {
+		t.Fatalf("saturated cleanup: got %d want foreign %d, cursor %+v", got, foreign, handle.directory)
 	}
 	releaseDirectoryBytes(secondExport, foreign)
 	if got := tree.export.server.Status().RetainedDirectoryBytes; got != 0 {
@@ -440,8 +440,8 @@ func TestDirectorySnapshotInternalCloseReleasesBeforePendingMutationQuery(t *tes
 		}
 	}()
 	<-entered
-	if got := server.Status().RetainedDirectoryBytes; got != 0 || tree.export.directoryBytes != 0 {
-		t.Fatalf("internal close retained snapshot while mutation query blocked: %d / %d", got, tree.export.directoryBytes)
+	if got := server.Status().RetainedDirectoryBytes; got != 0 {
+		t.Fatalf("internal close retained snapshot while mutation query blocked: %d", got)
 	}
 	if handle.directory != nil {
 		t.Fatal("fenced cursor remained reachable during mutation recovery")

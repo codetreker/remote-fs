@@ -46,7 +46,6 @@ func reserveDirectoryBytes(export *Export, amount int) error {
 		return syscall.ENOMEM
 	}
 	server.directoryBytes += amount
-	export.directoryBytes += amount
 	return nil
 }
 
@@ -54,7 +53,6 @@ func releaseDirectoryBytes(export *Export, amount int) {
 	server := export.server
 	server.handleMu.Lock()
 	server.directoryBytes -= amount
-	export.directoryBytes -= amount
 	server.handleMu.Unlock()
 }
 
@@ -109,7 +107,6 @@ func reserveDirectoryCapture(export *Export) (limit int64, staging int, err erro
 	}
 	staging = fixed + 4*int(limit)
 	server.directoryBytes += staging
-	export.directoryBytes += staging
 	return limit, staging, nil
 }
 

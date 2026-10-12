@@ -49,7 +49,7 @@ Pattern 按现有 Windows 大小写等价匹配 UTF-16 units；`?` 消耗一个 
 
 ### 累计保留预算与清理
 
-`MaxRetainedDirectoryBytes` 默认 64 MiB，是目录 cursor、snapshot、capture reservation 的单一进程累计上限；Server／Export 在既有 handleMu 下记录同一费用，Export 归属不建立另一配额。既有 `MaxDirectoryBytes` 仍限制单次 collector。一次 enumeration state 建立后保留 1024 字节 cursor／expression 费用，失败的 restart 也继续承担保留 expression。
+`MaxRetainedDirectoryBytes` 默认 64 MiB，是目录 cursor、snapshot、capture reservation 的单一进程累计上限。Server 在既有 handleMu 下维护唯一累计费用，`Status.RetainedDirectoryBytes` 报告同一数值；所有 export 的目录状态共享这份预算，费用随原 FileId 的 capture、restart 和关闭路径取得或释放。既有 `MaxDirectoryBytes` 仍限制单次 collector。一次 enumeration state 建立后保留 1024 字节 cursor／expression 费用，失败的 restart 也继续承担保留 expression。
 
 捕获预算覆盖实际峰值表示与现有 HTTP 完整成功 body 的缓冲，不能假设 collector callback 先于 transport 分配。固定 allowance F 为 64 KiB；可用累计余额加已收费 cursor 部分为 A，collector limit `L=min(MaxDirectoryBytes,storage.MaxDirectoryBytes,floor((A−F)/5))`。L 不足固定 collector 费用时在 backing 前失败；capture 前另预留 `F−1024+4L`，保留原 cursor 费用。
 
@@ -76,7 +76,7 @@ CLOSE 先 fence／drain 原 FIFO，再于 pending Basic reconcile 和 native clo
 
 **把 FileIndex 做成可恢复的 byte-offset registry。** 需要 issued-index 映射、高水位、generation 与耗尽管理，而底层捕获没有可恢复流的承诺。零 FileIndex 与忽略 INDEX_SPECIFIED 不声称提供这种定位；真正跨连接续作需独立持久 handle 方案。
 
-**为全局、volume、tree、FileId 分别建立配额及 owner。** 同一只读缓存会重复计费并引入另一套退休顺序。单一累计 bytes budget、Export 归属与原 FIFO／CLOSE 已覆盖保留责任；原 native／transport 限制仍独立成立。
+**保存 Export 费用副本，或为 volume、tree、FileId 建立独立配额及 owner。** 目录资源准入和公开状态只消费 Server 累计费用；Export 副本不提供独立判断，却要求每次 reservation 与退款同步更新。分层配额与 owner 还会增加准入条件及退休顺序。单一累计 bytes budget 与原 FileId／FIFO／CLOSE 已覆盖保留和释放责任；原 native／transport 限制仍独立成立。
 
 **固定头部可容纳时仍拒绝首项部分名字，或按字符边界取整。** 会改变底层目录查询规定的 overflow 形状。完整长度与原始 byte prefix 保留协议结果，pending entry 不被消费，后续较大请求仍能取得完整项。
 

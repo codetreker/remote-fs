@@ -83,17 +83,21 @@ pinned SDK sits exactly on that ceiling.
 [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs the CI checks on every
 pull request and on every commit that reaches `main`. Three Linux jobs divide the work:
 `checks` builds, vets, checks formatting and links, runs the serial full-load acceptance,
-and runs the nonmounting race suite except the root SQLite package; `sqlite-race` runs that
-package alone with the race detector; `mounted` runs the FUSE and end-to-end race suite,
+then runs the nonmounting race suite excluding the root SQLite and HTTP packages. A
+following step runs the complete root `packages/transport/httprest` race suite on its
+own, after the parallel suite succeeds. `sqlite-race` runs the root SQLite package
+alone with the race detector; `mounted` runs the FUSE and end-to-end race suite,
 checks that mounts are gone, and executes the module-wide coverage gate. A wedged mount
 cannot hide the nonmounting results. The root SQLite race binary has its own runner because
 parallel package contention can exhaust its ten-minute cumulative watchdog while its
-tests are still advancing. The separate job retains `-count=1`, the same per-binary
+tests are still advancing. The HTTP step removes same-job Go package contention without
+adding another runner. Every race invocation retains `-count=1`, the same per-binary
 `-timeout 10m`, and the strict no-skip verdict check. The protected branch requires the
 existing `checks` status, so `checks` depends on `sqlite-race`, still runs when that job
 fails or is skipped, and has a final step that fails unless `sqlite-race` succeeded.
-[The CI isolation decision](.agents/notes/implemented/process/2026-09-29-isolate-sqlite-race-ci.md)
-records the scheduling and required-check link. A focused Windows Server 2025 job runs
+[The SQLite isolation decision](.agents/notes/implemented/process/2026-09-29-isolate-sqlite-race-ci.md)
+records its scheduling and required-check link; [the HTTP scheduling decision](.agents/notes/implemented/process/2026-10-12-isolate-http-race-ci.md)
+records the sequential step and its cost. A focused Windows Server 2025 job runs
 the native SSPI package tests and vet, plus the root SMB and wire race suites through
 the strict verdict runner. The root suite compares every UTF-16 code unit and the
 resulting order with the native Windows ordinal name API. Windows 11 redirector and

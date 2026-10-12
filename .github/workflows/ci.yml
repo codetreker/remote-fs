@@ -79,10 +79,13 @@ jobs:
           set -euo pipefail
           # Both expansions are lists of import paths and must split into arguments.
           # shellcheck disable=SC2046,SC2086
-          go list $MOUNTING_PACKAGES ./packages/metastore/sqlite >"$RUNNER_TEMP/separate-packages"
+          go list $MOUNTING_PACKAGES ./packages/metastore/sqlite ./packages/transport/httprest >"$RUNNER_TEMP/separate-packages"
           # shellcheck disable=SC2046
           .github/scripts/assert-every-test-ran.sh -race -count=1 -timeout 10m \
             $(go list ./... | grep -vxF -f "$RUNNER_TEMP/separate-packages")
+
+      - name: HTTP contract and race tests
+        run: .github/scripts/assert-every-test-ran.sh -race -count=1 -timeout 10m ./packages/transport/httprest
 
       - name: Require SQLite contract and race tests
         if: ${{ always() && !cancelled() }}

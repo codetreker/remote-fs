@@ -41,18 +41,17 @@ type Server struct {
 }
 
 type Export struct {
-	directoryBytes int    // Protected by Server.handleMu.
-	ioGeneration   uint64 // Protected by the server's write ledger.
-	server         *Server
-	share          Share
-	volumeSerial   uint64
-	key            string
-	refs           int
-	trees          int
-	active         int
-	stopping       bool
-	published      bool
-	cleanupMu      cleanupGate
+	ioGeneration uint64 // Protected by the server's write ledger.
+	server       *Server
+	share        Share
+	volumeSerial uint64
+	key          string
+	refs         int
+	trees        int
+	active       int
+	stopping     bool
+	published    bool
+	cleanupMu    cleanupGate
 }
 
 func interfaceNil(value any) bool {
