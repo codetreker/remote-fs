@@ -7,9 +7,11 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"strings"
 	"sync"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/codetreker/remote-fs/packages/authz"
 	"github.com/codetreker/remote-fs/packages/smb"
@@ -91,7 +93,7 @@ func TestNativeWindowsDeleteOnClose(t *testing.T) {
 		if err := h.Close(); err != nil {
 			t.Fatal(err)
 		}
-		nativeDeleteAbsent(t, path)
+		nativeDeleteAbsent(t, path, backend, receipts)
 	})
 	t.Run("metadata-only-file", func(t *testing.T) {
 		path := drive + `\alpha.txt`
@@ -99,7 +101,7 @@ func TestNativeWindowsDeleteOnClose(t *testing.T) {
 		if err := h.Close(); err != nil {
 			t.Fatal(err)
 		}
-		nativeDeleteAbsent(t, path)
+		nativeDeleteAbsent(t, path, backend, receipts)
 	})
 	t.Run("empty-directory", func(t *testing.T) {
 		path := drive + `\empty`
@@ -107,7 +109,7 @@ func TestNativeWindowsDeleteOnClose(t *testing.T) {
 		if err := h.Close(); err != nil {
 			t.Fatal(err)
 		}
-		nativeDeleteAbsent(t, path)
+		nativeDeleteAbsent(t, path, backend, receipts)
 	})
 	t.Run("two-compatible-handles", func(t *testing.T) {
 		path := drive + `\beta.bin`
@@ -116,12 +118,17 @@ func TestNativeWindowsDeleteOnClose(t *testing.T) {
 		if err := initiator.Close(); err != nil {
 			t.Fatal(err)
 		}
-		var standard [24]byte
-		if err := win.GetFileInformationByHandleEx(survivor.Handle, win.FileStandardInfo, &standard[0], uint32(len(standard))); err != nil {
-			t.Fatal(err)
+		var standard smb.NativeProbeFileStandardInfo
+		if unsafe.Sizeof(standard) != 24 || unsafe.Alignof(standard) != 8 || unsafe.Offsetof(standard.DeletePending) != 20 || unsafe.Offsetof(standard.Directory) != 21 {
+			t.Fatal("invalid Win32 FILE_STANDARD_INFO layout")
 		}
-		if links := binary.LittleEndian.Uint32(standard[16:]); links != 0 || standard[20] != 1 {
-			t.Fatalf("pending standard info links=%d pending=%d", links, standard[20])
+		t.Logf("Win32 FILE_STANDARD_INFO: size=%d alignment=%d pointer remainder=%d", unsafe.Sizeof(standard), unsafe.Alignof(standard), uintptr(unsafe.Pointer(&standard))%8)
+		infoErr := win.GetFileInformationByHandleEx(survivor.Handle, win.FileStandardInfo, (*byte)(unsafe.Pointer(&standard)), uint32(unsafe.Sizeof(standard)))
+		if infoErr != nil {
+			t.Fatal(infoErr)
+		}
+		if standard.NumberOfLinks != 0 || standard.DeletePending != 1 || standard.Directory != 0 || standard.EndOfFile != 0 || standard.AllocationSize != 0 {
+			t.Fatalf("pending standard info=%+v", standard)
 		}
 		var data [1]byte
 		var read uint32
@@ -143,16 +150,19 @@ func TestNativeWindowsDeleteOnClose(t *testing.T) {
 		if err := survivor.Close(); err != nil {
 			t.Fatal(err)
 		}
-		nativeDeleteAbsent(t, path)
+		nativeDeleteAbsent(t, path, backend, receipts)
 	})
 	t.Run("nonempty-directory-close-results", func(t *testing.T) {
 		path := drive + `\folder`
 		survivor := nativeOpenDirectory(t, path)
-		var before [24]byte
-		if err := win.GetFileInformationByHandleEx(survivor, win.FileIdInfo, &before[0], uint32(len(before))); err != nil {
+		var before smb.NativeProbeFileIDInfo
+		if unsafe.Sizeof(before) != 24 || unsafe.Alignof(before) != 8 {
+			t.Fatal("invalid Win32 FILE_ID_INFO layout")
+		}
+		if err := win.GetFileInformationByHandleEx(survivor, win.FileIdInfo, (*byte)(unsafe.Pointer(&before)), uint32(unsafe.Sizeof(before))); err != nil {
 			t.Fatal(err)
 		}
-		if id := binary.LittleEndian.Uint64(before[8:]); id != 2 {
+		if id := binary.LittleEndian.Uint64(before.FileID[:]); id != 2 {
 			t.Fatalf("native original directory ID=%d", id)
 		}
 		nativeFindNames(t, path+`\*`, []string{"nested.txt"})
@@ -172,8 +182,8 @@ func TestNativeWindowsDeleteOnClose(t *testing.T) {
 		if !found {
 			t.Fatal("authority did not retain nonempty directory NotExecuted result")
 		}
-		var after [24]byte
-		if err := win.GetFileInformationByHandleEx(survivor, win.FileIdInfo, &after[0], uint32(len(after))); err != nil {
+		var after smb.NativeProbeFileIDInfo
+		if err := win.GetFileInformationByHandleEx(survivor, win.FileIdInfo, (*byte)(unsafe.Pointer(&after)), uint32(unsafe.Sizeof(after))); err != nil {
 			t.Fatal(err)
 		}
 		if before != after {
@@ -245,7 +255,7 @@ func TestNativeWindowsDeleteOnClose(t *testing.T) {
 		if err := h.Close(); err != nil {
 			t.Fatal(err)
 		}
-		nativeDeleteAbsent(t, path)
+		nativeDeleteAbsent(t, path, backend, receipts)
 	})
 	t.Run("connection-loss", func(t *testing.T) {
 		path := drive + `\disconnect.txt`
@@ -309,23 +319,64 @@ func nativeDeleteOpen(t *testing.T, path string, access, share, disposition, fla
 	})
 	return owned
 }
-func nativeDeleteAbsent(t *testing.T, path string) {
+func nativeDeleteAbsent(t *testing.T, path string, backend storage.FileStorage, receipts *nativeDeleteReceipts) {
 	t.Helper()
+	leaf := path[strings.LastIndex(path, `\`)+1:]
+	receipts.mu.Lock()
+	receipts.missingName = leaf
+	receipts.missingRequests = make(map[[2]uint64]struct{})
+	receipts.missingStatuses = nil
+	receipts.mu.Unlock()
 	name, err := win.UTF16PtrFromString(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = win.GetFileAttributes(name)
+	h, err := win.CreateFile(name, win.FILE_READ_ATTRIBUTES, 7, nil, win.OPEN_EXISTING, win.FILE_FLAG_BACKUP_SEMANTICS, 0)
+	if err == nil {
+		_ = win.CloseHandle(h)
+		t.Fatalf("deleted native path %q reopened", path)
+	}
 	if !errors.Is(err, win.ERROR_FILE_NOT_FOUND) && !errors.Is(err, win.ERROR_PATH_NOT_FOUND) {
 		t.Fatalf("deleted native path %q error=%v", path, err)
+	}
+	receipts.waitMissing(t)
+	authority, err := backend.NewFileSession(t.Context(), storage.DefaultFileSessionOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := authority.Close(context.Background()); err != nil {
+			t.Error(err)
+		}
+	})
+	result, err := storage.NewListResult(65536, 0, func(_ int, name, metadata int64, _ storage.Attr) (int64, error) {
+		return storage.ObservedEntryBytes(name, metadata)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := authority.(storage.DirectoryReader).ReadDirNodeBounded(t.Context(), storage.DirectoryTarget{NodeID: 1}, result); err != nil {
+		t.Fatal(err)
+	}
+	entries, err := result.Entries()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if entry.Name == leaf {
+			t.Fatalf("authority retained deleted name %q", leaf)
+		}
 	}
 }
 
 type nativeDeleteReceipts struct {
-	mu      sync.Mutex
-	creates []wire.CreateRequest
-	closes  []uint32
-	err     error
+	mu              sync.Mutex
+	creates         []wire.CreateRequest
+	closes          []uint32
+	missingName     string
+	missingRequests map[[2]uint64]struct{}
+	missingStatuses []uint32
+	err             error
 }
 
 func (r *nativeDeleteReceipts) fail(err error) { r.mu.Lock(); defer r.mu.Unlock(); r.err = err }
@@ -354,6 +405,13 @@ func (r *nativeDeleteReceipts) request(packet []byte) {
 				r.err = err
 				return
 			}
+			if r.missingName != "" && create.Name == r.missingName && create.Disposition == 1 && create.Options&0x1000 == 0 {
+				if len(r.missingRequests) >= 4 {
+					r.err = fmt.Errorf("native absence probe exceeds four requests")
+					return
+				}
+				r.missingRequests[[2]uint64{request.Header.SessionID, request.Header.MessageID}] = struct{}{}
+			}
 			if create.Options&0x1000 != 0 {
 				if len(r.creates) >= 32 {
 					r.err = fmt.Errorf("native close-delete trace exceeds 32 opens")
@@ -376,6 +434,18 @@ func (r *nativeDeleteReceipts) response(packet []byte) {
 		if err != nil {
 			r.err = err
 			return
+		}
+		key := [2]uint64{header.SessionID, header.MessageID}
+		_, missing := r.missingRequests[key]
+		if missing && header.Command == wire.Create {
+			if header.Flags&(wire.FlagResponse|wire.FlagSigned) != (wire.FlagResponse | wire.FlagSigned) {
+				r.err = fmt.Errorf("native delete probe response is unsigned")
+				return
+			}
+			if missing && header.Command == wire.Create {
+				r.missingStatuses = append(r.missingStatuses, header.Status)
+				delete(r.missingRequests, key)
+			}
 		}
 		if header.Command == wire.Close {
 			if len(r.closes) >= 128 {
@@ -442,6 +512,31 @@ func (r *nativeDeleteReceipts) report(t *testing.T) {
 	}
 	for _, create := range r.creates {
 		t.Logf("native delete CREATE: access=%#x share=%#x disposition=%d options=%#x", create.DesiredAccess, create.ShareAccess, create.Disposition, create.Options)
+	}
+}
+
+func (r *nativeDeleteReceipts) waitMissing(t *testing.T) {
+	t.Helper()
+	deadline := time.NewTimer(10 * time.Second)
+	defer deadline.Stop()
+	for {
+		r.mu.Lock()
+		err := r.err
+		statuses := append([]uint32(nil), r.missingStatuses...)
+		r.mu.Unlock()
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, status := range statuses {
+			if status == 0xc0000034 {
+				return
+			}
+		}
+		select {
+		case <-deadline.C:
+			t.Fatalf("native absent-name OPEN_EXISTING lacks signed STATUS_OBJECT_NAME_NOT_FOUND: statuses=%x", statuses)
+		case <-time.After(10 * time.Millisecond):
+		}
 	}
 }
 

@@ -11,10 +11,34 @@ import (
 	"syscall"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/codetreker/remote-fs/packages/smb/internal/wire"
 	"github.com/codetreker/remote-fs/packages/storage"
 )
+
+// Native output structures retain the SDK's LARGE_INTEGER alignment.
+// https://learn.microsoft.com/en-us/windows/win32/api/winbase/ns-winbase-file_standard_info
+type NativeProbeFileStandardInfo struct {
+	AllocationSize, EndOfFile int64
+	NumberOfLinks             uint32
+	DeletePending, Directory  uint8
+}
+type NativeProbeFileIDInfo struct {
+	VolumeSerial uint64
+	FileID       [16]byte
+}
+
+func TestNativeProbeInformationBufferLayout(t *testing.T) {
+	var standard NativeProbeFileStandardInfo
+	if unsafe.Sizeof(standard) != 24 || unsafe.Alignof(standard) != 8 || unsafe.Offsetof(standard.NumberOfLinks) != 16 || unsafe.Offsetof(standard.DeletePending) != 20 || unsafe.Offsetof(standard.Directory) != 21 || uintptr(unsafe.Pointer(&standard))%8 != 0 {
+		t.Fatal("invalid FILE_STANDARD_INFO native layout or alignment")
+	}
+	var identity NativeProbeFileIDInfo
+	if unsafe.Sizeof(identity) != 24 || unsafe.Alignof(identity) != 8 || unsafe.Offsetof(identity.FileID) != 8 || uintptr(unsafe.Pointer(&identity))%8 != 0 {
+		t.Fatal("invalid FILE_ID_INFO native layout or alignment")
+	}
+}
 
 // NewNativeDeleteProbeBackend models only the native probe's mutable namespace.
 // Persistence and process retirement are exercised against SQLite separately.
@@ -754,6 +778,21 @@ func TestNativeDeleteProbeByteCreateUsesEndpointContract(t *testing.T) {
 		if _, status := c.closeFile(ctx, s, tr, wire.Request{Header: wire.Header{Command: wire.Close}, Body: closeBody}, wire.FileID{}); status != statusOK {
 			t.Fatalf("byte CLOSE %q=%#x", test.name, status)
 		}
+		if test.name == "exclusive.txt" {
+			if _, status, id := c.createFile(ctx, s, tr, request(test.name, 1, accessReadAttr, 7, createBackupIntent)); status != statusNameNotFound || id != (wire.FileID{}) {
+				t.Fatalf("deleted metadata-only OPEN_EXISTING status=%#x id=%x", status, id)
+			}
+		}
+	}
+	_, status, metadataID := c.createFile(ctx, s, tr, request("beta.bin", 1, accessReadAttr, 7, createBackupIntent))
+	if status != statusOK || metadataID == (wire.FileID{}) {
+		t.Fatalf("existing metadata-only OPEN_EXISTING status=%#x id=%x", status, metadataID)
+	}
+	closeMetadata := make([]byte, 24)
+	binary.LittleEndian.PutUint16(closeMetadata, 24)
+	copy(closeMetadata[8:], metadataID[:])
+	if _, status := c.closeFile(ctx, s, tr, wire.Request{Header: wire.Header{Command: wire.Close}, Body: closeMetadata}, wire.FileID{}); status != statusOK {
+		t.Fatalf("metadata-only CLOSE=%#x", status)
 	}
 	if _, status, _ := c.createFile(ctx, s, tr, request("without-delete.txt", 2, accessReadAttr, 7, createDeleteOnClose)); status != statusDenied {
 		t.Fatalf("missing DELETE CREATE=%#x", status)
