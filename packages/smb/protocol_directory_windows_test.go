@@ -23,6 +23,7 @@ import (
 
 	"github.com/codetreker/remote-fs/packages/authz"
 	"github.com/codetreker/remote-fs/packages/smb"
+	"github.com/codetreker/remote-fs/packages/smb/internal/wire"
 	smbwindows "github.com/codetreker/remote-fs/packages/smb/windows"
 	win "golang.org/x/sys/windows"
 )
@@ -507,6 +508,23 @@ func (r *nativeDirectoryReceipts) record(connection uint32, response bool, packe
 			}
 			if !response && len(body) >= 24 {
 				fact.detail = fmt.Sprintf("token-offset=%d token-length=%d", binary.LittleEndian.Uint16(body[12:]), binary.LittleEndian.Uint16(body[14:]))
+			}
+		}
+		if !response && fact.command == 5 {
+			requests, err := wire.ParseFrame(packet, wire.Limits{MaxBytes: 2 << 20, MaxCommands: 32, MaxContexts: 16})
+			if err == nil && commands < len(requests) {
+				create, err := requests[commands].Create()
+				if err == nil {
+					var contexts []string
+					for _, context := range create.Contexts {
+						contexts = append(contexts, fmt.Sprintf("%x:%d", context.Name[:min(32, len(context.Name))], len(context.Data)))
+					}
+					fact.detail = fmt.Sprintf("access=%#x share=%#x attributes=%#x disposition=%d options=%#x oplock=%#x impersonation=%d contexts=%v", create.DesiredAccess, create.ShareAccess, create.Attributes, create.Disposition, create.Options, create.OplockLevel, create.Impersonation, contexts)
+				} else {
+					fact.detail = "invalid-create-body"
+				}
+			} else {
+				fact.detail = "invalid-create-frame"
 			}
 		}
 		r.headers = append(r.headers, fact)
