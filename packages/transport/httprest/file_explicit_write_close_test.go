@@ -93,18 +93,55 @@ func TestHTTPReleasedCloseCancelsPendingWriteDetach(t *testing.T) {
 				case <-time.After(time.Second):
 					t.Fatal("server mutation did not complete")
 				}
-				ctx, cancel := context.WithTimeout(t.Context(), 30*time.Millisecond)
-				started := time.Now()
-				result, err := closeCall(ctx)
+				ctx, cancel := context.WithCancel(t.Context())
+				t.Cleanup(cancel)
+				type closeOutcome struct {
+					result storage.ReferenceCloseResult
+					err    error
+				}
+				closeDone := make(chan closeOutcome, 1)
+				go func() {
+					result, err := closeCall(ctx)
+					closeDone <- closeOutcome{result: result, err: err}
+				}()
+				// Detachment begins only after the client has decoded Released. The
+				// cancellation must reach the blocked local gate, not the close RPC.
+				phaseDeadline := time.NewTimer(30 * time.Second)
+				phasePoll := time.NewTicker(time.Millisecond)
+				for {
+					session.mu.Lock()
+					entry := session.explicitWrites[file.id+":"+string(command.Action)]
+					detaching := entry != nil && entry.detached
+					session.mu.Unlock()
+					if detaching {
+						break
+					}
+					select {
+					case outcome := <-closeDone:
+						phaseDeadline.Stop()
+						phasePoll.Stop()
+						t.Fatalf("close returned before local detachment: result=%+v err=%v", outcome.result, outcome.err)
+					case <-phaseDeadline.C:
+						phasePoll.Stop()
+						t.Fatal("close did not enter local detachment")
+					case <-phasePoll.C:
+					}
+				}
+				phaseDeadline.Stop()
+				phasePoll.Stop()
 				cancel()
+				var outcome closeOutcome
+				select {
+				case outcome = <-closeDone:
+				case <-time.After(time.Second):
+					unblock()
+					t.Fatal("close ignored caller cancellation")
+				}
+				result, err := outcome.result, outcome.err
 				var pending *storage.CloseSettlementError
-				if !result.Released || !result.Determined || !errors.As(err, &pending) || pending.State != storage.CloseSettlementPending || !errors.Is(err, context.DeadlineExceeded) {
+				if !result.Released || !result.Determined || !errors.As(err, &pending) || pending.State != storage.CloseSettlementPending || !errors.Is(err, context.Canceled) {
 					unblock()
 					t.Fatalf("canceled close result=%+v err=%v", result, err)
-				}
-				if time.Since(started) > time.Second {
-					unblock()
-					t.Fatal("close ignored caller deadline")
 				}
 				session.mu.Lock()
 				entry := session.explicitWrites[file.id+":"+string(command.Action)]

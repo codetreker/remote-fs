@@ -202,7 +202,10 @@ func (s *endpointFileSession) CloseWithResult(ctx context.Context) (storage.Refe
 
 type endpointCreateCapabilities struct{}
 
-func (endpointCreateCapabilities) CheckAllocationReporting() error          { return nil }
+func (endpointCreateCapabilities) CheckAllocationReporting() error { return nil }
+func (endpointCreateCapabilities) AllocationUnitBytes(context.Context) (uint64, error) {
+	return 4096, nil
+}
 func (endpointCreateCapabilities) CheckDirectoryMetadataObservation() error { return nil }
 func (endpointCreateCapabilities) ObserveDirectoryMetadata(context.Context, storage.DirectoryTarget, storage.DirectoryMetadataOptions, *storage.ListResult) (storage.DirectoryMetadataObservation, error) {
 	return storage.DirectoryMetadataObservation{}, syscall.ENOSYS

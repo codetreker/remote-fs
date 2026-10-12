@@ -49,10 +49,10 @@ func TestContentMetadataEnrollmentOwnsMasksAndObservationWithoutMetadataRights(t
 	if err := store.CheckOpenContentMetadata(); err != nil {
 		t.Fatal(err)
 	}
-	if err := file.CheckContentMetadata(); err != nil {
+	if err := file.CheckMetadataAccess(); err != nil {
 		t.Fatal(err)
 	}
-	absent, err := file.ObserveContentMetadata(t.Context(), 0)
+	absent, err := file.ObserveMetadata(t.Context(), storage.MetadataObservationRequest{Purpose: storage.MetadataObservationContentEffect, EffectIndex: 0})
 	if err != nil || absent.NodeID != uint64(file.id) || absent.Value != nil {
 		t.Fatalf("absent observation = %+v, %v", absent, err)
 	}
@@ -71,7 +71,7 @@ func TestContentMetadataEnrollmentOwnsMasksAndObservationWithoutMetadataRights(t
 	}
 	effects[0].Namespace = "wrong.namespace"
 	effects[0].PayloadBytes = 1
-	observed, err := file.ObserveContentMetadata(t.Context(), 0)
+	observed, err := file.ObserveMetadata(t.Context(), storage.MetadataObservationRequest{Purpose: storage.MetadataObservationContentEffect, EffectIndex: 0})
 	if err != nil || observed.Value == nil || !bytes.Equal(observed.Value.Version, initial.Version) || !bytes.Equal(observed.Value.Data, initial.Data) {
 		t.Fatalf("write-only observation = %+v, %v", observed, err)
 	}
@@ -103,7 +103,7 @@ func TestContentMetadataEnrollmentOwnsMasksAndObservationWithoutMetadataRights(t
 	}
 	observed.Value.Data[0] = 0xff
 	observed.Value.Version[0] = 0xff
-	fresh, err := file.ObserveContentMetadata(t.Context(), 0)
+	fresh, err := file.ObserveMetadata(t.Context(), storage.MetadataObservationRequest{Purpose: storage.MetadataObservationContentEffect, EffectIndex: 0})
 	if err != nil || fresh.Value == nil || !bytes.Equal(fresh.Value.Data, want) || bytes.Equal(fresh.Value.Version, observed.Value.Version) {
 		t.Fatalf("observation aliased stored payload: %+v, %v", fresh, err)
 	}
@@ -143,7 +143,6 @@ func TestContentMetadataCASAndRejectedRequestsLeaveContentTimesAndLogUntouched(t
 		{"arbitrary metadata", func(c *storage.FileMutation) {
 			c.Metadata = map[string]storage.OpaquePayload{"test.other": {Data: []byte("bad")}}
 		}, syscall.EINVAL},
-		{"truncate effect", func(c *storage.FileMutation) { c.Kind, c.Size, c.Data = storage.MutateTruncate, 0, nil }, syscall.EINVAL},
 	}
 	for _, test := range invalid {
 		t.Run(test.name, func(t *testing.T) {
@@ -167,21 +166,21 @@ func TestContentMetadataCASAndRejectedRequestsLeaveContentTimesAndLogUntouched(t
 
 func TestContentMetadataObservationRequiresExactLiveWritableReference(t *testing.T) {
 	store, file := openContentEffectFile(t, []storage.ContentMetadataEffect{testContentEffect()})
-	if _, err := file.ObserveContentMetadata(t.Context(), 1); !errors.Is(err, syscall.EINVAL) {
+	if _, err := file.ObserveMetadata(t.Context(), storage.MetadataObservationRequest{Purpose: storage.MetadataObservationContentEffect, EffectIndex: 1}); !errors.Is(err, syscall.EINVAL) {
 		t.Fatalf("unknown effect observation = %v", err)
 	}
 	otherSession := metastore.WithReferenceSession(t.Context(), new(advisory.Session))
-	if _, err := file.ObserveContentMetadata(otherSession, 0); !errors.Is(err, storage.ErrInvalidScope) {
+	if _, err := file.ObserveMetadata(otherSession, storage.MetadataObservationRequest{Purpose: storage.MetadataObservationContentEffect, EffectIndex: 0}); !errors.Is(err, storage.ErrInvalidScope) {
 		t.Fatalf("cross-session observation = %v", err)
 	}
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
-	if _, err := file.ObserveContentMetadata(ctx, 0); !errors.Is(err, context.Canceled) {
+	if _, err := file.ObserveMetadata(ctx, storage.MetadataObservationRequest{Purpose: storage.MetadataObservationContentEffect, EffectIndex: 0}); !errors.Is(err, context.Canceled) {
 		t.Fatalf("cancelled observation = %v", err)
 	}
 	denied := errors.New("reference authority stopped")
 	guarded := metastore.WithFilePublicationGuard(t.Context(), func() error { return denied })
-	if _, err := file.ObserveContentMetadata(guarded, 0); !errors.Is(err, denied) {
+	if _, err := file.ObserveMetadata(guarded, storage.MetadataObservationRequest{Purpose: storage.MetadataObservationContentEffect, EffectIndex: 0}); !errors.Is(err, denied) {
 		t.Fatalf("publication guard observation = %v", err)
 	}
 	readOnly, err := store.OpenNode(t.Context(), uint64(file.id), storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true}})
@@ -189,13 +188,13 @@ func TestContentMetadataObservationRequiresExactLiveWritableReference(t *testing
 		t.Fatal(err)
 	}
 	defer readOnly.Close(t.Context())
-	if _, err := readOnly.(*retainedFile).ObserveContentMetadata(t.Context(), 0); !errors.Is(err, syscall.EBADF) {
+	if _, err := readOnly.(*retainedFile).ObserveMetadata(t.Context(), storage.MetadataObservationRequest{Purpose: storage.MetadataObservationContentEffect, EffectIndex: 0}); !errors.Is(err, syscall.EBADF) {
 		t.Fatalf("read-only observation = %v", err)
 	}
 	if err := file.Retire(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := file.ObserveContentMetadata(t.Context(), 0); !errors.Is(err, syscall.ESTALE) {
+	if _, err := file.ObserveMetadata(t.Context(), storage.MetadataObservationRequest{Purpose: storage.MetadataObservationContentEffect, EffectIndex: 0}); !errors.Is(err, syscall.ESTALE) {
 		t.Fatalf("retired observation = %v", err)
 	}
 }
@@ -254,7 +253,7 @@ func TestContentMetadataMalformedStoredPayloadDoesNotUseAbsenceDefault(t *testin
 			if _, err := store.write.ExecContext(t.Context(), `UPDATE nodes SET metadata=? WHERE volume=? AND id=?`, encoded, store.volume, file.id); err != nil {
 				t.Fatal(err)
 			}
-			if got, err := file.ObserveContentMetadata(t.Context(), 0); !errors.Is(err, syscall.EIO) || got.NodeID != 0 || got.Value != nil {
+			if got, err := file.ObserveMetadata(t.Context(), storage.MetadataObservationRequest{Purpose: storage.MetadataObservationContentEffect, EffectIndex: 0}); !errors.Is(err, syscall.EIO) || got.NodeID != 0 || got.Value != nil {
 				t.Fatalf("corrupt observation = %+v, %v", got, err)
 			}
 			before, err := file.Node(t.Context())
@@ -291,7 +290,7 @@ func TestContentMetadataObservationRejectsCorruptAndUnboundedStoredEnvelope(t *t
 		if _, err := store.write.ExecContext(t.Context(), `UPDATE nodes SET metadata=? WHERE volume=? AND id=?`, encoded, store.volume, file.id); err != nil {
 			t.Fatal(err)
 		}
-		if got, err := file.ObserveContentMetadata(t.Context(), 0); !errors.Is(err, syscall.EIO) || got.NodeID != 0 || got.Value != nil {
+		if got, err := file.ObserveMetadata(t.Context(), storage.MetadataObservationRequest{Purpose: storage.MetadataObservationContentEffect, EffectIndex: 0}); !errors.Is(err, syscall.EIO) || got.NodeID != 0 || got.Value != nil {
 			t.Fatalf("corrupt %d-byte envelope observation = %+v, %v", len(encoded), got, err)
 		}
 		// Restore a valid envelope so final native reference retirement can read

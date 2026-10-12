@@ -42,7 +42,7 @@ func TestIdentityNamespaceAndReferenceCapabilities(t *testing.T) {
 	if err != nil || opened.File == nil {
 		t.Fatalf("open=%+v error=%v", opened, err)
 	}
-	fileState, err := opened.File.(storage.ReferenceStateAccess).State(t.Context())
+	fileState, err := opened.File.(storage.ReferenceStateAccess).State(t.Context(), storage.StateFull)
 	if err != nil || fileState.Attr.ID != lookedUp.ID || fileState.Detached {
 		t.Fatalf("file state=%+v error=%v", fileState, err)
 	}
@@ -81,7 +81,7 @@ func TestIdentityNamespaceAndReferenceCapabilities(t *testing.T) {
 	if err := stateAccess.CheckReferenceState(); err != nil {
 		t.Fatal(err)
 	}
-	referenceState, err := stateAccess.State(t.Context())
+	referenceState, err := stateAccess.State(t.Context(), storage.StateFull)
 	if err != nil || referenceState.Attr.ID != directory.Attr.ID || string(referenceState.Attr.Metadata["test.coverage"].Data) != "value" {
 		t.Fatalf("reference state=%+v error=%v", referenceState, err)
 	}

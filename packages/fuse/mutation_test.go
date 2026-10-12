@@ -182,6 +182,10 @@ func (f *mutationFile) CheckMetadataAccess() error {
 	return f.File.(storage.ReferenceMetadataAccess).CheckMetadataAccess()
 }
 
+func (f *mutationFile) ObserveMetadata(ctx context.Context, request storage.MetadataObservationRequest) (storage.MetadataObservation, error) {
+	return f.File.(storage.ReferenceMetadataAccess).ObserveMetadata(ctx, request)
+}
+
 func (f *mutationFile) SetMetadata(ctx context.Context, namespace string, version, data []byte) (storage.OpaquePayload, error) {
 	if err := f.owner.enter(ctx, "setattr"); err != nil {
 		return storage.OpaquePayload{}, err

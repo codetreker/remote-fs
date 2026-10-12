@@ -67,7 +67,10 @@ func decodeWindowsMetadata(values map[string]storage.OpaquePayload) (windowsMeta
 	if !present {
 		return windowsMetadata{}, nil
 	}
-	data := value.Data
+	return decodeWindowsMetadataPayload(value.Data)
+}
+
+func decodeWindowsMetadataPayload(data []byte) (windowsMetadata, error) {
 	if len(data) < 4 || !bytes.Equal(data[:3], []byte("SMW")) {
 		return windowsMetadata{}, fmt.Errorf("invalid Windows metadata header: %w", syscall.EIO)
 	}

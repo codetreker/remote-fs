@@ -33,22 +33,13 @@ func (s *Store) referenceState(ctx context.Context, tx *sql.Tx, id int64) (metas
 	if err != nil {
 		return metastore.ReferenceState{}, err
 	}
-	var explicit bool
-	var generation int64
-	var accepted bool
-	if err := tx.QueryRowContext(ctx, `SELECT pending_unlink,pending_generation,EXISTS(
-		SELECT 1 FROM delete_intents WHERE volume=? AND node=? AND outcome IN (?,?))
-		FROM nodes WHERE volume=? AND id=?`, s.volume, id, storage.DeleteIntentPending,
-		storage.DeleteIntentCleanupFailed, s.volume, id).Scan(&explicit, &generation, &accepted); err != nil {
+	pending, err := s.capturePendingDeletion(ctx, tx, id)
+	if err != nil {
 		return metastore.ReferenceState{}, err
 	}
-	pending := explicit || accepted
-	if generation < 0 || pending && generation == 0 {
-		return metastore.ReferenceState{}, fmt.Errorf("node %d has an invalid pending-unlink generation: %w", id, syscall.EIO)
-	}
-	result := metastore.ReferenceState{State: state, LinkTarget: bytes.Clone(state.LinkTarget), PendingUnlink: pending}
-	if pending {
-		result.PendingGeneration = binary.BigEndian.AppendUint64(nil, uint64(generation))
+	result := metastore.ReferenceState{State: state, LinkTarget: bytes.Clone(state.LinkTarget), PendingUnlink: pending.pending}
+	if pending.pending {
+		result.PendingGeneration = binary.BigEndian.AppendUint64(nil, uint64(pending.generation))
 	}
 	return result, nil
 }
@@ -67,24 +58,95 @@ func (s *Store) returnedReferenceState(ctx context.Context, tx *sql.Tx, id int64
 	return state, nil
 }
 
-func (f *retainedFile) State(ctx context.Context) (metastore.ReferenceState, error) {
-	if f.metadata&storage.ReadMetadata == 0 {
+func (s *Store) referenceScalarState(ctx context.Context, tx *sql.Tx, id int64) (metastore.ReferenceState, error) {
+	var kind, size, allocation, detached int64
+	err := tx.QueryRowContext(ctx, `SELECT
+		CASE WHEN typeof(n.kind)='integer' THEN n.kind ELSE 0 END,
+		CASE WHEN typeof(n.size)='integer' THEN n.size ELSE -1 END,
+		CASE WHEN typeof(n.allocation_size)='integer' THEN n.allocation_size ELSE -1 END,
+		CASE WHEN typeof(n.detached)='integer' THEN n.detached ELSE -1 END
+		FROM nodes n WHERE n.volume=? AND n.id=?`, s.volume, id).Scan(&kind, &size, &allocation, &detached)
+	if errors.Is(err, sql.ErrNoRows) {
+		return metastore.ReferenceState{}, syscall.ESTALE
+	}
+	if err != nil {
+		return metastore.ReferenceState{}, err
+	}
+	if kind < int64(storage.NodeRegular) || kind > int64(storage.NodeSymlink) || size < 0 || allocation < 0 || detached < 0 || detached > 1 {
+		return metastore.ReferenceState{}, syscall.EIO
+	}
+	want, err := allocatedSize(storage.NodeKind(kind), size)
+	if err != nil || allocation != want || kind == int64(storage.NodeDirectory) && size != 0 {
+		return metastore.ReferenceState{}, syscall.EIO
+	}
+	pending, err := s.capturePendingDeletion(ctx, tx, id)
+	if err != nil {
+		return metastore.ReferenceState{}, err
+	}
+	name, _, err := s.nameObservationHeader(ctx, tx, id)
+	if err != nil {
+		return metastore.ReferenceState{}, err
+	}
+	if (name.State == storage.NameDetached) != (detached == 1) {
+		return metastore.ReferenceState{}, syscall.EIO
+	}
+	return metastore.ReferenceState{State: metastore.FileState{
+		Node:     metastore.Node{ID: id, Kind: storage.NodeKind(kind), Size: size, AllocationSize: allocation, AllocationKnown: true},
+		Detached: detached == 1,
+	}, PendingUnlink: pending.pending}, nil
+}
+
+func (f *retainedFile) State(ctx context.Context, projection storage.StateProjection) (metastore.ReferenceState, error) {
+	if projection != storage.StateFull && projection != storage.StateScalars {
+		return metastore.ReferenceState{}, syscall.EINVAL
+	}
+	if projection == storage.StateFull && f.metadata&storage.ReadMetadata == 0 {
 		return metastore.ReferenceState{}, syscall.EBADF
 	}
 	if err := f.store.coordinator.commit.acquire(ctx); err != nil {
 		return metastore.ReferenceState{}, err
 	}
 	defer f.store.coordinator.commit.release()
-	if err := f.checkPendingUnlinkAccess(ctx); err != nil {
+	check := f.checkPendingUnlinkAccess
+	if projection == storage.StateScalars {
+		check = f.checkReferenceObservation
+	}
+	if err := check(ctx); err != nil {
 		return metastore.ReferenceState{}, err
 	}
 	var state metastore.ReferenceState
 	err := f.store.inspect(ctx, func(tx *sql.Tx) error {
 		var err error
-		state, err = f.store.returnedReferenceState(ctx, tx, f.id)
+		if projection == storage.StateFull {
+			state, err = f.store.returnedReferenceState(ctx, tx, f.id)
+		} else {
+			state, err = f.store.referenceScalarState(ctx, tx, f.id)
+		}
 		return err
 	})
-	return state, sqlerr.Failure(err)
+	if err == nil {
+		err = metastore.CheckFilePublication(ctx)
+	}
+	if err == nil {
+		err = ctx.Err()
+	}
+	if err != nil {
+		return metastore.ReferenceState{}, sqlerr.Failure(err)
+	}
+	return state, nil
+}
+
+func (f *retainedFile) checkReferenceObservation(ctx context.Context) error {
+	if err := f.check(); err != nil {
+		return err
+	}
+	if err := f.store.checkFileOwnership(); err != nil {
+		return err
+	}
+	if _, err := f.store.resolveUseScope(ctx, f.scope, uint64(f.id), 0); err != nil {
+		return err
+	}
+	return metastore.CheckFilePublication(ctx)
 }
 
 func (f *retainedFile) checkPendingUnlinkAccess(ctx context.Context) error {

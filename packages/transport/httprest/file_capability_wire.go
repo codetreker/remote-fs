@@ -395,11 +395,11 @@ func (value clearPendingUnlinkCommand) storage() storage.ClearPendingUnlinkComma
 }
 
 type referenceState struct {
-	LinkTarget        canonicalBytes  `json:"linkTarget,omitempty"`
-	Attr              *Attr           `json:"attr"`
-	Detached          bool            `json:"detached"`
-	PendingUnlink     bool            `json:"pendingUnlink"`
-	PendingGeneration metadataVersion `json:"pendingGeneration"`
+	LinkTarget        *canonicalBytes  `json:"linkTarget,omitempty"`
+	Attr              *stateAttrJSON   `json:"attr"`
+	Detached          bool             `json:"detached"`
+	PendingUnlink     bool             `json:"pendingUnlink"`
+	PendingGeneration *metadataVersion `json:"pendingGeneration,omitempty"`
 }
 
 type deleteIntentStatus struct {
@@ -530,11 +530,13 @@ func (value deleteIntentStatus) storage() (storage.DeleteIntentStatus, error) {
 }
 
 func referenceStateOf(value storage.ReferenceState) *referenceState {
-	return &referenceState{LinkTarget: canonicalBytes(bytes.Clone(value.LinkTarget)), Attr: AttrOf(value.Attr), Detached: value.Detached, PendingUnlink: value.PendingUnlink, PendingGeneration: metadataVersion(bytes.Clone(value.PendingGeneration))}
-}
-
-func (value referenceState) storage() storage.ReferenceState {
-	return storage.ReferenceState{LinkTarget: bytes.Clone(value.LinkTarget), Attr: value.Attr.Storage(), Detached: value.Detached, PendingUnlink: value.PendingUnlink, PendingGeneration: bytes.Clone(value.PendingGeneration)}
+	generation := metadataVersion(bytes.Clone(value.PendingGeneration))
+	state := &referenceState{Attr: stateAttrOf(value.Attr), Detached: value.Detached, PendingUnlink: value.PendingUnlink, PendingGeneration: &generation}
+	if len(value.LinkTarget) != 0 {
+		target := canonicalBytes(bytes.Clone(value.LinkTarget))
+		state.LinkTarget = &target
+	}
+	return state
 }
 
 // metadataVersion is request-side CAS state. Empty means the namespace must be

@@ -107,8 +107,9 @@ type checkOnlySession struct{ storage.FileSession }
 
 func (checkOnlySession) CheckMetadataAccess() error { return nil }
 
-func (s advertisedSession) CheckMetadataAccess() error      { return s.err }
-func (s advertisedSession) CheckAllocationReporting() error { return s.err }
+func (s advertisedSession) CheckMetadataAccess() error                        { return s.err }
+func (s advertisedSession) CheckAllocationReporting() error                   { return s.err }
+func (advertisedSession) AllocationUnitBytes(context.Context) (uint64, error) { panic("not called") }
 func (advertisedSession) SetMetadata(context.Context, uint64, string, []byte, []byte) (storage.OpaquePayload, error) {
 	panic("not called")
 }
@@ -143,6 +144,10 @@ func (f advertisedFile) CheckScopedReference() error                   { return 
 func (advertisedFile) Scope(context.Context) (storage.UseScope, error) { panic("not called") }
 func (f advertisedFile) CheckMetadataAccess() error                    { return f.err }
 func (advertisedFile) SetMetadata(context.Context, string, []byte, []byte) (storage.OpaquePayload, error) {
+	panic("not called")
+}
+
+func (advertisedFile) ObserveMetadata(context.Context, storage.MetadataObservationRequest) (storage.MetadataObservation, error) {
 	panic("not called")
 }
 
@@ -193,7 +198,7 @@ func TestAllocationCapabilityRequiresKnownResults(t *testing.T) {
 	unknown.AllocationSize = 0
 	for _, result := range []fileResponse{
 		{Attr: &unknown},
-		{State: &referenceState{Attr: &unknown}},
+		{State: &referenceState{Attr: stateAttrOf(unknown.Storage())}},
 		{Directory: &observedDirectory{Entries: []observedEntry{{Attr: &unknown}}}},
 	} {
 		if err := checkReportedAllocation(result); err == nil {

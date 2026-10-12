@@ -1,0 +1,304 @@
+package sqlite
+
+import (
+	"bytes"
+	"context"
+	"database/sql"
+	"errors"
+	"reflect"
+	"syscall"
+	"testing"
+
+	"github.com/codetreker/remote-fs/packages/advisory"
+	"github.com/codetreker/remote-fs/packages/metastore"
+	"github.com/codetreker/remote-fs/packages/storage"
+)
+
+func TestReferenceScalarStateDoesNotGrantMetadataAndTracksDetachedObject(t *testing.T) {
+	store, root, node, _ := guardedFileFixture(t)
+	opened, err := store.OpenNodeRef(t.Context(), uint64(node.ID), storage.NodeRefOptions{Kind: storage.NodeRegular, Action: fileAction(t),
+		Target: storage.ChildCondition{State: storage.SameNode, NodeID: uint64(node.ID)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opened.Reference.Close(context.Background())
+	ref := opened.Reference.(*retainedNodeReference)
+	if err := ref.CheckReferenceState(); err != nil {
+		t.Fatal(err)
+	}
+	want := metastore.ReferenceState{State: metastore.FileState{Node: metastore.Node{ID: node.ID, Kind: storage.NodeRegular, Size: 4, AllocationSize: 4096, AllocationKnown: true}}}
+	if got, err := ref.State(t.Context(), storage.StateScalars); err != nil || !reflect.DeepEqual(got, want) {
+		t.Fatalf("scalar state = %+v, %v", got, err)
+	}
+	if _, err := ref.Node(t.Context()); !errors.Is(err, syscall.EBADF) {
+		t.Fatalf("scalar capability granted public metadata: %v", err)
+	}
+	if _, err := ref.State(t.Context(), storage.StateFull); !errors.Is(err, syscall.EBADF) {
+		t.Fatalf("scalar capability granted full state: %v", err)
+	}
+	name := storage.ChildName{Parent: directoryTarget(root), RawLeaf: []byte("file")}
+	if _, err := store.MutateName(t.Context(), storage.NameCommand{Action: fileAction(t), Kind: storage.NameRemove, Name: name,
+		Target: storage.ChildCondition{State: storage.SameNode, NodeID: uint64(node.ID)}}); err != nil {
+		t.Fatal(err)
+	}
+	want.State.Detached = true
+	if got, err := ref.State(t.Context(), storage.StateScalars); err != nil || !reflect.DeepEqual(got, want) {
+		t.Fatalf("detached identity = %+v, %v", got, err)
+	}
+}
+
+func TestReferenceStateRejectsUnknownProjection(t *testing.T) {
+	_, file := openContentEffectFile(t, nil)
+	for _, projection := range []storage.StateProjection{0, 3, 255} {
+		if got, err := file.State(t.Context(), projection); !errors.Is(err, syscall.EINVAL) || !reflect.DeepEqual(got, metastore.ReferenceState{}) {
+			t.Fatalf("invalid projection %d = %+v, %v", projection, got, err)
+		}
+	}
+}
+
+func TestReferenceScalarStateDirectoryAndSymlinkKinds(t *testing.T) {
+	store, root, _, _ := guardedFileFixture(t)
+	for _, test := range []struct {
+		kind storage.NodeKind
+		name string
+		link []byte
+	}{
+		{storage.NodeDirectory, "directory", nil},
+		{storage.NodeSymlink, "link", []byte("target")},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			opened, err := store.OpenChildRef(t.Context(), selectChild(storage.ChildName{Parent: directoryTarget(root), RawLeaf: []byte(test.name)}),
+				storage.NodeRefOptions{Kind: test.kind, Create: true, Exclusive: true, Action: fileAction(t),
+					Target:       storage.ChildCondition{State: storage.Absent},
+					InitialState: storage.InitialState{OnCreate: storage.InitialFields{LinkTarget: test.link}}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer opened.Reference.Close(context.Background())
+			got, err := opened.Reference.(*retainedNodeReference).State(t.Context(), storage.StateScalars)
+			want := metastore.ReferenceState{State: metastore.FileState{Node: metastore.Node{
+				ID: opened.State.ID, Kind: test.kind, Size: int64(len(test.link)), AllocationKnown: true,
+			}}}
+			if err != nil || !reflect.DeepEqual(got, want) {
+				t.Fatalf("node scalar state = %+v, %v", got, err)
+			}
+		})
+	}
+}
+
+func TestReferenceScalarStateDoesNotLoadOversizedSymlinkTarget(t *testing.T) {
+	store, root, _, _ := guardedFileFixture(t)
+	target := []byte("target")
+	opened, err := store.OpenChildRef(t.Context(), selectChild(storage.ChildName{Parent: directoryTarget(root), RawLeaf: []byte("observed-link")}),
+		storage.NodeRefOptions{Kind: storage.NodeSymlink, Create: true, Exclusive: true, Action: fileAction(t),
+			MetadataAccess: storage.ReadMetadata, Target: storage.ChildCondition{State: storage.Absent},
+			InitialState: storage.InitialState{OnCreate: storage.InitialFields{LinkTarget: target}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opened.Reference.Close(context.Background())
+	ref := opened.Reference.(*retainedNodeReference)
+	want, err := ref.State(t.Context(), storage.StateScalars)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if full, err := ref.State(t.Context(), storage.StateFull); err != nil || !bytes.Equal(full.LinkTarget, target) {
+		t.Fatalf("baseline full symlink state = %+v, %v", full, err)
+	}
+	connection, err := store.write.Conn(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connection.Close()
+	if _, err := connection.ExecContext(t.Context(), `PRAGMA ignore_check_constraints=ON`); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if _, err := connection.ExecContext(context.Background(), `UPDATE nodes SET link_target=? WHERE volume=? AND id=?`, target, store.volume, opened.State.ID); err != nil {
+			t.Error(err)
+		}
+		if _, err := connection.ExecContext(context.Background(), `PRAGMA ignore_check_constraints=OFF`); err != nil {
+			t.Error(err)
+		}
+	}()
+	if _, err := connection.ExecContext(t.Context(), `UPDATE nodes SET link_target=? WHERE volume=? AND id=?`,
+		bytes.Repeat([]byte{'x'}, storage.MaxLinkTargetBytes+1), store.volume, opened.State.ID); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := ref.State(t.Context(), storage.StateScalars); err != nil || !reflect.DeepEqual(got, want) {
+		t.Fatalf("scalar state depended on unrequested symlink target = %+v, %v", got, err)
+	}
+	if got, err := ref.State(t.Context(), storage.StateFull); !errors.Is(err, syscall.EIO) || !reflect.DeepEqual(got, metastore.ReferenceState{}) {
+		t.Fatalf("full state accepted oversized symlink target = %+v, %v", got, err)
+	}
+}
+
+func TestReferenceScalarStateZeroesLifetimeAndAuthorityFailures(t *testing.T) {
+	_, file := openContentEffectFile(t, nil)
+	denied := errors.New("publication denied")
+	for _, test := range []struct {
+		name string
+		ctx  context.Context
+		want error
+	}{
+		{"other session", metastore.WithReferenceSession(t.Context(), new(advisory.Session)), storage.ErrInvalidScope},
+		{"publication", metastore.WithFilePublicationGuard(t.Context(), func() error { return denied }), denied},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got, err := file.State(test.ctx, storage.StateScalars); !errors.Is(err, test.want) || !reflect.DeepEqual(got, metastore.ReferenceState{}) {
+				t.Fatalf("failed scalar state = %+v, %v", got, err)
+			}
+		})
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if got, err := file.State(ctx, storage.StateScalars); !errors.Is(err, context.Canceled) || !reflect.DeepEqual(got, metastore.ReferenceState{}) {
+		t.Fatalf("cancelled scalar state = %+v, %v", got, err)
+	}
+	calls := 0
+	guarded := metastore.WithFilePublicationGuard(t.Context(), func() error {
+		calls++
+		if calls > 1 {
+			return denied
+		}
+		return nil
+	})
+	if got, err := file.State(guarded, storage.StateScalars); !errors.Is(err, denied) || !reflect.DeepEqual(got, metastore.ReferenceState{}) {
+		t.Fatalf("post-capture authority failure = %+v, %v", got, err)
+	}
+	if err := file.Retire(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := file.State(t.Context(), storage.StateScalars); !errors.Is(err, syscall.ESTALE) || !reflect.DeepEqual(got, metastore.ReferenceState{}) {
+		t.Fatalf("retired scalar state = %+v, %v", got, err)
+	}
+}
+
+func TestReferenceScalarStateRejectsMalformedStoredScalars(t *testing.T) {
+	for _, update := range []string{
+		`kind=0`, `kind=X'31'`, `size=-1`, `size=X'31'`, `allocation_size=NULL`, `allocation_size=8192`,
+		`detached=1`, `detached=2`, `detached=X'30'`, `pending_unlink=2`, `pending_unlink=X'30'`,
+		`pending_generation=-1`, `pending_generation=X'30'`, `pending_unlink=1,pending_generation=0`,
+	} {
+		t.Run(update, func(t *testing.T) {
+			store, file := openContentEffectFile(t, nil)
+			before, err := file.Node(t.Context())
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				if _, err := store.write.ExecContext(context.Background(), `UPDATE nodes SET kind=?,size=?,allocation_size=?,detached=0,pending_unlink=0,pending_generation=0 WHERE volume=? AND id=?`,
+					before.Kind, before.Size, before.AllocationSize, store.volume, file.id); err != nil {
+					t.Error(err)
+				}
+			})
+			connection, err := store.write.Conn(t.Context())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer connection.Close()
+			if _, err := connection.ExecContext(t.Context(), `PRAGMA ignore_check_constraints=ON`); err != nil {
+				t.Fatal(err)
+			}
+			defer connection.ExecContext(context.Background(), `PRAGMA ignore_check_constraints=OFF`)
+			if _, err := connection.ExecContext(t.Context(), `UPDATE nodes SET `+update+` WHERE volume=? AND id=?`, store.volume, file.id); err != nil {
+				t.Fatal(err)
+			}
+			if got, err := file.State(t.Context(), storage.StateScalars); !errors.Is(err, syscall.EIO) || !reflect.DeepEqual(got, metastore.ReferenceState{}) {
+				t.Fatalf("malformed scalar state = %+v, %v", got, err)
+			}
+		})
+	}
+}
+
+func TestReferenceScalarStateProjectsPendingGenerationWithoutPayloads(t *testing.T) {
+	store, file := openContentEffectFile(t, nil)
+	want, err := file.State(t.Context(), storage.StateScalars)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = store.mutate(t.Context(), func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(t.Context(), `UPDATE nodes SET pending_generation=7 WHERE volume=? AND id=?`, store.volume, file.id)
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := file.State(t.Context(), storage.StateScalars); err != nil || !reflect.DeepEqual(got, want) {
+		t.Fatalf("historical generation = %+v, %v", got, err)
+	}
+	if _, err := store.write.ExecContext(t.Context(), `UPDATE nodes SET pending_unlink=1 WHERE volume=? AND id=?`, store.volume, file.id); err != nil {
+		t.Fatal(err)
+	}
+	want.PendingUnlink = true
+	if got, err := file.State(t.Context(), storage.StateScalars); err != nil || !reflect.DeepEqual(got, want) {
+		t.Fatalf("explicit pending = %+v, %v", got, err)
+	}
+	if _, err := store.write.ExecContext(t.Context(), `UPDATE nodes SET pending_unlink=0 WHERE volume=? AND id=?`, store.volume, file.id); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestReferenceScalarStateProjectsAcceptedIntentAndRejectsMalformedOutcome(t *testing.T) {
+	store, err := OpenLocking(t.Context(), lockingTestConfig(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	file, _, intent := openCloseUnlinkReference(t, store, false, storage.NodeRegular,
+		storage.UseClaim{Uses: storage.ReadData | storage.DeleteName})
+	t.Cleanup(func() {
+		if err := file.Close(context.Background()); err != nil {
+			t.Error(err)
+		}
+	})
+	for _, outcome := range []storage.DeleteIntentOutcome{storage.DeleteIntentArmed, storage.DeleteIntentPending, storage.DeleteIntentCleanupFailed} {
+		var failure any
+		if outcome == storage.DeleteIntentCleanupFailed {
+			failure = int64(syscall.EIO)
+		}
+		if _, err := store.write.ExecContext(t.Context(), `UPDATE delete_intents SET outcome=?,failure=? WHERE volume=? AND intent=?`,
+			outcome, failure, store.volume, intent); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.write.ExecContext(t.Context(), `UPDATE nodes SET pending_generation=1 WHERE volume=? AND id=?`, store.volume, file.id); err != nil {
+			t.Fatal(err)
+		}
+		got, err := file.State(t.Context(), storage.StateScalars)
+		if err != nil || got.PendingUnlink != (outcome != storage.DeleteIntentArmed) {
+			t.Fatalf("outcome %d information = %+v, %v", outcome, got, err)
+		}
+		state, err := file.State(t.Context(), storage.StateFull)
+		if err != nil || state.PendingUnlink != got.PendingUnlink || state.PendingUnlink && len(state.PendingGeneration) != 8 {
+			t.Fatalf("outcome %d full state = %+v, %v", outcome, state, err)
+		}
+	}
+	connection, err := store.write.Conn(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connection.Close()
+	if _, err := connection.ExecContext(t.Context(), `PRAGMA ignore_check_constraints=ON`); err != nil {
+		t.Fatal(err)
+	}
+	defer connection.ExecContext(context.Background(), `PRAGMA ignore_check_constraints=OFF`)
+	for _, outcome := range []string{`X'32'`, `0`, `6`, `7`, `2.5`} {
+		if _, err := connection.ExecContext(t.Context(), `UPDATE delete_intents SET outcome=`+outcome+` WHERE volume=? AND intent=?`, store.volume, intent); err != nil {
+			t.Fatal(err)
+		}
+		if got, err := file.State(t.Context(), storage.StateScalars); !errors.Is(err, syscall.EIO) || !reflect.DeepEqual(got, metastore.ReferenceState{}) {
+			t.Fatalf("malformed outcome %s scalar projection = %+v, %v", outcome, got, err)
+		}
+		if got, err := file.State(t.Context(), storage.StateFull); !errors.Is(err, syscall.EIO) || !reflect.DeepEqual(got, metastore.ReferenceState{}) {
+			t.Fatalf("malformed outcome %s full projection = %+v, %v", outcome, got, err)
+		}
+	}
+	if _, err := connection.ExecContext(t.Context(), `UPDATE delete_intents SET outcome=?,failure=NULL WHERE volume=? AND intent=?`,
+		storage.DeleteIntentArmed, store.volume, intent); err != nil {
+		t.Fatal(err)
+	}
+}

@@ -24,6 +24,23 @@ func (s *remoteFileSession) CheckAtomicFileOpen() error {
 func (s *remoteFileSession) CheckAllocationReporting() error {
 	return checkFileCapability(s.capabilities.Allocation)
 }
+func (s *remoteFileSession) AllocationUnitBytes(ctx context.Context) (uint64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	if err := s.CheckAllocationReporting(); err != nil {
+		return 0, err
+	}
+	if err := validateAllocationUnitCapability(&s.capabilities, true); err != nil {
+		return 0, unreachable(Request{Op: OpFileControl}, err)
+	}
+	if failure := s.capabilities.AllocationUnitError; failure != nil {
+		errno, _ := storage.ErrnoByName(failure.Errno)
+		return 0, &operationError{req: Request{Op: OpFileControl}, errno: errno, detail: failure.Message, capability: capabilityErrors[failure.CapabilityCode]}
+	}
+	return *s.capabilities.AllocationUnitBytes, nil
+}
+
 func (s *remoteFileSession) CheckNamespaceAccess() error {
 	return checkFileCapability(s.capabilities.Namespace)
 }
@@ -439,8 +456,8 @@ func (r *remoteNodeReference) SetMetadataWithBarrier(ctx context.Context, namesp
 	return r.file.SetMetadataWithBarrier(ctx, namespace, version, data)
 }
 func (r *remoteNodeReference) CheckReferenceState() error { return r.file.CheckReferenceState() }
-func (r *remoteNodeReference) State(ctx context.Context) (storage.ReferenceState, error) {
-	return r.file.State(ctx)
+func (r *remoteNodeReference) State(ctx context.Context, projection storage.StateProjection) (storage.ReferenceState, error) {
+	return r.file.State(ctx, projection)
 }
 func (r *remoteNodeReference) CheckDeleteIntent() error { return r.file.CheckDeleteIntent() }
 func (r *remoteNodeReference) SetPendingUnlink(ctx context.Context, command storage.PendingUnlinkCommand) (storage.ReferenceState, error) {
@@ -477,15 +494,25 @@ func (f *remoteFile) Scope(ctx context.Context) (storage.UseScope, error) {
 	return *response.Scope, nil
 }
 
-func (f *remoteFile) State(ctx context.Context) (storage.ReferenceState, error) {
+func (f *remoteFile) State(ctx context.Context, projection storage.StateProjection) (storage.ReferenceState, error) {
+	if err := projection.Check(); err != nil {
+		return storage.ReferenceState{}, err
+	}
 	if err := f.CheckReferenceState(); err != nil {
 		return storage.ReferenceState{}, err
 	}
-	response, err := f.call(ctx, fileRequest{Op: storage.OpFileState})
+	response, err := f.call(ctx, fileRequest{Op: storage.OpFileState, StateProjection: projection})
 	if response.State == nil {
 		return storage.ReferenceState{}, err
 	}
-	return response.State.storage(), err
+	if err != nil {
+		return storage.ReferenceState{}, err
+	}
+	value := response.State.storage()
+	if err := value.CheckProjection(f.node, projection); err != nil {
+		return storage.ReferenceState{}, unreachable(Request{Op: OpFileControl}, err)
+	}
+	return value, nil
 }
 
 func (f *remoteFile) SetMetadata(ctx context.Context, namespace string, version, data []byte) (storage.OpaquePayload, error) {
@@ -564,7 +591,7 @@ func (f *remoteFile) mutateFileWithBarrier(ctx context.Context, mutation storage
 	if err := mutation.CheckDataLimit(f.session.storage.maxWriteBytes); err != nil {
 		return storage.Attr{}, nil, err
 	}
-	if mutation.Action != "" && len(mutation.Data) <= MaxFileRecoveryDataBytes && (mutation.Kind == storage.MutateWriteAt || mutation.Kind == storage.MutateAppend) {
+	if mutation.Action != "" && len(mutation.Data) <= MaxFileRecoveryDataBytes && (mutation.Kind == storage.MutateWriteAt || mutation.Kind == storage.MutateAppend || mutation.Kind == storage.MutateTruncate || mutation.Kind == storage.MutateAttributes) {
 		admitted, release, _, err := f.session.admitExplicitWrite(ctx, f.id, mutation.Action)
 		if err != nil {
 			return storage.Attr{}, nil, err

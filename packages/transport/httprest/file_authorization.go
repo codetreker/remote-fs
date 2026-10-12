@@ -15,7 +15,7 @@ func (h *Handler) authorizeFile(ctx context.Context, request fileRequest) error 
 	}
 	appendOperation := func(operation storage.Operation) {
 		for _, access := range accesses {
-			if access.Operation == operation && len(access.ContentMetadataEffects) == 0 && reflect.DeepEqual(access.Open, storage.OpenAccess{}) {
+			if access.Operation == operation && access.MetadataObservation == nil && access.StateProjection == 0 && len(access.ContentMetadataEffects) == 0 && reflect.DeepEqual(access.Open, storage.OpenAccess{}) {
 				return
 			}
 		}
@@ -31,7 +31,7 @@ func (h *Handler) authorizeFile(ctx context.Context, request fileRequest) error 
 		if len(options.ContentMetadataEffects) != 0 {
 			accesses = append(accesses,
 				authz.AccessRequest{Operation: storage.OpFileSetMetadata, ContentMetadataEffects: storage.CloneContentMetadataEffects(options.ContentMetadataEffects)},
-				authz.AccessRequest{Operation: storage.OpFileObserveContentMetadata, ContentMetadataEffects: storage.CloneContentMetadataEffects(options.ContentMetadataEffects)})
+				authz.AccessRequest{Operation: storage.OpFileObserveMetadata, ContentMetadataEffects: storage.CloneContentMetadataEffects(options.ContentMetadataEffects)})
 		}
 		if options.MetadataAccess&storage.ReadMetadata != 0 {
 			appendOperation(storage.OpFileStat)
@@ -104,20 +104,23 @@ func (h *Handler) authorizeFile(ctx context.Context, request fileRequest) error 
 		}
 	}
 
+	if request.Op == storage.OpFileState {
+		accesses[0].StateProjection = request.StateProjection
+	}
+	if request.Op == storage.OpFileObserveMetadata {
+		observation := request.MetadataObservation.storage().Clone()
+		accesses[0].MetadataObservation = &observation
+	}
 	effects, err := h.fileContentEffects(request)
 	if err != nil {
 		return err
 	}
-	if request.Op == storage.OpFileObserveContentMetadata && len(effects) != 0 {
+	if request.Op == storage.OpFileObserveMetadata && len(effects) != 0 {
 		accesses[0].ContentMetadataEffects = effects
 		effects = nil
 	}
 	if len(effects) != 0 {
-		operation := storage.OpFileSetMetadata
-		if request.Op == storage.OpFileObserveContentMetadata {
-			operation = storage.OpFileObserveContentMetadata
-		}
-		accesses = append(accesses, authz.AccessRequest{Operation: operation, ContentMetadataEffects: effects})
+		accesses = append(accesses, authz.AccessRequest{Operation: storage.OpFileSetMetadata, ContentMetadataEffects: effects})
 	}
 	for _, access := range accesses {
 		if err := h.authorize(ctx, access.Clone()); err != nil {

@@ -102,8 +102,11 @@ func validateFileRequest(r fileRequest) error {
 	case storage.OpFileSetNodeAttr:
 		expected.Node = r.Node
 		expected.Change = r.Change
-	case storage.OpFileStat, storage.OpFileSync, storage.OpFileAck, storage.OpFileState, storage.OpFileScope, storage.OpFileCloseOwnerStatus:
+	case storage.OpFileStat, storage.OpFileSync, storage.OpFileAck, storage.OpFileScope, storage.OpFileCloseOwnerStatus:
 		reference = true
+	case storage.OpFileState:
+		reference = true
+		expected.StateProjection = r.StateProjection
 	case storage.OpFileClose:
 		reference = true
 		expected.CloseGeneration = r.CloseGeneration
@@ -140,9 +143,9 @@ func validateFileRequest(r fileRequest) error {
 	case storage.OpFileObserveDirectoryMetadata:
 		expected.Directory = r.Directory
 		expected.DirectoryMetadata = r.DirectoryMetadata
-	case storage.OpFileObserveContentMetadata:
+	case storage.OpFileObserveMetadata:
 		reference = true
-		expected.ContentEffect = r.ContentEffect
+		expected.MetadataObservation = r.MetadataObservation
 	case storage.OpFileObserveName:
 		reference = true
 		expected.Guards = r.Guards
@@ -284,6 +287,8 @@ func validateFileResponse(req fileRequest, r fileResponse) error {
 		expected.Retry = true
 	} else {
 		switch req.Op {
+		case storage.OpFileObserveMetadata:
+			expected.ObservedMetadata = r.ObservedMetadata
 		case storage.OpFileBackendIdentity:
 			expected.BackendIdentity = r.BackendIdentity
 		case storage.OpFileSessionOpen:
@@ -314,8 +319,6 @@ func validateFileResponse(req fileRequest, r fileResponse) error {
 			expected.Attr = r.Attr
 		case storage.OpFileReadDirNode, storage.OpFileObserveDirectoryMetadata:
 			expected.Directory = r.Directory
-		case storage.OpFileObserveContentMetadata:
-			expected.ContentMetadata = r.ContentMetadata
 		case storage.OpFileObserveName:
 			expected.NameObservation = r.NameObservation
 		case storage.OpFileRead:
@@ -378,6 +381,9 @@ func validateFileResponse(req fileRequest, r fileResponse) error {
 		if !validFileCapability(r.Session) || r.Status == nil || r.Capabilities == nil {
 			return errors.New("file session response has no valid capability or status")
 		}
+		if err := validateAllocationUnitCapability(r.Capabilities, true); err != nil {
+			return err
+		}
 		if err := validateSessionIdentity(r); err != nil {
 			return err
 		}
@@ -415,18 +421,24 @@ func validateFileResponse(req fileRequest, r fileResponse) error {
 		if !validFileCapability(r.File) || r.Capabilities == nil {
 			return errors.New("file open response carries no reference capability")
 		}
-		if r.Capabilities.ReferenceName != (r.Node != 0) {
+		if err := validateAllocationUnitCapability(r.Capabilities, false); err != nil {
+			return err
+		}
+		if (r.Capabilities.ReferenceName || r.Capabilities.State) != (r.Node != 0) {
 			return errors.New("file open identity does not match name observation capability")
 		}
-		if req.Op == storage.OpFileOpenNode && r.Capabilities.ReferenceName && r.Node != req.Node {
+		if req.Op == storage.OpFileOpenNode && (r.Capabilities.ReferenceName || r.Capabilities.State) && r.Node != req.Node {
 			return errors.New("identity open substituted its target")
 		}
-		if req.Op == storage.OpFileOpen && r.Capabilities.ReferenceName && req.Open.ExpectedID != 0 && r.Node != req.Open.ExpectedID {
+		if req.Op == storage.OpFileOpen && (r.Capabilities.ReferenceName || r.Capabilities.State) && req.Open.ExpectedID != 0 && r.Node != req.Open.ExpectedID {
 			return errors.New("path open substituted its expected identity")
 		}
 	case storage.OpFileOpenAt, storage.OpFileOpenNodeRef, storage.OpFileOpenChildRef:
 		if !validFileCapability(r.File) || r.Attr == nil || r.Capabilities == nil || r.Outcome < storage.Opened || r.Outcome > storage.Replaced {
 			return errors.New("atomic open response is incomplete")
+		}
+		if err := validateAllocationUnitCapability(r.Capabilities, false); err != nil {
+			return err
 		}
 		if req.Op == storage.OpFileOpenNodeRef && r.Attr.ID != req.Node {
 			return errors.New("node reference open substituted its target")
@@ -451,11 +463,11 @@ func validateFileResponse(req fileRequest, r fileResponse) error {
 		if req.Name == nil || nameResultNeedsAttr(req.Name.Kind) && r.Attr == nil {
 			return errors.New("name response carries no required attributes")
 		}
-	case storage.OpFileObserveContentMetadata:
-		if r.ContentMetadata == nil {
-			return errors.New("content metadata observation is absent")
+	case storage.OpFileObserveMetadata:
+		if r.ObservedMetadata == nil {
+			return errors.New("metadata observation is absent")
 		}
-		if err := r.ContentMetadata.storage().Check(); err != nil {
+		if err := r.ObservedMetadata.storage().Check(); err != nil {
 			return err
 		}
 	case storage.OpFileObserveName:
@@ -545,7 +557,11 @@ func validateFileResponse(req fileRequest, r fileResponse) error {
 		}
 	}
 	if r.State != nil {
-		if err := validateReferenceState(r.State); err != nil {
+		if req.Op == storage.OpFileState {
+			if err := validateReferenceStateProjection(r.State, req.StateProjection); err != nil {
+				return err
+			}
+		} else if err := validateReferenceState(r.State); err != nil {
 			return err
 		}
 	}
@@ -666,12 +682,16 @@ func validateReferenceState(state *referenceState) error {
 	if state.Detached && state.PendingUnlink {
 		return errors.New("detached reference cannot remain pending unlink")
 	}
-	if state.PendingUnlink != (len(state.PendingGeneration) != 0) || len(state.PendingGeneration) > storage.MaxObservationTokenBytes {
+	if state.PendingGeneration == nil {
+		return errors.New("full reference state omits pending generation")
+	}
+	value := state.storage()
+	if state.PendingUnlink != (len(value.PendingGeneration) != 0) || len(value.PendingGeneration) > storage.MaxObservationTokenBytes {
 		return errors.New("reference state carries inconsistent pending generation")
 	}
-	if len(state.LinkTarget) > storage.MaxLinkTargetBytes ||
-		state.Attr.Kind == storage.NodeSymlink && (len(state.LinkTarget) == 0 || int64(len(state.LinkTarget)) != state.Attr.Size) ||
-		state.Attr.Kind != storage.NodeSymlink && len(state.LinkTarget) != 0 {
+	if len(value.LinkTarget) > storage.MaxLinkTargetBytes ||
+		state.Attr.Kind == storage.NodeSymlink && (len(value.LinkTarget) == 0 || int64(len(value.LinkTarget)) != state.Attr.Size) ||
+		state.Attr.Kind != storage.NodeSymlink && len(value.LinkTarget) != 0 {
 		return errors.New("reference state carries an invalid link target")
 	}
 	return nil

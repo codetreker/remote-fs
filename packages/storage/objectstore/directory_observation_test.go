@@ -111,7 +111,7 @@ func TestObjectDirectoryMetadataObservationKeepsApplicationPermissionsSeparate(t
 	if _, err := opened.Reference.Stat(t.Context()); !errors.Is(err, syscall.EBADF) {
 		t.Fatalf("metadata observation granted reference Stat: %v", err)
 	}
-	if _, err := objectCapability[storage.ReferenceStateAccess](t, opened.Reference).State(t.Context()); !errors.Is(err, syscall.EBADF) {
+	if _, err := objectCapability[storage.ReferenceStateAccess](t, opened.Reference).State(t.Context(), storage.StateFull); !errors.Is(err, syscall.EBADF) {
 		t.Fatalf("metadata observation granted reference State: %v", err)
 	}
 }

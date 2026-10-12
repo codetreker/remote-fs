@@ -21,5 +21,5 @@ func volumeFixtureWithLocks(t *testing.T, options locking.Options) *objectstore.
 
 func failingStorage(t *testing.T, err error) failing {
 	t.Helper()
-	return failing{Backend: volumeFixture(t), err: err}
+	return failing{err: err}
 }

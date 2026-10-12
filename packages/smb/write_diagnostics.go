@@ -92,7 +92,7 @@ type writeLedger struct {
 }
 
 func (s *Server) reserveIORecord(t *tree, h *fileHandle, bytes int, flush bool) (WriteOwnerID, error) {
-	if t == nil || t.export == nil || h == nil || h.file == nil || bytes < 0 {
+	if t == nil || t.export == nil || h == nil || h.reference() == nil || bytes < 0 {
 		return WriteOwnerID{}, syscall.EINVAL
 	}
 	s.handleMu.Lock()

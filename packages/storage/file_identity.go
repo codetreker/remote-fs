@@ -45,9 +45,11 @@ type StableReferenceIdentity interface {
 	CheckStableReferenceIdentity() error
 }
 
-// OpenMetadataAccess promises independent metadata permissions for OpenAt.
-// Zero grants neither Stat nor metadata mutation; byte rights and Uses do not
-// confer metadata rights. The original atomic OpenResult still contains Attr.
+// OpenMetadataAccess promises independent metadata permissions and the complete
+// ReferenceMetadataAccess contract for OpenAt, OpenNodeRef and OpenChildRef.
+// Zero grants neither Stat nor arbitrary namespace observation or mutation;
+// byte rights and Uses do not confer metadata rights. An enrolled content effect
+// can be observed through its separate selector. Atomic open results retain Attr.
 type OpenMetadataAccess interface {
 	CheckOpenMetadataAccess() error
 }

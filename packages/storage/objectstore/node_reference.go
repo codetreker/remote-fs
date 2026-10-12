@@ -12,6 +12,7 @@ import (
 )
 
 type nodeReference struct {
+	metadata   storage.MetadataPermissions
 	session    *fileSession
 	native     metastore.NodeReference
 	uses       referenceUses
@@ -207,19 +208,6 @@ func publicReferenceState(state metastore.ReferenceState) storage.ReferenceState
 	}
 }
 
-func (r *nodeReference) State(ctx context.Context) (storage.ReferenceState, error) {
-	if err := r.CheckReferenceState(); err != nil {
-		return storage.ReferenceState{}, err
-	}
-	ctx, done, err := r.begin(ctx)
-	if err != nil {
-		return storage.ReferenceState{}, err
-	}
-	defer done()
-	state, err := r.native.(metastore.ReferenceStateAccess).State(ctx)
-	return publicReferenceState(state), err
-}
-
 func (r *nodeReference) CheckDeleteIntent() error {
 	capability, ok := r.native.(metastore.DeleteIntent)
 	if !ok {
@@ -329,3 +317,118 @@ var (
 	_ storage.DeleteIntent            = (*nodeReference)(nil)
 	_ storage.ConditionalFileMutation = (*nodeReference)(nil)
 )
+
+func (r *nodeReference) State(ctx context.Context, projection storage.StateProjection) (storage.ReferenceState, error) {
+	if err := projection.Check(); err != nil {
+		return storage.ReferenceState{}, err
+	}
+	if projection == storage.StateFull && r.metadata&storage.ReadMetadata == 0 {
+		return storage.ReferenceState{}, syscall.EBADF
+	}
+	if err := r.CheckReferenceState(); err != nil {
+		return storage.ReferenceState{}, err
+	}
+	id, err := storage.ReferenceNodeID(r.native)
+	if err != nil {
+		return storage.ReferenceState{}, err
+	}
+	ctx, done, err := r.begin(ctx)
+	if err != nil {
+		return storage.ReferenceState{}, err
+	}
+	defer done()
+	return observeNativeState(ctx, r.session, r.native, id, projection, &r.active)
+}
+
+func (r *nodeReference) ObserveMetadata(ctx context.Context, request storage.MetadataObservationRequest) (storage.MetadataObservation, error) {
+	if err := request.Check(); err != nil {
+		return storage.MetadataObservation{}, err
+	}
+	if request.Purpose != storage.MetadataObservationNamespace || r.metadata&storage.WriteMetadata == 0 {
+		return storage.MetadataObservation{}, syscall.EBADF
+	}
+	if err := r.CheckMetadataAccess(); err != nil {
+		return storage.MetadataObservation{}, err
+	}
+	id, err := storage.ReferenceNodeID(r.native)
+	if err != nil {
+		return storage.MetadataObservation{}, err
+	}
+	ctx, done, err := r.begin(ctx)
+	if err != nil {
+		return storage.MetadataObservation{}, err
+	}
+	defer done()
+	return observeNativeMetadata(ctx, r.session, r.native, id, request, nil, &r.active)
+}
+
+func observeNativeState(ctx context.Context, session *fileSession, capability metastore.ReferenceStateAccess, id uint64, projection storage.StateProjection, active *bool) (storage.ReferenceState, error) {
+	ctx = metastore.WithReferenceSession(ctx, session.locks)
+	if err := session.locks.IOHealth(ctx, id); err != nil {
+		return storage.ReferenceState{}, err
+	}
+	state, err := capability.State(ctx, projection)
+	if err != nil {
+		return storage.ReferenceState{}, err
+	}
+	var result storage.ReferenceState
+	if projection == storage.StateFull {
+		result = publicReferenceState(state)
+	} else {
+		if state.State.Metadata != nil || state.State.BirthTime != nil || state.State.ChangeTime != nil ||
+			!state.State.AccessTime.IsZero() || !state.State.ModTime.IsZero() || state.State.LinkTarget != nil ||
+			state.State.DirectoryRevision != nil || state.State.Content != "" || state.State.Revision != 0 ||
+			state.LinkTarget != nil || state.PendingGeneration != nil {
+			return storage.ReferenceState{}, syscall.EIO
+		}
+		result = storage.ReferenceState{Attr: storage.Attr{ID: uint64(state.State.ID), Kind: state.State.Kind, Size: state.State.Size, AllocationSize: state.State.AllocationSize, AllocationKnown: state.State.AllocationKnown}, Detached: state.State.Detached, PendingUnlink: state.PendingUnlink}
+	}
+	if err := result.CheckProjection(id, projection); err != nil {
+		return storage.ReferenceState{}, err
+	}
+	if err := checkObservedReference(ctx, session, id, active); err != nil {
+		return storage.ReferenceState{}, err
+	}
+	return result, nil
+}
+
+func observeNativeMetadata(ctx context.Context, session *fileSession, capability storage.ReferenceMetadataAccess, id uint64, request storage.MetadataObservationRequest, effect *storage.ContentMetadataEffect, active *bool) (storage.MetadataObservation, error) {
+	ctx = metastore.WithReferenceSession(ctx, session.locks)
+	if err := session.locks.IOHealth(ctx, id); err != nil {
+		return storage.MetadataObservation{}, err
+	}
+	result, err := capability.ObserveMetadata(ctx, request.Clone())
+	if err != nil {
+		return storage.MetadataObservation{}, err
+	}
+	if request.Purpose == storage.MetadataObservationNamespace {
+		err = result.CheckNamespace(id, request.Namespace, request.MaxPayloadBytes)
+	} else {
+		err = result.CheckEffect(id, *effect)
+	}
+	if err != nil {
+		return storage.MetadataObservation{}, err
+	}
+	if err := checkObservedReference(ctx, session, id, active); err != nil {
+		return storage.MetadataObservation{}, err
+	}
+	return result.Clone(), nil
+}
+
+func checkObservedReference(ctx context.Context, session *fileSession, id uint64, active *bool) error {
+	if err := session.locks.IOHealth(ctx, id); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := session.publicationAllowed(); err != nil {
+		return err
+	}
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	if !*active {
+		return syscall.EBADF
+	}
+	return nil
+}

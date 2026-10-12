@@ -8,19 +8,19 @@ Windows 程序取得 SMB FileId 后，需要通过该句柄读取、范围写入
 
 ## 决定
 
-SMB 3.1.1 的 regular-file READ、flags=0 WRITE 和 FLUSH 使用[有界 CREATE/CLOSE](2026-09-28-smb-bounded-create-close.md)保存的 typed FileId 与同一 authority。字节内容、固定派生 metadata、句柄排序、原 action 恢复、清理证明和有界失败状态共同构成一条内容访问路径。文件信息／EOF 和 volume 信息由[信息提案](../../proposed/feature/2026-09-28-smb-file-data-information.md)保留，范围锁、名字、通知／缓存与原生资格仍为独立能力。
+SMB 3.1.1 的 regular-file READ、flags=0 WRITE 和 FLUSH 使用[有界 CREATE/CLOSE](2026-09-28-smb-bounded-create-close.md)保存的 typed FileId 与同一 authority。字节内容、固定派生 metadata、句柄排序、原 action 恢复、清理证明和有界失败状态共同构成一条内容访问路径。文件信息／EOF 由[文件信息](2026-09-28-smb-file-information.md)拥有，volume 信息由[volume 信息提案](../../proposed/feature/2026-09-28-smb-file-data-information.md)保留，范围锁、名字、通知／缓存与原生资格仍为独立能力。
 
 该决定服务 R-FS-6 至 R-FS-8、R-CON-1、R-ERR-1 至 R-ERR-4、R-SEC-5、R-INT-8、R-WIN-2、R-WIN-5 和 R-WIN-10。实际结构见[SMB 端点设计](../../../../docs/design/client/smb-endpoint.md)与[文件契约](../../../../docs/design/server/file-handles.md)，错误与竞争验证见[测试策略](../../../../docs/testing.md)。这些命令的交付不宣布完整 Windows drive 或私有缓存资格完成。
 
 ### 平台解释与中立固定效果
 
-OpenAtOptions.ContentMetadataEffects 将固定 namespace 转换密封在 exact writable File 上；OpenContentMetadata 检查整个链，ReferenceContentMetadata 只观察已 enrollment 的一个 namespace，返回 NodeID 与明确存在／缺席的 OpaquePayload。descriptor 包括 Namespace、PayloadBytes、PresentPrefix、AbsentPayload、ClearMask、SetMask；最多 16 项、单 payload 32 KiB、合计 64 KiB。prefix 对应 masks 为零；不存在值使用已批准模板，存在空值不冒充缺席。旧 FileOpenOptions 不接受该 enrollment。
+OpenAtOptions.ContentMetadataEffects 将固定 namespace 转换密封在 exact writable File 上；OpenContentMetadata 检查整个链；既有 ReferenceMetadataAccess.ObserveMetadata 以明确 ContentEffect purpose 只观察原引用已封存的一个效果 namespace，返回 NodeID 与明确存在／缺席的 OpaquePayload。descriptor 包括 Namespace、PayloadBytes、PresentPrefix、AbsentPayload、ClearMask、SetMask；最多 16 项、单 payload 32 KiB、合计 64 KiB。prefix 对应 masks 为零；不存在值使用已批准模板，存在空值不冒充缺席。旧 FileOpenOptions 不接受该 enrollment。
 
 SMB 密封 smb.windows 的八字节 SMW version-1 payload，固定清除 NORMAL、设置 ARCHIVE，保留 READONLY/HIDDEN/SYSTEM 与其它 namespace。Windows 解码和 READONLY 判定留在 SMB；authority 只验证通用格式、条件与固定转换，不执行平台 hook，不需要 host 注册平台策略。
 
-FileMutation.ContentEffects 只用于非空 WriteAt／Append，Attr 与任意 Metadata 为空，每个所选 namespace 必须有显式 ExpectedMetadata entry；空 token 表示确认缺席，遗漏 entry 非法。native 最终 publication 同时核对 exact scope、数据 Use、metadata token、descriptor 格式和内容 revision，以 (old &^ ClearMask) | SetMask 计算结果，与内容、时间、日志一次提交。原 OpenAt descriptor、mutation target／command／enrolled vector 进入 action digest，每处 slice／map 深复制。
+FileMutation.ContentEffects 用于非空 WriteAt／Append；[文件信息](2026-09-28-smb-file-information.md)在同一路径支持 Truncate，Attr 与任意 Metadata 为空，每个所选 namespace 必须有显式 ExpectedMetadata entry；空 token 表示确认缺席，遗漏 entry 非法。native 最终 publication 同时核对 exact scope、数据 Use、metadata token、descriptor 格式和内容 revision，以 (old &^ ClearMask) | SetMask 计算结果，与内容、时间、日志一次提交。原 OpenAt descriptor、mutation target／command／enrolled vector 进入 action digest，每处 slice／map 深复制。
 
-enrollment、限定观察与每次 mutation／typed replay 都经当前实际业务授权；AccessRequest 携带准确 descriptor，Metadata=nil 不能绕过 OpFileSetMetadata。OpenAt 批准不构成终身授权。公开 Stat、SetAttr、SetMetadata 和任意属性修改继续独立受 MetadataAccess 约束，byte-only 与 append-only 句柄不能借派生效果扩权。
+enrollment、条件观察与每次 mutation／typed replay 都经当前实际业务授权；AccessRequest 携带准确 descriptor，Metadata=nil 不能绕过 OpFileSetMetadata。OpenAt 批准不构成终身授权。公开 Stat、SetAttr、SetMetadata 和任意属性修改继续独立受 MetadataAccess 约束，byte-only 与 append-only 句柄不能借派生效果扩权。
 
 ### 协议与读取／写入
 
@@ -36,7 +36,7 @@ READ Padding、Channel NONE 的 RemainingBytes 与 channel-info 被忽略；未�
 
 file_io_gate.go 保存 bounded FIFO、running pointer、sequence 与 fence。每次请求在入队前授权，取得 turn 后 backing dispatch 前再核对身份与当前授权。短锁按 authority installation、tree fileMu、session mu、handle ioMu 排序，全部释放后才访问 backing。queued 项保留原 frame 费用，取得 turn 前不复制 Data；不同 FileId 并行，同对象最终顺序由 authority 决定。
 
-write_owner.go 在 dispatch 前预留原 immutable Data、action、token、effects、完整 response 与 failure-record。Completed receipt 只允许同 ID／reference／负载 typed replay，不能代替 Attr 与全链 barrier。bound NotExecuted 的 metadata 条件冲突最多重读两次新条件并 mint 两个新 action；Unknown、Retired、无 Operation 的 NotExecuted、失联或授权拒绝不 remint。Unknown 结束 active execution，但保留 owner 与 charge，不能阻塞无关 FileId、renew、状态与 cleanup。
+mutation_owner.go 在 dispatch 前预留原 immutable Data、action、token、effects、完整 response 与 failure-record。Completed receipt 只允许同 ID／reference／负载 typed replay，不能代替 Attr 与全链 barrier。bound NotExecuted 的 smb.windows 条件冲突最多重读两次 token 并 mint 两个新 action；Unknown、Retired、无 Operation 的 NotExecuted、失联或授权拒绝不 remint。Unknown 结束 active execution，但保留 owner 与 charge，不能阻塞无关 FileId、renew、状态与 cleanup。
 
 FLUSH 用独立 flush_owner.go 的无 Data confirmation，通过同句柄 FIFO 后调用 exact File.Sync。HTTP Sync 不要求 Action、不进入 pending journal，也不先扫描全 session pending；仍保留 post-Sync barrier response。Sync 可重新确认同一引用，不重写 WRITE，不从旧路径重新打开。
 
@@ -44,7 +44,7 @@ CLOSE 在既有 requestCloseMu／closeLifetime 保护下 fence 新 I/O、移除 
 
 ### HTTP 恢复与责任终结
 
-不超过 8 MiB 的 explicit WriteAt／Append 有独立 file capability＋nested action＋immutable request pending entry 与 recovery gate；其它 FileId、Renew、Status、Sync 与 cleanup 不扫描它。初次使用 data admission，原动作重投使用 POST /v5/file-recovery，业务授权仍是原 file.mutate／write／所选 metadata 效果。recovery envelope 为 min(maxBodyBytes,12 MiB)，每 session 一项、无排队，server 全局 MaxSessions；client 全局独立 MaxConcurrentLockControls。256 KiB control 和关闭保留容量不被大 data replay 占用。既有 native history、digest、quota 和 close receipts 不重设计。
+不超过 8 MiB 的 explicit WriteAt／Append／Truncate／Attributes 有独立 file capability＋nested action＋immutable request pending entry 与 recovery gate；其它 FileId、Renew、Status、Sync 与 cleanup 不扫描它。初次使用 data admission，原动作重投使用 POST /v5/file-recovery，业务授权仍是原 file.mutate／write／所选 metadata 效果。recovery envelope 为 min(maxBodyBytes,12 MiB)，每 session 一项、无排队，server 全局 MaxSessions；client 全局独立 MaxConcurrentLockControls。256 KiB control 和关闭保留容量不被大 data replay 占用。中立 semantic Action 使用 native journal 的 epoch／digest／history，HTTP elapsed window 只管隐式 transport 动作，不能因两层起算时刻不同拒绝仍有效的原 Action 或要求换 ID；native 对陈旧／未知 ID 与意图改变的拒绝继续保留。既有 native history、digest、quota 和 close receipts 不重设计。
 
 exact reference 或完整父 session 的正面 Released 与 HTTP 下游链 settled 后，HTTP 在 session 短锁内 fence 原 entries，锁外用关闭 context 等待各 action gate，排空后才释放本层复制 Data。取消／deadline 保留未排空的 fenced payload，返回 Released=true 与 Pending CloseSettlementError，并保留原 SemanticErr 和暂时 Cause；迟到 WRITE 成功／失败响应都不能删掉它。后续同 owner 关闭继续本地排空，不再执行 native 关闭或写入。HTTP 不确认其上方 replica barrier；SMB 原 Data／额度保持到包含 replica 的全链关闭／settlement。原 ExecutionUnknown 不变成未执行。
 
@@ -82,4 +82,4 @@ Status 包含 WriteOwners、UnknownWrites、PendingFlushes、RetainedWriteBytes 
 
 package-local 正常、权限、CAS、byte-only、append、empty WRITE、wire／credits、未知恢复、并发 CLOSE 和真实 HTTP 链验证承担这些保证；完整测试策略与观察到的命令结果由当前验证记录提供。schema 未变，旧 FileOpenOptions 不因本能力改变；普通 File.WriteAt(empty) 的旧公开分支没有顺带重构。
 
-QUERY_INFO、SET_INFO／EOF、volume presentation、目录枚举、directory FLUSH、range LOCK／CANCEL、名字／删除义务、通知／缓存及 WNet／原生支持资格仍由独立任务承担。真实 Windows redirector 的缓存可能遮蔽正确 backing 结果，本段 Go／wire 验证不等于完整 network-drive 资格。
+文件 QUERY_INFO 与 Basic／EOF SET_INFO 由[文件信息](2026-09-28-smb-file-information.md)拥有；volume presentation、目录枚举、directory FLUSH、range LOCK／CANCEL、名字／删除义务、通知／缓存及 WNet／原生支持资格仍由独立任务承担。真实 Windows redirector 的缓存可能遮蔽正确 backing 结果，本段 Go／wire 验证不等于完整 network-drive 资格。

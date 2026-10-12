@@ -19,7 +19,11 @@ func httpContentEffect() storage.ContentMetadataEffect {
 }
 func httpContentOpen(t *testing.T, client *Storage, backend storage.Storage) (*remoteFileSession, *remoteFile) {
 	t.Helper()
-	if err := backend.Write(t.Context(), "content", []byte("old")); err != nil {
+	return httpContentOpenNamed(t, client, backend, "content")
+}
+func httpContentOpenNamed(t *testing.T, client *Storage, backend storage.Storage, name string) (*remoteFileSession, *remoteFile) {
+	t.Helper()
+	if err := backend.Write(t.Context(), name, []byte("old")); err != nil {
 		t.Fatal(err)
 	}
 	root, err := backend.Stat(t.Context(), "")
@@ -37,7 +41,7 @@ func httpContentOpen(t *testing.T, client *Storage, backend storage.Storage) (*r
 		}
 	})
 	options := storage.OpenAtOptions{Read: true, Write: true, Target: storage.ChildCondition{State: storage.Any}, Existing: storage.Keep, Use: storage.UseClaim{Uses: storage.ReadData | storage.WriteData}, Action: httpFileAction(t, session), ContentMetadataEffects: []storage.ContentMetadataEffect{httpContentEffect()}}
-	opened, err := session.OpenAt(t.Context(), storage.ChildSelection{Name: storage.ChildName{Parent: storage.DirectoryTarget{NodeID: root.ID}, RawLeaf: []byte("content")}}, options)
+	opened, err := session.OpenAt(t.Context(), storage.ChildSelection{Name: storage.ChildName{Parent: storage.DirectoryTarget{NodeID: root.ID}, RawLeaf: []byte(name)}}, options)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -52,7 +56,7 @@ func TestHTTPContentMetadataByteOnlyReference(t *testing.T) {
 	if _, err := file.Stat(t.Context()); !errors.Is(err, syscall.EBADF) {
 		t.Fatalf("public Stat=%v", err)
 	}
-	absent, err := file.ObserveContentMetadata(t.Context(), 0)
+	absent, err := file.ObserveMetadata(t.Context(), storage.MetadataObservationRequest{Purpose: storage.MetadataObservationContentEffect, EffectIndex: 0})
 	if err != nil || absent.NodeID != file.node || absent.Value != nil {
 		t.Fatalf("absence=%+v err=%v", absent, err)
 	}
@@ -61,11 +65,11 @@ func TestHTTPContentMetadataByteOnlyReference(t *testing.T) {
 	if _, err := file.MutateFile(t.Context(), command); err != nil {
 		t.Fatal(err)
 	}
-	observed, err := file.ObserveContentMetadata(t.Context(), 0)
+	observed, err := file.ObserveMetadata(t.Context(), storage.MetadataObservationRequest{Purpose: storage.MetadataObservationContentEffect, EffectIndex: 0})
 	if err != nil || observed.Value == nil || !bytes.Equal(observed.Value.Data, []byte{'T', 1}) {
 		t.Fatalf("observed=%+v err=%v", observed, err)
 	}
-	if _, err := file.ObserveContentMetadata(t.Context(), 1); !errors.Is(err, syscall.EINVAL) {
+	if _, err := file.ObserveMetadata(t.Context(), storage.MetadataObservationRequest{Purpose: storage.MetadataObservationContentEffect, EffectIndex: 1}); !errors.Is(err, syscall.EINVAL) {
 		t.Fatalf("invalid effect=%v", err)
 	}
 	command.Action = httpFileAction(t, session)
@@ -146,7 +150,7 @@ func TestHTTPContentEffectCurrentPolicyAndSealedDescriptor(t *testing.T) {
 	if _, err := file.MutateFile(t.Context(), command); err != nil {
 		t.Fatal(err)
 	}
-	observed, err := file.ObserveContentMetadata(t.Context(), 0)
+	observed, err := file.ObserveMetadata(t.Context(), storage.MetadataObservationRequest{Purpose: storage.MetadataObservationContentEffect, EffectIndex: 0})
 	if err != nil || !bytes.Equal(observed.Value.Data, []byte{'T', 1}) || calls.Load() != 3 {
 		t.Fatalf("sealed replay observed=%+v err=%v calls=%d", observed, err, calls.Load())
 	}
@@ -166,9 +170,9 @@ func TestHTTPContentMetadataStrictWire(t *testing.T) {
 			t.Fatalf("damaged descriptor accepted %s", damage)
 		}
 	}
-	observation := contentMetadataObservationOf(storage.ContentMetadataObservation{NodeID: 1})
+	observation := metadataObservationOf(storage.MetadataObservation{NodeID: 1})
 	body, _ := json.Marshal(observation)
-	var result contentMetadataObservation
+	var result metadataObservation
 	if err := decodeFileJSON(body, &result); err != nil || result.Value != nil {
 		t.Fatalf("absence wire=%s err=%v", body, err)
 	}

@@ -14,17 +14,20 @@ type contentMetadataProbe struct {
 	storage.File
 	id                             uint64
 	identityErr, checkErr, callErr error
-	observed                       storage.ContentMetadataObservation
+	observed                       storage.MetadataObservation
 	calls                          int
 	index                          uint16
 }
 
 func (p *contentMetadataProbe) ReferenceNodeID() (uint64, error) { return p.id, p.identityErr }
-func (p *contentMetadataProbe) CheckContentMetadata() error      { return p.checkErr }
-func (p *contentMetadataProbe) ObserveContentMetadata(_ context.Context, index uint16) (storage.ContentMetadataObservation, error) {
+func (p *contentMetadataProbe) CheckMetadataAccess() error       { return p.checkErr }
+func (p *contentMetadataProbe) ObserveMetadata(_ context.Context, request storage.MetadataObservationRequest) (storage.MetadataObservation, error) {
 	p.calls++
-	p.index = index
+	p.index = request.EffectIndex
 	return p.observed, p.callErr
+}
+func (p *contentMetadataProbe) SetMetadata(context.Context, string, []byte, []byte) (storage.OpaquePayload, error) {
+	return storage.OpaquePayload{}, syscall.EBADF
 }
 func (p *contentMetadataProbe) Stat(context.Context) (storage.Attr, error) {
 	return storage.Attr{}, syscall.EBADF
@@ -35,17 +38,17 @@ func contentWrapper(native storage.File) storage.File {
 }
 
 func TestContentMetadataObservesExactByteOnlyReferenceThroughCompleteChain(t *testing.T) {
-	want := storage.ContentMetadataObservation{NodeID: 19, Value: &storage.OpaquePayload{Version: []byte{1}, Data: []byte{'M', 0xff, 0}}}
+	want := storage.MetadataObservation{NodeID: 19, Value: &storage.OpaquePayload{Version: []byte{1}, Data: []byte{'M', 0xff, 0}}}
 	probe := &contentMetadataProbe{id: 19, observed: want}
 	wrapper := contentWrapper(contentWrapper(probe))
-	observer := wrapper.(storage.ReferenceContentMetadata)
-	if err := observer.CheckContentMetadata(); err != nil {
+	observer := wrapper.(storage.ReferenceMetadataAccess)
+	if err := observer.CheckMetadataAccess(); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := wrapper.Stat(t.Context()); !errors.Is(err, syscall.EBADF) {
 		t.Fatalf("public metadata access = %v", err)
 	}
-	got, err := observer.ObserveContentMetadata(t.Context(), 3)
+	got, err := observer.ObserveMetadata(t.Context(), storage.MetadataObservationRequest{Purpose: storage.MetadataObservationContentEffect, EffectIndex: 3})
 	if err != nil || !reflect.DeepEqual(got, want) || probe.index != 3 || probe.calls != 1 {
 		t.Fatalf("observation=%+v, %v; calls=%d index=%d", got, err, probe.calls, probe.index)
 	}
@@ -54,12 +57,12 @@ func TestContentMetadataObservesExactByteOnlyReferenceThroughCompleteChain(t *te
 	if probe.observed.Value.Version[0] != 1 || probe.observed.Value.Data[0] != 'M' {
 		t.Fatal("observation aliases authority payload")
 	}
-	probe.observed = storage.ContentMetadataObservation{NodeID: 19}
-	if got, err := observer.ObserveContentMetadata(t.Context(), 3); err != nil || got.Value != nil || got.NodeID != 19 {
+	probe.observed = storage.MetadataObservation{NodeID: 19}
+	if got, err := observer.ObserveMetadata(t.Context(), storage.MetadataObservationRequest{Purpose: storage.MetadataObservationContentEffect, EffectIndex: 3}); err != nil || got.Value != nil || got.NodeID != 19 {
 		t.Fatalf("confirmed absence=%+v, %v", got, err)
 	}
-	probe.observed = storage.ContentMetadataObservation{NodeID: 19, Value: &storage.OpaquePayload{Version: []byte{1}}}
-	if got, err := observer.ObserveContentMetadata(t.Context(), 3); err != nil || got.Value == nil {
+	probe.observed = storage.MetadataObservation{NodeID: 19, Value: &storage.OpaquePayload{Version: []byte{1}}}
+	if got, err := observer.ObserveMetadata(t.Context(), storage.MetadataObservationRequest{Purpose: storage.MetadataObservationContentEffect, EffectIndex: 3}); err != nil || got.Value == nil {
 		t.Fatalf("present empty value became absent: %+v, %v", got, err)
 	}
 }
@@ -68,7 +71,7 @@ func TestContentMetadataRejectsCapabilityIdentityAndCaptureFailures(t *testing.T
 	cause := errors.New("content metadata unavailable")
 	for _, scenario := range []string{"missing capability", "missing identity", "check failure", "identity failure", "zero identity", "wrong identity", "malformed", "capture failure"} {
 		t.Run(scenario, func(t *testing.T) {
-			probe := &contentMetadataProbe{id: 19, observed: storage.ContentMetadataObservation{NodeID: 19, Value: &storage.OpaquePayload{Version: []byte{1}, Data: []byte{1}}}}
+			probe := &contentMetadataProbe{id: 19, observed: storage.MetadataObservation{NodeID: 19, Value: &storage.OpaquePayload{Version: []byte{1}, Data: []byte{1}}}}
 			var native storage.File = probe
 			switch scenario {
 			case "missing capability":
@@ -76,8 +79,8 @@ func TestContentMetadataRejectsCapabilityIdentityAndCaptureFailures(t *testing.T
 			case "missing identity":
 				native = &struct {
 					storage.File
-					storage.ReferenceContentMetadata
-				}{ReferenceContentMetadata: probe}
+					storage.ReferenceMetadataAccess
+				}{ReferenceMetadataAccess: probe}
 			case "check failure":
 				probe.checkErr = cause
 			case "identity failure":
@@ -91,16 +94,16 @@ func TestContentMetadataRejectsCapabilityIdentityAndCaptureFailures(t *testing.T
 			case "capture failure":
 				probe.callErr = cause
 			}
-			observer := contentWrapper(contentWrapper(native)).(storage.ReferenceContentMetadata)
-			got, err := observer.ObserveContentMetadata(t.Context(), 0)
-			if err == nil || !reflect.DeepEqual(got, storage.ContentMetadataObservation{}) {
+			observer := contentWrapper(contentWrapper(native)).(storage.ReferenceMetadataAccess)
+			got, err := observer.ObserveMetadata(t.Context(), storage.MetadataObservationRequest{Purpose: storage.MetadataObservationContentEffect, EffectIndex: 0})
+			if err == nil || !reflect.DeepEqual(got, storage.MetadataObservation{}) {
 				t.Fatalf("invalid observation=%+v, %v", got, err)
 			}
 			preflight := scenario == "missing capability" || scenario == "missing identity" || scenario == "check failure" || scenario == "identity failure" || scenario == "zero identity"
 			if preflight && probe.calls != 0 {
 				t.Fatalf("failed preflight dispatched %d calls", probe.calls)
 			}
-			if preflight && observer.CheckContentMetadata() == nil {
+			if preflight && observer.CheckMetadataAccess() == nil {
 				t.Fatal("whole-chain checker accepted unsupported reference")
 			}
 			if (scenario == "check failure" || scenario == "identity failure" || scenario == "capture failure") && !errors.Is(err, cause) {

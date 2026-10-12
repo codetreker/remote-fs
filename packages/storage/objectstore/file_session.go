@@ -94,7 +94,7 @@ var _ storage.FileStorage = (*Storage)(nil)
 var _ storage.FileSession = (*fileSession)(nil)
 
 func (s *fileSession) CheckAllocationReporting() error {
-	reporter, ok := s.storage.meta.(storage.AllocationReporting)
+	reporter, ok := s.native.(storage.AllocationReporting)
 	if !ok {
 		return syscall.EOPNOTSUPP
 	}
@@ -558,3 +558,36 @@ func (s *Storage) CloseFileSessions() error {
 	}
 	return nil
 }
+
+func (fs *fileSession) AllocationUnitBytes(ctx context.Context) (uint64, error) {
+	if err := fs.CheckAllocationReporting(); err != nil {
+		return 0, err
+	}
+	ctx, cancel := fs.operationContext(ctx)
+	defer cancel()
+	ctx = metastore.WithFilePublicationGuard(ctx, fs.publicationAllowed)
+	done, err := fs.begin(ctx, true)
+	if err != nil {
+		return 0, err
+	}
+	defer done()
+	if _, err := fs.FileSessionIdentity(ctx); err != nil {
+		return 0, err
+	}
+	unit, err := fs.native.(storage.AllocationReporting).AllocationUnitBytes(ctx)
+	if err != nil {
+		return 0, err
+	}
+	if unit == 0 {
+		return 0, syscall.EIO
+	}
+	if err := fs.publicationAllowed(); err != nil {
+		return 0, err
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	return unit, nil
+}
+
+var _ storage.AllocationReporting = (*fileSession)(nil)

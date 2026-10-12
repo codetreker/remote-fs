@@ -1866,12 +1866,14 @@ func (r *decoratedNodeReference) CheckReferenceState() error {
 	return r.NodeReference.CheckReferenceState()
 }
 
-func (r *decoratedNodeReference) State(ctx context.Context) (storage.ReferenceState, error) {
-	state, err := r.NodeReference.State(ctx)
+func (r *decoratedNodeReference) State(ctx context.Context, projection storage.StateProjection) (storage.ReferenceState, error) {
+	state, err := r.NodeReference.State(ctx, projection)
 	if err != nil {
 		return state, err
 	}
-	state.Attr = r.hooks.describe(r.path, state.Attr)
+	if projection == storage.StateFull {
+		state.Attr = r.hooks.describe(r.path, state.Attr)
+	}
 	return state, nil
 }
 
@@ -1891,6 +1893,10 @@ func (f *decoratedFile) Scope(ctx context.Context) (storage.UseScope, error) {
 
 func (f *decoratedFile) CheckMetadataAccess() error {
 	return f.File.(storage.ReferenceMetadataAccess).CheckMetadataAccess()
+}
+
+func (f *decoratedFile) ObserveMetadata(ctx context.Context, request storage.MetadataObservationRequest) (storage.MetadataObservation, error) {
+	return f.File.(storage.ReferenceMetadataAccess).ObserveMetadata(ctx, request)
 }
 
 func (f *decoratedFile) SetMetadata(ctx context.Context, namespace string, version, data []byte) (storage.OpaquePayload, error) {

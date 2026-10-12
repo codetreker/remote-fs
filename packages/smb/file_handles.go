@@ -32,6 +32,7 @@ type fileHandle struct {
 	ownerSession    *session
 	identity        storage.FileSessionIdentityResult
 	nodeID          uint64
+	nodeKind        storage.NodeKind
 	diagnostic      atomic.Pointer[HandleOwnerStatus]
 	capacity        *Server
 	use             storage.UseClaim
@@ -61,7 +62,7 @@ type fileHandle struct {
 	ioIdle          chan struct{}
 	ioFenced        bool
 	contentEffects  []storage.ContentMetadataEffect
-	pendingWrite    *writeOwner
+	pendingWrite    *mutationOwner
 	pendingFlush    *flushOwner
 }
 
@@ -225,11 +226,18 @@ func (h *fileHandle) bindReference(ctx context.Context, t *tree, attr storage.At
 	if t.fileStopping || h.ownerSession.retired || a.stopping || a.closed || !time.Now().Before(a.deadline) || t.handles[h.id] != h {
 		return syscall.ESTALE
 	}
-	h.nodeID, h.use = attr.ID, use
+	h.nodeID, h.nodeKind, h.use = attr.ID, attr.Kind, use
 	h.diagnostic.Store(&HandleOwnerStatus{FileID: h.id, TreeID: h.treeID, SessionID: h.sessionID, NodeID: h.nodeID, OpenAction: h.action})
 	h.published = true
 	h.state.Store(uint32(handleLive))
 	return nil
+}
+
+func (h *fileHandle) reference() any {
+	if h.node != nil {
+		return h.node
+	}
+	return h.file
 }
 
 func (h *fileHandle) closeActions() (storage.ReferenceCloseActions, error) {

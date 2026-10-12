@@ -385,7 +385,8 @@ func (c FileMutation) Check() error {
 		return syscall.EFBIG
 	}
 	if len(c.ContentEffects) != 0 {
-		if (c.Kind != MutateWriteAt && c.Kind != MutateAppend) || len(c.Data) == 0 || !c.Attr.Empty() || len(c.Metadata) != 0 {
+		if (c.Kind != MutateWriteAt && c.Kind != MutateAppend && c.Kind != MutateTruncate) ||
+			(c.Kind != MutateTruncate && len(c.Data) == 0) || !c.Attr.Empty() || len(c.Metadata) != 0 {
 			return syscall.EINVAL
 		}
 		seen := make(map[uint16]struct{}, len(c.ContentEffects))

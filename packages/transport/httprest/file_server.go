@@ -880,7 +880,11 @@ func (h *Handler) fileCall(ctx context.Context, req fileRequest, digest [32]byte
 		return h.backendIdentity(ctx)
 	}
 	if req.Op == storage.OpFileSessionOpen {
-		return registry.enroll(ctx, req.Options)
+		response, err := registry.enroll(ctx, req.Options)
+		if err != nil {
+			return response, err
+		}
+		return boundedFileSessionResponse(response, min(h.maxBodyBytes, MaxFileControlBytes))
 	}
 
 	registry.mu.Lock()
@@ -1199,11 +1203,13 @@ func (h *Handler) fileCall(ctx context.Context, req fileRequest, digest [32]byte
 			}
 			return fileResponse{}, syscall.EAGAIN
 		}
-		if actionEpoch != epoch && !nativeExplicitClose {
+		// Semantic identities belong to the native action journal. Its admission
+		// clock and exact replay checks are independent of the HTTP action window.
+		if actionEpoch != epoch && !nativeExplicitClose && semanticFileAction(req) == "" {
 			session.mu.Unlock()
 			// The immediately preceding window still has every admitted result.
 			// Absence here proves this action never ran; older windows cannot prove it.
-			if actionEpoch+1 == epoch && semanticFileAction(req) == "" {
+			if actionEpoch+1 == epoch {
 				return fileResponse{Epoch: epoch, Retry: true}, nil
 			}
 			return fileResponse{}, syscall.ESTALE
@@ -1702,7 +1708,9 @@ func (h *Handler) performFile(ctx context.Context, s *servedFileSession, req fil
 				return response, syscall.EBADF
 			}
 			err = data.Sync(ctx)
-		case storage.OpFileObserveName, storage.OpFileObserveContentMetadata, storage.OpFileState, storage.OpFileScope, storage.OpFileSetMetadata, storage.OpFileSetPendingUnlink, storage.OpFileClearPendingUnlink, storage.OpFileMutate:
+		case storage.OpFileObserveMetadata:
+			response, err = performMetadataObservation(ctx, file.native, req, file.contentEffects)
+		case storage.OpFileObserveName, storage.OpFileState, storage.OpFileScope, storage.OpFileSetMetadata, storage.OpFileSetPendingUnlink, storage.OpFileClearPendingUnlink, storage.OpFileMutate:
 			response, err = performReferenceCapability(ctx, file.native, req)
 		case storage.OpFileClose:
 			if !req.CloseImplicit && !s.recoverable {
@@ -1850,6 +1858,17 @@ func (r *fileRegistry) enroll(ctx context.Context, options storage.FileSessionOp
 	err = errors.Join(err, capabilityErr)
 	identity, identityErr := sessionIdentityOf(ctx, native, capabilities, status)
 	err = errors.Join(err, identityErr)
+	if capabilities.Allocation {
+		unit, failure := native.(storage.AllocationReporting).AllocationUnitBytes(ctx)
+		if failure == nil && unit == 0 {
+			failure = syscall.EIO
+		}
+		if failure != nil {
+			capabilities.AllocationUnitError = &ErrorResponse{Errno: storage.ErrnoNameOf(failure), Message: boundedRetainedFileDetail(failure.Error()), CapabilityCode: capabilityErrorCode(failure)}
+		} else {
+			capabilities.AllocationUnitBytes = &unit
+		}
+	}
 	session := &servedFileSession{authority: status.Epoch, revision: status.Revision, native: native, files: make(map[string]*servedFile), actions: make(map[storage.LockRequestID]*servedFileAction), options: options, started: started, expires: started.Add(status.Remaining), sessionCloseReserve: 2, cleanupReserved: 2, recoverable: capabilities.CloseRecovery, stableIdentity: capabilities.StableIdentity}
 	if inline, ok := native.(storage.InlineCloseSettlement); ok {
 		session.inlineSettlement = inline.CheckInlineCloseSettlement() == nil
@@ -1868,7 +1887,7 @@ func (r *fileRegistry) enroll(ctx context.Context, options storage.FileSessionOp
 	}
 	status.Remaining = maxDuration(time.Until(session.expires))
 	status.HistoryRemaining = maxDuration(status.HistoryRemaining - time.Since(started))
-	return fileResponse{Session: id, Epoch: session.epoch(time.Now()), Status: &status, Capabilities: capabilities, SessionIdentity: identity}, nil
+	return fileResponse{Session: id, Epoch: session.epoch(time.Now()), Status: &status, Capabilities: capabilities, SessionIdentity: identity, Data: []byte{}}, nil
 }
 
 func checkFileSessionOptions(options, maximum storage.FileSessionOptions) error {

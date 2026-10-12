@@ -165,9 +165,6 @@ func (c *connection) authorizeOpen(ctx context.Context, t *tree, operation stora
 		}
 	}
 	if len(intent.contentEffects) != 0 {
-		if err := authorize(storage.OpFileObserveContentMetadata, storage.OpenAccess{}, intent.contentEffects); err != nil {
-			return err
-		}
 		if err := authorize(storage.OpFileSetMetadata, storage.OpenAccess{}, intent.contentEffects); err != nil {
 			return err
 		}
@@ -376,11 +373,11 @@ func (c *connection) createFile(ctx context.Context, s *session, t *tree, reques
 			return nil, c.finishFailedOpen(ctx, t, handle, err), wire.FileID{}
 		}
 		if len(intent.contentEffects) != 0 {
-			content, ok := handle.file.(storage.ReferenceContentMetadata)
+			content, ok := handle.file.(storage.ReferenceMetadataAccess)
 			if !ok {
 				return nil, c.finishFailedOpen(ctx, t, handle, syscall.EOPNOTSUPP), wire.FileID{}
 			}
-			if err := content.CheckContentMetadata(); err != nil {
+			if err := content.CheckMetadataAccess(); err != nil {
 				return nil, c.finishFailedOpen(ctx, t, handle, err), wire.FileID{}
 			}
 		}

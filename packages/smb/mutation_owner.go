@@ -7,28 +7,28 @@ import (
 	"errors"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/codetreker/remote-fs/packages/authz"
 	"github.com/codetreker/remote-fs/packages/storage"
 )
 
-const maxWriteConditionRetries = 2
+const maxMutationConditionRetries = 2
 
-type writeOwner struct {
+type mutationOwner struct {
 	mu               sync.Mutex
 	server           *Server
 	volume           string
 	id               WriteOwnerID
 	handle           *fileHandle
-	file             storage.File
+	nodeKind         storage.NodeKind
 	actions          storage.FileActions
 	mutation         storage.ConditionalFileMutation
 	command          storage.FileMutation
 	effects          []storage.ContentMetadataEffect
 	sequence         uint64
+	resultByteLimit  int64
 	authorize        func(context.Context) error
-	reobserve        func(context.Context) (map[string][]byte, error)
-	epoch            func() uint64
 	result           storage.Attr
 	captured         storage.Attr
 	firstErr         error
@@ -40,17 +40,33 @@ type writeOwner struct {
 	responseFinal    bool
 }
 
-func (s *Server) reserveWriteOwner(t *tree, h *fileHandle, sequence uint64, command storage.FileMutation, effects []storage.ContentMetadataEffect) (*writeOwner, error) {
-	if h == nil || h.file == nil || t == nil || t.authority == nil || command.Action.Check() != nil || (command.Kind != storage.MutateWriteAt && command.Kind != storage.MutateAppend) {
+func (s *Server) reserveMutationOwner(t *tree, h *fileHandle, sequence uint64, command storage.FileMutation, effects []storage.ContentMetadataEffect) (*mutationOwner, error) {
+	if h == nil {
 		return nil, syscall.EINVAL
 	}
-	if !command.Attr.Empty() || len(command.Metadata) != 0 || len(command.Uses) != 0 || command.ExpectedSize != nil {
+	kind := h.nodeKind
+	if h == nil || h.reference() == nil || t == nil || t.authority == nil || t.export == nil ||
+		(kind != storage.NodeRegular && kind != storage.NodeDirectory) || kind != storage.NodeRegular && command.Kind != storage.MutateAttributes {
+		return nil, syscall.EINVAL
+	}
+	if len(command.Uses) != 0 || command.Kind != storage.MutateAttributes && (!command.Attr.Empty() || len(command.Metadata) != 0) {
 		return nil, syscall.EINVAL
 	}
 	if err := storage.CheckContentMutation(command, effects); err != nil {
 		return nil, err
 	}
-	mutation, ok := h.file.(storage.ConditionalFileMutation)
+	if command.Kind == storage.MutateAttributes {
+		if len(command.ExpectedMetadata) != 0 || len(command.Metadata) > 1 {
+			return nil, syscall.EINVAL
+		}
+		if len(command.Metadata) != 0 {
+			if _, present := command.Metadata[windowsMetadataKey]; !present {
+				return nil, syscall.EINVAL
+			}
+		}
+	}
+
+	mutation, ok := h.reference().(storage.ConditionalFileMutation)
 	if !ok {
 		return nil, syscall.EOPNOTSUPP
 	}
@@ -65,9 +81,22 @@ func (s *Server) reserveWriteOwner(t *tree, h *fileHandle, sequence uint64, comm
 		return nil, err
 	}
 	charged := len(command.Data)
-	for name, token := range command.ExpectedMetadata {
-		charged += len(name) + max(len(token), storage.MaxObservationTokenBytes)
+
+	for name := range command.ExpectedMetadata {
+		charged += len(name) + storage.MaxObservationTokenBytes
 	}
+	for name, value := range command.Metadata {
+		charged += len(name) + len(value.Data) + storage.MaxObservationTokenBytes
+	}
+	for _, instant := range []*time.Time{command.Attr.BirthTime, command.Attr.AccessTime, command.Attr.ModTime} {
+		if instant != nil {
+			charged += 24
+		}
+	}
+	if command.ExpectedSize != nil {
+		charged += 8
+	}
+	charged += 2 * len(command.ContentEffects)
 	for _, effect := range effects {
 		charged += len(effect.Namespace) + len(effect.PresentPrefix) + len(effect.AbsentPayload) + len(effect.ClearMask) + len(effect.SetMask)
 	}
@@ -75,7 +104,8 @@ func (s *Server) reserveWriteOwner(t *tree, h *fileHandle, sequence uint64, comm
 	if err != nil {
 		return nil, err
 	}
-	o := &writeOwner{server: s, volume: t.export.share.Volume, id: id, handle: h, file: h.file, actions: actions, mutation: mutation, command: cloneWriteCommand(command), effects: storage.CloneContentMetadataEffects(effects), sequence: sequence}
+	o := &mutationOwner{server: s, volume: t.export.share.Volume, id: id, handle: h, nodeKind: kind, actions: actions, mutation: mutation, command: cloneMutationCommand(command), effects: storage.CloneContentMetadataEffects(effects), sequence: sequence}
+
 	s.writes.update(id, func(r *writeRecord) {
 		r.fact.Action = command.Action
 		r.fact.Operation = storage.OpFileMutate
@@ -85,11 +115,21 @@ func (s *Server) reserveWriteOwner(t *tree, h *fileHandle, sequence uint64, comm
 	return o, nil
 }
 
-func cloneWriteCommand(command storage.FileMutation) storage.FileMutation {
+func cloneMutationCommand(command storage.FileMutation) storage.FileMutation {
 	command.Data = bytes.Clone(command.Data)
 	command.ContentEffects = append([]uint16(nil), command.ContentEffects...)
 	command.ExpectedMetadata = storage.CloneInitialMetadata(command.ExpectedMetadata)
 	command.Metadata = storage.CloneMetadata(command.Metadata)
+	cloneTime := func(value *time.Time) *time.Time {
+		if value == nil {
+			return nil
+		}
+		copy := *value
+		return &copy
+	}
+	command.Attr.BirthTime = cloneTime(command.Attr.BirthTime)
+	command.Attr.AccessTime = cloneTime(command.Attr.AccessTime)
+	command.Attr.ModTime = cloneTime(command.Attr.ModTime)
 	command.Uses = append([]storage.TargetUse(nil), command.Uses...)
 	if command.ExpectedSize != nil {
 		size := *command.ExpectedSize
@@ -98,10 +138,14 @@ func cloneWriteCommand(command storage.FileMutation) storage.FileMutation {
 	return command
 }
 
-func (o *writeOwner) execute(ctx context.Context, authorize func(context.Context) error, reobserve func(context.Context) (map[string][]byte, error), epoch func() uint64) (storage.Attr, error) {
+func (o *mutationOwner) executeMutation(ctx context.Context, authorize func(context.Context) error, reobserve func(context.Context) (windowsMetadataCondition, error), epoch func() uint64) (storage.Attr, error) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	o.authorize, o.reobserve, o.epoch = authorize, reobserve, epoch
+	o.authorize = authorize
+	if limit, bounded := storage.AttrResultByteLimit(ctx); bounded {
+		o.resultByteLimit = limit
+	}
+	ctx = o.resultContext(ctx)
 	if authorize == nil {
 		return o.failLocked(syscall.EINVAL)
 	}
@@ -113,7 +157,7 @@ func (o *writeOwner) execute(ctx context.Context, authorize func(context.Context
 			return o.failLocked(err)
 		}
 		o.dispatched = true
-		attr, err := o.mutation.MutateFile(ctx, cloneWriteCommand(o.command))
+		attr, err := o.mutation.MutateFile(ctx, cloneMutationCommand(o.command))
 		o.captureResultLocked(attr)
 		if err == nil {
 			if err = o.acceptResultLocked(attr); err == nil {
@@ -126,23 +170,24 @@ func (o *writeOwner) execute(ctx context.Context, authorize func(context.Context
 			return o.failLocked(errors.Join(err, queryErr))
 		}
 		if receipt.Outcome == storage.FileActionNotExecuted && receipt.Operation == storage.OpFileMutate {
-			if errors.Is(err, storage.ErrConditionConflict) && o.conditionRetries < maxWriteConditionRetries && reobserve != nil && epoch != nil {
-				conditions, observeErr := reobserve(ctx)
+			if errors.Is(err, storage.ErrConditionConflict) && o.conditionRetries < maxMutationConditionRetries && reobserve != nil && epoch != nil {
+				condition, observeErr := reobserve(ctx)
 				if observeErr != nil {
 					o.rejectLocked(observeErr)
 					return o.failLocked(observeErr)
 				}
-				if !o.validRetryConditionsLocked(conditions) {
-					o.rejectLocked(syscall.EIO)
-					return o.failLocked(syscall.EIO)
+				retryCommand, retryErr := applyWindowsMetadataCondition(cloneMutationCommand(o.command), condition, o.handle.nodeID == o.handle.identity.Backend.RootNodeID)
+				if retryErr != nil {
+					o.rejectLocked(retryErr)
+					return o.failLocked(retryErr)
 				}
 				newAction, mintErr := storage.NewFileActionID(epoch())
 				if mintErr != nil {
 					o.rejectLocked(mintErr)
 					return o.failLocked(mintErr)
 				}
+				o.command = retryCommand
 				o.command.Action = newAction
-				o.command.ExpectedMetadata = storage.CloneInitialMetadata(conditions)
 				o.conditionRetries++
 				o.dispatched = false
 				o.server.writes.update(o.id, func(r *writeRecord) { r.fact.Action = newAction })
@@ -162,7 +207,7 @@ func (o *writeOwner) execute(ctx context.Context, authorize func(context.Context
 	}
 }
 
-func (o *writeOwner) queryLocked(ctx context.Context) (storage.FileActionReceipt, error) {
+func (o *mutationOwner) queryLocked(ctx context.Context) (storage.FileActionReceipt, error) {
 	if o.authorize == nil {
 		return storage.FileActionReceipt{}, syscall.EIO
 	}
@@ -188,27 +233,46 @@ func (o *writeOwner) queryLocked(ctx context.Context) (storage.FileActionReceipt
 	return receipt, nil
 }
 
-func (o *writeOwner) validRetryConditionsLocked(conditions map[string][]byte) bool {
-	if len(conditions) != len(o.command.ExpectedMetadata) {
-		return false
+func (o *mutationOwner) resultContext(ctx context.Context) context.Context {
+	if o.resultByteLimit == 0 {
+		return ctx
 	}
-	for name := range o.command.ExpectedMetadata {
-		token, present := conditions[name]
-		if !present || len(token) > storage.MaxObservationTokenBytes {
-			return false
+	return storage.WithBoundedAttrResult(ctx, o.resultByteLimit, func(attr storage.Attr, metadataBytes int64) error {
+		if err := o.checkResultIdentity(attr); err != nil {
+			return err
 		}
-	}
-	return true
+		if o.command.Kind != storage.MutateAttributes {
+			if err := checkCreateAllocation(attr); err != nil {
+				return err
+			}
+			for _, instant := range []*time.Time{attr.BirthTime, &attr.AccessTime, &attr.ModTime, attr.ChangeTime} {
+				if instant != nil {
+					if _, err := toFiletime(*instant); err != nil {
+						return err
+					}
+				}
+			}
+		}
+		retained, err := storage.MetadataRetentionBytes(metadataBytes)
+		if err != nil {
+			return err
+		}
+		if retained+512 > o.resultByteLimit {
+			return syscall.EFBIG
+		}
+		return nil
+	})
 }
 
-func (o *writeOwner) replayLocked(ctx context.Context) (storage.Attr, error) {
+func (o *mutationOwner) replayLocked(ctx context.Context) (storage.Attr, error) {
+	ctx = o.resultContext(ctx)
 	if o.authorize == nil {
 		return storage.Attr{}, syscall.EIO
 	}
 	if err := o.authorize(ctx); err != nil {
 		return storage.Attr{}, err
 	}
-	attr, err := o.mutation.MutateFile(ctx, cloneWriteCommand(o.command))
+	attr, err := o.mutation.MutateFile(ctx, cloneMutationCommand(o.command))
 	o.captureResultLocked(attr)
 	if err != nil {
 		o.lastErr = err
@@ -225,19 +289,54 @@ func (o *writeOwner) replayLocked(ctx context.Context) (storage.Attr, error) {
 	return result, nil
 }
 
-func (o *writeOwner) acceptResultLocked(attr storage.Attr) error {
-	if attr.ID != o.handle.nodeID || attr.ID == 0 || attr.Kind != storage.NodeRegular || attr.Size < 0 || attr.CheckAllocation() != nil || !attr.AllocationKnown {
+func (o *mutationOwner) checkResultIdentity(attr storage.Attr) error {
+	if attr.ID == 0 || attr.ID != o.handle.nodeID || attr.Kind != o.nodeKind || attr.CheckAllocation() != nil ||
+		attr.Kind == storage.NodeRegular && attr.Size < 0 {
 		return syscall.EIO
 	}
-	if len(o.command.Data) != 0 {
-		if o.command.Kind == storage.MutateWriteAt && attr.Size < o.command.Offset+int64(len(o.command.Data)) || o.command.Kind == storage.MutateAppend && attr.Size < int64(len(o.command.Data)) {
+	return nil
+}
+
+func (o *mutationOwner) acceptResultLocked(attr storage.Attr) error {
+	if o.checkResultIdentity(attr) != nil {
+		return syscall.EIO
+	}
+	switch o.command.Kind {
+	case storage.MutateWriteAt, storage.MutateAppend, storage.MutateTruncate:
+		if !attr.AllocationKnown {
 			return syscall.EIO
 		}
-		metadata, err := decodeWindowsMetadata(attr.Metadata)
-		if err != nil || metadata.Attributes&dosArchive == 0 {
-			return errors.Join(err, syscall.EIO)
+		if o.command.Kind == storage.MutateTruncate && attr.Size != o.command.Size ||
+			o.command.Kind == storage.MutateWriteAt && len(o.command.Data) != 0 && attr.Size < o.command.Offset+int64(len(o.command.Data)) ||
+			o.command.Kind == storage.MutateAppend && attr.Size < int64(len(o.command.Data)) {
+			return syscall.EIO
 		}
+		if len(o.command.ContentEffects) != 0 {
+			metadata, err := decodeWindowsMetadata(attr.Metadata)
+			if err != nil || metadata.Attributes&dosArchive == 0 {
+				return errors.Join(err, syscall.EIO)
+			}
+		}
+	case storage.MutateAttributes:
+		if storage.CheckMetadata(attr.Metadata) != nil {
+			return syscall.EIO
+		}
+		for name, update := range o.command.Metadata {
+			value, present := attr.Metadata[name]
+			if !present || !bytes.Equal(value.Data, update.Data) {
+				return syscall.EIO
+			}
+		}
+		change := o.command.Attr
+		if change.BirthTime != nil && (attr.BirthTime == nil || !attr.BirthTime.Equal(*change.BirthTime)) ||
+			change.AccessTime != nil && !attr.AccessTime.Equal(*change.AccessTime) ||
+			change.ModTime != nil && !attr.ModTime.Equal(*change.ModTime) {
+			return syscall.EIO
+		}
+	default:
+		return syscall.EIO
 	}
+
 	o.result = attr.Clone()
 	o.settled = true
 	o.lastErr = nil
@@ -250,15 +349,15 @@ func (o *writeOwner) acceptResultLocked(attr storage.Attr) error {
 	return nil
 }
 
-func (o *writeOwner) captureResultLocked(attr storage.Attr) {
-	if attr.ID == 0 || attr.ID != o.handle.nodeID || attr.Kind != storage.NodeRegular || attr.Size < 0 || attr.CheckAllocation() != nil {
+func (o *mutationOwner) captureResultLocked(attr storage.Attr) {
+	if o.checkResultIdentity(attr) != nil {
 		return
 	}
 	attr.Metadata = nil
 	o.captured = attr.Clone()
 }
 
-func (o *writeOwner) rejectLocked(err error) {
+func (o *mutationOwner) rejectLocked(err error) {
 	o.settled = true
 	o.lastErr = err
 	o.server.writes.update(o.id, func(r *writeRecord) {
@@ -269,15 +368,20 @@ func (o *writeOwner) rejectLocked(err error) {
 	o.releasePayloadLocked()
 }
 
-func (o *writeOwner) releasePayloadLocked() {
+func (o *mutationOwner) releasePayloadLocked() {
 	o.command.Data = nil
 	o.command.ExpectedMetadata = nil
 	o.command.ContentEffects = nil
+	o.command.Attr = storage.AttrChange{}
+	o.command.Metadata = nil
+	o.command.ExpectedSize = nil
+	o.command.Uses = nil
 	o.effects = nil
+	o.authorize = nil
 	o.server.writes.releasePayload(o.id)
 }
 
-func (o *writeOwner) failLocked(err error) (storage.Attr, error) {
+func (o *mutationOwner) failLocked(err error) (storage.Attr, error) {
 	if err == nil {
 		err = syscall.EIO
 	}
@@ -297,7 +401,7 @@ func (o *writeOwner) failLocked(err error) (storage.Attr, error) {
 	return storage.Attr{}, err
 }
 
-func (o *writeOwner) reconcile(ctx context.Context) (storage.Attr, error) {
+func (o *mutationOwner) reconcile(ctx context.Context) (storage.Attr, error) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	if o.settled {
@@ -331,13 +435,13 @@ func (o *writeOwner) reconcile(ctx context.Context) (storage.Attr, error) {
 	return attr, nil
 }
 
-func (o *writeOwner) pending() bool {
+func (o *mutationOwner) pending() bool {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	return !o.settled && !o.retired
 }
 
-func (o *writeOwner) retire(released, settled bool) error {
+func (o *mutationOwner) retire(released, settled bool) error {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	if !released || !settled {
@@ -365,7 +469,7 @@ func (o *writeOwner) retire(released, settled bool) error {
 	return o.firstErr
 }
 
-func (o *writeOwner) recordResponse(disposition ResponseDisposition) {
+func (o *mutationOwner) recordResponse(disposition ResponseDisposition) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	if disposition != ResponseSent && disposition != ResponseSendFailed && disposition != ResponseNotSent {

@@ -3,6 +3,7 @@ package httprest
 import (
 	"github.com/codetreker/remote-fs/packages/storage"
 	"math"
+	"reflect"
 	"syscall"
 	"unicode/utf8"
 )
@@ -11,7 +12,9 @@ func validateCapabilityArguments(req fileRequest) error {
 	switch req.Op {
 	case storage.OpFileScope:
 		return nil
-	case storage.OpFileState, storage.OpFileCloseOwnerStatus:
+	case storage.OpFileState:
+		return req.StateProjection.Check()
+	case storage.OpFileCloseOwnerStatus:
 		return nil
 	case storage.OpFileQueryAction:
 		return req.FileAction.Check()
@@ -72,8 +75,11 @@ func validateCapabilityArguments(req fileRequest) error {
 			return err
 		}
 		return req.DirectoryMetadata.storage().Check()
-	case storage.OpFileObserveContentMetadata:
-		return nil
+	case storage.OpFileObserveMetadata:
+		if req.MetadataObservation == nil {
+			return syscall.EINVAL
+		}
+		return req.MetadataObservation.storage().Check()
 	case storage.OpFileObserveName:
 		return req.Guards.storage().Check()
 	case storage.OpFileMutateName:
@@ -142,6 +148,39 @@ func validateCapabilityArguments(req fileRequest) error {
 			return syscall.EINVAL
 		}
 		return req.Mutation.storage().Check()
+	}
+	return nil
+}
+
+func validateAllocationUnitCapability(caps *fileCapabilities, session bool) error {
+	if !session || !caps.Allocation {
+		if caps.AllocationUnitBytes != nil || caps.AllocationUnitError != nil {
+			return syscall.EIO
+		}
+		return nil
+	}
+	if (caps.AllocationUnitBytes == nil) == (caps.AllocationUnitError == nil) {
+		return syscall.EIO
+	}
+	if caps.AllocationUnitBytes != nil {
+		if *caps.AllocationUnitBytes == 0 {
+			return syscall.EIO
+		}
+		return nil
+	}
+	failure := caps.AllocationUnitError
+	errno, known := storage.ErrnoByName(failure.Errno)
+	if !known || len(failure.Message) > 4096 || !utf8.ValidString(failure.Message) {
+		return syscall.EIO
+	}
+	if failure.CapabilityCode != "" {
+		capability, known := capabilityErrors[failure.CapabilityCode]
+		if !known || storage.ErrnoOf(capability) != errno {
+			return syscall.EIO
+		}
+	}
+	if !reflect.DeepEqual(*failure, ErrorResponse{Errno: failure.Errno, Message: failure.Message, CapabilityCode: failure.CapabilityCode}) {
+		return syscall.EIO
 	}
 	return nil
 }

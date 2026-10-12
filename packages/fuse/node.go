@@ -601,7 +601,7 @@ func (n *node) Readlink(ctx context.Context) ([]byte, syscall.Errno) {
 	if err := result.Reference.CheckReferenceState(); err != nil {
 		return nil, errnoOf(n.volume.closeUnreturnedReference(ctx, result.Reference, err, false))
 	}
-	observed, err := result.Reference.State(ctx)
+	observed, err := result.Reference.State(ctx, storage.StateFull)
 	if err == nil {
 		err = n.checkAttr(observed.Attr)
 	}

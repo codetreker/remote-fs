@@ -355,7 +355,7 @@ func TestNodeReferenceDelegatesMetadataMutationPendingDeleteAndLifecycle(t *test
 	if err != nil || read.ID != int64(opened.State.Attr().ID) {
 		t.Fatalf("reference node = %+v, %v", read, err)
 	}
-	readState, err := ref.State(t.Context())
+	readState, err := ref.State(t.Context(), storage.StateFull)
 	if err != nil || readState.PendingUnlink {
 		t.Fatalf("reference state after clear = %+v, %v", readState, err)
 	}

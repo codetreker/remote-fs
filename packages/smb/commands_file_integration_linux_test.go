@@ -900,6 +900,19 @@ func nonSMBMatrixOpen(t *testing.T, raw storage.FileSession, root, nodeID uint64
 	}, nil
 }
 
+// Command-only fixtures have no renewal worker. Refresh the native admission
+// epoch before each new action; a long lease does not extend action history.
+func renewSMBCommandFixture(t *testing.T, fixture realSMBFixture) {
+	t.Helper()
+	state, err := fixture.raw.Renew(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = fixture.tree.authority.acceptStatus(state); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestCreateShareMatrixAcrossTwoSMBSessionsAndNonSMBDirectAndHTTP(t *testing.T) {
 	classes := []struct {
 		name             string
@@ -936,6 +949,7 @@ func TestCreateShareMatrixAcrossTwoSMBSessionsAndNonSMBDirectAndHTTP(t *testing.
 						label := fmt.Sprintf("%s/share%d/%s", incumbent.name, share, applicant.name)
 						request := createRequestForTest("matrix", 1, incumbent.access)
 						binary.LittleEndian.PutUint32(request.Body[32:], share)
+						renewSMBCommandFixture(t, first)
 						_, status, firstID := first.connection.createFile(t.Context(), first.session, first.tree, request)
 						if status != statusOK {
 							t.Fatalf("%s incumbent status=%#x", label, status)
@@ -944,6 +958,7 @@ func TestCreateShareMatrixAcrossTwoSMBSessionsAndNonSMBDirectAndHTTP(t *testing.
 						if share&applicant.shareBit == 0 {
 							expected = statusSharingViolation
 						}
+						renewSMBCommandFixture(t, second)
 						_, status, secondID := second.connection.createFile(t.Context(), second.session, second.tree, createRequestForTest("matrix", 1, applicant.access))
 						if status != expected {
 							t.Fatalf("%s secondSMB status=%#x want=%#x", label, status, expected)
@@ -964,6 +979,7 @@ func TestCreateShareMatrixAcrossTwoSMBSessionsAndNonSMBDirectAndHTTP(t *testing.
 							t.Fatalf("%s external incumbent err=%v", label, err)
 						}
 						for _, endpoint := range []realSMBFixture{first, second} {
+							renewSMBCommandFixture(t, endpoint)
 							_, status, id := endpoint.connection.createFile(t.Context(), endpoint.session, endpoint.tree, createRequestForTest("matrix", 1, applicant.access))
 							if status != expected {
 								t.Fatalf("%s reverseSMB session%d status=%#x want=%#x", label, endpoint.session.id, status, expected)

@@ -15,11 +15,11 @@ func TestWriteFailureAcknowledgmentWaitsForFinalResponseAndIsAtomic(t *testing.T
 	session.query = func(id storage.FileActionID) (storage.FileActionReceipt, error) {
 		return storage.FileActionReceipt{Action: id, Outcome: storage.FileActionUnknown}, nil
 	}
-	owner, err := server.reserveWriteOwner(tree, h, 1, command, effects)
+	owner, err := server.reserveMutationOwner(tree, h, 1, command, effects)
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, _ = owner.execute(t.Context(), func(context.Context) error { return nil }, nil, nil)
+	_, _ = owner.executeMutation(t.Context(), func(context.Context) error { return nil }, nil, nil)
 	_ = owner.retire(true, true)
 	if err := server.AcknowledgeWriteFailures([]WriteOwnerID{owner.id}); err == nil {
 		t.Fatal("ack raced response")
@@ -53,7 +53,7 @@ func TestWriteOwnerReservationBoundsPayloadAndDiagnosticsBeforeDispatch(t *testi
 		return storage.Attr{}, nil
 	}
 	server.config.Limits.MaxRetainedWriteBytes = 1
-	if _, err := server.reserveWriteOwner(tree, h, 1, command, effects); !errors.Is(err, syscall.ENOMEM) {
+	if _, err := server.reserveMutationOwner(tree, h, 1, command, effects); !errors.Is(err, syscall.ENOMEM) {
 		t.Fatalf("byte bound: %v", err)
 	}
 	if server.Status().WriteOwners != 0 {
@@ -61,7 +61,7 @@ func TestWriteOwnerReservationBoundsPayloadAndDiagnosticsBeforeDispatch(t *testi
 	}
 	server.config.Limits.MaxRetainedWriteBytes = 1 << 20
 	server.config.Limits.MaxWriteOwners = 1
-	if _, err := server.reserveWriteOwner(tree, h, 1, command, effects); err != nil {
+	if _, err := server.reserveMutationOwner(tree, h, 1, command, effects); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := server.reserveFlushOwner(tree, h, 2); !errors.Is(err, syscall.ENOMEM) {

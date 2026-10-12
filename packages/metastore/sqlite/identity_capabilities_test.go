@@ -321,7 +321,7 @@ func TestNodeReferenceRetainsSymlinkTargetAfterUnlink(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	state, err := ref.file.State(t.Context())
+	state, err := ref.file.State(t.Context(), storage.StateFull)
 	if err != nil || !state.State.Detached || !bytes.Equal(state.LinkTarget, []byte("target")) {
 		t.Fatalf("detached symlink = %+v, %v", state, err)
 	}

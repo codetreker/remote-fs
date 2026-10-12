@@ -62,15 +62,16 @@ func (s *facetSession) check(name string) error {
 	return nil
 }
 
-func (s *facetSession) CheckNamespaceAccess() error     { return s.check("namespace") }
-func (s *facetSession) CheckDirectoryRead() error       { return s.check("directory") }
-func (s *facetSession) CheckAtomicFileOpen() error      { return s.check("open") }
-func (s *facetSession) CheckMetadataAccess() error      { return s.check("metadata") }
-func (s *facetSession) CheckUseOwners() error           { return s.check("owners") }
-func (s *facetSession) CheckRangeControl() error        { return s.check("ranges") }
-func (s *facetSession) CheckNodeReferences() error      { return s.check("references") }
-func (s *facetSession) CheckFileActions() error         { return s.check("actions") }
-func (s *facetSession) CheckAllocationReporting() error { return s.check("allocation") }
+func (s *facetSession) CheckNamespaceAccess() error                         { return s.check("namespace") }
+func (s *facetSession) CheckDirectoryRead() error                           { return s.check("directory") }
+func (s *facetSession) CheckAtomicFileOpen() error                          { return s.check("open") }
+func (s *facetSession) CheckMetadataAccess() error                          { return s.check("metadata") }
+func (s *facetSession) CheckUseOwners() error                               { return s.check("owners") }
+func (s *facetSession) CheckRangeControl() error                            { return s.check("ranges") }
+func (s *facetSession) CheckNodeReferences() error                          { return s.check("references") }
+func (s *facetSession) CheckFileActions() error                             { return s.check("actions") }
+func (s *facetSession) CheckAllocationReporting() error                     { return s.check("allocation") }
+func (s *facetSession) AllocationUnitBytes(context.Context) (uint64, error) { return 0, syscall.ENOSYS }
 func (s *facetSession) Close(ctx context.Context) error {
 	s.closes++
 	_, deadline := ctx.Deadline()

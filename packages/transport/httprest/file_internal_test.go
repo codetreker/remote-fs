@@ -92,6 +92,14 @@ func TestRetainedOpenAccessKeepsFlatStrictJSONFields(t *testing.T) {
 func retainedHTTPFixture(t *testing.T, limits FileLimits) (*Storage, *Handler, *objectstore.Storage) {
 	t.Helper()
 	_, backend := memoryfixture.New(t, "retained-http", 1<<20, locking.DefaultOptions())
+	client, handler := retainedHTTPPair(t, limits, backend)
+	return client, handler, backend
+}
+
+// Each pair owns its transport journals and sessions; table cases may borrow the
+// parent test's native authority while keeping their namespace and handles separate.
+func retainedHTTPPair(t *testing.T, limits FileLimits, backend *objectstore.Storage) (*Storage, *Handler) {
+	t.Helper()
 	options := DefaultHandlerOptions()
 	options.Files = limits
 	h, err := NewHandlerWithOptions(backend, nil, options)
@@ -109,7 +117,7 @@ func retainedHTTPFixture(t *testing.T, limits FileLimits) (*Storage, *Handler, *
 	if err != nil {
 		t.Fatal(err)
 	}
-	return client, h, backend
+	return client, h
 }
 
 func TestRetainedHTTPUnacknowledgedOpenExpiresDuringRenewal(t *testing.T) {

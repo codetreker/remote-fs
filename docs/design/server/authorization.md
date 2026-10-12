@@ -16,6 +16,8 @@ type AccessRequest struct {
     Operation storage.Operation
     Open      storage.OpenAccess
     ContentMetadataEffects []storage.ContentMetadataEffect
+    StateProjection storage.StateProjection
+    MetadataObservation *storage.MetadataObservationRequest
 }
 ```
 
@@ -60,7 +62,7 @@ storage.Operation 是覆盖路径、文件会话、复制和锁控制的 transpo
 | `file.read-dir-node` | `/v5/file`，`file.read-dir-node` | 按目录身份执行应用枚举并检查 `ReadEntries` |
 | `file.observe-directory-metadata` | `/v5/file`，同名动作 | 取得完整目录 entries、revision 与可选目录当前名字 |
 | `file.observe-name` | `/v5/file`，`file.observe-name` | 取得一个保留引用的 Root／Linked／Detached 当前绑定 |
-| `file.observe-content-metadata` | `/v5/file`，同名动作 | 只观察可写 exact reference 已 enrollment 的 namespace；AccessRequest 携带所选固定效果 |
+| `file.observe-metadata` | `/v5/file`，`file.observe-metadata` | 按明确 ContentEffect／Namespace purpose 读取 exact 引用的条件，AccessRequest 携带实际请求和所选效果 |
 | `file.mutate-name` | `/v5/file`，`file.mutate-name` | 按父身份创建、删除或改名子项 |
 | `file.open-node-ref` | `/v5/file`，`file.open-node-ref` | 按 NodeID 打开 metadata-only 引用 |
 | `file.open-child-ref` | `/v5/file`，`file.open-child-ref` | 按父身份打开或创建节点引用 |
@@ -70,7 +72,7 @@ storage.Operation 是覆盖路径、文件会话、复制和锁控制的 transpo
 | `file.acknowledge-delete-intent` | `/v5/file-control`，同名动作 | 幂等确认并释放 durable 删除终态记录 |
 | `file.ack` | `/v5/file-control`，`file.ack` | 确认已交付的打开引用 |
 | `file.stat` | `/v5/file`，`file.stat` | 查询保留引用的属性 |
-| `file.state` | `/v5/file-control`，`file.state` | 原子读取引用属性、link target 与 pending 状态 |
+| `file.state` | `/v5/file-control`，`file.state` | 按明确 Full／Scalars 投影原子读取引用与 pending 事实，AccessRequest 携带实际投影 |
 | `file.read` | `/v5/file`，`file.read` | 按保留引用读取范围 |
 | `file.write` | `/v5/file`，`file.write` | 按保留引用修改范围 |
 | `file.truncate` | `/v5/file`，`file.truncate` | 改变保留文件长度 |
@@ -111,7 +113,9 @@ storage.Operation 是覆盖路径、文件会话、复制和锁控制的 transpo
 
 `volume.write` 可以创建缺失文件，单独拒绝 volume.create 不能禁止创建。应用枚举、完整目录 metadata 与 reference current-name 分别授权；允许 `file.read-dir-node` 不授予另两项，DirectoryMetadataObserver 也不从 `ReadEntries` 或 `ReadMetadata` 推导权限。metadata、range apply 与 range drop 同样分别授权；查询、取消或已有 owner 不能绕过本次策略。range mode 不代替内容读写权限，后续数据访问仍检查 file.read / file.write。FUSE 的 flock/POSIX 解释不进入 AccessRequest。
 
-OpenAt 的 ContentMetadataEffects 随实际 OpenAccess 交给策略，enrollment 另核对 OpFileSetMetadata 与 OpFileObserveContentMetadata。ReferenceContentMetadata 的 effect index 只选择原引用已深复制的 descriptor；新观察与每次非空 MutateWriteAt／MutateAppend 的 typed replay 都以当前策略核对真实效果。派生更新的 AccessRequest.ContentMetadataEffects 包含所选 namespace、格式和固定 masks；Metadata=nil 不省略 OpFileSetMetadata，打开批准不构成终身授权。限定 descriptor 的 OpFileSetMetadata 不替代 initial metadata 或公开 metadata 写权所需的普通 OpFileSetMetadata；去重同时核对 operation、Open 与 descriptor，不能合并不同语义。公开 Stat、SetAttr、SetMetadata 的 MetadataAccess 仍独立，固定效果不扩大它们的权限。
+OpenAt 的 ContentMetadataEffects 随实际 OpenAccess 交给策略，enrollment 另核对 OpFileSetMetadata 与 OpFileObserveMetadata；固定 descriptor 的批准不构成终身权限。每次 ContentEffect 观察从原引用的封存向量解析实际 descriptor，并将明确 MetadataObservationRequest 与所选 ContentMetadataEffects 交给当前策略。非空 WriteAt／Append 与 Truncate 的 typed replay 继续按真实派生效果核对 OpFileSetMetadata；Metadata=nil 不省略这项授权。固定效果许可不替代 initial metadata 或普通 metadata 更新的独立许可。
+
+Namespace purpose 的 ObserveMetadata 使用 WriteMetadata，但不授予 ReadMetadata；每次 AccessRequest.MetadataObservation 携带实际 Namespace、MaxPayloadBytes 和明确 purpose，策略可逐 namespace／bound 批准或拒绝。它不在打开时 enrollment namespace scope，也不允许从另一个 purpose 推导权限。State 使用 OpFileState 与 AccessRequest.StateProjection，Full 仍需 ReadMetadata，Scalars 只读取低权限事实。分配单位或原错误作为授权 session enrollment 的不可变结果取得，不增加逐次单位观察 Operation；文件查询仍核对本次 State／Stat 的授权和健康。已有引用、固定 NodeID 或上次批准都不能跳过本次授权。selectors 与 callback 数据各自深复制，策略修改输入不能改变原请求。
 
 ## 三、请求、capability 与关闭
 
@@ -122,7 +126,7 @@ OpenAt 的 ContentMetadataEffects 随实际 OpenAccess 交给策略，enrollment
 3. handler 从已解码语义构造一个 AccessRequest，执行一次入口 Authorize。
 4. 允许后才读取或触碰 capability、分配引用或动作、重放回执、读取 Log、取得订阅／snapshot／page 资源或访问 backend。存储权限、配额、锁与原有取消分类继续生效。
 
-格式合法但不存在的 capability、action receipt、delete intent、无 Log（包括 publisher 为 nil）或错误续订游标，在拒绝时只返回授权错误；允许后才返回原有 ESTALE／ENOSYS 等结果。旧 action ID、成功过的动作、durable intent ID 与已有 capability 均不能省略检查。ack、renew、status、metadata、query、list、cancel、drop、release、retire 与 close 各自可被拒绝；intent list、query 与 ACK 各执行自己的授权。已经接受的 CloseIntent 后续触发是原动作固定效果，不因原会话消失或权限撤销而重新授权；对其状态的新查询仍独立授权。
+格式合法但不存在的 capability、action receipt、delete intent、无 Log（包括 publisher 为 nil）或错误续订游标，在拒绝时只返回授权错误；允许后才返回原有 ESTALE／ENOSYS 等结果。旧 action ID、成功过的动作、durable intent ID 与已有 capability 均不能省略检查。带中立 semantic FileActionID 的请求即使经过原 ID 重投仍执行当前授权，epoch／digest／history 由 native journal 验证；HTTP elapsed window 不替代 native 结果或产生换 ID 的 Retry。ack、renew、status、metadata、query、list、cancel、drop、release、retire 与 close 各自可被拒绝；intent list、query 与 ACK 各执行自己的授权。已经接受的 CloseIntent 后续触发是原动作固定效果，不因原会话消失或权限撤销而重新授权；对其状态的新查询仍独立授权。
 
 拒绝只说明本次尝试未获准，不能证明此前超时的动作未执行。client 无法获准核对时保留原来的未知结果，不合成 Cancelled、Released、NotApplied 或已记录的 rejection。请求 cleanup 被拒绝仍报告拒绝；服务器自主 lease 到期、退休、shutdown 与资源回收由原拥有者执行，不重新请求该访问身份的权限。
 
@@ -200,8 +204,8 @@ func newAuthorizedHandler(
             if r.Open.Read && !access.CanRead { return authz.ErrDenied }
             if (r.Open.Write || r.Open.Create || r.Open.Truncate) && !access.CanWrite {
                 return authz.ErrDenied
-            }
-        }
+}
+}
         return nil
     })
     options := httprest.DefaultHandlerOptions()
@@ -214,7 +218,7 @@ func newAuthorizedHandler(
         if err != nil {
             http.Error(w, "authentication failed", http.StatusUnauthorized)
             return
-        }
+}
         ctx := context.WithValue(r.Context(), identityKey{}, identity)
         handler.ServeHTTP(w, r.WithContext(ctx))
     })

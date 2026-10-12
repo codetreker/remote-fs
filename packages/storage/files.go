@@ -29,6 +29,14 @@ type FileStorage interface {
 // an operation whose effect cannot be undone if allocation is unavailable.
 type AllocationReporting interface {
 	CheckAllocationReporting() error
+	// AllocationUnitBytes optionally reports the authority's nonzero logical
+	// allocation unit, immutable for the owning FileSession/backend incarnation.
+	// The result may be cached and establishes no current health, identity or
+	// reference lifetime; these require an authoritative State/Stat query.
+	// EOPNOTSUPP means the unit is unavailable without weakening the byte-allocation
+	// promise. Every failure returns zero and preserves the actual error. Host disk
+	// geometry and a configured capacity allowance do not determine this fact.
+	AllocationUnitBytes(context.Context) (uint64, error)
 }
 
 // FileSession owns file references, advisory owners, and action history until

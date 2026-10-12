@@ -364,3 +364,41 @@ func TestFileIOGateConcurrentCancellationCompletionAndFence(t *testing.T) {
 		}
 	}
 }
+
+func TestFileIOGateNodeReferenceCloseDrainsRunningMetadataAndRejectsQueue(t *testing.T) {
+	for _, kind := range []storage.NodeKind{storage.NodeRegular, storage.NodeDirectory} {
+		t.Run(map[storage.NodeKind]string{storage.NodeRegular: "metadata-only", storage.NodeDirectory: "directory"}[kind], func(t *testing.T) {
+			tree, session, h := fileIOGateFixture()
+			closed := make(chan struct{})
+			h.nodeKind = kind
+			h.node = &resultOnlyOwnerNode{result: func(int) (storage.ReferenceCloseResult, error) {
+				close(closed)
+				return storage.ReferenceCloseResult{Released: true, Determined: true}, nil
+			}}
+			first := admitGateTicket(t, tree, session, h)
+			queued := admitGateTicket(t, tree, session, h)
+			if err := first.wait(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			finished := make(chan error, 1)
+			go func() { finished <- tree.closeFileHandle(ctx, h) }()
+			if err := queued.wait(ctx); !errors.Is(err, syscall.EBADF) {
+				t.Fatalf("queued metadata call was not fenced: %v", err)
+			}
+			select {
+			case <-closed:
+				t.Fatal("node reference closed while metadata call was running")
+			default:
+			}
+			first.finish()
+			if err := <-finished; err != nil {
+				t.Fatal(err)
+			}
+			if tree.findFileHandle(h.id) != nil || tree.fileActive != 0 {
+				t.Fatal("node CLOSE retained handle or FIFO admission")
+			}
+		})
+	}
+}

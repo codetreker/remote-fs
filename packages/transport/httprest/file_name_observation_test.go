@@ -819,7 +819,7 @@ func (*mismatchedIdentityReference) Scope(context.Context) (storage.UseScope, er
 	return storage.UseScope{Token: "scope"}, nil
 }
 func (*mismatchedIdentityReference) CheckReferenceState() error { return nil }
-func (*mismatchedIdentityReference) State(context.Context) (storage.ReferenceState, error) {
+func (*mismatchedIdentityReference) State(context.Context, storage.StateProjection) (storage.ReferenceState, error) {
 	return storage.ReferenceState{Attr: storage.Attr{ID: 2, Kind: storage.NodeDirectory}}, nil
 }
 func (*mismatchedIdentityReference) CheckReferenceNameObservation() error { return nil }

@@ -14,9 +14,9 @@ Status: implemented
 
 [SQLite 匿名发布矩阵](../../../../packages/metastore/sqlite/publication_test.go)为 S、X 各建立一份真实 fixture，共两份。每种权限仍按原顺序执行九种操作，共 18 个 leaf；每次调用前后的 List、Space 与 Conflict 分类断言保留。调用前还与该权限 fixture 的初始列表、配额比较，上一项拒绝若污染状态，下一项会明确失败，不能把污染当作新的基线。
 
-[HTTP 构造选项的两个矩阵](../../../../packages/transport/httprest/server_test.go)分别复用各自原有的 failingStorage 包装器。每个子用例从完整 options 值复制后只破坏原定字段，继续调用原来的 Check／constructor。可用配置与零值默认配置仍成功；后端保留真实能力与原错误行为，不能靠换一个总是拒绝的替身让非法选项用例通过。
+[HTTP 构造选项的两个矩阵](../../../../packages/transport/httprest/server_test.go)分别复用各自原有的 failingStorage 包装器。每个子用例从完整 options 值复制后只破坏原定字段，继续调用原来的 Check／constructor。可用配置与零值默认配置仍成功；构造测试验证配置和所需接口形状，错误路径保留原注入错误。纯拒绝fixture的storage与lockservice全部方法返回该错误和零结果，不使用能意外成功的健康backing；健康publication与lock能力由真实nativefixture的独立用例验证。
 
-复用限于这些不应改变后端的拒绝检查。会修改状态、测试构造失败清理或验证持久状态形成的用例保留各自 fixture；没有加入新的 detached 完整性种子复制。
+HTTP文件信息、metadata观察与恢复矩阵复用顶层真实authority的schema准备，各项保持独立对象、HTTPpair、session、journal与faultwriter；不共享已接受动作或恢复状态。持久状态形成、初始化失败清理与真实锁／publication验证继续使用各自必要的nativefixture；没有加入新的detached完整性种子复制。文件信息的fixture归属见[文件信息决定](../feature/2026-09-28-smb-file-information.md)。
 
 ### 确认用例在初始化完成后控制事件交付
 

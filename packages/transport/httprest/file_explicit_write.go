@@ -22,7 +22,7 @@ type explicitFileWrite struct {
 }
 
 func isExplicitFileWrite(req fileRequest) bool {
-	return req.Op == storage.OpFileMutate && req.Mutation != nil && req.Mutation.Action != "" && len(req.Mutation.Data) <= MaxFileRecoveryDataBytes && (req.Mutation.Kind == storage.MutateWriteAt || req.Mutation.Kind == storage.MutateAppend)
+	return req.Op == storage.OpFileMutate && req.Mutation != nil && req.Mutation.Action != "" && len(req.Mutation.Data) <= MaxFileRecoveryDataBytes && (req.Mutation.Kind == storage.MutateWriteAt || req.Mutation.Kind == storage.MutateAppend || req.Mutation.Kind == storage.MutateTruncate || req.Mutation.Kind == storage.MutateAttributes)
 }
 func (s *remoteFileSession) writeEntry(req fileRequest, scope locking.MutationScope, hasScope bool) (*explicitFileWrite, error) {
 	key := req.File + ":" + string(req.Mutation.Action)
@@ -35,6 +35,12 @@ func (s *remoteFileSession) writeEntry(req fileRequest, scope locking.MutationSc
 		return nil, s.failed
 	}
 	if previous := s.explicitWrites[key]; previous != nil {
+		// Recovery sends the original complete request, including its result bound.
+		// A later caller can reserve more bytes without changing the action intent.
+		if req.ResultBytes < previous.request.ResultBytes {
+			return nil, syscall.EFBIG
+		}
+		req.ResultBytes = previous.request.ResultBytes
 		if !reflect.DeepEqual(previous.request, req) || previous.hasScope != hasScope || hasScope && !reflect.DeepEqual(previous.scope, scope) {
 			return nil, syscall.EINVAL
 		}

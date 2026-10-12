@@ -493,3 +493,36 @@ var (
 	_ storage.ScopedReference         = (*retainedFile)(nil)
 	_ storage.ReferenceMetadataAccess = (*retainedFile)(nil)
 )
+
+func (s *fileSession) CheckOpenContentMetadata() error {
+	return capabilityCheck(s.remote, storage.OpenContentMetadata.CheckOpenContentMetadata)
+}
+
+var _ storage.OpenContentMetadata = (*fileSession)(nil)
+
+func (s *fileSession) AllocationUnitBytes(ctx context.Context) (uint64, error) {
+	return fileCall(ctx, s, true, func(ctx context.Context) (uint64, error) {
+		if err := s.CheckAllocationReporting(); err != nil {
+			return 0, err
+		}
+		if _, err := s.FileSessionIdentity(ctx); err != nil {
+			return 0, err
+		}
+		result, err := s.remote.(storage.AllocationReporting).AllocationUnitBytes(ctx)
+		if err != nil {
+			return 0, err
+		}
+		if result == 0 {
+			return 0, syscall.EIO
+		}
+		if err := s.base.usable("file", ""); err != nil {
+			return 0, err
+		}
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
+		return result, nil
+	})
+}
+
+var _ storage.AllocationReporting = (*fileSession)(nil)

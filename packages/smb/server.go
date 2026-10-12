@@ -43,6 +43,7 @@ type Export struct {
 	ioGeneration uint64 // Protected by the server's write ledger.
 	server       *Server
 	share        Share
+	volumeSerial uint64
 	key          string
 	refs         int
 	trees        int
@@ -100,7 +101,11 @@ func (s *Server) Publish(share Share) (*Export, error) {
 	if err != nil || key == "IPC$" || share.Volume == "" || share.BackendVolume == "" || share.RootNodeID == 0 || interfaceNil(share.Backend) {
 		return nil, ErrConfig
 	}
-	e := &Export{server: s, share: share, key: key, active: 1}
+	volumeSerial, err := stableVolumeSerial(share.BackendVolume)
+	if err != nil {
+		return nil, fmt.Errorf("SMB backend volume identity: %w", errors.Join(ErrConfig, err))
+	}
+	e := &Export{server: s, share: share, volumeSerial: volumeSerial, key: key, active: 1}
 	s.mu.Lock()
 	if s.stopping || s.stopped {
 		s.mu.Unlock()
@@ -109,6 +114,12 @@ func (s *Server) Publish(share Share) (*Export, error) {
 	if len(s.exports) >= s.config.Limits.MaxExports || s.exports[key] != nil {
 		s.mu.Unlock()
 		return nil, ErrBusy
+	}
+	for _, existing := range s.exports {
+		if existing.volumeSerial == volumeSerial && existing.share.BackendVolume != share.BackendVolume {
+			s.mu.Unlock()
+			return nil, fmt.Errorf("SMB volume serial collision: %w", ErrConfig)
+		}
 	}
 	s.exports[key] = e
 	s.mu.Unlock()

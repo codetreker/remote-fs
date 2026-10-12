@@ -139,7 +139,7 @@ func (fs *fileSession) OpenNodeRef(ctx context.Context, id uint64, options stora
 			return result.Reference != nil || result.Attr.ID != 0 || result.Outcome != 0
 		},
 		func() (storage.NodeOpenResult, error) {
-			return fs.openNodeReference(ctx, func(ctx context.Context) (metastore.NodeOpenResult, error) {
+			return fs.openNodeReference(ctx, options, func(ctx context.Context) (metastore.NodeOpenResult, error) {
 				return fs.native.(metastore.NodeReferences).OpenNodeRef(ctx, id, options)
 			})
 		})
@@ -162,13 +162,13 @@ func (fs *fileSession) OpenChildRef(ctx context.Context, selection storage.Child
 			return result.Reference != nil || result.Attr.ID != 0 || result.Outcome != 0
 		},
 		func() (storage.NodeOpenResult, error) {
-			return fs.openNodeReference(ctx, func(ctx context.Context) (metastore.NodeOpenResult, error) {
+			return fs.openNodeReference(ctx, options, func(ctx context.Context) (metastore.NodeOpenResult, error) {
 				return fs.native.(metastore.NodeReferences).OpenChildRef(ctx, selection, options)
 			})
 		})
 }
 
-func (fs *fileSession) openNodeReference(ctx context.Context, open func(context.Context) (metastore.NodeOpenResult, error)) (storage.NodeOpenResult, error) {
+func (fs *fileSession) openNodeReference(ctx context.Context, options storage.NodeRefOptions, open func(context.Context) (metastore.NodeOpenResult, error)) (storage.NodeOpenResult, error) {
 	ctx, cancel := fs.operationContext(ctx)
 	defer cancel()
 	ctx = metastore.WithFilePublicationGuard(ctx, fs.publicationAllowed)
@@ -182,8 +182,7 @@ func (fs *fileSession) openNodeReference(ctx context.Context, open func(context.
 	if result.Reference == nil {
 		return opened, fs.finishOpen(nil, err)
 	}
-	reference := &nodeReference{session: fs, native: result.Reference, uses: referenceUses{nodeID: uint64(result.State.ID)}, active: true,
-		closing: referenceCloseState{next: 1}}
+	reference := &nodeReference{metadata: options.MetadataAccess, session: fs, native: result.Reference, uses: referenceUses{nodeID: uint64(result.State.ID)}, active: true, closing: referenceCloseState{next: 1}}
 	opened.Reference = reference
 	err = fs.finishOpen(reference, err)
 	return opened, err
@@ -359,19 +358,6 @@ func (f *openFile) CheckReferenceState() error {
 	return capability.CheckReferenceState()
 }
 
-func (f *openFile) State(ctx context.Context) (storage.ReferenceState, error) {
-	if err := f.CheckReferenceState(); err != nil {
-		return storage.ReferenceState{}, err
-	}
-	ctx, done, err := f.begin(ctx)
-	if err != nil {
-		return storage.ReferenceState{}, err
-	}
-	defer done()
-	state, err := any(f.native).(metastore.ReferenceStateAccess).State(ctx)
-	return publicReferenceState(state), err
-}
-
 func (f *openFile) CheckDeleteIntent() error {
 	capability, ok := any(f.native).(metastore.DeleteIntent)
 	if !ok {
@@ -438,3 +424,72 @@ var (
 	_ storage.ReferenceStateAccess = (*openFile)(nil)
 	_ storage.DeleteIntent         = (*openFile)(nil)
 )
+
+func (f *openFile) State(ctx context.Context, projection storage.StateProjection) (storage.ReferenceState, error) {
+	if err := projection.Check(); err != nil {
+		return storage.ReferenceState{}, err
+	}
+	if projection == storage.StateFull && f.metadata&storage.ReadMetadata == 0 {
+		return storage.ReferenceState{}, syscall.EBADF
+	}
+	if err := f.CheckReferenceState(); err != nil {
+		return storage.ReferenceState{}, err
+	}
+	id, err := storage.ReferenceNodeID(f.native)
+	if err != nil {
+		return storage.ReferenceState{}, err
+	}
+	ctx, done, err := f.begin(ctx)
+	if err != nil {
+		return storage.ReferenceState{}, err
+	}
+	defer done()
+	return observeNativeState(ctx, f.session, f.native.(metastore.ReferenceStateAccess), id, projection, &f.active)
+}
+
+func (f *openFile) ObserveMetadata(ctx context.Context, request storage.MetadataObservationRequest) (storage.MetadataObservation, error) {
+	if err := request.Check(); err != nil {
+		return storage.MetadataObservation{}, err
+	}
+	var effect *storage.ContentMetadataEffect
+	if request.Purpose == storage.MetadataObservationNamespace {
+		if f.metadata&storage.WriteMetadata == 0 {
+			return storage.MetadataObservation{}, syscall.EBADF
+		}
+	} else {
+		if !f.options.Write {
+			return storage.MetadataObservation{}, syscall.EBADF
+		}
+		effects, err := storage.ResolveContentMetadataEffects(f.contentEffects, []uint16{request.EffectIndex})
+		if err != nil {
+			return storage.MetadataObservation{}, err
+		}
+		effect = &effects[0]
+	}
+	if err := f.CheckMetadataAccess(); err != nil {
+		return storage.MetadataObservation{}, err
+	}
+	id, err := storage.ReferenceNodeID(f.native)
+	if err != nil {
+		return storage.MetadataObservation{}, err
+	}
+	ctx, done, err := f.begin(ctx)
+	if err != nil {
+		return storage.MetadataObservation{}, err
+	}
+	defer done()
+	return observeNativeMetadata(ctx, f.session, f.native, id, request, effect, &f.active)
+}
+
+func (fs *fileSession) CheckOpenContentMetadata() error {
+	if err := fs.CheckAtomicFileOpen(); err != nil {
+		return err
+	}
+	capability, ok := fs.native.(storage.OpenContentMetadata)
+	if !ok {
+		return syscall.EOPNOTSUPP
+	}
+	return capability.CheckOpenContentMetadata()
+}
+
+var _ storage.OpenContentMetadata = (*fileSession)(nil)

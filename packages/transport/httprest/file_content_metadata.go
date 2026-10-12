@@ -2,7 +2,6 @@ package httprest
 
 import (
 	"bytes"
-	"context"
 	"syscall"
 
 	"github.com/codetreker/remote-fs/packages/storage"
@@ -38,28 +37,8 @@ func contentMetadataEffectsStorage(values []contentMetadataEffect) []storage.Con
 	return result
 }
 
-type contentMetadataObservation struct {
-	NodeID uint64         `json:"nodeId"`
-	Value  *OpaquePayload `json:"value,omitempty"`
-}
-
-func contentMetadataObservationOf(value storage.ContentMetadataObservation) *contentMetadataObservation {
-	result := &contentMetadataObservation{NodeID: value.NodeID}
-	if value.Value != nil {
-		result.Value = &OpaquePayload{Version: bytes.Clone(value.Value.Version), Data: append([]byte{}, value.Value.Data...)}
-	}
-	return result
-}
-func (value contentMetadataObservation) storage() storage.ContentMetadataObservation {
-	result := storage.ContentMetadataObservation{NodeID: value.NodeID}
-	if value.Value != nil {
-		result.Value = &storage.OpaquePayload{Version: bytes.Clone(value.Value.Version), Data: bytes.Clone(value.Value.Data)}
-	}
-	return result
-}
-
 func (h *Handler) fileContentEffects(request fileRequest) ([]storage.ContentMetadataEffect, error) {
-	if request.Op != storage.OpFileObserveContentMetadata && (request.Op != storage.OpFileMutate || request.Mutation == nil || len(request.Mutation.ContentEffects) == 0) {
+	if (request.Op != storage.OpFileObserveMetadata || request.MetadataObservation == nil || request.MetadataObservation.Purpose != storage.MetadataObservationContentEffect) && (request.Op != storage.OpFileMutate || request.Mutation == nil || len(request.Mutation.ContentEffects) == 0) {
 		return nil, nil
 	}
 	h.files.mu.Lock()
@@ -76,7 +55,10 @@ func (h *Handler) fileContentEffects(request fileRequest) ([]storage.ContentMeta
 	}
 	effects := storage.CloneContentMetadataEffects(reference.contentEffects)
 	session.mu.Unlock()
-	indices := []uint16{request.ContentEffect}
+	indices := []uint16{}
+	if request.MetadataObservation != nil {
+		indices = append(indices, request.MetadataObservation.EffectIndex)
+	}
 	if request.Op == storage.OpFileMutate {
 		indices = request.Mutation.ContentEffects
 	}
@@ -89,30 +71,5 @@ func (s *remoteFileSession) CheckOpenContentMetadata() error {
 	}
 	return nil
 }
-func (f *remoteFile) CheckContentMetadata() error {
-	if !f.capabilities.ContentMetadata {
-		return syscall.EOPNOTSUPP
-	}
-	return nil
-}
-func (f *remoteFile) ObserveContentMetadata(ctx context.Context, index uint16) (storage.ContentMetadataObservation, error) {
-	if err := f.CheckContentMetadata(); err != nil {
-		return storage.ContentMetadataObservation{}, err
-	}
-	effects, err := storage.ResolveContentMetadataEffects(f.contentEffects, []uint16{index})
-	if err != nil {
-		return storage.ContentMetadataObservation{}, err
-	}
-	response, err := f.call(ctx, fileRequest{Op: storage.OpFileObserveContentMetadata, ContentEffect: index})
-	if err != nil {
-		return storage.ContentMetadataObservation{}, err
-	}
-	value := response.ContentMetadata.storage()
-	if err := value.CheckEffect(f.node, effects[0]); err != nil {
-		return storage.ContentMetadataObservation{}, unreachable(Request{Op: OpFile}, err)
-	}
-	return value, nil
-}
 
 var _ storage.OpenContentMetadata = (*remoteFileSession)(nil)
-var _ storage.ReferenceContentMetadata = (*remoteFile)(nil)

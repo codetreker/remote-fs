@@ -152,11 +152,20 @@ type NodeReferences interface {
 }
 
 // ReferenceStateAccess captures identity state and pending deletion together.
-// Failure cannot be replaced by invented detached or pending values.
+// StateFull requires ReadMetadata. StateScalars exposes only identity, kind, size,
+// allocation and deletion facts through a live reference; it grants no metadata
+// permission. The projection is explicit, and every failed query returns zero.
 type ReferenceStateAccess interface {
 	CheckReferenceState() error
-	State(context.Context) (ReferenceState, error)
+	State(context.Context, StateProjection) (ReferenceState, error)
 }
+
+type StateProjection uint8
+
+const (
+	StateFull StateProjection = iota + 1
+	StateScalars
+)
 
 // FileActions queries the finite receipt history owned by a FileSession. A
 // repeated action with the same ID and input returns its original method result;
@@ -189,10 +198,13 @@ type MetadataAccess interface {
 	SetMetadata(context.Context, uint64, string, []byte, []byte) (OpaquePayload, error)
 }
 
-// ReferenceMetadataAccess applies the same metadata namespace operation through a
-// retained File identity.
+// ReferenceMetadataAccess observes conditional namespace state and applies metadata
+// CAS through the exact live reference. Namespace observations and SetMetadata
+// require WriteMetadata; content-effect observations require only the enrolled
+// writable content capability. Neither observation grants public metadata reads.
 type ReferenceMetadataAccess interface {
 	CheckMetadataAccess() error
+	ObserveMetadata(context.Context, MetadataObservationRequest) (MetadataObservation, error)
 	SetMetadata(context.Context, string, []byte, []byte) (OpaquePayload, error)
 }
 

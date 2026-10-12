@@ -769,10 +769,6 @@ func (s *Store) Space(ctx context.Context) (storage.Space, error) {
 	return space, nil
 }
 
-var _ storage.AllocationReporting = (*Store)(nil)
-
-func (s *Store) CheckAllocationReporting() error { return nil }
-
 // mutate runs f inside a write transaction, committing it if f succeeds and rolling it back
 // if it does not.
 //

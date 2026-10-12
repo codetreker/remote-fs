@@ -153,8 +153,8 @@ func (r *nodeReference) CheckReferenceState() error {
 	return r.referenceCapabilities.CheckReferenceState()
 }
 
-func (r *nodeReference) State(ctx context.Context) (storage.ReferenceState, error) {
-	return r.referenceCapabilities.State(ctx)
+func (r *nodeReference) State(ctx context.Context, projection storage.StateProjection) (storage.ReferenceState, error) {
+	return r.referenceCapabilities.State(ctx, projection)
 }
 
 var _ storage.NodeReference = (*nodeReference)(nil)

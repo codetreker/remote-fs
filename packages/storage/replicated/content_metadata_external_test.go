@@ -36,8 +36,8 @@ func TestContentMetadataMutationConfirmsAuthorityAndReplicaThroughHTTP(t *testin
 		t.Fatalf("byte-only enrollment = %+v, %v", opened, err)
 	}
 	file := opened.File
-	observer := file.(storage.ReferenceContentMetadata)
-	if err := observer.CheckContentMetadata(); err != nil {
+	observer := file.(storage.ReferenceMetadataAccess)
+	if err := observer.CheckMetadataAccess(); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := file.Stat(t.Context()); !errors.Is(err, syscall.EBADF) {
@@ -46,7 +46,7 @@ func TestContentMetadataMutationConfirmsAuthorityAndReplicaThroughHTTP(t *testin
 	if _, err := file.(storage.ReferenceMetadataAccess).SetMetadata(t.Context(), "app.flags", nil, []byte("bad")); !errors.Is(err, syscall.EBADF) {
 		t.Fatalf("content enrollment granted public metadata mutation: %v", err)
 	}
-	observed, err := observer.ObserveContentMetadata(t.Context(), 0)
+	observed, err := observer.ObserveMetadata(t.Context(), storage.MetadataObservationRequest{Purpose: storage.MetadataObservationContentEffect, EffectIndex: 0})
 	if err != nil || observed.NodeID != original.ID || observed.Value != nil {
 		t.Fatalf("initial absence = %+v, %v", observed, err)
 	}
@@ -64,7 +64,7 @@ func TestContentMetadataMutationConfirmsAuthorityAndReplicaThroughHTTP(t *testin
 	if content, err := s.elsewhere.Read(t.Context(), "file"); err != nil || string(content) != "new" {
 		t.Fatalf("authority bytes = %q, %v", content, err)
 	}
-	observed, err = observer.ObserveContentMetadata(t.Context(), 0)
+	observed, err = observer.ObserveMetadata(t.Context(), storage.MetadataObservationRequest{Purpose: storage.MetadataObservationContentEffect, EffectIndex: 0})
 	if err != nil || observed.Value == nil {
 		t.Fatalf("derived observation = %+v, %v", observed, err)
 	}

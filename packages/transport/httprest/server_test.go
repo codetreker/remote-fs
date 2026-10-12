@@ -462,10 +462,9 @@ func TestAVolumeWithNoRoomToReportSaysSoByName(t *testing.T) {
 	}
 }
 
-// failing injects storage errors while retaining a real fixture authority.
-// Its operations fail before publication and cannot produce an unlocked mutation.
+// failing rejects every storage and lock operation before any effect.
+// Healthy publication and lock tests use a native volume fixture.
 type failing struct {
-	locked.Backend
 	err error
 }
 

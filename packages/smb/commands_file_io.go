@@ -30,7 +30,7 @@ func checkFileIOIdentity(ctx context.Context, s *session, t *tree, h *fileHandle
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if h == nil || h.file == nil || h.ownerSession != s || h.treeID != t.id || h.sessionID != s.id {
+	if h == nil || h.reference() == nil || h.ownerSession != s || h.treeID != t.id || h.sessionID != s.id {
 		return syscall.EBADF
 	}
 	if s.expiredIdentity() {
@@ -52,7 +52,7 @@ func checkFileIOIdentity(ctx context.Context, s *session, t *tree, h *fileHandle
 	if !valid {
 		return syscall.ESTALE
 	}
-	identity, ok := h.file.(storage.ReferenceIdentity)
+	identity, ok := h.reference().(storage.ReferenceIdentity)
 	if !ok {
 		return syscall.EIO
 	}
@@ -221,10 +221,11 @@ func (c *connection) writeFile(ctx context.Context, s *session, t *tree, request
 	h = ticket.handle
 	command := storage.FileMutation{Kind: storage.MutateWriteAt}
 	if len(parsed.Data) != 0 {
-		command.ExpectedMetadata, err = c.observeWriteMetadata(ctx, s, t, h)
-		if err != nil {
-			return nil, ioStatusError(err)
+		condition, observeErr := c.observeWriteMetadata(ctx, s, t, h)
+		if observeErr != nil {
+			return nil, ioStatusError(observeErr)
 		}
+		command.ExpectedMetadata = map[string][]byte{windowsMetadataKey: condition.Version}
 		command.ContentEffects = []uint16{0}
 		if h.access&accessWriteData == 0 || parsed.Offset == math.MaxUint64 {
 			command.Kind = storage.MutateAppend
@@ -242,7 +243,7 @@ func (c *connection) writeFile(ctx context.Context, s *session, t *tree, request
 		return nil, ioStatusError(err)
 	}
 	command.Data = parsed.Data
-	owner, err := c.server.reserveWriteOwner(t, h, ticket.sequence, command, effects)
+	owner, err := c.server.reserveMutationOwner(t, h, ticket.sequence, command, effects)
 	if err != nil {
 		return nil, ioStatusError(err)
 	}
@@ -251,8 +252,11 @@ func (c *connection) writeFile(ctx context.Context, s *session, t *tree, request
 	authorize := func(call context.Context) error {
 		return c.authorizeFileIO(call, s, t, h, storage.OpFileWrite, effects)
 	}
-	reobserve := func(call context.Context) (map[string][]byte, error) {
-		return c.observeWriteMetadata(call, s, t, h)
+	var reobserve func(context.Context) (windowsMetadataCondition, error)
+	if len(parsed.Data) != 0 {
+		reobserve = func(call context.Context) (windowsMetadataCondition, error) {
+			return c.observeWriteMetadata(call, s, t, h)
+		}
 	}
 	currentEpoch := func() uint64 {
 		t.authority.installMu.RLock()
@@ -260,7 +264,7 @@ func (c *connection) writeFile(ctx context.Context, s *session, t *tree, request
 		return t.authority.actionEpoch
 	}
 	call := storage.WithBoundedAttrResult(ctx, int64(c.server.config.Limits.MaxFrameBytes), createAttrBudget(int64(c.server.config.Limits.MaxFrameBytes)))
-	_, err = owner.execute(call, authorize, reobserve, currentEpoch)
+	_, err = owner.executeMutation(call, authorize, reobserve, currentEpoch)
 	if err != nil {
 		return nil, ioStatusError(err)
 	}

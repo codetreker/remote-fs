@@ -329,7 +329,7 @@ Pending 用例先占满 authority 的申请队列，随后确认 HTTP control ad
 
 ## SMB endpoint、认证与生命周期
 
-SMB 的协议 primitive 与 endpoint lifecycle 分层验证。`packages/smb/internal/wire` 直接覆盖 SMB2 header、Direct TCP payload、compound alignment、UTF-16、negotiate context、SESSION_SETUP、TREE_CONNECT、CREATE/CLOSE 与 READ/WRITE/FLUSH shape；畸形 offset、CREATE context 的 Next 越界／重叠、重复或互斥 context、混合 related compound、超量 command/context、半个 all-ones FileId 和截断 body 必须在消费受控状态前失败。`packages/smb/internal/signing` 使用 CMAC 标准向量核对 SP800-108 key derivation、SHA-512 preauthentication transcript、packet sign/verify，以及 signer destroy 与并发 sign 的互斥。
+SMB 的协议 primitive 与 endpoint lifecycle 分层验证。`packages/smb/internal/wire` 直接覆盖 SMB2 header、Direct TCP payload、compound alignment、UTF-16、negotiate context、SESSION_SETUP、TREE_CONNECT、CREATE/CLOSE、READ/WRITE/FLUSH 与 QUERY_INFO/SET_INFO shape；畸形 offset、CREATE context 的 Next 越界／重叠、重复或互斥 context、混合 related compound、超量 command/context、半个 all-ones FileId 和截断 body 必须在消费受控状态前失败。`packages/smb/internal/signing` 使用 CMAC 标准向量核对 SP800-108 key derivation、SHA-512 preauthentication transcript、packet sign/verify，以及 signer destroy 与并发 sign 的互斥。
 
 `packages/smb` 的真实 TCP transcript 从 NEGOTIATE、两轮 SESSION_SETUP、ECHO 到 volume TREE_CONNECT／TREE_DISCONNECT／LOGOFF，逐帧验证签名和状态。协商只接受 SMB 3.1.1、SHA-512 与 AES-CMAC；client 未发送 signing-capabilities context 时 response 不虚构该 context，显式发送时只回显实际选择。unsigned session request 的拒绝保持 unsigned；带 signed flag 的坏 MAC 和已建立 session 的 malformed reauthentication 得到 signed denial，旧 session 仍可继续使用。sessionless ECHO 在 authentication 前后均不借用另一 session 的 signer。错误 session/tree、unsupported flag 与已识别但未实现的 file/directory command 都在 backing 之前拒绝；后者的用例同时核对 `STATUS_NOT_SUPPORTED` 与 backend data call 为零。CANCEL、未知 command 和畸形 request 的 fail-closed 用例断言连接终止且没有受控效果，不要求一个协议不定义的响应。
 
@@ -344,6 +344,8 @@ SMB CREATE 直接核对五种 disposition 的缺席／已有结果、目录与 m
 名字验证同时覆盖 UTF-16、设备名、非法 sibling、大小写歧义、合法无关 symlink、选中 symlink 拒绝、取消、root substitution 和祖先 ID 重用。每级观察单独使用 OpFileObserveDirectoryMetadata、可信 volume 与请求 principal 授权；策略拒绝时 observer 调用和 CREATE 效果均为零，允许观察而拒绝 replication.snapshot 的策略仍可完成按名打开。每一级必须消费完整权威 listing，再用固定 revision/edge guards 执行最终打开；坏条目不能被精确命中或 pattern 过滤遮蔽。portable comparer 核对规范表与边界向量，Windows native 比较用例遍历全部 65,536 个 UTF-16 unit 并核对排序／等价，另覆盖多 unit、surrogate、composed/decomposed 和非等价 Unicode 向量。
 
 访问矩阵区分 byte rights、Use/share 与 MetadataAccess：execute-only、DELETE-only、attribute-only 是 NodeReference；execute+write 声明 read/write Use 却没有字节读；字节读+metadata 写与字节写+metadata 读分别保持授予。参与 sharing 的 data/execute/write/append/DELETE access 与三种 share 位在两个 SMB sessions 及非 SMB 入口上双向核对，目录也参与 ReadEntries 声明。metadata/control-only Use=0 的 Windows 打开忽略 ShareAccess、Deny=0；在参与者之前／之后打开均不能产生 sharing conflict。授权拒绝不得留下引用、Use、创建、内容、metadata 或 allocation 效果。
+
+跨两个SMB sessions与非SMB入口的share矩阵使用command-only fixture，没有后台renew worker；每个新SMB打开前调用真实FileSession.Renew，并经authority.acceptStatus安装返回的admission epoch。延长lease不延长actionhistory；矩阵不能沿过期epoch生成新action。显式 semanticAction 以 native history 判定；回归先观察真实 native epoch 轮换，再改变 served session 的 HTTP started 起算点制造两层 clock 偏差，验证仍有效的 OpenAt／MutateTruncate 可执行、typed replay 保留原 Attr／barrier、未来／陈旧 native ID 拒绝且无效果。同 ID 意图变化、implicit transport epoch／Retry 和 explicit close cursor 继续由各自原有测试验证。短 history 回归以 Status 确认同一 native incarnation 的 ActionEpoch 前进，验证旧 admission epoch 的新动作被拒绝，真实续期后 CREATE 成功；sharing 结果仍由独立矩阵逐项验证。
 
 容量用例分别限制 MaxHandles、底层 MaxFiles、open action、close receipt、未结清 owner、directory observation 和响应 frame。opening、cleanup-only、barrier-only 继续计费，历史 close receipt 未到期时新 CREATE 不能借端点空闲槽绕过。error+非 nil reference、取消、响应丢失、编码／发送失败始终保留清理 owner；无引用的 Unknown 只重投原方法／action／输入，NotExecuted 必须绑定原动作。恢复沿原授权后接受的不可变意图续作；endpoint 当前策略随后撤销不能遗弃该 owner，公共 HTTP RPC 的独立授权仍须保留。
 
@@ -371,7 +373,40 @@ file_io_gate tests 受控排列 running／queued／cancel／CLOSE／tree／paren
 
 FLUSH 用原 exact File.Sync；Sync DTO拒绝Action，不进入session pending journal，未知confirmation不堵无关句柄。HTTP SyncWithBarrier与replica用例核对post-Sync确切barrier未完成时不成功，重作Sync不写内容。write_diagnostics tests 覆盖response final前不可ack、typed generation/stale/missing/duplicates全批拒绝、原failure facts深复制与饱和预留。payload仅在exact引用或完整父no-future及全链settlement证明后释放；ExecutionUnknown与发送未确认保留至宿主明确接管诊断，停止未完成责任保持stopping/error。
 
-真实 SMB→replica→HTTP→native 关闭用例在原 Unknown WRITE 后暂停 SSE 的 close barrier：下层 native 已 Released、HTTP 可撤下本层 copy，SMB 原 owner 仍保留 Data／charge 且不能 acknowledgment。恢复同一 barrier 并沿原 close attempt 结算后才释放 bytes，终态 ExecutionUnknown 仍保留；不能以本层释放冒充完整链确认。HTTP detachment 用例另阻塞已完成 WRITE 的响应，交错 implicit／explicit file close 与 parent session close；关闭等待 action gate 被取消时必须保留 Released=true、Pending settlement、原 semantic error 与 payload。迟到成功／丢失响应不能删 fenced entry，后续原关闭结算后才排空；等待本身服从 context，不以 stalled response 无限占住关闭。
+真实 SMB→replica→HTTP→native 关闭用例在原 Unknown WRITE 后暂停 SSE 的 close barrier：下层 native 已 Released、HTTP 可撤下本层 copy，SMB 原 owner 仍保留 Data／charge 且不能 acknowledgment。恢复同一 barrier 并沿原 close attempt 结算后才释放 bytes，终态 ExecutionUnknown 仍保留；不能以本层释放冒充完整链确认。HTTP detachment 用例另阻塞已完成 WRITE 的响应，交错 implicit／explicit file close 与 parent session close；测试在客户端已经解码 Released，并在 session 锁下确认原 entry 的 detached fence 后才取消关闭 context；取消起点不包含前置 status／close RPC。关闭等待 action gate 被取消时必须在一秒内返回并保留 Released=true、Pending settlement、原 semantic error 与 payload。直接 gate 的 deadline 用例继续验证 DeadlineExceeded。迟到成功／丢失响应不能删 fenced entry，后续原关闭结算后才排空；等待本身服从 context，不以 stalled response 无限占住关闭。
+
+HTTP 文件信息／metadata／恢复的 table tests在顶层建立一份真实 authority，各子用例仍拥有独立对象、HTTP pair、session、journal与fault writer。复用的是数据库与schema准备，不共享已接纳动作或恢复状态；不同leaf防止对象状态跨用例混淆。只验证错误传递的failingStorage不建立SQLite：storage与十二个lockservice方法均返回原注入error和零结果，独立用例核对没有隐藏健康操作。健康publication、真实lock和durability验证继续使用nativevolume。测试watchdog、strictinventory与断言不因减少准备工作而放宽。
+
+### 文件信息与条件修改
+
+wire file_info 用例核对 QUERY_INFO／SET_INFO 固定体、当前 compoundextent、offset、保留字段、relatedFileId 和五类完整输出。五个文件 QUERY 类的 Flags、AdditionalInformation、InputBufferLength／Offset 按规范忽略，含超界输入字段；SET 非 securityAdditionalInformation 须零，SET payload 越过当前 command、半个 all-onesFileId、畸形 length 在 backing 前失败。固定输出不足的 INFO_LENGTH_MISMATCH 携带规范 errorcontext，不能返回半个结构；黄金向量逐字段核对时间、allocation、EOF、linkcount、pending、kind、serial 和128-bitID。
+
+State 投影用例分别通过 File／NodeReference 验证 zero-access、WRITE-only、APPEND-only、execute-only 和 WRITE_ATTRIBUTES-only 的 StateScalars，不授予 Stat／StateFull 权限。Full 显式要求 ReadMetadata，Scalars 不载入或返回时间、metadata、link target、pending generation。零／未知 projection、错误 kind／allocation、身份不符、取消、退休和 authority 故障均返回零结果；低权限结果夹带 protected 字段，即使为空或 null，也必须拒绝；State编解码复用既有typed DTO和字段presence验证，不按响应字段推测调用方projection。limited 对两种投影保持原 allocation unknown 规则，FUSE 明确 Full，授权 callback 携带实际 projection。
+
+ReferenceMetadataAccess 的 ObserveMetadata 用例验证互斥 ContentEffect／Namespace purpose；零／未知 purpose、混合 selector、非法 namespace／bound 在 backing 前失败。ContentEffect 只解析原 sealed effect，以 WriteData 和当前 descriptor 授权；Namespace 每次按 WriteMetadata 和实际 namespace／bound 授权，不增加打开 enrollment 或 ReadMetadata。presence／absence、结果独立拷贝、坏 token、损坏 canonical envelope、payload 上限和取消／退休均保留真实错误。完整最大 payload、token 与 JSON／base64 response 在 observer 前预留，短预算拒绝且 backing 调用为零；普通 metadata mutation 仍独立授权。
+
+两个 purpose 在原 transaction 中复用私有 namespace capture，两种 State projection 复用同次 pending deletion 捕获；损坏 generation／intent 不允许一种成功另一种失败，Scalars 不通过完整状态取得受保护 payload。HTTP 使用既有 file.state／file.observe-metadata route、strict projection-aware envelope 和既有 capability bits，不保留平行 information／observer routes 或旧字段 fallback。
+
+SMB 五类查询在 directnative 与真实 HTTP 中核对原对象：rename／unlink／same-namereplacement 后已有 FileId 仍报告原 ID，Standard 同次取得 EOF／allocation 与 deletepending，Basic／NetworkOpen 所有字段来自一次 Stat。Internal／Id 必须进行本次 live scalar 观察，不能由退休后仍可读取的固定 ID 恢复生命期。AllocationReporting的字节保证和可选单位分别验证。授权HTTP session enrollment取得不可变非零单位或原错误，capability DTO严格要求二者择一，不能隐藏EIO／取消／malformed为缺席。remote getter不发RPC，单位失败不关闭tree；本次StateScalars／Stat继续授权和健康检查。单位getter失败、零单位或非对齐事实只失败需要该事实的类；Space=ENOSYS不影响独立文件分配事实，native文件单位只走exclusive authority；volume serial 稳定且不同 volume 的投影碰撞在发布准入拒绝。
+
+Basic SET 组合在 File、directory 和 metadata-only 上一次提交 AttrChange 与 smb.windows；零字段保持、NORMAL 清空、实际 volume 根 HIDDEN／SYSTEM 保留且其它属性可修改、subtreeshare 根区别、派生位、非零 ChangeTime、-1／-2 与 FILETIME 范围分别验证。EOF 要求 WRITE_DATA，APPEND-only／目录／metadata-only 无效果拒绝；成功截短／增长和 ARCHIVE、时间、日志同动作，READONLY 在观察后改变、metadata policy 撤销、quota 或 CAS 冲突无部分效果。Basic条件重试只更新smb.windows token／Version及实际volume根保留的HIDDEN／SYSTEM，原时间／内容／其余请求属性保持；Changed／Completed 只用原 typedmethod 取回结果，unboundNotExecuted／Unknown／Retired 不 remint。
+
+mutation_owner用例涵盖原Attr／Metadata／Data／token／effect深复制、唯一result budget、保留bytes计费、cancel／CLOSE排空与同action恢复。directory／metadata-only 使用同一 gate 及 owner；reconcile 失败仍继续 exactclose，只有 Released 加全链 settlement 释放保留 payload，原 failurefacts 保持可查询。HTTP 显式 Truncate／Attributes 恢复与 WRITE 相同地按 exactfilecapability／nestedAction 隔离，Unknown 不阻塞 sibling State 查询、Renew／Status 或 cleanup。正常／错误、fullresultbudget、signedrelatedcompound 与必要 race 分别提供 package-local 证据。
+
+### SMB 与 FUSE 的同 volume 联合验收
+
+[`mountacceptance`](../packages/smb/internal/mountacceptance/cross_entry_linux_test.go) 使用真实签名 SMB 3.1.1 TCP 请求与实际 FUSE 挂载，各自持有独立 FileSession；direct 与 HTTP 两种路径都指向同一 native volume。Linux fd 从创建起持续打开，SMB FileId 也持续保留，不以重新打开掩盖身份或可见性问题。
+
+SMB Basic 设置共享时间与 HIDDEN／SYSTEM 后，Linux 原 fd 的 fstat 必须看到准确时间，inode 与 POSIX mode 保持不变；SMB EOF 缩短／扩展后，Linux 原 fd 必须看到相同对象的长度、内容与补零，SMB ARCHIVE 同时设置。随后设置 READONLY／HIDDEN／SYSTEM 并清除 ARCHIVE，经 FUSE fd 执行 chmod、write、truncate，SMB 的新 QUERY_INFO／READ 必须看到新公共事实与相同对象 ID，而 Windows 三个位保持、ARCHIVE 不因 Linux 修改被自动设置。READONLY 限制 SMB EOF，不能替代 Linux 的 mode 检查；被拒绝的 SMB 修改仍须无内容效果。
+
+测试文件只有 `linux && rfs_mountacceptance` 标签，不选择不同生产代码。CI 的 mounted job 在已有挂载测试之后、coverage gate 之前执行整个 test-only package，使用 strict runner，不加 `-run`：
+
+```text
+.github/scripts/assert-every-test-ran.sh -race -count=1 -timeout 10m \
+  -tags rfs_mountacceptance ./packages/smb/internal/mountacceptance
+```
+
+该验收使用 `/dev/fuse` 与现有挂载清理检查；默认非挂载 SMB／Windows suites 保持独立。此 test binary 的执行不记入生产 package coverage，也不证明 Windows 11 redirector／WNet 或私有缓存资格。
 
 `packages/smb/windows` 的平台无关测试核对 canonical SID／logon-session、同 SID 不同登录会话的拒绝、anonymous／Guest／service account 拒绝、context cancellation 和 secret-free `SECURITY_STATUS`。SMB session 用例另验证 `AuthorizeIdentity` 在 signer/principal 安装前执行，明确拒绝与无法决定分别映射为 access denied 和 I/O failure，并且失败的 reauthentication 不改变旧身份或 expiry。`windows-2025` CI job 在 Windows Server 2025 runner 上以 race detector 执行 native SSPI Negotiate exchange，核对 current token 的 SID、`TOKEN_STATISTICS.AuthenticationId`、session key 与 security-context expiry；取消用例核对 exchange 关闭且不能复用。注入失败的 ownership 用例分别核对 credential、context、token 与 buffer cleanup 会尝试全部独立 owner、保留失败项并在后续 Close 重试。该 runner 验证 Windows API 与 SSPI ownership，不是 R-INT-8 所要求的 Windows 11 24H2 redirector/WNet 环境；其它平台仍须明确返回不支持，不能用假的身份通过。
 
@@ -384,7 +419,7 @@ FLUSH 用原 exact File.Sync；Sync DTO拒绝Action，不进入session pending j
 
 交叉编译只验证可构建；native 比较的实际 verdict 必须来自 Windows runner。Linux package-local 测试与必要 race 验证分别覆盖 SMB、storage identity/open、SQLite/objectstore、HTTP 和 wrappers；其它包 test binary 的执行不计入它们的 production coverage。
 
-这些用例证明端点的协议、安全、CREATE/CLOSE、READ/WRITE/FLUSH、共享准入与清理路径。原生 unit/order 与 SSPI 测试证明所调用 Windows API 的行为；它们不构成 Windows 11 redirector、WNet 映射、Windows redirector 数据 I/O、目录浏览、通知、缓存一致性或最终 network-drive 资格证据。完整结论由相应真实 Windows 入口验收给出。
+这些用例证明端点的协议、安全、CREATE/CLOSE、READ/WRITE/FLUSH、文件信息／条件修改、共享准入与清理路径。原生 unit/order 与 SSPI 测试证明所调用 Windows API 的行为；它们不构成 Windows 11 redirector、WNet 映射、Windows redirector 数据 I/O、目录浏览、通知、缓存一致性或最终 network-drive 资格证据。完整结论由相应真实 Windows 入口验收给出。
 
 ## 测真实入口
 

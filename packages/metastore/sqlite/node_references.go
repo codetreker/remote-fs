@@ -139,9 +139,12 @@ func (r *retainedNodeReference) SetMetadata(ctx context.Context, namespace strin
 	}
 	return r.file.SetMetadata(ctx, namespace, expected, data)
 }
+func (r *retainedNodeReference) ObserveMetadata(ctx context.Context, request storage.MetadataObservationRequest) (storage.MetadataObservation, error) {
+	return r.file.ObserveMetadata(ctx, request)
+}
 func (r *retainedNodeReference) CheckReferenceState() error { return r.file.CheckReferenceState() }
-func (r *retainedNodeReference) State(ctx context.Context) (metastore.ReferenceState, error) {
-	return r.file.State(ctx)
+func (r *retainedNodeReference) State(ctx context.Context, projection storage.StateProjection) (metastore.ReferenceState, error) {
+	return r.file.State(ctx, projection)
 }
 func (r *retainedNodeReference) CheckDeleteIntent() error { return r.file.CheckDeleteIntent() }
 func (r *retainedNodeReference) SetPendingUnlink(ctx context.Context, command storage.PendingUnlinkCommand) (metastore.ReferenceState, error) {

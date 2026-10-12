@@ -2,7 +2,6 @@ package storage
 
 import (
 	"bytes"
-	"context"
 	"slices"
 	"strings"
 	"syscall"
@@ -23,20 +22,9 @@ type ContentMetadataEffect struct {
 	SetMask       []byte
 }
 
-// OpenContentMetadata verifies enrollment support through the complete backing chain.
+// OpenContentMetadata verifies sealed transformation enrollment and its
+// ReferenceMetadataAccess observation selector through the complete backing chain.
 type OpenContentMetadata interface{ CheckOpenContentMetadata() error }
-
-// ReferenceContentMetadata observes only an enrolled namespace through the exact
-// live writable reference, without granting public metadata read or write access.
-type ReferenceContentMetadata interface {
-	CheckContentMetadata() error
-	ObserveContentMetadata(context.Context, uint16) (ContentMetadataObservation, error)
-}
-
-type ContentMetadataObservation struct {
-	NodeID uint64
-	Value  *OpaquePayload
-}
 
 func (e ContentMetadataEffect) Check() error {
 	if err := CheckMetadataNamespace(e.Namespace); err != nil {
@@ -123,7 +111,7 @@ func ResolveContentMetadataEffects(effects []ContentMetadataEffect, indices []ui
 }
 
 // CheckContentMutation requires an explicit condition even for an absent namespace.
-// Effects cannot be used as arbitrary metadata writes or as empty data operations.
+// Effects cannot be used as arbitrary metadata writes or as empty byte writes.
 func CheckContentMutation(command FileMutation, effects []ContentMetadataEffect) error {
 	if err := command.Check(); err != nil {
 		return err
@@ -140,25 +128,7 @@ func CheckContentMutation(command FileMutation, effects []ContentMetadataEffect)
 	return nil
 }
 
-func (o ContentMetadataObservation) Clone() ContentMetadataObservation {
-	if o.Value != nil {
-		value := OpaquePayload{Version: bytes.Clone(o.Value.Version), Data: bytes.Clone(o.Value.Data)}
-		o.Value = &value
-	}
-	return o
-}
-
-func (o ContentMetadataObservation) Check() error {
-	if o.NodeID == 0 {
-		return syscall.EIO
-	}
-	if o.Value != nil && (len(o.Value.Version) == 0 || len(o.Value.Version) > MaxObservationTokenBytes || len(o.Value.Data) > MaxMetadataValueBytes) {
-		return syscall.EIO
-	}
-	return nil
-}
-
-func (o ContentMetadataObservation) CheckEffect(nodeID uint64, effect ContentMetadataEffect) error {
+func (o MetadataObservation) CheckEffect(nodeID uint64, effect ContentMetadataEffect) error {
 	if nodeID == 0 || o.NodeID != nodeID {
 		return syscall.EIO
 	}
