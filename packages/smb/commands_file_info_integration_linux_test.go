@@ -260,7 +260,7 @@ func TestFileInformationReauthorizesEveryLiveObservationAndMutation(t *testing.T
 		if err != nil {
 			t.Fatal(err)
 		}
-		for _, denied := range []storage.Operation{storage.OpFileState, storage.OpFileStat, storage.OpFileAllocationUnit, storage.OpFileSetAttr, storage.OpFileSetMetadata, storage.OpFileObserveMetadata, storage.OpFileTruncate} {
+		for _, denied := range []storage.Operation{storage.OpFileState, storage.OpFileStat, storage.OpFileSetAttr, storage.OpFileSetMetadata, storage.OpFileObserveMetadata, storage.OpFileTruncate} {
 			f.server.config.Authorize = authz.AuthorizerFunc(func(_ context.Context, request authz.AccessRequest) error {
 				if request.Operation == denied {
 					return syscall.EACCES
@@ -273,8 +273,7 @@ func TestFileInformationReauthorizesEveryLiveObservationAndMutation(t *testing.T
 				_, status = f.connection.queryFileInfo(t.Context(), f.session, f.tree, queryInfoRequestForTest(id, wire.FileInternalInformation, 8))
 			case storage.OpFileStat:
 				_, status = f.connection.queryFileInfo(t.Context(), f.session, f.tree, queryInfoRequestForTest(id, wire.FileBasicInformation, 40))
-			case storage.OpFileAllocationUnit:
-				_, status = f.connection.queryFileInfo(t.Context(), f.session, f.tree, queryInfoRequestForTest(id, wire.FileStandardInformation, 24))
+
 			case storage.OpFileSetAttr, storage.OpFileSetMetadata, storage.OpFileObserveMetadata:
 				_, status = f.connection.setFileInfo(t.Context(), f.session, f.tree, setInfoRequestForTest(id, wire.FileBasicInformation, wire.FileBasicInformationBody(wire.FileBasicInfo{Attributes: dosHidden})))
 			default:

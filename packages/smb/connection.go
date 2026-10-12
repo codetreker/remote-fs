@@ -586,11 +586,6 @@ func responseBudget(request wire.Request) int {
 		return 128
 	case wire.Write:
 		return 80
-	case wire.QueryInfo:
-		if parsed, err := request.QueryInfo(); err == nil {
-			return max(80, (72+int(parsed.OutputBufferLength)+7)&^7)
-		}
-		return 80
 	case wire.SetInfo:
 		return 80
 	case wire.Flush:

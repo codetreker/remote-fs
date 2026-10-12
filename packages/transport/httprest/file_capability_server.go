@@ -343,50 +343,6 @@ func (h *Handler) openReference(ctx context.Context, session *servedFileSession,
 func (h *Handler) performSessionCapability(ctx context.Context, session storage.FileSession, req fileRequest) (fileResponse, error) {
 	response := fileResponse{}
 	switch req.Op {
-	case storage.OpFileAllocationUnit:
-		reporter, ok := session.(storage.AllocationReporting)
-		if !ok {
-			return response, syscall.EOPNOTSUPP
-		}
-		if err := reporter.CheckAllocationReporting(); err != nil {
-			return response, err
-		}
-		identity, ok := session.(storage.FileSessionIdentity)
-		if !ok {
-			return response, syscall.EOPNOTSUPP
-		}
-		if err := identity.CheckFileSessionIdentity(); err != nil {
-			return response, err
-		}
-		before, err := identity.FileSessionIdentity(ctx)
-		if err != nil {
-			return response, err
-		}
-		if err := before.Check(); err != nil {
-			return response, err
-		}
-		unit, err := reporter.AllocationUnitBytes(ctx)
-		if err != nil {
-			return response, err
-		}
-		if unit == 0 {
-			return response, syscall.EIO
-		}
-		after, err := identity.FileSessionIdentity(ctx)
-		if err != nil {
-			return response, err
-		}
-		if err := after.Check(); err != nil {
-			return response, err
-		}
-		if after != before {
-			return response, syscall.EIO
-		}
-		if err := ctx.Err(); err != nil {
-			return response, err
-		}
-		response.AllocationUnitBytes = &unit
-		return response, nil
 	case storage.OpFileObserveDirectoryMetadata:
 		return h.observeDirectoryMetadata(ctx, session, req)
 	case storage.OpFileQueryAction, storage.OpFileQueryDeleteIntent, storage.OpFileListDeleteIntents, storage.OpFileAcknowledgeDeleteIntent:

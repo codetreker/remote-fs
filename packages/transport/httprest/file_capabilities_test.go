@@ -198,7 +198,7 @@ func TestAllocationCapabilityRequiresKnownResults(t *testing.T) {
 	unknown.AllocationSize = 0
 	for _, result := range []fileResponse{
 		{Attr: &unknown},
-		{State: &referenceState{Attr: &unknown}},
+		{State: &referenceState{Attr: stateAttrOf(unknown.Storage())}},
 		{Directory: &observedDirectory{Entries: []observedEntry{{Attr: &unknown}}}},
 	} {
 		if err := checkReportedAllocation(result); err == nil {

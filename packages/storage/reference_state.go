@@ -9,8 +9,8 @@ func (p StateProjection) Check() error {
 	return nil
 }
 
-// CheckProjection validates query results. Mutation results can contain partial
-// cleanup facts on failure and retain their separate validation contract.
+// CheckProjection validates query identity and scalar bounds and privacy. Full
+// payloads and mutation results retain their entry-specific validation contracts.
 func (r ReferenceState) CheckProjection(nodeID uint64, projection StateProjection) error {
 	if err := projection.Check(); err != nil {
 		return err
@@ -27,20 +27,6 @@ func (r ReferenceState) CheckProjection(nodeID uint64, projection StateProjectio
 			return syscall.EIO
 		}
 		return nil
-	}
-	if len(r.PendingGeneration) > MaxObservationTokenBytes || r.PendingUnlink && len(r.PendingGeneration) == 0 ||
-		!r.PendingUnlink && len(r.PendingGeneration) != 0 {
-		return syscall.EIO
-	}
-	if r.Attr.Kind == NodeSymlink {
-		if len(r.LinkTarget) == 0 || len(r.LinkTarget) > MaxLinkTargetBytes || int64(len(r.LinkTarget)) != r.Attr.Size {
-			return syscall.EIO
-		}
-	} else if len(r.LinkTarget) != 0 {
-		return syscall.EIO
-	}
-	if err := CheckMetadata(r.Attr.Metadata); err != nil {
-		return syscall.EIO
 	}
 	return nil
 }

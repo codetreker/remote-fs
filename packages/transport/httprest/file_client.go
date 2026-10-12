@@ -28,7 +28,7 @@ func fileReadOnly(op storage.Operation) bool {
 		return true
 	}
 	switch op {
-	case storage.OpFileBackendIdentity, storage.OpFileAllocationUnit, storage.OpFileObserveMetadata, storage.OpFileRead, storage.OpFileStat, storage.OpFileStatNode, storage.OpFileLookupAt, storage.OpFileReadDirNode, storage.OpFileObserveDirectoryMetadata, storage.OpFileObserveName, storage.OpFileQueryAction, storage.OpFileCloseOwnerStatus, storage.OpFileQueryDeleteIntent, storage.OpFileListDeleteIntents, storage.OpFileState, storage.OpFileScope, storage.OpFileRangeGetConflict, storage.OpFileRangeQuery, storage.OpFileStatus:
+	case storage.OpFileBackendIdentity, storage.OpFileObserveMetadata, storage.OpFileRead, storage.OpFileStat, storage.OpFileStatNode, storage.OpFileLookupAt, storage.OpFileReadDirNode, storage.OpFileObserveDirectoryMetadata, storage.OpFileObserveName, storage.OpFileQueryAction, storage.OpFileCloseOwnerStatus, storage.OpFileQueryDeleteIntent, storage.OpFileListDeleteIntents, storage.OpFileState, storage.OpFileScope, storage.OpFileRangeGetConflict, storage.OpFileRangeQuery, storage.OpFileStatus:
 		return true
 	}
 	return false
@@ -477,8 +477,8 @@ func checkReportedAllocation(response fileResponse) error {
 	if err := check(response.Attr); err != nil {
 		return err
 	}
-	if response.State != nil {
-		if err := check(response.State.Attr); err != nil {
+	if response.State != nil && response.State.Attr != nil {
+		if err := check(AttrOf(response.State.Attr.Storage())); err != nil {
 			return err
 		}
 	}

@@ -221,10 +221,11 @@ func (c *connection) writeFile(ctx context.Context, s *session, t *tree, request
 	h = ticket.handle
 	command := storage.FileMutation{Kind: storage.MutateWriteAt}
 	if len(parsed.Data) != 0 {
-		command.ExpectedMetadata, err = c.observeWriteMetadata(ctx, s, t, h)
-		if err != nil {
-			return nil, ioStatusError(err)
+		condition, observeErr := c.observeWriteMetadata(ctx, s, t, h)
+		if observeErr != nil {
+			return nil, ioStatusError(observeErr)
 		}
+		command.ExpectedMetadata = map[string][]byte{windowsMetadataKey: condition.Version}
 		command.ContentEffects = []uint16{0}
 		if h.access&accessWriteData == 0 || parsed.Offset == math.MaxUint64 {
 			command.Kind = storage.MutateAppend
@@ -251,11 +252,11 @@ func (c *connection) writeFile(ctx context.Context, s *session, t *tree, request
 	authorize := func(call context.Context) error {
 		return c.authorizeFileIO(call, s, t, h, storage.OpFileWrite, effects)
 	}
-	reobserve := func(call context.Context) (storage.FileMutation, error) {
-		conditions, err := c.observeWriteMetadata(call, s, t, h)
-		refreshed := cloneMutationCommand(command)
-		refreshed.ExpectedMetadata = conditions
-		return refreshed, err
+	var reobserve func(context.Context) (windowsMetadataCondition, error)
+	if len(parsed.Data) != 0 {
+		reobserve = func(call context.Context) (windowsMetadataCondition, error) {
+			return c.observeWriteMetadata(call, s, t, h)
+		}
 	}
 	currentEpoch := func() uint64 {
 		t.authority.installMu.RLock()

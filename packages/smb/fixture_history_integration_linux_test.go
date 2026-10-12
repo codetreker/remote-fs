@@ -46,12 +46,28 @@ func TestCommandFixtureRenewsNativeActionEpochAfterHistoryRotation(t *testing.T)
 			case <-t.Context().Done():
 				t.Fatal(t.Context().Err())
 			}
-			rotated, err := raw.Status(t.Context())
-			if err != nil {
-				t.Fatal(err)
-			}
-			if rotated.ActionEpoch == initial.ActionEpoch {
-				t.Fatalf("native history did not rotate: initial=%+v current=%+v", initial, rotated)
+			// Transport subtracts elapsed time from HistoryRemaining, so expiry of
+			// that lower bound cannot prove the native admission epoch advanced.
+			rotation, cancelRotation := context.WithTimeout(t.Context(), options.History)
+			defer cancelRotation()
+			poll := time.NewTicker(time.Millisecond)
+			defer poll.Stop()
+			for {
+				rotated, err := raw.Status(rotation)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if rotated.Epoch != initial.Epoch || rotated.ActionEpoch < initial.ActionEpoch {
+					t.Fatalf("native history identity changed: initial=%+v current=%+v", initial, rotated)
+				}
+				if rotated.ActionEpoch > initial.ActionEpoch {
+					break
+				}
+				select {
+				case <-poll.C:
+				case <-rotation.Done():
+					t.Fatalf("native history did not rotate: initial=%+v current=%+v: %v", initial, rotated, rotation.Err())
+				}
 			}
 			if _, status, _ := fixture.connection.createFile(t.Context(), fixture.session, fixture.tree, createRequestForTest("stale", 3, accessReadData)); status != statusSessionDeleted {
 				t.Fatalf("old action epoch CREATE=%#x", status)

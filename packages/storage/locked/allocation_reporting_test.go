@@ -14,18 +14,13 @@ type allocationSessionProbe struct {
 	identity                       storage.FileSessionIdentityResult
 	checkErr, callErr, identityErr error
 	calls, identityCalls           int
-	changeIdentity                 bool
 }
 
 func (p *allocationSessionProbe) CheckFileSessionIdentity() error { return p.checkErr }
 func (p *allocationSessionProbe) CheckAllocationReporting() error { return p.checkErr }
 func (p *allocationSessionProbe) FileSessionIdentity(context.Context) (storage.FileSessionIdentityResult, error) {
 	p.identityCalls++
-	result := p.identity
-	if p.changeIdentity && p.identityCalls > 1 {
-		result.Backend.Authority = "changed"
-	}
-	return result, p.identityErr
+	return p.identity, p.identityErr
 }
 func (p *allocationSessionProbe) AllocationUnitBytes(context.Context) (uint64, error) {
 	p.calls++
@@ -39,14 +34,14 @@ func TestAllocationUnitUsesExactAuthoritativeSession(t *testing.T) {
 		t.Fatal(err)
 	}
 	got, err := wrapper.AllocationUnitBytes(t.Context())
-	if err != nil || got != probe.unit || probe.calls != 1 || probe.identityCalls != 2 {
+	if err != nil || got != probe.unit || probe.calls != 1 || probe.identityCalls != 1 {
 		t.Fatalf("allocation unit=%d %v, calls=%d identityCalls=%d", got, err, probe.calls, probe.identityCalls)
 	}
 }
 
-func TestAllocationUnitRejectsUnknownAndSubstitutedFacts(t *testing.T) {
+func TestAllocationUnitRejectsUnknownFacts(t *testing.T) {
 	failure := errors.New("authority unavailable")
-	for _, scenario := range []string{"check", "capture", "identity", "malformed", "replacement", "canceled"} {
+	for _, scenario := range []string{"check", "capture", "identity", "malformed", "canceled"} {
 		t.Run(scenario, func(t *testing.T) {
 			probe := &allocationSessionProbe{unit: 4096, identity: storage.FileSessionIdentityResult{Backend: storage.BackendIdentityResult{Volume: "volume", Authority: "authority", RootNodeID: 1}, SessionEpoch: "epoch"}}
 			wrapper := &fileSession{FileSession: probe, storage: &Storage{}}
@@ -62,9 +57,6 @@ func TestAllocationUnitRejectsUnknownAndSubstitutedFacts(t *testing.T) {
 			case "malformed":
 				probe.unit = 0
 				want = syscall.EIO
-			case "replacement":
-				probe.changeIdentity = true
-				want = syscall.ESTALE
 			case "canceled":
 				var cancel context.CancelFunc
 				ctx, cancel = context.WithCancel(ctx)

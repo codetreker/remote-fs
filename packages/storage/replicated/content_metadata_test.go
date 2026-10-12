@@ -80,8 +80,8 @@ func TestContentMetadataRejectsAuthorityFailuresAndLocalRetirement(t *testing.T)
 			case "missing identity":
 				remote = &struct {
 					httprest.FileWithBarrier
-					storage.ReferenceMetadataAccess
-				}{FileWithBarrier: &fileAuthorityStub{}, ReferenceMetadataAccess: authority}
+					httprest.ReferenceMetadataAccessWithBarrier
+				}{FileWithBarrier: &fileAuthorityStub{}, ReferenceMetadataAccessWithBarrier: authority}
 			case "check failure":
 				authority.checkErr = failure
 			case "identity failure":

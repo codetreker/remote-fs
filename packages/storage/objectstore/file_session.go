@@ -563,9 +563,6 @@ func (fs *fileSession) AllocationUnitBytes(ctx context.Context) (uint64, error) 
 	if err := fs.CheckAllocationReporting(); err != nil {
 		return 0, err
 	}
-	if err := fs.CheckFileSessionIdentity(); err != nil {
-		return 0, err
-	}
 	ctx, cancel := fs.operationContext(ctx)
 	defer cancel()
 	ctx = metastore.WithFilePublicationGuard(ctx, fs.publicationAllowed)
@@ -574,8 +571,7 @@ func (fs *fileSession) AllocationUnitBytes(ctx context.Context) (uint64, error) 
 		return 0, err
 	}
 	defer done()
-	before, err := fs.currentAllocationIdentity(ctx)
-	if err != nil {
+	if _, err := fs.FileSessionIdentity(ctx); err != nil {
 		return 0, err
 	}
 	unit, err := fs.native.(storage.AllocationReporting).AllocationUnitBytes(ctx)
@@ -585,12 +581,8 @@ func (fs *fileSession) AllocationUnitBytes(ctx context.Context) (uint64, error) 
 	if unit == 0 {
 		return 0, syscall.EIO
 	}
-	after, err := fs.currentAllocationIdentity(ctx)
-	if err != nil {
+	if err := fs.publicationAllowed(); err != nil {
 		return 0, err
-	}
-	if after != before {
-		return 0, syscall.ESTALE
 	}
 	if err := ctx.Err(); err != nil {
 		return 0, err

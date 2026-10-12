@@ -337,7 +337,7 @@ func (r *nodeReference) State(ctx context.Context, projection storage.StateProje
 		return storage.ReferenceState{}, err
 	}
 	defer done()
-	return observeNativeState(ctx, r.session, r.native, r.native, id, projection, &r.active)
+	return observeNativeState(ctx, r.session, r.native, id, projection, &r.active)
 }
 
 func (r *nodeReference) ObserveMetadata(ctx context.Context, request storage.MetadataObservationRequest) (storage.MetadataObservation, error) {
@@ -362,7 +362,7 @@ func (r *nodeReference) ObserveMetadata(ctx context.Context, request storage.Met
 	return observeNativeMetadata(ctx, r.session, r.native, id, request, nil, &r.active)
 }
 
-func observeNativeState(ctx context.Context, session *fileSession, capability metastore.ReferenceStateAccess, reference any, id uint64, projection storage.StateProjection, active *bool) (storage.ReferenceState, error) {
+func observeNativeState(ctx context.Context, session *fileSession, capability metastore.ReferenceStateAccess, id uint64, projection storage.StateProjection, active *bool) (storage.ReferenceState, error) {
 	ctx = metastore.WithReferenceSession(ctx, session.locks)
 	if err := session.locks.IOHealth(ctx, id); err != nil {
 		return storage.ReferenceState{}, err
@@ -386,7 +386,7 @@ func observeNativeState(ctx context.Context, session *fileSession, capability me
 	if err := result.CheckProjection(id, projection); err != nil {
 		return storage.ReferenceState{}, err
 	}
-	if err := checkObservedReference(ctx, session, reference, id, active); err != nil {
+	if err := checkObservedReference(ctx, session, id, active); err != nil {
 		return storage.ReferenceState{}, err
 	}
 	return result, nil
@@ -409,20 +409,13 @@ func observeNativeMetadata(ctx context.Context, session *fileSession, capability
 	if err != nil {
 		return storage.MetadataObservation{}, err
 	}
-	if err := checkObservedReference(ctx, session, capability, id, active); err != nil {
+	if err := checkObservedReference(ctx, session, id, active); err != nil {
 		return storage.MetadataObservation{}, err
 	}
 	return result.Clone(), nil
 }
 
-func checkObservedReference(ctx context.Context, session *fileSession, reference any, expected uint64, active *bool) error {
-	id, err := storage.ReferenceNodeID(reference)
-	if err != nil {
-		return err
-	}
-	if id != expected {
-		return syscall.EIO
-	}
+func checkObservedReference(ctx context.Context, session *fileSession, id uint64, active *bool) error {
 	if err := session.locks.IOHealth(ctx, id); err != nil {
 		return err
 	}

@@ -363,7 +363,7 @@ func observeReferenceState(ctx context.Context, session *fileSession, remote any
 		if err := result.CheckProjection(id, projection); err != nil {
 			return storage.ReferenceState{}, err
 		}
-		if err := checkObservedReference(ctx, session, remote, id); err != nil {
+		if err := checkObservedReference(ctx, session); err != nil {
 			return storage.ReferenceState{}, err
 		}
 		result.Attr = result.Attr.Clone()
@@ -401,21 +401,14 @@ func observeReferenceMetadata(ctx context.Context, session *fileSession, remote 
 		if err != nil {
 			return storage.MetadataObservation{}, err
 		}
-		if err := checkObservedReference(ctx, session, remote, id); err != nil {
+		if err := checkObservedReference(ctx, session); err != nil {
 			return storage.MetadataObservation{}, err
 		}
 		return result.Clone(), nil
 	})
 }
 
-func checkObservedReference(ctx context.Context, session *fileSession, remote any, expected uint64) error {
-	id, err := storage.ReferenceNodeID(remote)
-	if err != nil {
-		return err
-	}
-	if id != expected {
-		return syscall.ESTALE
-	}
+func checkObservedReference(ctx context.Context, session *fileSession) error {
 	if err := session.base.usable("file", ""); err != nil {
 		return err
 	}

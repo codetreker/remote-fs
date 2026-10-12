@@ -188,7 +188,7 @@ func (p *httpStatePolicy) deny(operation storage.Operation) {
 	p.mu.Unlock()
 }
 
-func TestHTTPStateAndAllocationUnitRecheckCurrentPolicy(t *testing.T) {
+func TestHTTPStateRechecksCurrentPolicyAndEnrolledAllocationUnit(t *testing.T) {
 	client, handler, backend := retainedHTTPFixture(t, DefaultFileLimits())
 	if err := backend.Write(t.Context(), "file", []byte("body")); err != nil {
 		t.Fatal(err)
@@ -221,10 +221,6 @@ func TestHTTPStateAndAllocationUnitRecheckCurrentPolicy(t *testing.T) {
 	unit, err := reporter.AllocationUnitBytes(t.Context())
 	if err != nil || unit != 4096 {
 		t.Fatalf("allocation unit=%d error=%v", unit, err)
-	}
-	policy.deny(storage.OpFileAllocationUnit)
-	if unit, err := reporter.AllocationUnitBytes(t.Context()); !errors.Is(err, syscall.EACCES) || unit != 0 {
-		t.Fatalf("revoked allocation unit=%d error=%v", unit, err)
 	}
 	policy.deny("")
 	if err := file.Close(t.Context()); err != nil {
@@ -310,21 +306,29 @@ func TestHTTPScalarStateRejectsProtectedFieldsEvenWhenEmpty(t *testing.T) {
 		t.Fatal("scalar reply accepted as full mutation receipt")
 	}
 	for name, member := range map[string]string{
-		"metadata":          `"metadata":{}`,
-		"birth time":        `"birth_time":{"unix_sec":-62135596800,"nanos":0}`,
-		"change time":       `"change_time":{"unix_sec":-62135596800,"nanos":0}`,
-		"access time":       `"access_time":{"unix_sec":-62135596800,"nanos":0}`,
-		"modification time": `"mod_time":{"unix_sec":-62135596800,"nanos":0}`,
-		"generation":        `"pendingGeneration":""`,
-		"link target":       `"linkTarget":""`,
+		"metadata":               `"metadata":{}`,
+		"birth time":             `"birth_time":{"unix_sec":-62135596800,"nanos":0}`,
+		"change time":            `"change_time":{"unix_sec":-62135596800,"nanos":0}`,
+		"access time":            `"access_time":{"unix_sec":-62135596800,"nanos":0}`,
+		"modification time":      `"mod_time":{"unix_sec":-62135596800,"nanos":0}`,
+		"generation":             `"pendingGeneration":""`,
+		"link target":            `"linkTarget":""`,
+		"metadata null":          `"metadata":null`,
+		"birth time null":        `"birth_time":null`,
+		"change time null":       `"change_time":null`,
+		"access time null":       `"access_time":null`,
+		"modification time null": `"mod_time":null`,
+		"generation null":        `"pendingGeneration":null`,
+		"link target null":       `"linkTarget":null`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			body := string(encoded)
-			if name == "generation" || name == "link target" {
+			if strings.HasPrefix(name, "generation") || strings.HasPrefix(name, "link target") {
 				body = strings.Replace(body, `"pendingUnlink":true`, `"pendingUnlink":true,`+member, 1)
 			} else {
 				body = strings.Replace(body, `"allocation_known":true`, `"allocation_known":true,`+member, 1)
 			}
+			decoded = fileResponse{}
 			if err := decodeFileJSON([]byte(body), &decoded); err != nil {
 				return
 			}

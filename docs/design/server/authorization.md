@@ -62,7 +62,6 @@ storage.Operation 是覆盖路径、文件会话、复制和锁控制的 transpo
 | `file.read-dir-node` | `/v5/file`，`file.read-dir-node` | 按目录身份执行应用枚举并检查 `ReadEntries` |
 | `file.observe-directory-metadata` | `/v5/file`，同名动作 | 取得完整目录 entries、revision 与可选目录当前名字 |
 | `file.observe-name` | `/v5/file`，`file.observe-name` | 取得一个保留引用的 Root／Linked／Detached 当前绑定 |
-| `file.allocation-unit` | `/v5/file-control`，`file.allocation-unit` | 读取原 session volume 的可信非零分配单位，不查询 Space |
 | `file.observe-metadata` | `/v5/file`，`file.observe-metadata` | 按明确 ContentEffect／Namespace purpose 读取 exact 引用的条件，AccessRequest 携带实际请求和所选效果 |
 | `file.mutate-name` | `/v5/file`，`file.mutate-name` | 按父身份创建、删除或改名子项 |
 | `file.open-node-ref` | `/v5/file`，`file.open-node-ref` | 按 NodeID 打开 metadata-only 引用 |
@@ -116,7 +115,7 @@ storage.Operation 是覆盖路径、文件会话、复制和锁控制的 transpo
 
 OpenAt 的 ContentMetadataEffects 随实际 OpenAccess 交给策略，enrollment 另核对 OpFileSetMetadata 与 OpFileObserveMetadata；固定 descriptor 的批准不构成终身权限。每次 ContentEffect 观察从原引用的封存向量解析实际 descriptor，并将明确 MetadataObservationRequest 与所选 ContentMetadataEffects 交给当前策略。非空 WriteAt／Append 与 Truncate 的 typed replay 继续按真实派生效果核对 OpFileSetMetadata；Metadata=nil 不省略这项授权。固定效果许可不替代 initial metadata 或普通 metadata 更新的独立许可。
 
-Namespace purpose 的 ObserveMetadata 使用 WriteMetadata，但不授予 ReadMetadata；每次 AccessRequest.MetadataObservation 携带实际 Namespace、MaxPayloadBytes 和明确 purpose，策略可逐 namespace／bound 批准或拒绝。它不在打开时 enrollment namespace scope，也不允许从另一个 purpose 推导权限。State 使用 OpFileState 与 AccessRequest.StateProjection，Full 仍需 ReadMetadata，Scalars 只读取低权限事实；分配单位使用 OpFileAllocationUnit。已有引用、固定 NodeID 或上次批准都不能跳过本次授权。selectors 与 callback 数据各自深复制，策略修改输入不能改变原请求。
+Namespace purpose 的 ObserveMetadata 使用 WriteMetadata，但不授予 ReadMetadata；每次 AccessRequest.MetadataObservation 携带实际 Namespace、MaxPayloadBytes 和明确 purpose，策略可逐 namespace／bound 批准或拒绝。它不在打开时 enrollment namespace scope，也不允许从另一个 purpose 推导权限。State 使用 OpFileState 与 AccessRequest.StateProjection，Full 仍需 ReadMetadata，Scalars 只读取低权限事实。分配单位或原错误作为授权 session enrollment 的不可变结果取得，不增加逐次单位观察 Operation；文件查询仍核对本次 State／Stat 的授权和健康。已有引用、固定 NodeID 或上次批准都不能跳过本次授权。selectors 与 callback 数据各自深复制，策略修改输入不能改变原请求。
 
 ## 三、请求、capability 与关闭
 

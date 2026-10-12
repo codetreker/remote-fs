@@ -64,18 +64,4 @@ func TestReferenceStateRequiresExplicitProjectionAndPreservesFullFacts(t *testin
 			t.Fatalf("full query %+v = %v", state, err)
 		}
 	}
-	for _, state := range []storage.ReferenceState{
-		{Attr: storage.Attr{ID: 7, Kind: storage.NodeRegular}, PendingUnlink: true},
-		{Attr: storage.Attr{ID: 7, Kind: storage.NodeRegular}, PendingGeneration: []byte{1}},
-		{Attr: storage.Attr{ID: 7, Kind: storage.NodeRegular}, PendingUnlink: true, PendingGeneration: make([]byte, storage.MaxObservationTokenBytes+1)},
-		{Attr: storage.Attr{ID: 7, Kind: storage.NodeSymlink}},
-		{Attr: storage.Attr{ID: 7, Kind: storage.NodeSymlink, Size: 3}, LinkTarget: []byte("dest")},
-		{Attr: storage.Attr{ID: 7, Kind: storage.NodeRegular}, LinkTarget: []byte("dest")},
-		{Attr: storage.Attr{ID: 7, Kind: storage.NodeSymlink, Size: storage.MaxLinkTargetBytes + 1}, LinkTarget: make([]byte, storage.MaxLinkTargetBytes+1)},
-		{Attr: storage.Attr{ID: 7, Kind: storage.NodeRegular, Metadata: map[string]storage.OpaquePayload{"app.flags": {Data: []byte{1}}}}},
-	} {
-		if err := state.CheckProjection(7, storage.StateFull); !errors.Is(err, syscall.EIO) {
-			t.Fatalf("invalid full query %+v = %v", state, err)
-		}
-	}
 }

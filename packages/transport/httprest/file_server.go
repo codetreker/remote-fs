@@ -880,7 +880,11 @@ func (h *Handler) fileCall(ctx context.Context, req fileRequest, digest [32]byte
 		return h.backendIdentity(ctx)
 	}
 	if req.Op == storage.OpFileSessionOpen {
-		return registry.enroll(ctx, req.Options)
+		response, err := registry.enroll(ctx, req.Options)
+		if err != nil {
+			return response, err
+		}
+		return boundedFileSessionResponse(response, min(h.maxBodyBytes, MaxFileControlBytes))
 	}
 
 	registry.mu.Lock()
@@ -1566,8 +1570,6 @@ func (h *Handler) performFile(ctx context.Context, s *servedFileSession, req fil
 	response := fileResponse{}
 	var err error
 	switch req.Op {
-	case storage.OpFileAllocationUnit:
-		return h.performSessionCapability(ctx, s.native, req)
 	case storage.OpFileStatus, storage.OpFileRenew:
 		start := time.Now()
 		var status storage.FileSessionStatus
@@ -1856,6 +1858,17 @@ func (r *fileRegistry) enroll(ctx context.Context, options storage.FileSessionOp
 	err = errors.Join(err, capabilityErr)
 	identity, identityErr := sessionIdentityOf(ctx, native, capabilities, status)
 	err = errors.Join(err, identityErr)
+	if capabilities.Allocation {
+		unit, failure := native.(storage.AllocationReporting).AllocationUnitBytes(ctx)
+		if failure == nil && unit == 0 {
+			failure = syscall.EIO
+		}
+		if failure != nil {
+			capabilities.AllocationUnitError = &ErrorResponse{Errno: storage.ErrnoNameOf(failure), Message: boundedRetainedFileDetail(failure.Error()), CapabilityCode: capabilityErrorCode(failure)}
+		} else {
+			capabilities.AllocationUnitBytes = &unit
+		}
+	}
 	session := &servedFileSession{authority: status.Epoch, revision: status.Revision, native: native, files: make(map[string]*servedFile), actions: make(map[storage.LockRequestID]*servedFileAction), options: options, started: started, expires: started.Add(status.Remaining), sessionCloseReserve: 2, cleanupReserved: 2, recoverable: capabilities.CloseRecovery, stableIdentity: capabilities.StableIdentity}
 	if inline, ok := native.(storage.InlineCloseSettlement); ok {
 		session.inlineSettlement = inline.CheckInlineCloseSettlement() == nil
@@ -1874,7 +1887,7 @@ func (r *fileRegistry) enroll(ctx context.Context, options storage.FileSessionOp
 	}
 	status.Remaining = maxDuration(time.Until(session.expires))
 	status.HistoryRemaining = maxDuration(status.HistoryRemaining - time.Since(started))
-	return fileResponse{Session: id, Epoch: session.epoch(time.Now()), Status: &status, Capabilities: capabilities, SessionIdentity: identity}, nil
+	return fileResponse{Session: id, Epoch: session.epoch(time.Now()), Status: &status, Capabilities: capabilities, SessionIdentity: identity, Data: []byte{}}, nil
 }
 
 func checkFileSessionOptions(options, maximum storage.FileSessionOptions) error {

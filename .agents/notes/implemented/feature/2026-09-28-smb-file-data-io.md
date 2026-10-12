@@ -36,7 +36,7 @@ READ Padding、Channel NONE 的 RemainingBytes 与 channel-info 被忽略；未�
 
 file_io_gate.go 保存 bounded FIFO、running pointer、sequence 与 fence。每次请求在入队前授权，取得 turn 后 backing dispatch 前再核对身份与当前授权。短锁按 authority installation、tree fileMu、session mu、handle ioMu 排序，全部释放后才访问 backing。queued 项保留原 frame 费用，取得 turn 前不复制 Data；不同 FileId 并行，同对象最终顺序由 authority 决定。
 
-mutation_owner.go 在 dispatch 前预留原 immutable Data、action、token、effects、完整 response 与 failure-record。Completed receipt 只允许同 ID／reference／负载 typed replay，不能代替 Attr 与全链 barrier。bound NotExecuted 的 metadata 条件冲突最多重读两次新条件并 mint 两个新 action；Unknown、Retired、无 Operation 的 NotExecuted、失联或授权拒绝不 remint。Unknown 结束 active execution，但保留 owner 与 charge，不能阻塞无关 FileId、renew、状态与 cleanup。
+mutation_owner.go 在 dispatch 前预留原 immutable Data、action、token、effects、完整 response 与 failure-record。Completed receipt 只允许同 ID／reference／负载 typed replay，不能代替 Attr 与全链 barrier。bound NotExecuted 的 smb.windows 条件冲突最多重读两次 token 并 mint 两个新 action；Unknown、Retired、无 Operation 的 NotExecuted、失联或授权拒绝不 remint。Unknown 结束 active execution，但保留 owner 与 charge，不能阻塞无关 FileId、renew、状态与 cleanup。
 
 FLUSH 用独立 flush_owner.go 的无 Data confirmation，通过同句柄 FIFO 后调用 exact File.Sync。HTTP Sync 不要求 Action、不进入 pending journal，也不先扫描全 session pending；仍保留 post-Sync barrier response。Sync 可重新确认同一引用，不重写 WRITE，不从旧路径重新打开。
 

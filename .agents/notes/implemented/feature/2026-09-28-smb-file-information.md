@@ -26,7 +26,7 @@ Basic／NetworkOpen 不能拼接多次 Stat 的字段。Standard／Internal／Id
 
 NodeID 在同一 volume 内不可复用；128-bit ID 对 uint64 NodeID 做无损单射编码，不增加另一份持久 ID map。64-bit serial 从 canonical durable VolumeID 稳定投影，不同发布 volume 的投影碰撞在发布准入拒绝；SMB 每次打开的 FileId 只标识 capability，与对象 ID 分离。未来 32-bit volume serial 的投影与碰撞规则由 volume 信息独立决定。
 
-AllocationKnown／AllocationSize 保留中立分配字节事实；Standard／NetworkOpen 另从既有 `AllocationReporting.AllocationUnitBytes(ctx)` 取得当前可信非零单位并验证整数倍，不能暗中取整或从 EOF 推算。CheckAllocationReporting 同时保证真实 Attr 分配与 getter 的完整链，单位绑定原 volume／session；未知、负值、非法单位或来源失败使相应查询失败。getter 不调用 Space，未配置 allowance 导致 Space=ENOSYS 不影响独立分配事实。内置单位表示已验证的逻辑分配规则，不是 host 物理 sector。后续 volume 容量／sector 表达按其实际消费者定义，不建立本段的平行 geometry API。
+AllocationKnown／AllocationSize 保留权威分配字节，单位是既有 AllocationReporting 的独立可选结果。Standard／NetworkOpen 需要会话内不变的可信非零单位验证整数倍，不能取整或从 EOF 推算。HTTP 在授权 session enrollment 中保留单位或原失败，不增加单位查询RPC；单位不可用不降低字节 capability 或使整个tree失败。需要该事实的文件类明确报告相应错误，当前访问授权和健康仍由本次 StateScalars／Stat保证。单位不依赖 Space allowance 或 host 物理 sector；SQLite 文件消费者复用原 exclusive authority身份路径。
 
 ### 既有状态与 metadata 能力的投影
 
@@ -44,7 +44,7 @@ Basic SET_INFO 严格解析 40 字节，要求 FILE_WRITE_ATTRIBUTES，经 `Muta
 
 EOF SET_INFO 严格解析 8 字节非负长度，只接受普通 File 的 FILE_WRITE_DATA，APPEND-only／目录／metadata-only 不满足。`MutateTruncate` 将长度与已 enrollment 的固定 ARCHIVE 效果同次提交，最终同时核对 READONLY namespace token、原对象 scope、用途／访问保护及额度。truncate 后补 setter 会形成部分效果，不能使用。
 
-Basic 条件动作固定 ExpectedMetadata 与更新 payload 的 Version；只有原动作绑定的 NotExecuted 条件冲突才可同时刷新两者并创建有界新动作。EOF 使用 sealed ContentEffects，客户端不提交替代 payload；authority 验证 descriptor 并计算 ARCHIVE，保留其它位和 namespace。授权失败、quota、READONLY 翻转和条件冲突没有部分内容／属性／时间效果。
+Basic 条件动作保存原时间与请求属性，重读只提供 smb.windows token和实际volume根的HIDDEN／SYSTEM保留位；没有任意namespace／mask／整份command刷新框架。只有原动作绑定的NotExecuted条件冲突才可刷新同一namespace的condition与Version并创建有界新动作。EOF 使用 sealed ContentEffects，客户端不提交替代 payload；authority 验证 descriptor 并计算 ARCHIVE，保留其它位和 namespace。授权失败、quota、READONLY 翻转和条件冲突没有部分内容／属性／时间效果。
 
 ### 准入、预算与恢复
 
@@ -52,7 +52,7 @@ QUERY_INFO／SET_INFO 的原签名字节不改写，related FileId 只在 frame-
 
 逐引用 FIFO 同时覆盖 File／NodeReference。入队前与取得 turn 后分别核对身份、实际访问权及当前授权；CLOSE 先 fence 新请求、移除 queued、排空 running，再恢复已接纳条件动作并执行精确关闭。恢复错误不能阻断取得 no-future-publication 证明的关闭路径。不同 FileId 并行，同一对象最终顺序由 authority 负责。
 
-条件 mutation owner 保存原 Action、kind、target、Attr、Metadata、ExpectedMetadata、Data 及 ContentEffects 的深复制，所有保留字节和 diagnostic 在效果前计费。内部模块为 mutation_owner.go，公开 MaxWriteOwners／MaxRetainedWriteBytes、WriteOwners／WriteFailures 与 AcknowledgeWriteFailures 共用原有条件修改统计和宿主责任转移，不另建一套生命周期。结果校验按 mutation kind 区分，目录与 metadata-only 只接受 Attributes。Completed 只允许同 ID／reference／负载 typed replay 取回完整 Attr／barrier；Unknown／Retired／无 Operation 的 NotExecuted 不能 remint。保留 payload 仅在 exact 引用或完整父 Released 及全链 settlement 证明后释放，终态 failurefacts 继续由宿主明确接管报告责任。HTTP 的 explicitmutation 恢复沿原 filecapability、nestedAction 与 immutableintent 隔离，不阻塞 sibling 查询、renew、状态和 cleanup。
+条件 mutation owner 保存原 Action、kind、target、Attr、Metadata、ExpectedMetadata、Data 及 ContentEffects 的深复制，所有保留字节和 diagnostic 在效果前计费；SET和恢复的Attr预算由原owner统一执行。内部模块为 mutation_owner.go，公开 MaxWriteOwners／MaxRetainedWriteBytes、WriteOwners／WriteFailures 与 AcknowledgeWriteFailures 共用原有条件修改统计和宿主责任转移，不另建一套生命周期。结果校验按 mutation kind 区分，目录与 metadata-only 只接受 Attributes。Completed 只允许同 ID／reference／负载 typed replay 取回完整 Attr／barrier；Unknown／Retired／无 Operation 的 NotExecuted 不能 remint。保留 payload 仅在 exact 引用或完整父 Released 及全链 settlement 证明后释放，终态 failurefacts 继续由宿主明确接管报告责任。HTTP 的 explicitmutation 恢复沿原 filecapability、nestedAction 与 immutableintent 隔离，不阻塞 sibling 查询、renew、状态和 cleanup。
 
 ### 范围切分
 
@@ -108,6 +108,6 @@ command-only SMB share矩阵没有后台续期任务，每次新打开之前通�
 
 逐引用 FIFO 限制单句柄吞吐；Unknown 条件动作继续占有限 owner／bytes／diagnostic，容量满时拒绝新工作并保留关闭与状态能力。Basic 的条件重试同时保存原属性语义和更新 Version，不通过重试改变已接受意图。
 
-文件 allocation 依赖 AllocationReporting 的可信分配单位，第三方缺失事实时相应类明确失败，其它类和文件操作按自身能力继续。文件信息没有新增磁盘 schema；serial 投影与 NodeID 编码的稳定性使重连、改名、unlink 和同名 replacement 保留原对象区别。
+文件 allocation 需要的单位来自 AllocationReporting 可选不变结果，第三方缺失事实时相应类明确失败，其它类和文件操作按自身能力继续。文件信息没有新增磁盘 schema；serial 投影与 NodeID 编码的稳定性使重连、改名、unlink 和同名 replacement 保留原对象区别。
 
 package-local 正常、错误、权限、资源与并发用例验证类表、单 snapshot、条件提交、typedreplay 及关闭结算。Go／wire 与 WindowsAPIunit 测试不等于 Windows11redirector／WNet、通知或私有缓存一致性资格；这些由各自独立交付验证。

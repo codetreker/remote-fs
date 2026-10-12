@@ -40,8 +40,7 @@ func TestQueryInfoRequest(t *testing.T) {
 		packet[67] = class
 		result, err := parseOne(t, packet).QueryInfo()
 		if err != nil || result.InfoType != InfoFile || result.FileInfoClass != class || result.OutputBufferLength != 24 ||
-			result.InputBufferOffset != 0xffff || result.InputBufferLength != ^uint32(0) || result.AdditionalInformation != 0x12345678 ||
-			result.Flags != ^uint32(0) || result.InputBuffer != nil || result.FileID != (FileID{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}) {
+			result.InputBufferLength != ^uint32(0) || result.FileID != (FileID{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}) {
 			t.Fatalf("QUERY_INFO class %d = %+v, %v", class, result, err)
 		}
 		original[67] = class
@@ -61,35 +60,6 @@ func TestQueryInfoRequest(t *testing.T) {
 	} {
 		if _, err := parseOne(t, corrupt(bytes.Clone(packet))).QueryInfo(); !errors.Is(err, ErrMalformed) {
 			t.Fatalf("malformed QUERY_INFO accepted: %v", err)
-		}
-	}
-}
-
-func TestQueryInfoInputExtent(t *testing.T) {
-	for _, infoType := range []byte{InfoFile, InfoQuota} {
-		packet := queryInfoPacket()
-		packet[66], packet[67] = infoType, FileFullEaInformation
-		le.PutUint16(packet[72:74], 104)
-		le.PutUint32(packet[76:80], 4)
-		packet = append(packet, 1, 2, 3, 4)
-		result, err := parseOne(t, packet).QueryInfo()
-		if err != nil || !bytes.Equal(result.InputBuffer, []byte{1, 2, 3, 4}) {
-			t.Fatalf("QUERY_INFO input = %+v, %v", result, err)
-		}
-		packet[104] = 9
-		if result.InputBuffer[0] != 9 {
-			t.Fatal("QUERY_INFO must borrow bounded input bytes")
-		}
-		for _, corrupt := range []func([]byte){
-			func(p []byte) { le.PutUint16(p[72:74], 103) },
-			func(p []byte) { le.PutUint16(p[72:74], 0xffff) },
-			func(p []byte) { le.PutUint32(p[76:80], ^uint32(0)) },
-		} {
-			malformed := bytes.Clone(packet)
-			corrupt(malformed)
-			if _, err := parseOne(t, malformed).QueryInfo(); !errors.Is(err, ErrMalformed) {
-				t.Fatalf("QUERY_INFO accepted input extent: %v", err)
-			}
 		}
 	}
 }
@@ -158,28 +128,19 @@ func TestFileInfoRelatedAndCompoundExtent(t *testing.T) {
 				t.Fatalf("partial related FileId %d accepted: %v", command, err)
 			}
 		}
-		first := queryInfoPacket()
-		if command == QueryInfo {
-			first[67] = FileFullEaInformation
-			le.PutUint16(first[72:74], 104)
-			le.PutUint32(first[76:80], 4)
-		} else {
-			first = setInfoPacket(nil, 96)
+
+		if command == SetInfo {
+			first := setInfoPacket(nil, 96)
 			le.PutUint32(first[68:72], 4)
-		}
-		le.PutUint32(first[20:24], uint32(len(first)))
-		compound := append(first, requestPacket(Echo, 4, 4)...)
-		requests, err := ParseFrame(compound, testLimits)
-		if err != nil || len(requests) != 2 {
-			t.Fatalf("compound parse = %v", err)
-		}
-		if command == QueryInfo {
-			_, err = requests[0].QueryInfo()
-		} else {
-			_, err = requests[0].SetInfo()
-		}
-		if !errors.Is(err, ErrMalformed) {
-			t.Fatalf("file info %d borrowed next command bytes: %v", command, err)
+			le.PutUint32(first[20:24], uint32(len(first)))
+			compound := append(first, requestPacket(Echo, 4, 4)...)
+			requests, err := ParseFrame(compound, testLimits)
+			if err != nil || len(requests) != 2 {
+				t.Fatalf("compound parse = %v", err)
+			}
+			if _, err := requests[0].SetInfo(); !errors.Is(err, ErrMalformed) {
+				t.Fatalf("SET_INFO borrowed next command bytes: %v", err)
+			}
 		}
 	}
 }

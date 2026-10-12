@@ -251,32 +251,12 @@ func (c *connection) checkInformationAllocation(ctx context.Context, s *session,
 	if !known || allocated < 0 {
 		return syscall.EIO
 	}
+	if err := checkFileIOIdentity(ctx, s, t, h); err != nil {
+		return err
+	}
 	reporter, ok := t.authority.raw.(storage.AllocationReporting)
 	if !ok {
 		return syscall.EOPNOTSUPP
-	}
-	identity, ok := t.authority.raw.(storage.FileSessionIdentity)
-	if !ok {
-		return syscall.EOPNOTSUPP
-	}
-	checkAuthority := func() error {
-		if err := c.authorizeReference(ctx, s, t, h, storage.OpFileAllocationUnit, nil); err != nil {
-			return err
-		}
-		if err := identity.CheckFileSessionIdentity(); err != nil {
-			return err
-		}
-		current, err := identity.FileSessionIdentity(ctx)
-		if err != nil {
-			return err
-		}
-		if current != h.identity {
-			return syscall.ESTALE
-		}
-		return checkFileIOIdentity(ctx, s, t, h)
-	}
-	if err := checkAuthority(); err != nil {
-		return err
 	}
 	if err := reporter.CheckAllocationReporting(); err != nil {
 		return err
@@ -288,7 +268,7 @@ func (c *connection) checkInformationAllocation(ctx context.Context, s *session,
 	if unit == 0 || uint64(allocated)%unit != 0 {
 		return syscall.EIO
 	}
-	return checkAuthority()
+	return checkFileIOIdentity(ctx, s, t, h)
 }
 
 func setFiletime(value int64) (*time.Time, error) {
@@ -306,7 +286,7 @@ func setFiletime(value int64) (*time.Time, error) {
 	return &instant, nil
 }
 
-func basicMutation(info wire.FileBasicInfo, kind storage.NodeKind, _ bool) (storage.FileMutation, error) {
+func basicMutation(info wire.FileBasicInfo, kind storage.NodeKind) (storage.FileMutation, error) {
 	command := storage.FileMutation{Kind: storage.MutateAttributes}
 	var err error
 	command.Attr.BirthTime, err = setFiletime(info.CreationTime)
@@ -349,28 +329,25 @@ func basicMutation(info wire.FileBasicInfo, kind storage.NodeKind, _ bool) (stor
 	return command, nil
 }
 
-func (c *connection) observeBasicMetadata(ctx context.Context, s *session, t *tree, h *fileHandle, command storage.FileMutation) (storage.FileMutation, error) {
-	if len(command.Metadata) == 0 {
-		return command, nil
-	}
+func (c *connection) observeBasicMetadata(ctx context.Context, s *session, t *tree, h *fileHandle) (windowsMetadataCondition, error) {
 	request := storage.MetadataObservationRequest{Purpose: storage.MetadataObservationNamespace,
 		Namespace: windowsMetadataKey, MaxPayloadBytes: 8}
 	if err := c.authorizeReference(ctx, s, t, h, storage.OpFileObserveMetadata, &request); err != nil {
-		return storage.FileMutation{}, err
+		return windowsMetadataCondition{}, err
 	}
 	observer, ok := h.reference().(storage.ReferenceMetadataAccess)
 	if !ok {
-		return storage.FileMutation{}, syscall.EOPNOTSUPP
+		return windowsMetadataCondition{}, syscall.EOPNOTSUPP
 	}
 	if err := observer.CheckMetadataAccess(); err != nil {
-		return storage.FileMutation{}, err
+		return windowsMetadataCondition{}, err
 	}
 	observed, err := observer.ObserveMetadata(ctx, request)
 	if err != nil {
-		return storage.FileMutation{}, err
+		return windowsMetadataCondition{}, err
 	}
 	if err = observed.CheckNamespace(h.nodeID, request.Namespace, request.MaxPayloadBytes); err != nil {
-		return storage.FileMutation{}, err
+		return windowsMetadataCondition{}, err
 	}
 	values := map[string]storage.OpaquePayload{}
 	var token []byte
@@ -380,19 +357,13 @@ func (c *connection) observeBasicMetadata(ctx context.Context, s *session, t *tr
 	}
 	old, err := decodeWindowsMetadata(values)
 	if err != nil {
-		return storage.FileMutation{}, err
+		return windowsMetadataCondition{}, err
 	}
-	update := command.Metadata[windowsMetadataKey]
-	update.Data = bytes.Clone(update.Data)
+	condition := windowsMetadataCondition{Version: token}
 	if h.nodeID == h.identity.Backend.RootNodeID {
-		attributes := binary.LittleEndian.Uint32(update.Data[4:])
-		attributes = attributes&^(dosHidden|dosSystem) | old.Attributes&(dosHidden|dosSystem)
-		binary.LittleEndian.PutUint32(update.Data[4:], attributes)
+		condition.RootAttributes = old.Attributes & (dosHidden | dosSystem)
 	}
-	update.Version = bytes.Clone(token)
-	command.Metadata = map[string]storage.OpaquePayload{windowsMetadataKey: update}
-	command.ExpectedMetadata = map[string][]byte{windowsMetadataKey: token}
-	return command, nil
+	return condition, nil
 }
 
 func (c *connection) setFileInfo(ctx context.Context, s *session, t *tree, request wire.Request) ([]byte, uint32) {
@@ -425,7 +396,7 @@ func (c *connection) setFileInfo(ctx context.Context, s *session, t *tree, reque
 		if err != nil {
 			return nil, statusInvalid
 		}
-		command, err = basicMutation(info, h.nodeKind, h.nodeID == h.identity.Backend.RootNodeID)
+		command, err = basicMutation(info, h.nodeKind)
 		if err != nil {
 			return nil, ioStatusError(err)
 		}
@@ -465,17 +436,26 @@ func (c *connection) setFileInfo(ctx context.Context, s *session, t *tree, reque
 		return nil, ioStatusError(err)
 	}
 	defer ticket.finish()
-	reobserve := func(call context.Context) (storage.FileMutation, error) {
-		if command.Kind == storage.MutateTruncate {
-			refreshed := command
-			refreshed.ExpectedMetadata, err = c.observeWriteMetadata(call, s, t, h)
-			return refreshed, err
+	var reobserve func(context.Context) (windowsMetadataCondition, error)
+	if command.Kind == storage.MutateTruncate {
+		command.ExpectedMetadata = map[string][]byte{windowsMetadataKey: nil}
+		reobserve = func(call context.Context) (windowsMetadataCondition, error) {
+			return c.observeWriteMetadata(call, s, t, h)
 		}
-		return c.observeBasicMetadata(call, s, t, h, command)
+	} else if hasMetadata {
+		reobserve = func(call context.Context) (windowsMetadataCondition, error) {
+			return c.observeBasicMetadata(call, s, t, h)
+		}
 	}
-	command, err = reobserve(ctx)
-	if err != nil {
-		return nil, ioStatusError(err)
+	if reobserve != nil {
+		condition, observeErr := reobserve(ctx)
+		if observeErr != nil {
+			return nil, ioStatusError(observeErr)
+		}
+		command, err = applyWindowsMetadataCondition(command, condition, h.nodeID == h.identity.Backend.RootNodeID)
+		if err != nil {
+			return nil, ioStatusError(err)
+		}
 	}
 	epoch := func() uint64 {
 		t.authority.installMu.RLock()
@@ -486,34 +466,15 @@ func (c *connection) setFileInfo(ctx context.Context, s *session, t *tree, reque
 	if err != nil {
 		return nil, ioStatusError(err)
 	}
-	var preservation []mutationMetadataPreservation
-	if command.Kind == storage.MutateAttributes && len(command.Metadata) != 0 && h.nodeID == h.identity.Backend.RootNodeID {
-		mask := make([]byte, 8)
-		binary.LittleEndian.PutUint32(mask[4:], dosHidden|dosSystem)
-		preservation = []mutationMetadataPreservation{{Namespace: windowsMetadataKey, Mask: mask}}
-	}
-	owner, err := c.server.reserveMutationOwner(t, h, ticket.sequence, command, effects, preservation...)
+	owner, err := c.server.reserveMutationOwner(t, h, ticket.sequence, command, effects)
 	if err != nil {
 		return nil, ioStatusError(err)
 	}
 	h.pendingWrite = owner
 	registerIOResponse(ctx, owner.recordResponse)
 	authorizeOwner := func(call context.Context) error { return authorize(call, h) }
-	limit := int64(c.server.config.Limits.MaxFrameBytes)
-	call := storage.WithBoundedAttrResult(ctx, limit, func(attr storage.Attr, n int64) error {
-		if attr.ID != h.nodeID || attr.Kind != h.nodeKind || attr.Kind == storage.NodeRegular && attr.Size < 0 {
-			return syscall.EIO
-		}
-		retained, err := storage.MetadataRetentionBytes(n)
-		if err != nil {
-			return err
-		}
-		if retained+512 > limit {
-			return syscall.EFBIG
-		}
-		return nil
-	})
-	_, err = owner.executeMutation(call, authorizeOwner, reobserve, epoch)
+	owner.resultByteLimit = int64(c.server.config.Limits.MaxFrameBytes)
+	_, err = owner.executeMutation(ctx, authorizeOwner, reobserve, epoch)
 	if err != nil {
 		return nil, ioStatusError(err)
 	}

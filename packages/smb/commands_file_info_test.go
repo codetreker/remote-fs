@@ -187,7 +187,7 @@ func TestFileInformationRejectsContradictoryFacts(t *testing.T) {
 func TestFileInformationMissingAllocationUnitIsClassLocal(t *testing.T) {
 	f := validInfoFileProbe()
 	c, s, tree, h := newInfoCommandFixture(t, f, accessReadAttr)
-	tree.authority.raw.(*infoAllocationSession).checkErr = syscall.EOPNOTSUPP
+	tree.authority.raw.(*infoAllocationSession).err = syscall.EOPNOTSUPP
 	for _, class := range []byte{wire.FileBasicInformation, wire.FileInternalInformation, wire.FileIdInformation} {
 		if _, status := c.queryFileInfo(t.Context(), s, tree, queryInfoRequestForTest(h.id, class, 56)); status != statusOK {
 			t.Fatalf("allocation-independent class %d status=%#x", class, status)
@@ -283,7 +283,7 @@ func TestFileInformationIgnoresNonconsumedQueryFields(t *testing.T) {
 	}
 }
 
-func TestFileInfoCreditsAndResponseBudgetsUseDeclaredBufferLengths(t *testing.T) {
+func TestFileInfoCreditsUseDeclaredBufferLengthsWithFixedResponseBudgets(t *testing.T) {
 	for _, input := range []uint32{0, 65536, 65537, 1 << 20} {
 		for _, output := range []uint32{0, 40, 65536, 65537, 1 << 20} {
 			request := queryInfoRequestForTest(wire.FileID{1}, wire.FileBasicInformation, output)
@@ -292,7 +292,7 @@ func TestFileInfoCreditsAndResponseBudgetsUseDeclaredBufferLengths(t *testing.T)
 			if got := requiredCredits(request); got != want {
 				t.Fatalf("QUERY buffers %d/%d credits=%d want=%d", input, output, got, want)
 			}
-			if got := responseBudget(request); got != max(80, (72+int(output)+7)&^7) {
+			if got := responseBudget(request); got != 128 {
 				t.Fatalf("QUERY output=%d response budget=%d", output, got)
 			}
 		}
@@ -300,7 +300,7 @@ func TestFileInfoCreditsAndResponseBudgetsUseDeclaredBufferLengths(t *testing.T)
 	if got := responseBudget(setInfoRequestForTest(wire.FileID{1}, wire.FileBasicInformation, make([]byte, 40))); got != 80 {
 		t.Fatalf("SET budget=%d", got)
 	}
-	if got := responseBudget(wire.Request{Header: wire.Header{Command: wire.QueryInfo}}); got != 80 {
+	if got := responseBudget(wire.Request{Header: wire.Header{Command: wire.QueryInfo}}); got != 128 {
 		t.Fatalf("malformed QUERY error budget=%d", got)
 	}
 }
@@ -321,60 +321,66 @@ func TestFileInformationDirectorySizeSentinelDoesNotEnterEOFProjection(t *testin
 	}
 }
 
-func TestFileInformationAllocationUnitChecksOwningSessionAndCurrentPolicy(t *testing.T) {
-	for _, test := range []struct {
-		name  string
-		setup func(context.CancelFunc, *connection, *tree, *infoAllocationSession)
-		want  error
-		calls int
-	}{
-		{"substituted-before", func(_ context.CancelFunc, _ *connection, _ *tree, reporter *infoAllocationSession) {
-			reporter.status.Epoch = "substituted"
-		}, syscall.ESTALE, 0},
-		{"substituted-after", func(_ context.CancelFunc, _ *connection, _ *tree, reporter *infoAllocationSession) {
-			reporter.afterUnit = func() { reporter.status.Epoch = "substituted" }
-		}, syscall.ESTALE, 1},
-		{"retired-after", func(_ context.CancelFunc, _ *connection, tree *tree, reporter *infoAllocationSession) {
-			reporter.afterUnit = func() { tree.authority.closed = true }
-		}, syscall.ESTALE, 1},
-		{"canceled-after", func(cancel context.CancelFunc, _ *connection, _ *tree, reporter *infoAllocationSession) {
-			reporter.afterUnit = cancel
-		}, context.Canceled, 1},
-		{"denied-before", func(_ context.CancelFunc, c *connection, _ *tree, _ *infoAllocationSession) {
-			c.server.config.Authorize = authz.AuthorizerFunc(func(_ context.Context, request authz.AccessRequest) error {
-				if request.Operation == storage.OpFileAllocationUnit {
-					return authz.ErrDenied
-				}
-				return nil
-			})
-		}, authz.ErrDenied, 0},
-		{"revoked-after", func(_ context.CancelFunc, c *connection, _ *tree, reporter *infoAllocationSession) {
-			reporter.afterUnit = func() {
+func TestFileInformationAllocationFactsAndLiveQueryPolicy(t *testing.T) {
+	for _, class := range []byte{wire.FileStandardInformation, wire.FileNetworkOpenInformation} {
+		operation := storage.OpFileState
+		if class == wire.FileNetworkOpenInformation {
+			operation = storage.OpFileStat
+		}
+		for _, test := range []struct {
+			name  string
+			setup func(context.CancelFunc, *connection, *tree, *fileHandle, *infoAllocationSession)
+			want  error
+			calls int
+		}{
+			{"reference-invalid-before", func(_ context.CancelFunc, _ *connection, _ *tree, h *fileHandle, _ *infoAllocationSession) {
+				h.identity.SessionEpoch = "substituted"
+			}, syscall.ESTALE, 0},
+			{"reference-invalid-after", func(_ context.CancelFunc, _ *connection, _ *tree, h *fileHandle, reporter *infoAllocationSession) {
+				reporter.afterUnit = func() { h.identity.SessionEpoch = "substituted" }
+			}, syscall.ESTALE, 1},
+			{"retired-after", func(_ context.CancelFunc, _ *connection, tree *tree, _ *fileHandle, reporter *infoAllocationSession) {
+				reporter.afterUnit = func() { tree.authority.closed = true }
+			}, syscall.ESTALE, 1},
+			{"canceled-after", func(cancel context.CancelFunc, _ *connection, _ *tree, _ *fileHandle, reporter *infoAllocationSession) {
+				reporter.afterUnit = cancel
+			}, context.Canceled, 1},
+			{"denied-query-before", func(_ context.CancelFunc, c *connection, _ *tree, _ *fileHandle, _ *infoAllocationSession) {
 				c.server.config.Authorize = authz.AuthorizerFunc(func(_ context.Context, request authz.AccessRequest) error {
-					if request.Operation == storage.OpFileAllocationUnit {
+					if request.Operation == operation {
 						return authz.ErrDenied
 					}
 					return nil
 				})
-			}
-		}, authz.ErrDenied, 1},
-		{"checker-error", func(_ context.CancelFunc, _ *connection, _ *tree, reporter *infoAllocationSession) {
-			reporter.checkErr = syscall.EIO
-		}, syscall.EIO, 0},
-		{"unit-error", func(_ context.CancelFunc, _ *connection, _ *tree, reporter *infoAllocationSession) {
-			reporter.err = syscall.EIO
-		}, syscall.EIO, 1},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			c, s, tree, h := newInfoCommandFixture(t, validInfoFileProbe(), accessReadAttr)
-			reporter := tree.authority.raw.(*infoAllocationSession)
-			ctx, cancel := context.WithCancel(t.Context())
-			defer cancel()
-			test.setup(cancel, c, tree, reporter)
-			err := c.checkInformationAllocation(ctx, s, tree, h, true, 4096)
-			if !errors.Is(err, test.want) || reporter.units != test.calls {
-				t.Fatalf("allocation unit err=%v calls=%d; want %v/%d", err, reporter.units, test.want, test.calls)
-			}
-		})
+			}, authz.ErrDenied, 0},
+			{"revoked-query-after", func(_ context.CancelFunc, c *connection, _ *tree, _ *fileHandle, reporter *infoAllocationSession) {
+				reporter.afterUnit = func() {
+					c.server.config.Authorize = authz.AuthorizerFunc(func(_ context.Context, request authz.AccessRequest) error {
+						if request.Operation == operation {
+							return authz.ErrDenied
+						}
+						return nil
+					})
+				}
+			}, authz.ErrDenied, 1},
+			{"checker-error", func(_ context.CancelFunc, _ *connection, _ *tree, _ *fileHandle, reporter *infoAllocationSession) {
+				reporter.checkErr = syscall.EIO
+			}, syscall.EIO, 0},
+			{"unit-source-error", func(_ context.CancelFunc, _ *connection, _ *tree, _ *fileHandle, reporter *infoAllocationSession) {
+				reporter.err = syscall.EIO
+			}, syscall.EIO, 1},
+		} {
+			t.Run(fmt.Sprintf("%d/%s", class, test.name), func(t *testing.T) {
+				c, s, tree, h := newInfoCommandFixture(t, validInfoFileProbe(), accessReadAttr)
+				reporter := tree.authority.raw.(*infoAllocationSession)
+				ctx, cancel := context.WithCancel(t.Context())
+				defer cancel()
+				test.setup(cancel, c, tree, h, reporter)
+				body, status := c.queryFileInfo(ctx, s, tree, queryInfoRequestForTest(h.id, class, 56))
+				if status != ioStatusError(test.want) || len(body) != 0 || reporter.units != test.calls {
+					t.Fatalf("query status=%#x body=%x unit calls=%d; want %#x/%d", status, body, reporter.units, ioStatusError(test.want), test.calls)
+				}
+			})
+		}
 	}
 }

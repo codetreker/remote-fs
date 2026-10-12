@@ -387,13 +387,6 @@ func (r *referenceCapabilities) ObserveMetadata(ctx context.Context, request sto
 			return storage.MetadataObservation{}, err
 		}
 	}
-	after, err := r.ReferenceNodeID()
-	if err != nil {
-		return storage.MetadataObservation{}, err
-	}
-	if after != id {
-		return storage.MetadataObservation{}, syscall.ESTALE
-	}
 	if err := r.storage.healthy(); err != nil {
 		return storage.MetadataObservation{}, err
 	}
@@ -441,13 +434,6 @@ func (r *referenceCapabilities) State(ctx context.Context, projection storage.St
 	}
 	if err := result.CheckProjection(id, projection); err != nil {
 		return storage.ReferenceState{}, err
-	}
-	after, err := r.ReferenceNodeID()
-	if err != nil {
-		return storage.ReferenceState{}, err
-	}
-	if after != id {
-		return storage.ReferenceState{}, syscall.ESTALE
 	}
 	if err := r.storage.healthy(); err != nil {
 		return storage.ReferenceState{}, err

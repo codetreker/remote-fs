@@ -4,29 +4,23 @@ const (
 	InfoFile       byte = 1
 	InfoFilesystem byte = 2
 	InfoSecurity   byte = 3
-	InfoQuota      byte = 4
 )
 
 const (
 	FileBasicInformation       byte = 4
 	FileStandardInformation    byte = 5
 	FileInternalInformation    byte = 6
-	FileFullEaInformation      byte = 15
 	FileEndOfFileInformation   byte = 20
 	FileNetworkOpenInformation byte = 34
 	FileIdInformation          byte = 59
 )
 
 type QueryInfoRequest struct {
-	InfoType              byte
-	FileInfoClass         byte
-	OutputBufferLength    uint32
-	InputBufferOffset     uint16
-	InputBufferLength     uint32
-	AdditionalInformation uint32
-	Flags                 uint32
-	FileID                FileID
-	InputBuffer           []byte
+	InfoType           byte
+	FileInfoClass      byte
+	OutputBufferLength uint32
+	InputBufferLength  uint32
+	FileID             FileID
 }
 
 type SetInfoRequest struct {
@@ -47,23 +41,10 @@ func (request Request) QueryInfo() (QueryInfoRequest, error) {
 	result.InfoType = request.Body[2]
 	result.FileInfoClass = request.Body[3]
 	result.OutputBufferLength = le.Uint32(request.Body[4:8])
-	result.InputBufferOffset = le.Uint16(request.Body[8:10])
 	result.InputBufferLength = le.Uint32(request.Body[12:16])
-	result.AdditionalInformation = le.Uint32(request.Body[16:20])
-	result.Flags = le.Uint32(request.Body[20:24])
 	copy(result.FileID[:], request.Body[24:40])
 	if result.FileID.HasPartialRelatedPlaceholder() {
 		return QueryInfoRequest{}, ErrMalformed
-	}
-	// Only quota and EA queries consume input. Other classes ignore the length
-	// even when it cannot describe a buffer in this command.
-	// https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-smb2/abb48417-27e5-4a16-82e0-3e5981db97e8
-	if result.InfoType == InfoQuota || result.InfoType == InfoFile && result.FileInfoClass == FileFullEaInformation {
-		var err error
-		result.InputBuffer, err = request.field(uint32(result.InputBufferOffset), result.InputBufferLength, HeaderSize+40)
-		if err != nil {
-			return QueryInfoRequest{}, err
-		}
 	}
 	return result, nil
 }

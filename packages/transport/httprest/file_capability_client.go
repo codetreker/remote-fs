@@ -25,34 +25,20 @@ func (s *remoteFileSession) CheckAllocationReporting() error {
 	return checkFileCapability(s.capabilities.Allocation)
 }
 func (s *remoteFileSession) AllocationUnitBytes(ctx context.Context) (uint64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
 	if err := s.CheckAllocationReporting(); err != nil {
 		return 0, err
 	}
-	before, err := s.FileSessionIdentity(ctx)
-	if err != nil {
-		return 0, err
+	if err := validateAllocationUnitCapability(&s.capabilities, true); err != nil {
+		return 0, unreachable(Request{Op: OpFileControl}, err)
 	}
-	if err := before.Check(); err != nil {
-		return 0, err
+	if failure := s.capabilities.AllocationUnitError; failure != nil {
+		errno, _ := storage.ErrnoByName(failure.Errno)
+		return 0, &operationError{req: Request{Op: OpFileControl}, errno: errno, detail: failure.Message, capability: capabilityErrors[failure.CapabilityCode]}
 	}
-	response, err := s.call(ctx, fileRequest{Op: storage.OpFileAllocationUnit})
-	if err != nil {
-		return 0, err
-	}
-	after, err := s.FileSessionIdentity(ctx)
-	if err != nil {
-		return 0, err
-	}
-	if err := after.Check(); err != nil {
-		return 0, err
-	}
-	if after != before {
-		return 0, unreachable(Request{Op: OpFileControl}, syscall.EIO)
-	}
-	if response.AllocationUnitBytes == nil || *response.AllocationUnitBytes == 0 {
-		return 0, unreachable(Request{Op: OpFileControl}, syscall.EIO)
-	}
-	return *response.AllocationUnitBytes, nil
+	return *s.capabilities.AllocationUnitBytes, nil
 }
 
 func (s *remoteFileSession) CheckNamespaceAccess() error {

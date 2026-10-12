@@ -72,7 +72,7 @@ func (h *Handler) attrResultBudget(req fileRequest) storage.AttrResultBudget {
 				}
 				response.State = referenceStateOfProjection(storage.ReferenceState{Attr: attr}, storage.StateScalars)
 			} else {
-				response.State = &referenceState{Attr: AttrOf(attr), PendingGeneration: make([]byte, storage.MaxObservationTokenBytes)}
+				response.State = referenceStateOf(storage.ReferenceState{Attr: attr, PendingGeneration: make([]byte, storage.MaxObservationTokenBytes)})
 			}
 			if attr.Kind == storage.NodeSymlink && !(req.Op == storage.OpFileState && req.StateProjection == storage.StateScalars) {
 				if attr.Size < 0 || attr.Size > storage.MaxLinkTargetBytes {
@@ -132,4 +132,32 @@ func boundedObservationResponse(response fileResponse, budget int64) (fileRespon
 		return fileResponse{}, syscall.EFBIG
 	}
 	return response, nil
+}
+
+func boundedFileSessionResponse(response fileResponse, limit int64) (fileResponse, error) {
+	encoded, err := json.Marshal(response)
+	if err != nil {
+		return fileResponse{}, err
+	}
+	if int64(len(encoded)) <= limit {
+		return response, nil
+	}
+	if response.Capabilities == nil || response.Capabilities.AllocationUnitError == nil {
+		return fileResponse{}, errBodyTooLarge
+	}
+	caps := *response.Capabilities
+	failure := *caps.AllocationUnitError
+	caps.AllocationUnitError = &failure
+	response.Capabilities = &caps
+	for _, message := range []string{boundedErrorDetail, ""} {
+		failure.Message = message
+		encoded, err = json.Marshal(response)
+		if err != nil {
+			return fileResponse{}, err
+		}
+		if int64(len(encoded)) <= limit {
+			return response, nil
+		}
+	}
+	return fileResponse{}, errBodyTooLarge
 }

@@ -70,9 +70,9 @@ advisory session 的普通 `Status`／历史在退休后仍拒绝；仅 `WithClo
 | `RangeControl` | 查询冲突、批量编辑、核对、取消和按 domain 清理范围 |
 | `DeleteIntent` | 设置或按 generation 清除节点 pending deletion |
 | `ConditionalFileMutation` | 在最终发布处比较 size/metadata 条件并修改内容或属性 |
-| `AllocationReporting` | 检查本会话返回的每份 Attr 都具有已知分配量，并返回新鲜、可信、非零的 AllocationUnitBytes |
+| `AllocationReporting` | 检查本会话返回的每份 Attr 都具有已知分配量，并可提供会话内不变的非零 AllocationUnitBytes |
 
-Go 的 NamespaceAccess、DirectoryReader、DirectoryMetadataObserver 与 AllocationReporting 可以独立实现，各有自己的 Check。HTTP v5 的 DirectoryMetadata capability 是一个 transport bundle gate：server 只有在 FileSession 的完整包装链同时通过 CheckDirectoryRead 与 CheckDirectoryMetadataObservation 时才宣告 true，remote FileSession 的 ReadDirNode、ReadDirNodeBounded 与 ObserveDirectoryMetadata 都要求它。Namespace bit 只表示 LookupAt 与 MutateName，不参与这个 bundle。AllocationReporting bit 只有完整链保证所有 Attr 已知并可取得可信非零单位时才宣告；objectstore 只转发 metastore 的显式保证，locked、replicated 与 HTTP 会话逐层保留该检查。按精确 payload 收费的 `limited` 遮蔽所有返回 Attr 的底层分配量，将其标为未知，并以 `EOPNOTSUPP` 拒绝 AllocationReporting。ReferenceName 在 File/NodeReference 上独立宣告。能力缺失时不能由路径查询、副本或缓存模拟。
+Go 的 NamespaceAccess、DirectoryReader、DirectoryMetadataObserver 与 AllocationReporting 可以独立实现，各有自己的 Check。HTTP v5 的 DirectoryMetadata capability 是一个 transport bundle gate：server 只有在 FileSession 的完整包装链同时通过 CheckDirectoryRead 与 CheckDirectoryMetadataObservation 时才宣告 true，remote FileSession 的 ReadDirNode、ReadDirNodeBounded 与 ObserveDirectoryMetadata 都要求它。Namespace bit 只表示 LookupAt 与 MutateName，不参与这个 bundle。AllocationReporting bit 只保证完整链提供已知 Attr 分配字节；单位结果独立于该 bit；objectstore 只转发 metastore 的显式保证，locked、replicated 与 HTTP 会话逐层保留该检查。按精确 payload 收费的 `limited` 遮蔽所有返回 Attr 的底层分配量，将其标为未知，并以 `EOPNOTSUPP` 拒绝 AllocationReporting。ReferenceName 在 File/NodeReference 上独立宣告。能力缺失时不能由路径查询、副本或缓存模拟。
 
 ### State 投影与条件观察
 
@@ -84,7 +84,9 @@ Go 的 NamespaceAccess、DirectoryReader、DirectoryMetadataObserver 与 Allocat
 
 返回 `MetadataObservation{NodeID,Value}` 拥有自己的 bytes。Value=nil 仅表示权威确认缺席；存在空值仍携带有效 token。结果核对 exact NodeID、实际 purpose 与 payload bound，错误返回零。native 的私有 namespace capture 只加载至多 64 KiB canonical envelope，供两个 purpose 在同一读事务中取得一个 namespace；各公开入口仍独立核对权限、生命期、descriptor 或 per-call bound。Namespace 条件观察不增加打开 enrollment、引用 scope registry 或另一套 checker；完整契约由 OpenMetadataAccess／CheckMetadataAccess 逐层验证。
 
-`AllocationReporting.AllocationUnitBytes(ctx)` 返回同一 volume／session 的可信、非零分配单位，不读取 Space 或 host 磁盘 sector。既有 CheckAllocationReporting 验证实际 Attr 分配事实及这个 getter 的完整链；失败返回零单位。原生 getter 核对实际 mode、identity 和健康，objectstore／HTTP／wrappers 逐层保持 session 身份与来源；limited 继续拒绝底层分配保证。SMB Standard／NetworkOpen 的已知 AllocationSize 必须被该单位整除，不舍入或从 EOF 推算。未配置 allowance 时 Space 可以 ENOSYS，分配单位仍按其独立事实可查询；文件能力不增加第二套 geometry checker／capability。
+`AllocationReporting` 的 Check 只保证返回 Attr 的权威分配字节。`AllocationUnitBytes(ctx)` 可另提供会话内不变的非零逻辑单位；不支持为 EOPNOTSUPP，实际失败保留原错误，任一失败返回零。单位不依赖 Space allowance 或 host sector。SQLite 文件会话只使用原有 exclusive authority 路径，objectstore 与 adapters 保留实际健康／context／引用生命期检查。
+
+HTTP 在已经授权的 session enrollment 中取得单位或原失败，和既有 allocation capability 一起返回。remote getter读取这份不可变结果，不另发RPC。单位缺席、未知或失败只使需要整除校验的 Standard／NetworkOpen 查询明确失败；不能撤销已有分配字节保证、阻止 tree 的其它文件访问，或把真实错误隐藏为不支持。每次查询仍在原 StateScalars／Stat 路径检查当前授权、authority health、对象身份和非零单位整除，不舍入或从 EOF 推算。
 
 ## 二、保留节点、名字与回收
 
@@ -214,9 +216,10 @@ OpenAt 的 `contentMetadataEffects` 与 mutation 的 `contentEffects` 使用独�
 
 delete-intent query 使用顶层 `deleteOwner` 与 `deleteIntent`，list 使用 `deleteOwner`、`deleteAfter` 与 `deleteLimit`，ACK 命令携带 `owner`、`intent` 与 `action`。CloseIntent 的嵌套值也携带 `owner`。这些字段在访问持久账本前验证，HTTP 的 list、query 和 ACK 分别授权；同一个 owner 的页游标可跨 authority 重启继续使用。
 
-`file.state` 位于 `/v5/file-control`，必须携带非零 `stateProjection`。两种投影使用同一 `state` envelope；Scalars 的 `attr` 仅含 `id,kind,size,allocation_size,allocation_known`，外层仅含 detached／pendingUnlink，protected 字段即使为 null 或空值也拒绝。Full 要求完整时间／metadata 与对应 link／generation 结构，不能接受 scalar reply。两端按请求投影验证结果与 exact 引用身份，不隐式选 Full。
+`file.state` 位于 `/v5/file-control`，必须携带非零 `stateProjection`。两种投影使用同一 `state` envelope；Scalars 的 `attr` 仅含 `id,kind,size,allocation_size,allocation_known`，外层仅含 detached／pendingUnlink，protected 字段即使为 null 或空值也拒绝。Full 沿既有完整状态结构验证，不能接受 scalar reply。两端按请求投影验证结果与 exact 引用身份，不隐式选 Full。
 
-`file.observe-metadata` 位于 `/v5/file`，以 exact file capability 和 `metadataObservation{purpose,effectIndex,namespace,maxPayloadBytes}` 选择条件；所有 selector 字段显式传输，按 purpose 验证互斥组合。响应 `observedMetadata{nodeId,value?{version,data}}`，确认缺席省略 value。完整最大 payload、token、JSON／base64 envelope 在 backing 前按实际 purpose 预留，短预算以 EFBIG 拒绝。session 的 `openMetadata` 与 reference 的 `metadata` bool 验证同一 ReferenceMetadataAccess 契约；state 使用既有 reference `state` bool，没有另设信息／观察 capability bit。`file.allocation-unit` 是 control 查询，通过既有 session `allocation` bool 暴露，响应的 `allocationUnitBytes` 必须明确存在、非 null、整数且非零；失败返回零而不补固定单位。
+`file.observe-metadata` 位于 `/v5/file`，以 exact file capability 和 `metadataObservation{purpose,effectIndex,namespace,maxPayloadBytes}` 选择条件；所有 selector 字段显式传输，按 purpose 验证互斥组合。响应 `observedMetadata{nodeId,value?{version,data}}`，确认缺席省略 value。完整最大 payload、token、JSON／base64 envelope 在 backing 前按实际 purpose 预留，短预算以 EFBIG 拒绝。session 的 `openMetadata` 与 reference 的 `metadata` bool 验证同一 ReferenceMetadataAccess 契约；state 使用既有 reference `state` bool，没有另设信息／观察 capability bit。session capability 中，allocation=true 时必须恰好有一份 `allocationUnitBytes` 或 `allocationUnitError`：成功值为非 null、非零整数，错误保留封闭 errno／capability 分类与有界诊断；allocation=false 时二者均缺席。单位不可用不改变 allocation bool，null、双份、缺席、零值或畸形字段拒绝。没有独立 allocation-unit route；context 取消仍由 getter 明确返回。
+
 
 server 的 session 能力宣告 AtomicOpen、Namespace、References、FileActions、CloseRecovery、Metadata、Owners、Ranges、DirectoryMetadata、SessionIdentity、StableIdentity、OpenMetadata 与 OpenContentMetadata，wire 使用 lower-camel bool。DirectoryMetadata 只在 DirectoryReader 和 DirectoryMetadataObserver 的完整 backing chain 都可用时为 true。remote client 用这个 bit 同时 gate ReadDirNode 与 ObserveDirectoryMetadata，Namespace bit 只覆盖 LookupAt 与 MutateName。File 与 NodeReference 按实际方法宣告 Metadata、Scope、State、Delete、Conditional 与 ReferenceName；固定 ContentMetadataEffects 只在可写 File enrollment，NodeReference 不获得数据派生效果；StableIdentity 另承诺两类引用的稳定 ReferenceNodeID，client 即使未取得 ReferenceName 也验证返回身份。v5 client 只在对应 bool 为 true 时暴露可选接口，任意未知 capability 字段仍是协议错误。
 

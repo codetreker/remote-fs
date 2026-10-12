@@ -69,13 +69,18 @@ func (p *referenceObservationNativeProbe) ObserveMetadata(ctx context.Context, r
 
 type allocationUnitNativeProbe struct {
 	*identityCapabilityProbe
-	checkErr error
-	unit     uint64
-	unitErr  error
-	hook     func()
+	checkErr      error
+	unit          uint64
+	unitErr       error
+	identityCalls int
+	hook          func()
 }
 
 func (p *allocationUnitNativeProbe) CheckAllocationReporting() error { return p.checkErr }
+func (p *allocationUnitNativeProbe) BackendIdentity(ctx context.Context) (storage.BackendIdentityResult, error) {
+	p.identityCalls++
+	return p.identityCapabilityProbe.BackendIdentity(ctx)
+}
 func (p *allocationUnitNativeProbe) AllocationUnitBytes(context.Context) (uint64, error) {
 	if p.hook != nil {
 		p.hook()
@@ -125,7 +130,7 @@ func TestObjectReferenceStateAndMetadataCapabilityChecks(t *testing.T) {
 
 func TestObjectReferenceScalarStateRejectsFailuresAndRetirement(t *testing.T) {
 	for _, node := range []bool{false, true} {
-		for _, scenario := range []string{"valid", "identity", "changedidentity", "size", "allocation", "check", "getter", "cancel", "retired", "session"} {
+		for _, scenario := range []string{"valid", "identity", "size", "allocation", "check", "getter", "cancel", "retired", "session"} {
 			t.Run(scenario+map[bool]string{false: "/file", true: "/node"}[node], func(t *testing.T) {
 				session := actionTestSession(t, 10)
 				probe := &referenceObservationNativeProbe{id: 19, state: metastore.ReferenceState{State: metastore.FileState{Node: metastore.Node{ID: 19, Kind: storage.NodeRegular, Size: 4, AllocationSize: 4096, AllocationKnown: true}}}}
@@ -138,9 +143,6 @@ func TestObjectReferenceScalarStateRejectsFailuresAndRetirement(t *testing.T) {
 				switch scenario {
 				case "identity":
 					probe.state.State.ID++
-					want = syscall.EIO
-				case "changedidentity":
-					probe.hook = func(context.Context) { probe.id++ }
 					want = syscall.EIO
 				case "size":
 					probe.state.State.Size = -1
@@ -241,7 +243,7 @@ func TestObjectReferenceStateRejectsInvalidProjectionBeforeNativeCall(t *testing
 
 func TestObjectMetadataObservationEnforcesBoundsAndCopiesNativeBytes(t *testing.T) {
 	for _, node := range []bool{false, true} {
-		for _, scenario := range []string{"valid", "absent", "empty", "identity", "changedidentity", "version", "oversize", "permission", "index", "check", "getter", "cancel", "retired", "session"} {
+		for _, scenario := range []string{"valid", "absent", "empty", "identity", "version", "oversize", "permission", "index", "check", "getter", "cancel", "retired", "session"} {
 			t.Run(scenario+map[bool]string{false: "/file", true: "/node"}[node], func(t *testing.T) {
 				session := actionTestSession(t, 10)
 				probe := &referenceObservationNativeProbe{id: 19, observation: storage.MetadataObservation{NodeID: 19, Value: &storage.OpaquePayload{Version: []byte{1}, Data: []byte{2, 3}}}}
@@ -260,9 +262,6 @@ func TestObjectMetadataObservationEnforcesBoundsAndCopiesNativeBytes(t *testing.
 					probe.observation.Value.Data = nil
 				case "identity":
 					probe.observation.NodeID++
-					want = syscall.EIO
-				case "changedidentity":
-					probe.hook = func(context.Context) { probe.id++ }
 					want = syscall.EIO
 				case "version":
 					probe.observation.Value.Version = nil
@@ -325,8 +324,8 @@ func TestObjectMetadataObservationEnforcesBoundsAndCopiesNativeBytes(t *testing.
 	}
 }
 
-func TestObjectAllocationUnitBindsBackendBeforeAndAfterNativeCall(t *testing.T) {
-	for _, scenario := range []string{"valid", "zero", "getter", "before", "after", "session", "cancel"} {
+func TestObjectAllocationUnitUsesLiveSessionAndPropagatesFailures(t *testing.T) {
+	for _, scenario := range []string{"valid", "zero", "getter", "unsupported", "before", "session", "cancel"} {
 		t.Run(scenario, func(t *testing.T) {
 			session := actionTestSession(t, 10)
 			session.cleanup = context.Background()
@@ -349,11 +348,11 @@ func TestObjectAllocationUnitBindsBackendBeforeAndAfterNativeCall(t *testing.T) 
 			case "getter":
 				probe.unitErr = syscall.EIO
 				want = syscall.EIO
+			case "unsupported":
+				probe.unitErr = syscall.EOPNOTSUPP
+				want = syscall.EOPNOTSUPP
 			case "before":
 				probe.result.Authority = "different"
-				want = syscall.ESTALE
-			case "after":
-				probe.hook = func() { probe.result.Authority = "different" }
 				want = syscall.ESTALE
 			case "session":
 				probe.hook = func() { session.mu.Lock(); session.active = false; session.mu.Unlock() }
@@ -362,7 +361,13 @@ func TestObjectAllocationUnitBindsBackendBeforeAndAfterNativeCall(t *testing.T) 
 				probe.hook = func() { cancel() }
 				want = context.Canceled
 			}
+			if err := session.CheckAllocationReporting(); err != nil {
+				t.Fatalf("allocation byte capability=%v", err)
+			}
 			got, err := session.AllocationUnitBytes(ctx)
+			if probe.identityCalls != 1 {
+				t.Fatalf("identity calls=%d; want 1", probe.identityCalls)
+			}
 			if want != nil {
 				if !errors.Is(err, want) || got != 0 {
 					t.Fatalf("got=%+v,%v;want=%v", got, err, want)

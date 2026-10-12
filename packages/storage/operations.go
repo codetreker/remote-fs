@@ -83,5 +83,4 @@ const OpFileObserveDirectoryMetadata Operation = "file.observe-directory-metadat
 
 const (
 	OpFileObserveMetadata Operation = "file.observe-metadata"
-	OpFileAllocationUnit  Operation = "file.allocation-unit"
 )

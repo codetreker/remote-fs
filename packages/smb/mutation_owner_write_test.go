@@ -105,9 +105,9 @@ func TestWriteOwnerUnknownRetainsPayloadUntilCompleteProof(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			_, err = owner.executeMutation(t.Context(), func(context.Context) error { return nil }, func(context.Context) (storage.FileMutation, error) {
+			_, err = owner.executeMutation(t.Context(), func(context.Context) error { return nil }, func(context.Context) (windowsMetadataCondition, error) {
 				t.Fatal("unbound receipt reminted action")
-				return storage.FileMutation{}, nil
+				return windowsMetadataCondition{}, nil
 			}, func() uint64 { return 1 })
 			if !errors.Is(err, syscall.EIO) || !owner.pending() || calls != 1 {
 				t.Fatalf("unknown result: %v pending=%v calls=%d", err, owner.pending(), calls)
@@ -158,11 +158,9 @@ func TestWriteOwnerConditionRetriesRequireBoundRefusalAndRemainLimited(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = owner.executeMutation(t.Context(), func(context.Context) error { return nil }, func(context.Context) (storage.FileMutation, error) {
+	_, err = owner.executeMutation(t.Context(), func(context.Context) error { return nil }, func(context.Context) (windowsMetadataCondition, error) {
 		observations++
-		retry := cloneMutationCommand(command)
-		retry.ExpectedMetadata = map[string][]byte{windowsMetadataKey: []byte("new")}
-		return retry, nil
+		return windowsMetadataCondition{Version: []byte("new")}, nil
 	}, func() uint64 { return 1 })
 	if !errors.Is(err, storage.ErrConditionConflict) || calls != 3 || len(ids) != 3 || observations != 2 || owner.pending() {
 		t.Fatalf("retry result: %v calls=%d ids=%d obs=%d", err, calls, len(ids), observations)

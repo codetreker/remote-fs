@@ -5,7 +5,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
-	"reflect"
 	"sync"
 	"syscall"
 	"time"
@@ -27,7 +26,6 @@ type mutationOwner struct {
 	mutation         storage.ConditionalFileMutation
 	command          storage.FileMutation
 	effects          []storage.ContentMetadataEffect
-	preservation     []mutationMetadataPreservation
 	sequence         uint64
 	resultByteLimit  int64
 	authorize        func(context.Context) error
@@ -42,12 +40,7 @@ type mutationOwner struct {
 	responseFinal    bool
 }
 
-type mutationMetadataPreservation struct {
-	Namespace string
-	Mask      []byte
-}
-
-func (s *Server) reserveMutationOwner(t *tree, h *fileHandle, sequence uint64, command storage.FileMutation, effects []storage.ContentMetadataEffect, preservation ...mutationMetadataPreservation) (*mutationOwner, error) {
+func (s *Server) reserveMutationOwner(t *tree, h *fileHandle, sequence uint64, command storage.FileMutation, effects []storage.ContentMetadataEffect) (*mutationOwner, error) {
 	if h == nil {
 		return nil, syscall.EINVAL
 	}
@@ -62,14 +55,17 @@ func (s *Server) reserveMutationOwner(t *tree, h *fileHandle, sequence uint64, c
 	if err := storage.CheckContentMutation(command, effects); err != nil {
 		return nil, err
 	}
-	seen := make(map[string]bool, len(preservation))
-	for _, scope := range preservation {
-		value, present := command.Metadata[scope.Namespace]
-		if command.Kind != storage.MutateAttributes || !present || seen[scope.Namespace] || len(scope.Mask) != len(value.Data) {
+	if command.Kind == storage.MutateAttributes {
+		if len(command.ExpectedMetadata) != 0 || len(command.Metadata) > 1 {
 			return nil, syscall.EINVAL
 		}
-		seen[scope.Namespace] = true
+		if len(command.Metadata) != 0 {
+			if _, present := command.Metadata[windowsMetadataKey]; !present {
+				return nil, syscall.EINVAL
+			}
+		}
 	}
+
 	mutation, ok := h.reference().(storage.ConditionalFileMutation)
 	if !ok {
 		return nil, syscall.EOPNOTSUPP
@@ -85,9 +81,7 @@ func (s *Server) reserveMutationOwner(t *tree, h *fileHandle, sequence uint64, c
 		return nil, err
 	}
 	charged := len(command.Data)
-	for _, scope := range preservation {
-		charged += len(scope.Namespace) + len(scope.Mask)
-	}
+
 	for name := range command.ExpectedMetadata {
 		charged += len(name) + storage.MaxObservationTokenBytes
 	}
@@ -111,9 +105,7 @@ func (s *Server) reserveMutationOwner(t *tree, h *fileHandle, sequence uint64, c
 		return nil, err
 	}
 	o := &mutationOwner{server: s, volume: t.export.share.Volume, id: id, handle: h, nodeKind: kind, actions: actions, mutation: mutation, command: cloneMutationCommand(command), effects: storage.CloneContentMetadataEffects(effects), sequence: sequence}
-	for _, scope := range preservation {
-		o.preservation = append(o.preservation, mutationMetadataPreservation{Namespace: scope.Namespace, Mask: bytes.Clone(scope.Mask)})
-	}
+
 	s.writes.update(id, func(r *writeRecord) {
 		r.fact.Action = command.Action
 		r.fact.Operation = storage.OpFileMutate
@@ -146,11 +138,13 @@ func cloneMutationCommand(command storage.FileMutation) storage.FileMutation {
 	return command
 }
 
-func (o *mutationOwner) executeMutation(ctx context.Context, authorize func(context.Context) error, reobserve func(context.Context) (storage.FileMutation, error), epoch func() uint64) (storage.Attr, error) {
+func (o *mutationOwner) executeMutation(ctx context.Context, authorize func(context.Context) error, reobserve func(context.Context) (windowsMetadataCondition, error), epoch func() uint64) (storage.Attr, error) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	o.authorize = authorize
-	o.resultByteLimit, _ = storage.AttrResultByteLimit(ctx)
+	if limit, bounded := storage.AttrResultByteLimit(ctx); bounded {
+		o.resultByteLimit = limit
+	}
 	ctx = o.resultContext(ctx)
 	if authorize == nil {
 		return o.failLocked(syscall.EINVAL)
@@ -177,21 +171,22 @@ func (o *mutationOwner) executeMutation(ctx context.Context, authorize func(cont
 		}
 		if receipt.Outcome == storage.FileActionNotExecuted && receipt.Operation == storage.OpFileMutate {
 			if errors.Is(err, storage.ErrConditionConflict) && o.conditionRetries < maxMutationConditionRetries && reobserve != nil && epoch != nil {
-				retryCommand, observeErr := reobserve(ctx)
+				condition, observeErr := reobserve(ctx)
 				if observeErr != nil {
 					o.rejectLocked(observeErr)
 					return o.failLocked(observeErr)
 				}
-				if !o.validRetryCommandLocked(retryCommand) {
-					o.rejectLocked(syscall.EIO)
-					return o.failLocked(syscall.EIO)
+				retryCommand, retryErr := applyWindowsMetadataCondition(cloneMutationCommand(o.command), condition, o.handle.nodeID == o.handle.identity.Backend.RootNodeID)
+				if retryErr != nil {
+					o.rejectLocked(retryErr)
+					return o.failLocked(retryErr)
 				}
 				newAction, mintErr := storage.NewFileActionID(epoch())
 				if mintErr != nil {
 					o.rejectLocked(mintErr)
 					return o.failLocked(mintErr)
 				}
-				o.command = cloneMutationCommand(retryCommand)
+				o.command = retryCommand
 				o.command.Action = newAction
 				o.conditionRetries++
 				o.dispatched = false
@@ -236,44 +231,6 @@ func (o *mutationOwner) queryLocked(ctx context.Context) (storage.FileActionRece
 		return storage.FileActionReceipt{}, syscall.EIO
 	}
 	return receipt, nil
-}
-
-func (o *mutationOwner) validRetryCommandLocked(command storage.FileMutation) bool {
-	if len(command.ExpectedMetadata) != len(o.command.ExpectedMetadata) || len(command.Metadata) != len(o.command.Metadata) || storage.CheckContentMutation(command, o.effects) != nil {
-		return false
-	}
-	for name := range o.command.ExpectedMetadata {
-		if _, present := command.ExpectedMetadata[name]; !present {
-			return false
-		}
-	}
-	prior, retry := cloneMutationCommand(o.command), cloneMutationCommand(command)
-	prior.Action, retry.Action = "", ""
-	prior.ExpectedMetadata, retry.ExpectedMetadata = nil, nil
-	for name, oldValue := range prior.Metadata {
-		newValue, present := retry.Metadata[name]
-		if !present {
-			return false
-		}
-		condition, conditioned := command.ExpectedMetadata[name]
-		if !conditioned || !bytes.Equal(newValue.Version, condition) {
-			return false
-		}
-		for _, scope := range o.preservation {
-			if scope.Namespace == name {
-				if len(oldValue.Data) != len(scope.Mask) || len(newValue.Data) != len(scope.Mask) {
-					return false
-				}
-				for index, mask := range scope.Mask {
-					oldValue.Data[index] &^= mask
-					newValue.Data[index] &^= mask
-				}
-			}
-		}
-		oldValue.Version, newValue.Version = nil, nil
-		prior.Metadata[name], retry.Metadata[name] = oldValue, newValue
-	}
-	return reflect.DeepEqual(prior, retry)
 }
 
 func (o *mutationOwner) resultContext(ctx context.Context) context.Context {
@@ -420,7 +377,6 @@ func (o *mutationOwner) releasePayloadLocked() {
 	o.command.ExpectedSize = nil
 	o.command.Uses = nil
 	o.effects = nil
-	o.preservation = nil
 	o.authorize = nil
 	o.server.writes.releasePayload(o.id)
 }

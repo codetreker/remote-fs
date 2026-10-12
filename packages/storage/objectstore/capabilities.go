@@ -84,7 +84,7 @@ func (fs *fileSession) OpenAt(ctx context.Context, selection storage.ChildSelect
 		return storage.OpenResult{}, err
 	}
 	selection = selection.Clone()
-	options = canonicalFileActionInput(openAtActionInput{Options: options}).(openAtActionInput).Options
+	options.ContentMetadataEffects = storage.CloneContentMetadataEffects(options.ContentMetadataEffects)
 	if len(options.ContentMetadataEffects) != 0 {
 		if err := fs.CheckOpenContentMetadata(); err != nil {
 			return storage.OpenResult{}, err
@@ -133,7 +133,6 @@ func (fs *fileSession) OpenNodeRef(ctx context.Context, id uint64, options stora
 	if err := options.Check(); err != nil {
 		return storage.NodeOpenResult{}, err
 	}
-	options = canonicalFileActionInput(nodeRefActionInput{Options: options}).(nodeRefActionInput).Options
 	input := nodeRefActionInput{Node: id, Options: options}
 	return runFileAction(ctx, fs, options.Action, storage.OpFileOpenNodeRef, input, cloneNodeOpenResult,
 		func(result storage.NodeOpenResult) bool {
@@ -157,7 +156,6 @@ func (fs *fileSession) OpenChildRef(ctx context.Context, selection storage.Child
 		return storage.NodeOpenResult{}, err
 	}
 	selection = selection.Clone()
-	options = canonicalFileActionInput(nodeRefActionInput{Options: options}).(nodeRefActionInput).Options
 	input := nodeRefActionInput{Selection: &selection, Options: options}
 	return runFileAction(ctx, fs, options.Action, storage.OpFileOpenChildRef, input, cloneNodeOpenResult,
 		func(result storage.NodeOpenResult) bool {
@@ -446,7 +444,7 @@ func (f *openFile) State(ctx context.Context, projection storage.StateProjection
 		return storage.ReferenceState{}, err
 	}
 	defer done()
-	return observeNativeState(ctx, f.session, f.native.(metastore.ReferenceStateAccess), f.native, id, projection, &f.active)
+	return observeNativeState(ctx, f.session, f.native.(metastore.ReferenceStateAccess), id, projection, &f.active)
 }
 
 func (f *openFile) ObserveMetadata(ctx context.Context, request storage.MetadataObservationRequest) (storage.MetadataObservation, error) {

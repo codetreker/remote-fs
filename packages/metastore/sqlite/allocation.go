@@ -22,29 +22,17 @@ func (s *Store) AllocationUnitBytes(ctx context.Context) (uint64, error) {
 		return 0, err
 	}
 	defer s.coordinator.commit.release()
-	if s.files == nil || s.root <= 0 {
-		return 0, syscall.ESTALE
-	}
-	exclusive := s.leaseOwner != nil && s.leaseOwner.Exclusive()
-	if exclusive {
-		if err := s.checkFileOwnership(); err != nil {
-			return 0, err
-		}
-		if s.fileDomain == nil {
-			return 0, syscall.ESTALE
-		}
-	} else if err := s.coordinator.healthy(); err != nil {
+	if err := s.checkFileOwnership(); err != nil {
 		return 0, err
+	}
+	if s.fileDomain == nil || s.root <= 0 {
+		return 0, syscall.ESTALE
 	}
 	if err := metastore.CheckFilePublication(ctx); err != nil {
 		return 0, err
 	}
 	err := s.inspect(ctx, func(tx *sql.Tx) error {
-		if exclusive {
-			_, err := s.captureBackendIdentity(ctx, tx)
-			return err
-		}
-		_, err := s.captureVolumeIdentity(ctx, tx)
+		_, err := s.captureBackendIdentity(ctx, tx)
 		return err
 	})
 	if err == nil {

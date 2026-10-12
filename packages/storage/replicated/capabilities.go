@@ -134,8 +134,7 @@ func (s *fileSession) OpenAt(ctx context.Context, selection storage.ChildSelecti
 			result, barrier, err = capability.OpenAtWithBarrier(ctx, selection, options)
 			return barrier, err
 		})
-		result, err = s.wrapOpenResult(result, err)
-		return result, err
+		return s.wrapOpenResult(result, err)
 	})
 }
 
@@ -303,19 +302,17 @@ func (s *fileSession) MutateName(ctx context.Context, command storage.NameComman
 
 func (s *fileSession) OpenNodeRef(ctx context.Context, id uint64, options storage.NodeRefOptions) (storage.NodeOpenResult, error) {
 	return sessionCapability(ctx, s, true, func(ctx context.Context, capability httprest.NodeReferencesWithBarrier) (storage.NodeOpenResult, error) {
-		result, err := s.openReference(ctx, func(ctx context.Context) (storage.NodeOpenResult, *httprest.MutationBarrier, error) {
+		return s.openReference(ctx, func(ctx context.Context) (storage.NodeOpenResult, *httprest.MutationBarrier, error) {
 			return capability.OpenNodeRefWithBarrier(ctx, id, options)
 		})
-		return result, err
 	})
 }
 
 func (s *fileSession) OpenChildRef(ctx context.Context, selection storage.ChildSelection, options storage.NodeRefOptions) (storage.NodeOpenResult, error) {
 	return sessionCapability(ctx, s, true, func(ctx context.Context, capability httprest.NodeReferencesWithBarrier) (storage.NodeOpenResult, error) {
-		result, err := s.openReference(ctx, func(ctx context.Context) (storage.NodeOpenResult, *httprest.MutationBarrier, error) {
+		return s.openReference(ctx, func(ctx context.Context) (storage.NodeOpenResult, *httprest.MutationBarrier, error) {
 			return capability.OpenChildRefWithBarrier(ctx, selection, options)
 		})
-		return result, err
 	})
 }
 
@@ -508,11 +505,7 @@ func (s *fileSession) AllocationUnitBytes(ctx context.Context) (uint64, error) {
 		if err := s.CheckAllocationReporting(); err != nil {
 			return 0, err
 		}
-		if err := s.CheckFileSessionIdentity(); err != nil {
-			return 0, err
-		}
-		before, err := s.FileSessionIdentity(ctx)
-		if err != nil {
+		if _, err := s.FileSessionIdentity(ctx); err != nil {
 			return 0, err
 		}
 		result, err := s.remote.(storage.AllocationReporting).AllocationUnitBytes(ctx)
@@ -521,13 +514,6 @@ func (s *fileSession) AllocationUnitBytes(ctx context.Context) (uint64, error) {
 		}
 		if result == 0 {
 			return 0, syscall.EIO
-		}
-		after, err := s.FileSessionIdentity(ctx)
-		if err != nil {
-			return 0, err
-		}
-		if before != after {
-			return 0, syscall.ESTALE
 		}
 		if err := s.base.usable("file", ""); err != nil {
 			return 0, err

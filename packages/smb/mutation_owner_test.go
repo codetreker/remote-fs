@@ -33,9 +33,8 @@ func metadataOwnerFixture(t *testing.T, kind storage.NodeKind) (*Server, *tree, 
 		t.Fatal(err)
 	}
 	command = storage.FileMutation{Action: command.Action, Kind: storage.MutateAttributes,
-		Attr:             storage.AttrChange{BirthTime: &stamp, AccessTime: &stamp, ModTime: &stamp},
-		Metadata:         map[string]storage.OpaquePayload{windowsMetadataKey: {Version: []byte("old"), Data: data}},
-		ExpectedMetadata: map[string][]byte{windowsMetadataKey: []byte("old")},
+		Attr:     storage.AttrChange{BirthTime: &stamp, AccessTime: &stamp, ModTime: &stamp},
+		Metadata: map[string]storage.OpaquePayload{windowsMetadataKey: {Version: []byte("old"), Data: data}},
 	}
 	return server, tree, h, node, session, command
 }
@@ -62,7 +61,6 @@ func TestMutationOwnerNodeReferenceReplaysExactDeepCopiedIntent(t *testing.T) {
 					*got.Attr.BirthTime = time.Time{}
 					got.Metadata[windowsMetadataKey].Data[4] = byte(dosArchive)
 					got.Metadata[windowsMetadataKey].Version[0] = 'x'
-					got.ExpectedMetadata[windowsMetadataKey][0] = 'x'
 					return storage.Attr{}, syscall.EIO
 				}
 				return metadataOwnerAttr(h, got), nil
@@ -77,7 +75,6 @@ func TestMutationOwnerNodeReferenceReplaysExactDeepCopiedIntent(t *testing.T) {
 			*command.Attr.ModTime = time.Time{}
 			command.Metadata[windowsMetadataKey].Data[4] = byte(dosSystem)
 			command.Metadata[windowsMetadataKey].Version[0] = 'z'
-			command.ExpectedMetadata[windowsMetadataKey][0] = 'z'
 			attr, err := owner.executeMutation(t.Context(), func(context.Context) error { return nil }, nil, nil)
 			if err != nil || attr.ID != h.nodeID || attr.Kind != kind || calls != 2 {
 				t.Fatalf("metadata replay: attr=%+v err=%v calls=%d", attr, err, calls)
@@ -93,7 +90,7 @@ func TestMutationOwnerNodeReferenceReplaysExactDeepCopiedIntent(t *testing.T) {
 	}
 }
 
-func TestMutationOwnerBasicRetryRefreshesBothCASConditions(t *testing.T) {
+func TestMutationOwnerBasicRetryRefreshesExistingMetadataCASVersion(t *testing.T) {
 	server, tree, h, node, session, command := metadataOwnerFixture(t, storage.NodeDirectory)
 	calls, observations := 0, 0
 	priorAction := command.Action
@@ -102,8 +99,8 @@ func TestMutationOwnerBasicRetryRefreshesBothCASConditions(t *testing.T) {
 		if calls == 1 {
 			return storage.Attr{}, storage.ErrConditionConflict
 		}
-		if got.Action == priorAction || !bytes.Equal(got.ExpectedMetadata[windowsMetadataKey], []byte("fresh")) || !bytes.Equal(got.Metadata[windowsMetadataKey].Version, []byte("fresh")) {
-			t.Fatalf("retry did not refresh both CAS values: %+v", got)
+		if got.Action == priorAction || len(got.ExpectedMetadata) != 0 || !bytes.Equal(got.Metadata[windowsMetadataKey].Version, []byte("fresh")) {
+			t.Fatalf("retry did not refresh metadata CAS version: %+v", got)
 		}
 		return metadataOwnerAttr(h, got), nil
 	}
@@ -114,66 +111,48 @@ func TestMutationOwnerBasicRetryRefreshesBothCASConditions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = owner.executeMutation(t.Context(), func(context.Context) error { return nil }, func(context.Context) (storage.FileMutation, error) {
+	_, err = owner.executeMutation(t.Context(), func(context.Context) error { return nil }, func(context.Context) (windowsMetadataCondition, error) {
 		observations++
-		retry := cloneMutationCommand(command)
-		retry.ExpectedMetadata[windowsMetadataKey] = []byte("fresh")
-		update := retry.Metadata[windowsMetadataKey]
-		update.Version = []byte("fresh")
-		retry.Metadata[windowsMetadataKey] = update
-		return retry, nil
+		return windowsMetadataCondition{Version: []byte("fresh")}, nil
 	}, func() uint64 { return 1 })
 	if err != nil || calls != 2 || observations != 1 || owner.pending() {
 		t.Fatalf("retry failed: %v calls=%d observations=%d", err, calls, observations)
 	}
 }
 
-func TestMutationOwnerRejectsRetryThatChangesIntentOrLeavesStaleVersion(t *testing.T) {
-	for _, change := range []string{"stale-version", "data", "time", "kind", "namespace", "condition"} {
-		t.Run(change, func(t *testing.T) {
-			server, tree, h, node, session, command := metadataOwnerFixture(t, storage.NodeDirectory)
-			calls := 0
-			node.mutate = func(storage.FileMutation) (storage.Attr, error) {
-				calls++
-				return storage.Attr{}, storage.ErrConditionConflict
-			}
-			session.query = func(id storage.FileActionID) (storage.FileActionReceipt, error) {
-				return storage.FileActionReceipt{Action: id, Operation: storage.OpFileMutate, Outcome: storage.FileActionNotExecuted}, nil
-			}
-			owner, err := server.reserveMutationOwner(tree, h, 1, command, nil)
-			if err != nil {
-				t.Fatal(err)
-			}
-			_, err = owner.executeMutation(t.Context(), func(context.Context) error { return nil }, func(context.Context) (storage.FileMutation, error) {
-				retry := cloneMutationCommand(command)
-				retry.ExpectedMetadata[windowsMetadataKey] = []byte("fresh")
-				update := retry.Metadata[windowsMetadataKey]
-				update.Version = []byte("fresh")
-				switch change {
-				case "stale-version":
-					update.Version = []byte("old")
-				case "data":
-					update.Data[4] = byte(dosSystem)
-				case "time":
-					*retry.Attr.ModTime = retry.Attr.ModTime.Add(time.Second)
-				case "kind":
-					retry.Kind = storage.MutateTruncate
-				case "namespace":
-					delete(retry.Metadata, windowsMetadataKey)
-					retry.Metadata["other"] = update
-				case "condition":
-					delete(retry.ExpectedMetadata, windowsMetadataKey)
-					retry.ExpectedMetadata["other"] = []byte("fresh")
-				}
-				if change != "namespace" {
-					retry.Metadata[windowsMetadataKey] = update
-				}
-				return retry, nil
-			}, func() uint64 { return 1 })
-			if !errors.Is(err, syscall.EIO) || calls != 1 || owner.pending() || server.Status().RetainedWriteBytes != 0 {
-				t.Fatalf("invalid retry dispatched: %v calls=%d pending=%v", err, calls, owner.pending())
-			}
-		})
+func TestMutationOwnerBasicRetryKeepsCapturedIntent(t *testing.T) {
+	server, tree, h, node, session, command := metadataOwnerFixture(t, storage.NodeDirectory)
+	original := cloneMutationCommand(command)
+	calls := 0
+	node.mutate = func(got storage.FileMutation) (storage.Attr, error) {
+		calls++
+		if calls == 1 {
+			return storage.Attr{}, storage.ErrConditionConflict
+		}
+		original.Action = got.Action
+		update := original.Metadata[windowsMetadataKey]
+		update.Version = []byte("fresh")
+		original.Metadata[windowsMetadataKey] = update
+		if !reflect.DeepEqual(got, original) {
+			t.Fatalf("retry changed retained intent: %+v", got)
+		}
+		return metadataOwnerAttr(h, got), nil
+	}
+	session.query = func(id storage.FileActionID) (storage.FileActionReceipt, error) {
+		return storage.FileActionReceipt{Action: id, Operation: storage.OpFileMutate, Outcome: storage.FileActionNotExecuted}, nil
+	}
+	owner, err := server.reserveMutationOwner(tree, h, 1, command, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = owner.executeMutation(t.Context(), func(context.Context) error { return nil }, func(context.Context) (windowsMetadataCondition, error) {
+		*command.Attr.ModTime = command.Attr.ModTime.Add(time.Second)
+		command.Metadata[windowsMetadataKey].Data[4] = byte(dosArchive)
+		command.Kind = storage.MutateTruncate
+		return windowsMetadataCondition{Version: []byte("fresh")}, nil
+	}, func() uint64 { return 1 })
+	if err != nil || calls != 2 || owner.pending() {
+		t.Fatalf("immutable retry err=%v calls=%d", err, calls)
 	}
 }
 
@@ -192,7 +171,7 @@ func TestMutationOwnerNodeUnknownPreservesAllPayloadUntilSettledRelease(t *testi
 		t.Fatalf("unknown was accepted: %v", err)
 	}
 	charged := server.Status().RetainedWriteBytes
-	if charged < 72+2*storage.MaxObservationTokenBytes+len(command.Metadata[windowsMetadataKey].Data) {
+	if charged < 72+storage.MaxObservationTokenBytes+len(command.Metadata[windowsMetadataKey].Data) {
 		t.Fatalf("metadata retention undercharged: %d", charged)
 	}
 	owner.recordResponse(ResponseSent)
@@ -246,45 +225,71 @@ func TestMutationOwnerRejectsBadNodeResultsWithoutSettling(t *testing.T) {
 	}
 }
 
-func TestMutationOwnerRetryPreservesOnlySealedMetadataBits(t *testing.T) {
-	for _, permitted := range []bool{true, false} {
-		t.Run(map[bool]string{true: "preserved-hidden-system", false: "changed-archive"}[permitted], func(t *testing.T) {
+func TestMutationOwnerBasicRootRetryPreservesObservedHiddenSystem(t *testing.T) {
+	server, tree, h, node, session, command := metadataOwnerFixture(t, storage.NodeDirectory)
+	h.identity.Backend.RootNodeID = h.nodeID
+	owner, err := server.reserveMutationOwner(tree, h, 1, command, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	calls := 0
+	node.mutate = func(got storage.FileMutation) (storage.Attr, error) {
+		calls++
+		if calls == 1 {
+			return storage.Attr{}, storage.ErrConditionConflict
+		}
+		metadata, err := decodeWindowsMetadata(got.Metadata)
+		if err != nil || metadata.Attributes != dosSystem || !bytes.Equal(got.Metadata[windowsMetadataKey].Version, []byte("fresh")) {
+			t.Fatalf("root retry facts: %+v %v", got, err)
+		}
+		return metadataOwnerAttr(h, got), nil
+	}
+	session.query = func(id storage.FileActionID) (storage.FileActionReceipt, error) {
+		return storage.FileActionReceipt{Action: id, Operation: storage.OpFileMutate, Outcome: storage.FileActionNotExecuted}, nil
+	}
+	_, err = owner.executeMutation(t.Context(), func(context.Context) error { return nil }, func(context.Context) (windowsMetadataCondition, error) {
+		return windowsMetadataCondition{Version: []byte("fresh"), RootAttributes: dosSystem}, nil
+	}, func() uint64 { return 1 })
+	if err != nil || calls != 2 {
+		t.Fatalf("root retry err=%v calls=%d", err, calls)
+	}
+	if owner.authorize != nil {
+		t.Fatal("settled owner retained authorization capture")
+	}
+}
+
+func TestMutationOwnerRejectsInvalidObservedRootAttributesAndToken(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		root      bool
+		condition windowsMetadataCondition
+	}{
+		{"nonroot-hidden", false, windowsMetadataCondition{RootAttributes: dosHidden}},
+		{"root-archive", true, windowsMetadataCondition{RootAttributes: dosArchive}},
+		{"oversized-version", true, windowsMetadataCondition{Version: make([]byte, storage.MaxObservationTokenBytes+1)}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
 			server, tree, h, node, session, command := metadataOwnerFixture(t, storage.NodeDirectory)
-			mask := make([]byte, 8)
-			mask[4] = byte(dosHidden | dosSystem)
-			owner, err := server.reserveMutationOwner(tree, h, 1, command, nil, mutationMetadataPreservation{Namespace: windowsMetadataKey, Mask: mask})
-			if err != nil {
-				t.Fatal(err)
+			if test.root {
+				h.identity.Backend.RootNodeID = h.nodeID
 			}
-			mask[4] |= byte(dosArchive)
 			calls := 0
-			node.mutate = func(got storage.FileMutation) (storage.Attr, error) {
+			node.mutate = func(storage.FileMutation) (storage.Attr, error) {
 				calls++
-				if calls == 1 {
-					return storage.Attr{}, storage.ErrConditionConflict
-				}
-				return metadataOwnerAttr(h, got), nil
+				return storage.Attr{}, storage.ErrConditionConflict
 			}
 			session.query = func(id storage.FileActionID) (storage.FileActionReceipt, error) {
 				return storage.FileActionReceipt{Action: id, Operation: storage.OpFileMutate, Outcome: storage.FileActionNotExecuted}, nil
 			}
-			_, err = owner.executeMutation(t.Context(), func(context.Context) error { return nil }, func(context.Context) (storage.FileMutation, error) {
-				retry := cloneMutationCommand(command)
-				retry.ExpectedMetadata[windowsMetadataKey] = []byte("fresh")
-				update := retry.Metadata[windowsMetadataKey]
-				update.Version = []byte("fresh")
-				update.Data[4] = byte(dosSystem)
-				if !permitted {
-					update.Data[4] |= byte(dosArchive)
-				}
-				retry.Metadata[windowsMetadataKey] = update
-				return retry, nil
-			}, func() uint64 { return 1 })
-			if permitted && (err != nil || calls != 2) || !permitted && (!errors.Is(err, syscall.EIO) || calls != 1) {
-				t.Fatalf("preservation permitted=%t result=%v calls=%d", permitted, err, calls)
+			owner, err := server.reserveMutationOwner(tree, h, 1, command, nil)
+			if err != nil {
+				t.Fatal(err)
 			}
-			if owner.preservation != nil || owner.authorize != nil {
-				t.Fatal("settled owner retained retry scope or authorization capture")
+			_, err = owner.executeMutation(t.Context(), func(context.Context) error { return nil }, func(context.Context) (windowsMetadataCondition, error) {
+				return test.condition, nil
+			}, func() uint64 { return 1 })
+			if !errors.Is(err, syscall.EIO) || calls != 1 || owner.pending() {
+				t.Fatalf("invalid observation err=%v calls=%d", err, calls)
 			}
 		})
 	}
@@ -330,7 +335,7 @@ func TestMutationOwnerMetadataReservationChargesBeforeDispatch(t *testing.T) {
 		t.Fatal("budget-refused mutation dispatched")
 		return storage.Attr{}, nil
 	}
-	server.config.Limits.MaxRetainedWriteBytes = 72 + 2*storage.MaxObservationTokenBytes + 7
+	server.config.Limits.MaxRetainedWriteBytes = 72 + storage.MaxObservationTokenBytes + 7
 	if _, err := server.reserveMutationOwner(tree, h, 1, command, nil); !errors.Is(err, syscall.ENOMEM) {
 		t.Fatalf("metadata payload budget refusal: %v", err)
 	}
@@ -339,12 +344,10 @@ func TestMutationOwnerMetadataReservationChargesBeforeDispatch(t *testing.T) {
 	}
 }
 
-func TestMutationOwnerRejectsUnsupportedKindsAndRetryPreservationScopes(t *testing.T) {
-	for _, invalid := range []string{"directory-truncate", "unknown-kind", "uses", "effect-attrs", "absent-scope", "wrong-mask-size", "duplicate-scope"} {
+func TestMutationOwnerRejectsUnsupportedKinds(t *testing.T) {
+	for _, invalid := range []string{"directory-truncate", "unknown-kind", "uses", "effect-attrs", "other-namespace", "redundant-condition"} {
 		t.Run(invalid, func(t *testing.T) {
 			server, tree, h, _, _, command := metadataOwnerFixture(t, storage.NodeDirectory)
-			var scopes []mutationMetadataPreservation
-			scope := mutationMetadataPreservation{Namespace: windowsMetadataKey, Mask: make([]byte, 8)}
 			switch invalid {
 			case "directory-truncate":
 				command.Kind = storage.MutateTruncate
@@ -354,16 +357,13 @@ func TestMutationOwnerRejectsUnsupportedKindsAndRetryPreservationScopes(t *testi
 				command.Uses = []storage.TargetUse{{}}
 			case "effect-attrs":
 				command.ContentEffects = []uint16{0}
-			case "absent-scope":
-				scope.Namespace = "absent"
-				scopes = []mutationMetadataPreservation{scope}
-			case "wrong-mask-size":
-				scope.Mask = []byte{0}
-				scopes = []mutationMetadataPreservation{scope}
-			case "duplicate-scope":
-				scopes = []mutationMetadataPreservation{scope, scope}
+			case "other-namespace":
+				command.Metadata["other"] = command.Metadata[windowsMetadataKey]
+				delete(command.Metadata, windowsMetadataKey)
+			case "redundant-condition":
+				command.ExpectedMetadata = map[string][]byte{windowsMetadataKey: []byte("old")}
 			}
-			if _, err := server.reserveMutationOwner(tree, h, 1, command, nil, scopes...); !errors.Is(err, syscall.EINVAL) {
+			if _, err := server.reserveMutationOwner(tree, h, 1, command, nil); !errors.Is(err, syscall.EINVAL) {
 				t.Fatalf("invalid %s reservation: %v", invalid, err)
 			}
 		})

@@ -1138,7 +1138,7 @@ func TestPartialFileResponseValidatesPendingStateAndRejectsUnrelatedFields(t *te
 		t.Fatal(err)
 	}
 	for name, state := range map[string]*referenceState{
-		"missing attributes": {PendingUnlink: true, PendingGeneration: metadataVersion{1}},
+		"missing attributes": {PendingUnlink: true, PendingGeneration: new(metadataVersion{1})},
 		"detached pending":   referenceStateOf(storage.ReferenceState{Attr: storage.Attr{ID: 7, Kind: storage.NodeRegular}, Detached: true, PendingUnlink: true, PendingGeneration: []byte{1}}),
 		"missing generation": referenceStateOf(storage.ReferenceState{Attr: storage.Attr{ID: 7, Kind: storage.NodeRegular}, PendingUnlink: true}),
 		"unexpected generation": referenceStateOf(storage.ReferenceState{

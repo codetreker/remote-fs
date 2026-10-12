@@ -22,7 +22,7 @@ func fileControl(op storage.Operation) bool {
 		return true
 	}
 	switch op {
-	case storage.OpFileBackendIdentity, storage.OpFileAllocationUnit, storage.OpFileStatus, storage.OpFileRenew, storage.OpFileSessionClose, storage.OpFileQueryAction, storage.OpFileCloseOwnerStatus, storage.OpFileQueryDeleteIntent, storage.OpFileListDeleteIntents, storage.OpFileAcknowledgeDeleteIntent, storage.OpFileClose, storage.OpFileAck, storage.OpFileState, storage.OpFileScope, storage.OpFileNewUseOwner, storage.OpFileRetireUseOwner, storage.OpFileRangeGetConflict, storage.OpFileRangeApply, storage.OpFileRangeQuery, storage.OpFileRangeCancel, storage.OpFileRangeDrop, storage.OpFileSetPendingUnlink, storage.OpFileClearPendingUnlink:
+	case storage.OpFileBackendIdentity, storage.OpFileStatus, storage.OpFileRenew, storage.OpFileSessionClose, storage.OpFileQueryAction, storage.OpFileCloseOwnerStatus, storage.OpFileQueryDeleteIntent, storage.OpFileListDeleteIntents, storage.OpFileAcknowledgeDeleteIntent, storage.OpFileClose, storage.OpFileAck, storage.OpFileState, storage.OpFileScope, storage.OpFileNewUseOwner, storage.OpFileRetireUseOwner, storage.OpFileRangeGetConflict, storage.OpFileRangeApply, storage.OpFileRangeQuery, storage.OpFileRangeCancel, storage.OpFileRangeDrop, storage.OpFileSetPendingUnlink, storage.OpFileClearPendingUnlink:
 		return true
 	}
 	return false
@@ -103,34 +103,33 @@ func (r fileRequest) MarshalJSON() ([]byte, error) {
 }
 
 type fileResponse struct {
-	Node                uint64                     `json:"node,omitempty"`
-	Session             string                     `json:"session,omitempty"`
-	File                string                     `json:"file,omitempty"`
-	Retry               bool                       `json:"retry,omitempty"`
-	Epoch               uint64                     `json:"epoch"`
-	Status              *storage.FileSessionStatus `json:"status,omitempty"`
-	Attr                *Attr                      `json:"attr,omitempty"`
-	Data                []byte                     `json:"data"`
-	Conflict            *storage.RangeConflict     `json:"conflict,omitempty"`
-	Attempt             *storage.RangeAttempt      `json:"attempt,omitempty"`
-	Barrier             *MutationBarrier           `json:"barrier,omitempty"`
-	Capabilities        *fileCapabilities          `json:"capabilities,omitempty"`
-	BackendIdentity     *backendIdentity           `json:"backendIdentity,omitempty"`
-	SessionIdentity     *fileSessionIdentity       `json:"sessionIdentity,omitempty"`
-	Scope               *storage.UseScope          `json:"scope,omitempty"`
-	Owner               storage.UseOwner           `json:"owner,omitempty"`
-	Metadata            *OpaquePayload             `json:"metadata,omitempty"`
-	Outcome             storage.OpenOutcome        `json:"outcome,omitempty"`
-	State               *referenceState            `json:"state,omitempty"`
-	ActionReceipt       *storage.FileActionReceipt `json:"actionReceipt,omitempty"`
-	DeleteStatus        *deleteIntentStatus        `json:"deleteStatus,omitempty"`
-	DeletePage          *deleteIntentPage          `json:"deletePage,omitempty"`
-	CloseResult         *referenceCloseResult      `json:"closeResult,omitempty"`
-	CloseOwnerStatus    *closeOwnerStatusResult    `json:"closeOwnerStatus,omitempty"`
-	Directory           *observedDirectory         `json:"directory,omitempty"`
-	AllocationUnitBytes *uint64                    `json:"allocationUnitBytes,omitempty"`
-	ObservedMetadata    *metadataObservation       `json:"observedMetadata,omitempty"`
-	NameObservation     *nameObservation           `json:"nameObservation,omitempty"`
+	Node             uint64                     `json:"node,omitempty"`
+	Session          string                     `json:"session,omitempty"`
+	File             string                     `json:"file,omitempty"`
+	Retry            bool                       `json:"retry,omitempty"`
+	Epoch            uint64                     `json:"epoch"`
+	Status           *storage.FileSessionStatus `json:"status,omitempty"`
+	Attr             *Attr                      `json:"attr,omitempty"`
+	Data             []byte                     `json:"data"`
+	Conflict         *storage.RangeConflict     `json:"conflict,omitempty"`
+	Attempt          *storage.RangeAttempt      `json:"attempt,omitempty"`
+	Barrier          *MutationBarrier           `json:"barrier,omitempty"`
+	Capabilities     *fileCapabilities          `json:"capabilities,omitempty"`
+	BackendIdentity  *backendIdentity           `json:"backendIdentity,omitempty"`
+	SessionIdentity  *fileSessionIdentity       `json:"sessionIdentity,omitempty"`
+	Scope            *storage.UseScope          `json:"scope,omitempty"`
+	Owner            storage.UseOwner           `json:"owner,omitempty"`
+	Metadata         *OpaquePayload             `json:"metadata,omitempty"`
+	Outcome          storage.OpenOutcome        `json:"outcome,omitempty"`
+	State            *referenceState            `json:"state,omitempty"`
+	ActionReceipt    *storage.FileActionReceipt `json:"actionReceipt,omitempty"`
+	DeleteStatus     *deleteIntentStatus        `json:"deleteStatus,omitempty"`
+	DeletePage       *deleteIntentPage          `json:"deletePage,omitempty"`
+	CloseResult      *referenceCloseResult      `json:"closeResult,omitempty"`
+	CloseOwnerStatus *closeOwnerStatusResult    `json:"closeOwnerStatus,omitempty"`
+	Directory        *observedDirectory         `json:"directory,omitempty"`
+	ObservedMetadata *metadataObservation       `json:"observedMetadata,omitempty"`
+	NameObservation  *nameObservation           `json:"nameObservation,omitempty"`
 }
 
 func fileMutation(op storage.Operation) bool {
@@ -213,23 +212,25 @@ type FileSessionWithBarrier interface {
 }
 
 type fileCapabilities struct {
-	OpenContentMetadata bool `json:"openContentMetadata"`
-	SessionIdentity     bool `json:"sessionIdentity"`
-	StableIdentity      bool `json:"stableIdentity"`
-	OpenMetadata        bool `json:"openMetadata"`
-	Allocation          bool `json:"allocation"`
-	DirectoryMetadata   bool `json:"directoryMetadata"`
-	ReferenceName       bool `json:"referenceName"`
-	AtomicOpen          bool `json:"atomicOpen"`
-	Namespace           bool `json:"namespace"`
-	References          bool `json:"references"`
-	Actions             bool `json:"actions"`
-	Metadata            bool `json:"metadata"`
-	Owners              bool `json:"owners"`
-	Ranges              bool `json:"ranges"`
-	State               bool `json:"state"`
-	Scope               bool `json:"scope"`
-	Delete              bool `json:"delete"`
-	Conditional         bool `json:"conditional"`
-	CloseRecovery       bool `json:"closeRecovery"`
+	AllocationUnitBytes *uint64        `json:"allocationUnitBytes,omitempty"`
+	AllocationUnitError *ErrorResponse `json:"allocationUnitError,omitempty"`
+	OpenContentMetadata bool           `json:"openContentMetadata"`
+	SessionIdentity     bool           `json:"sessionIdentity"`
+	StableIdentity      bool           `json:"stableIdentity"`
+	OpenMetadata        bool           `json:"openMetadata"`
+	Allocation          bool           `json:"allocation"`
+	DirectoryMetadata   bool           `json:"directoryMetadata"`
+	ReferenceName       bool           `json:"referenceName"`
+	AtomicOpen          bool           `json:"atomicOpen"`
+	Namespace           bool           `json:"namespace"`
+	References          bool           `json:"references"`
+	Actions             bool           `json:"actions"`
+	Metadata            bool           `json:"metadata"`
+	Owners              bool           `json:"owners"`
+	Ranges              bool           `json:"ranges"`
+	State               bool           `json:"state"`
+	Scope               bool           `json:"scope"`
+	Delete              bool           `json:"delete"`
+	Conditional         bool           `json:"conditional"`
+	CloseRecovery       bool           `json:"closeRecovery"`
 }

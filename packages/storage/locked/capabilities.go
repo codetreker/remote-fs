@@ -32,7 +32,7 @@ func (s *fileSession) AllocationUnitBytes(ctx context.Context) (uint64, error) {
 	if err != nil {
 		return 0, err
 	}
-	before, err := s.FileSessionIdentity(ctx)
+	_, err = s.FileSessionIdentity(ctx)
 	if err != nil {
 		return 0, err
 	}
@@ -42,13 +42,6 @@ func (s *fileSession) AllocationUnitBytes(ctx context.Context) (uint64, error) {
 	}
 	if unit == 0 {
 		return 0, syscall.EIO
-	}
-	after, err := s.FileSessionIdentity(ctx)
-	if err != nil {
-		return 0, err
-	}
-	if after != before {
-		return 0, syscall.ESTALE
 	}
 	if err := ctx.Err(); err != nil {
 		return 0, err
@@ -387,13 +380,6 @@ func (r *referenceCapabilities) ObserveMetadata(ctx context.Context, request sto
 			return storage.MetadataObservation{}, err
 		}
 	}
-	after, err := r.ReferenceNodeID()
-	if err != nil {
-		return storage.MetadataObservation{}, err
-	}
-	if after != id {
-		return storage.MetadataObservation{}, syscall.ESTALE
-	}
 	if err := ctx.Err(); err != nil {
 		return storage.MetadataObservation{}, err
 	}
@@ -431,13 +417,6 @@ func (r *referenceCapabilities) State(ctx context.Context, projection storage.St
 	}
 	if err := result.CheckProjection(id, projection); err != nil {
 		return storage.ReferenceState{}, err
-	}
-	after, err := r.ReferenceNodeID()
-	if err != nil {
-		return storage.ReferenceState{}, err
-	}
-	if after != id {
-		return storage.ReferenceState{}, syscall.ESTALE
 	}
 	if err := ctx.Err(); err != nil {
 		return storage.ReferenceState{}, err
