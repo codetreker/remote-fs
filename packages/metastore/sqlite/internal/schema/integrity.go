@@ -33,6 +33,10 @@ func validateIntegrityWork(
 		return fmt.Errorf("the database has %d of the 2 required log tables: %w", logTables, syscall.EIO)
 	}
 
+	var serviceRecords int64
+	if err := serviceIntegrityWork(ctx, db, volume, maxIntegrityRecords, &serviceRecords); err != nil {
+		return err
+	}
 	var volumes, nodes, objects, entries, logs, changes, deleteIntents int64
 	var err error
 	if volume == nil {
@@ -97,7 +101,7 @@ func validateIntegrityWork(
 	if volumes < 0 || nodes < 0 || objects < 0 || entries < 0 || logs < 0 || changes < 0 || deleteIntents < 0 {
 		return fmt.Errorf("the database returned a negative volume integrity count: %w", syscall.EIO)
 	}
-	if sqlvalue.WouldExceed(maxIntegrityRecords, volumes, nodes, objects, entries, logs, changes, deleteIntents) {
+	if sqlvalue.WouldExceed(maxIntegrityRecords, volumes, nodes, objects, entries, logs, changes, deleteIntents, serviceRecords) {
 		return fmt.Errorf(
 			"volume integrity requires %d volumes, %d nodes, %d objects, %d entries, %d logs, %d changes, and %d deletion intents, above the configured work limit of %d; raise MaxIntegrityRecords to open it: %w",
 			volumes, nodes, objects, entries, logs, changes, deleteIntents, maxIntegrityRecords, syscall.EFBIG)
@@ -558,6 +562,11 @@ func validateIntegrityWithMetadataPolicy(
 	}
 	if version >= firstVirtualAllocationSchemaVersion {
 		if err := validateAllocation(ctx, db, volume, opaqueMetadataVersions); err != nil {
+			return err
+		}
+	}
+	if version >= 12 {
+		if err := validateServiceAuthority(ctx, db, volume); err != nil {
 			return err
 		}
 	}

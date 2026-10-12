@@ -23,6 +23,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/codetreker/remote-fs/internal/serviceapi"
 	"github.com/codetreker/remote-fs/packages/fuse"
 	"github.com/codetreker/remote-fs/packages/metastore/sqlite"
 	"github.com/codetreker/remote-fs/packages/storage"
@@ -46,6 +47,9 @@ func main() {
 		if !errors.Is(err, errUsage) {
 			fmt.Fprintf(os.Stderr, "remote-fs: %v\n", err)
 		}
+		if errors.Is(err, errUnknownOutcome) {
+			os.Exit(2)
+		}
 		os.Exit(1)
 	}
 }
@@ -53,11 +57,12 @@ func main() {
 // errUsage marks a command line that was rejected and already explained.
 var errUsage = errors.New("the command line was rejected")
 
-func run(args []string, errOut io.Writer) error {
+func runLegacy(args []string, errOut io.Writer) error {
 	flags := flag.NewFlagSet("remote-fs", flag.ContinueOnError)
 	flags.SetOutput(errOut)
 	serverURL := flags.String("server", "", "base URL of the server holding the volume, as http://host:port")
 	mountpoint := flags.String("mountpoint", "", "existing directory to present the volume at")
+	credentialFile := flags.String("credential-file", "", "private credential file for an authenticated service volume")
 	// The transport refuses to invent a timeout because it cannot know how long the
 	// caller is willing to wait. Deciding that is this program's job, and the decision has
 	// to be a number: with no timeout anywhere, an operation against a server that has
@@ -122,6 +127,35 @@ func run(args []string, errOut io.Writer) error {
 	if *timeout <= 0 {
 		return fmt.Errorf("-timeout must be positive, not %v", *timeout)
 	}
+	if *credentialFile != "" {
+		credential, err := loadCredential(*credentialFile)
+		if err != nil {
+			return err
+		}
+		client, err := serviceapi.NewClient(credential.Server, callerClient(*timeout), serviceapi.Credential{ID: credential.ID, Secret: credential.Secret})
+		if err != nil {
+			return err
+		}
+		capability, err := client.Capabilities(context.Background())
+		if err != nil {
+			return err
+		}
+		fileSession, err = capability.FileSession.NativeOptions()
+		if err != nil {
+			return err
+		}
+		explicit := make(map[string]bool)
+		flags.Visit(func(f *flag.Flag) { explicit[f.Name] = true })
+		if !explicit["file-session-lease"] {
+			*fileLease = fileSession.Lease
+		}
+		if !explicit["file-session-history"] {
+			*fileHistory = fileSession.History
+		}
+		if !explicit["max-file-size"] {
+			maxFileSize.bytes = fileSession.MaxFileSize
+		}
+	}
 	fileSession.Lease, fileSession.History = *fileLease, *fileHistory
 	if err := fileSession.Check(); err != nil {
 		return fmt.Errorf("invalid file session limits: %w", err)
@@ -134,7 +168,19 @@ func run(args []string, errOut io.Writer) error {
 		return fmt.Errorf("invalid mutation confirmation limits: %w", err)
 	}
 
-	volume, err := dialVolume(*serverURL, *timeout, maxHTTPFrameBytes.bytes)
+	var volume *httprest.Storage
+	var err error
+	if *credentialFile != "" {
+		client, clientErr := credentialHTTPClient(*credentialFile, *serverURL, *timeout)
+		if clientErr != nil {
+			return clientErr
+		}
+		options := httprest.DefaultDialOptions()
+		options.MaxFrameBytes = maxHTTPFrameBytes.bytes
+		volume, err = httprest.DialWithOptions(*serverURL, client, options)
+	} else {
+		volume, err = dialVolume(*serverURL, *timeout, maxHTTPFrameBytes.bytes)
+	}
 	if err != nil {
 		return err
 	}

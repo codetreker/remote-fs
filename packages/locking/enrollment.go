@@ -4,6 +4,8 @@ import (
 	"context"
 	"strconv"
 	"time"
+
+	"github.com/codetreker/remote-fs/packages/storage"
 )
 
 func (a *Authority) BeginEnrollment(ctx context.Context) (EnrollmentTicket, error) {
@@ -12,8 +14,28 @@ func (a *Authority) BeginEnrollment(ctx context.Context) (EnrollmentTicket, erro
 	if err := a.healthyLocked(ctx, false); err != nil {
 		return "", err
 	}
+	binding, err := bindingFrom(ctx)
+	if err != nil {
+		return "", err
+	}
+	now := a.clock.Now()
+	a.expireSessionsLocked(now)
 	expiry := a.tick(a.clock.Now().Add(a.options.TicketTTL))
-	return EnrollmentTicket(a.token("t", "", strconv.FormatInt(expiry, 10))), nil
+	extra := strconv.FormatInt(expiry, 10)
+	if binding != (storage.AccessBinding{}) {
+		if len(a.tickets) >= a.options.MaxTickets {
+			return "", fail(Capacity, "session enrollment capacity exhausted")
+		}
+		extra += ":" + bindingDigest(binding)
+	}
+	ticket := EnrollmentTicket(a.token("t", "", extra))
+	if binding != (storage.AccessBinding{}) {
+		// Bound hosts retain unused tickets so retirement cannot bypass their
+		// admitted access history. Embedded unbound tickets remain stateless.
+		a.tickets[ticket] = ticketRecord{expires: a.start.Add(time.Duration(expiry) * time.Millisecond), binding: binding}
+		a.wakeMaintenance()
+	}
+	return ticket, nil
 }
 
 func (a *Authority) OpenSession(ctx context.Context, ticket EnrollmentTicket) (Session, error) {
@@ -26,7 +48,15 @@ func (a *Authority) OpenSession(ctx context.Context, ticket EnrollmentTicket) (S
 	if err != nil {
 		return Session{}, err
 	}
-	expiry, err := a.ticketExpiry(extra)
+	expiryValue, digest := ticketBinding(extra)
+	if err := requireBindingDigest(ctx, digest); err != nil {
+		return Session{}, err
+	}
+	binding, err := bindingFrom(ctx)
+	if err != nil {
+		return Session{}, err
+	}
+	expiry, err := a.ticketExpiry(expiryValue)
 	if err != nil {
 		return Session{}, err
 	}
@@ -35,20 +65,26 @@ func (a *Authority) OpenSession(ctx context.Context, ticket EnrollmentTicket) (S
 	if !now.Before(expiry) {
 		return Session{}, fail(Retired, "enrollment ticket expired")
 	}
-	if previous, ok := a.tickets[ticket]; ok {
+	previous, recorded := a.tickets[ticket]
+	if recorded {
+		if err := requireBinding(ctx, previous.binding); err != nil {
+			return Session{}, err
+		}
+	}
+	if recorded && previous.session != "" {
 		if s := a.sessions[previous.session]; s != nil {
 			a.touchSessionLocked(s)
 			return a.sessionResultLocked(s), nil
 		}
 		return Session{ID: previous.session, Authority: a.incarnation, Retired: true, NowMillis: a.tick(now)}, nil
 	}
-	if len(a.tickets) >= a.options.MaxTickets || len(a.sessions) >= a.options.MaxSessions {
+	if (!recorded && len(a.tickets) >= a.options.MaxTickets) || len(a.sessions) >= a.options.MaxSessions {
 		return Session{}, fail(Capacity, "session enrollment capacity exhausted")
 	}
-	id := SessionID(a.token("s", "", ""))
-	s := &sessionRecord{id: id, expires: now.Add(a.options.SessionIdle), owners: make(map[OwnerID]*ownerRecord), creates: make(map[RequestID]OwnerID)}
+	id := SessionID(a.token("s", "", bindingDigest(binding)))
+	s := &sessionRecord{id: id, binding: binding, expires: now.Add(a.options.SessionIdle), owners: make(map[OwnerID]*ownerRecord), creates: make(map[RequestID]OwnerID)}
 	a.sessions[id] = s
-	a.tickets[ticket] = ticketRecord{session: id, expires: expiry}
+	a.tickets[ticket] = ticketRecord{session: id, expires: expiry, binding: binding}
 	a.wakeMaintenance()
 	return a.sessionResultLocked(s), nil
 }
@@ -64,7 +100,7 @@ func (a *Authority) CreateOwner(ctx context.Context, id SessionID, request Reque
 		return Owner{}, err
 	}
 	a.expireSessionsLocked(a.clock.Now())
-	s, err := a.sessionLocked(id)
+	s, err := a.sessionLocked(ctx, id)
 	if err != nil {
 		return Owner{}, err
 	}
@@ -102,7 +138,7 @@ func (a *Authority) RetireOwner(ctx context.Context, ref OwnerRef) error {
 			a.mu.Unlock()
 			return err
 		}
-		o, err := a.ownerLocked(ref)
+		o, err := a.ownerLocked(ctx, ref)
 		if err != nil {
 			a.mu.Unlock()
 			if CodeOf(err) == Retired {
@@ -133,7 +169,7 @@ func (a *Authority) CloseSession(ctx context.Context, id SessionID) error {
 			a.mu.Unlock()
 			return err
 		}
-		s, err := a.sessionLocked(id)
+		s, err := a.sessionLocked(ctx, id)
 		if err != nil {
 			a.mu.Unlock()
 			if CodeOf(err) == Retired {

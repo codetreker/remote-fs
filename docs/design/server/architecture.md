@@ -10,6 +10,7 @@ volume、保留文件与显式占有的权威持有者。将原生 storage 与�
 |---|---|---|
 | **请求处理**（`packages/transport/httprest`） | 一个 `http.Handler`。解析数据与锁控制请求，使用独立的有界 admission，验证 scope 与响应，把控制操作交给配对的授权方。它不缓存 volume 答案；文件 registry、订阅与快照保留各自有界的状态。 | R-INT-1、R-INT-3 |
 | **业务授权**（`packages/authz` 与 handler adapter） | 把可信 volume、语义操作与完整 Open 意图交给嵌入方策略；请求入口和流出站分别检查，原生占有检查保持独立。 | R-INT-7、R-SEC-4 至 R-SEC-6 |
+| **独立服务**（`internal/service`） | 管理 SQLite、登录、immutable owner、按 ID 选择 runtime 与持久管理动作；文件访问仍进入原 Handler。 | R-SVC-1 至 R-SVC-8 |
 | **协议词汇**（`packages/transport/httprest`） | 请求 URL 的形状、响应体的形状；错误的名字取自 storage 契约的 errno 词汇。与 client 共用同一份。 | R-INT-9 |
 | **变更日志** | volume 里每一次改动的有序记录，由 storage 底下的 metastore 提供。请求处理拿到它就开出复制那三个操作；拿不到（`nil`）时，在已启用的操作授权通过后以 `ENOSYS` 拒绝它们。 | R-CON-1、R-CON-2 |
 | **storage** | 原生发布集成确定实际资源并执行最终转换。localstore 与 Azure 组合在 metastore 事务中记账；第三方实现须履行同一原生集成契约。 | R-INT-6、R-INT-13 |
@@ -53,6 +54,10 @@ volume、保留文件与显式占有的权威持有者。将原生 storage 与�
 | `Resubscribe` | `GET /v5/resubscribe` | `incarnation`、`position` | — |
 | `Snapshot` | `GET /v5/snapshot` | 无 | — |
 | `Checkpoint` | `GET /v5/checkpoint` | 无 | — |
+| 原生 import/export | `POST /v5/file-transfer` | 无 | begin/export 的严格 JSON |
+| transfer 控制 | `POST /v5/file-transfer-control` | 无 | query/resume/publish/cancel/detach/cancel-action/close-export |
+| import 内容 | `POST /v5/file-transfer-data` | `path` 为 bound token | 确切长度的 binary body |
+| verified export | `GET /v5/file-transfer-export` | `path` 为 bound token | — |
 | 保留节点、身份 namespace、目录／名字观察、metadata 与条件修改 | `POST /v5/file` | 无 | 严格 JSON，op 使用规范的 file.* 操作值，携带 session/reference、action、结果预算与参数 |
 | backend 身份、文件会话、action/intent 查询、owner 与 range 控制 | `POST /v5/file-control` | 无 | 严格 JSON，身份 preflight 不要求 session，其余携带绑定 capability、动作或 owner |
 
@@ -257,7 +262,7 @@ v1/v2 数据库还面临 object lifecycle 证据缺失：旧实现把 reservatio
 
 作为库时：不注册信号处理、不写 stdout/stderr、不调用进程退出、包初始化不产生副作用（R-INT-2）。`packages/transport/httprest` 暴露 `NewHandler`、`NewHandlerWithLimits` 与 `NewHandlerWithOptions`；`HandlerOptions.Check` 可在打开 storage 前验证 HTTP 上限及 Authorizer／Volume 配置，constructor 会再次验证，并要求带原生发布能力的 `locked.Backend`，内部构造 `locked.Storage`；`locked.New` 拒绝 `CheckBounded` 失败或缺少绑定锁服务的 backend。可信 volume 与 backing、Log 的配对由集成方负责；认证 middleware 的 context 为 Authorizer 提供身份。监听、TLS、超时、路由前缀与 lifecycle 都由集成方决定。调用方也可以直接组合 `localstore.Open`，并通过 `Status`、`MaintenanceStatus`、`Sweep` 与 `Close` 管理它。
 
-独立二进制没有业务认证与授权配置，部署方继续保护访问边界。它接受两种互斥存储入口：
+独立服务通过 `serve --config` 提供管理员登录、own-volume 文件访问和只读普通用户摘要，见[服务架构](service.md)。单 volume reference 通过 `reference` 或原 direct flags 运行，访问边界由部署方保护；下列两种互斥存储入口及其 flags 属于 reference：
 
 | storage mode | 命令行 | 配额 | 复制 |
 |---|---|---|---|

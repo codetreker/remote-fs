@@ -11,6 +11,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/codetreker/remote-fs/packages/storage"
 )
 
 type Authority struct {
@@ -40,6 +42,7 @@ type Authority struct {
 	closeErr                error
 	fenced                  error
 	closed                  bool
+	retirementReserved      bool
 	stop                    chan struct{}
 	workerContext           context.Context
 	cancelWorkers           context.CancelFunc
@@ -50,9 +53,11 @@ type Authority struct {
 type ticketRecord struct {
 	session SessionID
 	expires time.Time
+	binding storage.AccessBinding
 }
 type sessionRecord struct {
 	id      SessionID
+	binding storage.AccessBinding
 	expires time.Time
 	owners  map[OwnerID]*ownerRecord
 	creates map[RequestID]OwnerID
@@ -181,6 +186,9 @@ func (a *Authority) healthyLocked(ctx context.Context, admission bool) error {
 	if a.closed {
 		return fail(Retired, "authority is closed")
 	}
+	if a.retirementReserved {
+		return fail(Retired, "authority retirement is reserved")
+	}
 	if a.fenced != nil {
 		return Wrap(Unavailable, "authority requires recovery", a.fenced)
 	}
@@ -190,8 +198,8 @@ func (a *Authority) healthyLocked(ctx context.Context, admission bool) error {
 	return nil
 }
 
-func (a *Authority) ownerLocked(ref OwnerRef) (*ownerRecord, error) {
-	if _, err := a.verify(string(ref.Session), "s", ""); err != nil {
+func (a *Authority) ownerLocked(ctx context.Context, ref OwnerRef) (*ownerRecord, error) {
+	if _, err := a.verifySessionBinding(ctx, ref.Session); err != nil {
 		return nil, err
 	}
 	if _, err := a.verify(string(ref.Owner), "o", string(ref.Session)); err != nil {
@@ -201,16 +209,22 @@ func (a *Authority) ownerLocked(ref OwnerRef) (*ownerRecord, error) {
 	if o == nil || o.ref != ref {
 		return nil, fail(Retired, "owner history is retired")
 	}
+	if err := requireBinding(ctx, o.session.binding); err != nil {
+		return nil, err
+	}
 	return o, nil
 }
 
-func (a *Authority) sessionLocked(id SessionID) (*sessionRecord, error) {
-	if _, err := a.verify(string(id), "s", ""); err != nil {
+func (a *Authority) sessionLocked(ctx context.Context, id SessionID) (*sessionRecord, error) {
+	if _, err := a.verifySessionBinding(ctx, id); err != nil {
 		return nil, err
 	}
 	s := a.sessions[id]
 	if s == nil {
 		return nil, fail(Retired, "session history is retired")
+	}
+	if err := requireBinding(ctx, s.binding); err != nil {
+		return nil, err
 	}
 	return s, nil
 }

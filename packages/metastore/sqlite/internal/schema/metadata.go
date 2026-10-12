@@ -162,6 +162,9 @@ func validateMetadataAccounting(ctx context.Context, db sqlvalue.Queryer, versio
 	if version >= firstVirtualAllocationSchemaVersion {
 		allowed += `,'changes_allocation_insert'`
 	}
+	if version >= 12 {
+		allowed += `,'entries_summary_insert','entries_summary_delete','entries_summary_update','nodes_summary_kind'`
+	}
 	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM sqlite_schema WHERE type='trigger' AND name NOT IN (`+allowed+`)`).Scan(&unexpected); err != nil {
 		return err
 	}
@@ -224,5 +227,31 @@ func validateMetadataAccounting(ctx context.Context, db sqlvalue.Queryer, versio
 			}
 		}
 	}
+	if version >= 12 {
+		body, err := migrationFiles.ReadFile("migrations/0012_service_authority.sql")
+		if err != nil {
+			return err
+		}
+		for _, name := range []string{"entries_summary_insert", "entries_summary_delete", "entries_summary_update", "nodes_summary_kind"} {
+			start := strings.Index(string(body), "CREATE TRIGGER "+name+" ")
+			if start < 0 {
+				return syscall.EIO
+			}
+			definition := string(body[start:])
+			end := strings.Index(definition, "\nEND;")
+			if end < 0 {
+				return syscall.EIO
+			}
+			definition = definition[:end+4]
+			var actual sql.NullString
+			if err := db.QueryRowContext(ctx, `SELECT CASE WHEN length(CAST(sql AS BLOB))<=8192 THEN sql END FROM sqlite_schema WHERE type='trigger' AND name=?`, name).Scan(&actual); err != nil {
+				return err
+			}
+			if !actual.Valid || sqliteschema.Structure(actual.String) != sqliteschema.Structure(definition) {
+				return fmt.Errorf("summary trigger %s does not match its schema: %w", name, syscall.EIO)
+			}
+		}
+	}
+
 	return nil
 }

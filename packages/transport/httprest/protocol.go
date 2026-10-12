@@ -106,6 +106,13 @@ const (
 	OpCheckpoint  Op = "checkpoint"
 )
 
+const (
+	OpFileTransfer        Op = "file-transfer"
+	OpFileTransferControl Op = "file-transfer-control"
+	OpFileTransferData    Op = "file-transfer-data"
+	OpFileTransferExport  Op = "file-transfer-export"
+)
+
 // Query keys for the operands. Operands travel in the query string rather than in the
 // URL path because the query string is the only part of a URL that survives a volume
 // path intact: http.ServeMux collapses "a//f" to "a/f" and resolves "a/b/../f" before a
@@ -134,19 +141,23 @@ const (
 )
 
 var ops = map[Op]opSpec{
-	OpFileRecovery: {method: http.MethodPost, body: contentJSON},
-	OpFileControl:  {method: http.MethodPost, body: contentJSON},
-	OpFile:         {method: http.MethodPost, body: contentJSON},
-	OpStat:         {operation: storage.OpVolumeStat, method: http.MethodGet, operands: []string{keyPath}},
-	OpSetAttr:      {operation: storage.OpVolumeSetAttr, method: http.MethodPost, operands: []string{keyPath}, body: contentJSON},
-	OpList:         {operation: storage.OpVolumeList, method: http.MethodGet, operands: []string{keyPath}},
-	OpRead:         {operation: storage.OpVolumeRead, method: http.MethodGet, operands: []string{keyPath}},
-	OpWrite:        {operation: storage.OpVolumeWrite, method: http.MethodPost, operands: []string{keyPath}, body: contentOctets},
-	OpCreate:       {operation: storage.OpVolumeCreate, method: http.MethodPost, operands: []string{keyPath}},
-	OpMkdir:        {operation: storage.OpVolumeMkdir, method: http.MethodPost, operands: []string{keyPath}},
-	OpRemove:       {operation: storage.OpVolumeRemove, method: http.MethodPost, operands: []string{keyPath}},
-	OpRemoveDir:    {operation: storage.OpVolumeRemoveDir, method: http.MethodPost, operands: []string{keyPath}},
-	OpRename:       {operation: storage.OpVolumeRename, method: http.MethodPost, operands: []string{keyPath, keyTo}},
+	OpFileTransfer:        {method: http.MethodPost, body: contentJSON},
+	OpFileTransferControl: {method: http.MethodPost, body: contentJSON},
+	OpFileTransferData:    {method: http.MethodPost, body: contentOctets, operands: []string{keyPath}},
+	OpFileTransferExport:  {method: http.MethodGet, operands: []string{keyPath}},
+	OpFileRecovery:        {method: http.MethodPost, body: contentJSON},
+	OpFileControl:         {method: http.MethodPost, body: contentJSON},
+	OpFile:                {method: http.MethodPost, body: contentJSON},
+	OpStat:                {operation: storage.OpVolumeStat, method: http.MethodGet, operands: []string{keyPath}},
+	OpSetAttr:             {operation: storage.OpVolumeSetAttr, method: http.MethodPost, operands: []string{keyPath}, body: contentJSON},
+	OpList:                {operation: storage.OpVolumeList, method: http.MethodGet, operands: []string{keyPath}},
+	OpRead:                {operation: storage.OpVolumeRead, method: http.MethodGet, operands: []string{keyPath}},
+	OpWrite:               {operation: storage.OpVolumeWrite, method: http.MethodPost, operands: []string{keyPath}, body: contentOctets},
+	OpCreate:              {operation: storage.OpVolumeCreate, method: http.MethodPost, operands: []string{keyPath}},
+	OpMkdir:               {operation: storage.OpVolumeMkdir, method: http.MethodPost, operands: []string{keyPath}},
+	OpRemove:              {operation: storage.OpVolumeRemove, method: http.MethodPost, operands: []string{keyPath}},
+	OpRemoveDir:           {operation: storage.OpVolumeRemoveDir, method: http.MethodPost, operands: []string{keyPath}},
+	OpRename:              {operation: storage.OpVolumeRename, method: http.MethodPost, operands: []string{keyPath, keyTo}},
 	// Space describes the whole volume rather than anything under a path, so it takes
 	// no operands. A path sent beside it is refused like any operand nobody asked for.
 	OpSpace: {operation: storage.OpVolumeSpace, method: http.MethodGet},

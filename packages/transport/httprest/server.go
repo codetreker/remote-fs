@@ -24,6 +24,12 @@ import (
 // server; http.StripPrefix is how it is mounted somewhere other than the root.
 type Handler struct {
 	authorizer          authz.Authorizer
+	accessBinding       storage.AccessBindingHook
+	transfers           *transferRegistry
+	requestMu           sync.Mutex
+	activeRequests      int
+	retiring            bool
+	retirementRollback  func()
 	volume              string
 	lifetime            context.Context
 	cancelLifetime      context.CancelCauseFunc
@@ -111,6 +117,7 @@ func NewHandlerWithOptions(s storage.Storage, log metastore.Log, options Handler
 	lifetime, cancelLifetime := context.WithCancelCause(context.Background())
 	h := &Handler{
 		authorizer:          options.Authorizer,
+		accessBinding:       options.AccessBinding,
 		volume:              options.Volume,
 		lifetime:            lifetime,
 		cancelLifetime:      cancelLifetime,
@@ -142,6 +149,14 @@ func NewHandlerWithOptions(s storage.Storage, log metastore.Log, options Handler
 		snapshots: newBodyAdmission(settled.replication.Snapshots, 0, 0),
 		stopping:  make(chan struct{}),
 	}
+	if options.Transfers.Enabled {
+		var err error
+		h.transfers, err = newTransferRegistry(s, options.Transfers, max(settled.maxConcurrentResponses, settled.maxConcurrentLockControls))
+		if err != nil {
+			cancelLifetime(err)
+			return nil, err
+		}
+	}
 	h.files = newFileRegistry(s, options.Files.settled())
 	if log != nil {
 		h.publisher = newPublisher(settled.replication.MaxSubscriptions)
@@ -164,6 +179,9 @@ func (h *Handler) beginStop() (attempt *fileCleanupAttempt, initiated bool) {
 		}
 		if h.files != nil {
 			attempt = h.files.stop()
+		}
+		if h.transfers != nil {
+			h.transfers.stop()
 		}
 		initiated = true
 	})
@@ -190,6 +208,29 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// A cached answer from a volume is a stale answer that reads exactly like a
 	// current one, which is the failure this system is least able to survive.
 	w.Header().Set("Cache-Control", "no-store")
+	finishRequest, err := h.admitRequest()
+	if err != nil {
+		h.writeOperationError(w, err)
+		return
+	}
+	defer finishRequest()
+	if h.accessBinding != nil {
+		binding, err := h.accessBinding(r.Context())
+		if err != nil {
+			errno := syscall.EIO
+			if errors.Is(err, authz.ErrDenied) || errors.Is(err, syscall.EACCES) {
+				errno = syscall.EACCES
+			}
+			h.writeOperationError(w, &authzFailure{errno: errno, cause: err})
+			return
+		}
+		bound, err := storage.WithAccessBinding(r.Context(), binding)
+		if err != nil {
+			h.writeOperationError(w, &authzFailure{errno: syscall.EIO, cause: err})
+			return
+		}
+		r = r.WithContext(bound)
+	}
 
 	req, err := ParseRequest(r.Method, r.URL)
 	if err != nil {
@@ -198,6 +239,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Op == OpFile || req.Op == OpFileControl || req.Op == OpFileRecovery {
 		h.serveFile(w, r)
+		return
+	}
+	if req.Op == OpFileTransfer || req.Op == OpFileTransferControl || req.Op == OpFileTransferData || req.Op == OpFileTransferExport {
+		h.serveTransfer(w, r, req)
 		return
 	}
 	if isLockControl(req.Op) {

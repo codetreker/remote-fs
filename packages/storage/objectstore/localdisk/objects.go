@@ -27,7 +27,7 @@ type objectHeader struct {
 	digest        [sha256.Size]byte
 }
 
-func encodeHeader(id ID, key string, payloadLength int, digest [sha256.Size]byte) [fixedEnvelopeBytes]byte {
+func encodeHeader(id ID, key string, payloadLength int64, digest [sha256.Size]byte) [fixedEnvelopeBytes]byte {
 	var encoded [fixedEnvelopeBytes]byte
 	copy(encoded[:8], envelopeMagic[:])
 	binary.BigEndian.PutUint16(encoded[8:10], envelopeVersion)
@@ -270,22 +270,26 @@ func readPayload(ctx context.Context, fd int, payload []byte, offset int64, key 
 // Put stores an immutable object by publishing a synced staging inode under its final
 // name with linkat(2). The link cannot replace an existing name, and both names are in the
 // same shard, so publication is one atomic directory operation.
-func (o *Objects) Put(ctx context.Context, key string, content []byte) (_ []byte, returned error) {
+func (o *Objects) Put(ctx context.Context, key string, content []byte) ([]byte, error) {
+	return nil, o.putImmutable(ctx, key, int64(len(content)), func() ([32]byte, error) { return digestContent(ctx, key, content) }, int64(len(content)), func(fd int) error { return writeContent(ctx, fd, content, "put", key) })
+}
+
+func (o *Objects) putImmutable(ctx context.Context, key string, size int64, seal func() ([32]byte, error), memoryBytes int64, writePayload func(int) error) (returned error) {
 	if err := checkContext(ctx, "put", key); err != nil {
-		return nil, err
+		return err
 	}
 	location, err := locate(key)
 	if err != nil {
-		return nil, fmt.Errorf("put %q: %w", key, err)
+		return fmt.Errorf("put %q: %w", key, err)
 	}
-	if int64(len(content)) > o.limits.maxObjectBytes {
-		return nil, fmt.Errorf("put %q: %d bytes is above the configured maximum %d: %w",
-			key, len(content), o.limits.maxObjectBytes, syscall.EFBIG)
+	if size > o.limits.maxObjectBytes {
+		return fmt.Errorf("put %q: %d bytes is above the configured maximum %d: %w",
+			key, size, o.limits.maxObjectBytes, syscall.EFBIG)
 	}
-	objectBytes := int64(fixedEnvelopeBytes) + int64(len(key)) + int64(len(content))
+	objectBytes := int64(fixedEnvelopeBytes) + int64(len(key)) + size
 	waiting, err := o.gate.acquireWaiting(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("put %q: %w", key, err)
+		return fmt.Errorf("put %q: %w", key, err)
 	}
 	var ticket *ticket
 	defer func() {
@@ -295,56 +299,59 @@ func (o *Objects) Put(ctx context.Context, key string, content []byte) (_ []byte
 		waiting.release()
 	}()
 	if err := o.health.failure(); err != nil {
-		return nil, fmt.Errorf("put %q: %w", key, err)
+		return fmt.Errorf("put %q: %w", key, err)
 	}
 	defer func() { returned = o.health.finish(ctx, returned) }()
 	unlock, err := o.acquireKey(ctx, "put", key)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	defer unlock()
 
 	shardFD, _, err := o.openShard(ctx, location, true)
 	if err != nil {
-		return nil, fmt.Errorf("put %q: %w", key, err)
+		return fmt.Errorf("put %q: %w", key, err)
 	}
 	defer unix.Close(shardFD)
-	ticket, err = waiting.promote(ctx, objectBytes)
+	ticket, err = waiting.promote(ctx, memoryBytes+fixedEnvelopeBytes+int64(len(key)))
 	if err != nil {
-		return nil, fmt.Errorf("put %q: %w", key, err)
+		return fmt.Errorf("put %q: %w", key, err)
 	}
+
 	if err := o.health.failure(); err != nil {
-		return nil, fmt.Errorf("put %q: %w", key, err)
+		return fmt.Errorf("put %q: %w", key, err)
 	}
 	if _, exists, err := inspectObject(
 		ctx, shardFD, location, o.id, key, o.limits.maxObjectBytes, o.filesystem, o.ops,
 	); err != nil {
-		return nil, fmt.Errorf("put %q: inspect existing object: %w", key, err)
+		return fmt.Errorf("put %q: inspect existing object: %w", key, err)
 	} else if exists {
-		return nil, fmt.Errorf("put %q: an object is already stored under this key: %w", key, syscall.EEXIST)
+		return fmt.Errorf("put %q: an object is already stored under this key: %w", key, syscall.EEXIST)
 	}
 	if _, exists, err := statPrivateEntryOnFilesystem(shardFD, location.staging, o.filesystem, o.ops); err != nil {
-		return nil, fmt.Errorf("put %q: inspect staging object: %w", key, err)
+		return fmt.Errorf("put %q: inspect staging object: %w", key, err)
 	} else if exists {
-		return nil, o.health.poison(fmt.Errorf("put %q found staging state without a recovery record", key))
+		return o.health.poison(fmt.Errorf("put %q found staging state without a recovery record", key))
 	}
+
 	if err := o.capacity.reserve(o.rootFD, objectBytes, o.limits.maintenanceReserveBytes, o.ops); err != nil {
-		return nil, fmt.Errorf("put %q: reserve physical capacity: %w", key, err)
+		return fmt.Errorf("put %q: reserve physical capacity: %w", key, err)
 	}
 	defer o.capacity.release(objectBytes)
+
 	marker, err := markerName(key, false)
 	if err != nil {
-		return nil, fmt.Errorf("put %q: name recovery record: %w", key, err)
+		return fmt.Errorf("put %q: name recovery record: %w", key, err)
 	}
 	if err := createMarker(o.objectsFD, marker, o.id, key, false, o.filesystem, o.ops); err != nil {
 		if errors.Is(err, syscall.EEXIST) {
-			return nil, o.health.poison(fmt.Errorf("put %q found an unexpected recovery record", key))
+			return o.health.poison(fmt.Errorf("put %q found an unexpected recovery record", key))
 		}
 		if errors.Is(err, errRecoveryResidue) {
-			return nil, errors.Join(fmt.Errorf("put %q: create recovery record: %w", key, err),
+			return errors.Join(fmt.Errorf("put %q: create recovery record: %w", key, err),
 				o.health.poison(fmt.Errorf("put %q may have left an untracked recovery record", key)))
 		}
-		return nil, fmt.Errorf("put %q: create recovery record: %w", key, err)
+		return fmt.Errorf("put %q: create recovery record: %w", key, err)
 	}
 	o.recoveryRecords.Add(1)
 	markerPresent := true
@@ -384,70 +391,68 @@ func (o *Objects) Put(ctx context.Context, key string, content []byte) (_ []byte
 	stageFD, err = unix.Openat(shardFD, location.staging,
 		unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|unix.O_NOFOLLOW|unix.O_CLOEXEC, privateFileMode)
 	if err != nil {
-		return nil, fmt.Errorf("put %q: create staging object: %w", key, unexpectedAbsence(err))
+		return fmt.Errorf("put %q: create staging object: %w", key, unexpectedAbsence(err))
 	}
 	stagePresent = true
 	if err := unix.Fchmod(stageFD, privateFileMode); err != nil {
-		return nil, fmt.Errorf("put %q: make staging object private: %w", key, err)
+		return fmt.Errorf("put %q: make staging object private: %w", key, err)
 	}
 	if err := requireFilesystemIdentity(stageFD, o.filesystem, o.ops); err != nil {
-		return nil, fmt.Errorf("put %q: validate staging object filesystem: %w", key, err)
+		return fmt.Errorf("put %q: validate staging object filesystem: %w", key, err)
 	}
-	digest, err := digestContent(ctx, key, content)
+	digest, err := seal()
 	if err != nil {
-		return nil, err
+		return err
 	}
-	header := encodeHeader(o.id, key, len(content), digest)
+	header := encodeHeader(o.id, key, size, digest)
 	if err := writeContent(ctx, stageFD, header[:], "put", key); err != nil {
-		return nil, fmt.Errorf("put %q: write envelope: %w", key, err)
+		return fmt.Errorf("put %q: write envelope: %w", key, err)
 	}
 	if err := writeContent(ctx, stageFD, []byte(key), "put", key); err != nil {
-		return nil, fmt.Errorf("put %q: write key: %w", key, err)
+		return fmt.Errorf("put %q: write key: %w", key, err)
 	}
-	if err := writeContent(ctx, stageFD, content, "put", key); err != nil {
-		return nil, fmt.Errorf("put %q: write payload: %w", key, err)
+	if err := writePayload(stageFD); err != nil {
+		return fmt.Errorf("put %q: write payload: %w", key, err)
 	}
 	if err := o.ops.fsync(stageFD); err != nil {
-		return nil, fmt.Errorf("put %q: sync staging object: %w", key, err)
+		return fmt.Errorf("put %q: sync staging object: %w", key, err)
 	}
 	closeErr := unix.Close(stageFD)
 	stageFD = -1
 	if closeErr != nil {
-		return nil, fmt.Errorf("put %q: close staging object: %w", key, closeErr)
+		return fmt.Errorf("put %q: close staging object: %w", key, closeErr)
 	}
 	if err := checkContext(ctx, "put", key); err != nil {
-		return nil, err
+		return err
 	}
 	if _, exists, err := statPrivateEntryOnFilesystem(shardFD, location.staging, o.filesystem, o.ops); err != nil {
-		return nil, fmt.Errorf("put %q: validate staged object filesystem: %w", key, err)
+		return fmt.Errorf("put %q: validate staged object filesystem: %w", key, err)
 	} else if !exists {
-		return nil, fmt.Errorf("put %q: staged object disappeared before publication: %w", key, syscall.EIO)
+		return fmt.Errorf("put %q: staged object disappeared before publication: %w", key, syscall.EIO)
 	}
 	if err := o.ops.linkat(shardFD, location.staging, shardFD, location.final, 0); err != nil {
 		if errors.Is(err, syscall.EEXIST) {
-			return nil, fmt.Errorf("put %q: an object is already stored under this key: %w", key, syscall.EEXIST)
+			return fmt.Errorf("put %q: an object is already stored under this key: %w", key, syscall.EEXIST)
 		}
-		return nil, fmt.Errorf("put %q: publish object: %w", key, unexpectedAbsence(err))
+		return fmt.Errorf("put %q: publish object: %w", key, unexpectedAbsence(err))
 	}
 	published = true
 	if err := o.ops.fsync(shardFD); err != nil {
-		return nil, fmt.Errorf("put %q: sync object publication: %w", key, err)
+		return fmt.Errorf("put %q: sync object publication: %w", key, err)
 	}
 	if err := o.ops.unlinkat(shardFD, location.staging, 0); err != nil {
-		return nil, fmt.Errorf("put %q: remove staging name: %w", key, unexpectedAbsence(err))
+		return fmt.Errorf("put %q: remove staging name: %w", key, unexpectedAbsence(err))
 	}
 	if err := o.ops.fsync(shardFD); err != nil {
-		return nil, fmt.Errorf("put %q: sync staging cleanup: %w", key, err)
+		return fmt.Errorf("put %q: sync staging cleanup: %w", key, err)
 	}
 	stagePresent = false
 	if err := removeMarker(o.objectsFD, marker, o.ops); err != nil {
-		return nil, fmt.Errorf("put %q: remove recovery record: %w", key, err)
+		return fmt.Errorf("put %q: remove recovery record: %w", key, err)
 	}
 	markerPresent = false
 	o.recoveryRecords.Add(-1)
-	// There is no lower service able to report a digest independently of the buffer sent,
-	// so nil is the only digest that satisfies objectstore.Objects' contract here.
-	return nil, nil
+	return nil
 }
 
 // Get verifies the file type, ownership, mode, format, store identity, original key,

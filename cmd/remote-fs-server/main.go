@@ -49,7 +49,7 @@ func main() {
 // errUsage marks a command line that was rejected and already explained.
 var errUsage = errors.New("the command line was rejected")
 
-func run(args []string, errOut io.Writer) error {
+func runReference(args []string, errOut io.Writer) error {
 	config, help, err := parseConfig(args, errOut)
 	if err != nil || help {
 		return err

@@ -2,6 +2,7 @@ package httprest
 
 import (
 	"bytes"
+	"context"
 	"syscall"
 
 	"github.com/codetreker/remote-fs/packages/storage"
@@ -37,7 +38,7 @@ func contentMetadataEffectsStorage(values []contentMetadataEffect) []storage.Con
 	return result
 }
 
-func (h *Handler) fileContentEffects(request fileRequest) ([]storage.ContentMetadataEffect, error) {
+func (h *Handler) fileContentEffects(ctx context.Context, request fileRequest) ([]storage.ContentMetadataEffect, error) {
 	if (request.Op != storage.OpFileObserveMetadata || request.MetadataObservation == nil || request.MetadataObservation.Purpose != storage.MetadataObservationContentEffect) && (request.Op != storage.OpFileMutate || request.Mutation == nil || len(request.Mutation.ContentEffects) == 0) {
 		return nil, nil
 	}
@@ -46,6 +47,9 @@ func (h *Handler) fileContentEffects(request fileRequest) ([]storage.ContentMeta
 	h.files.mu.Unlock()
 	if session == nil {
 		return nil, syscall.ESTALE
+	}
+	if err := storage.RequireAccessBinding(ctx, session.binding); err != nil {
+		return nil, err
 	}
 	session.mu.Lock()
 	reference := session.files[request.File]

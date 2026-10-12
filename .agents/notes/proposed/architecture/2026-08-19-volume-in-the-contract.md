@@ -22,7 +22,7 @@ storage 数据操作不逐次携带 volume 参数；一个实例包含一份根�
 
 embedding host 继续持有身份、注册、创建、销毁、计费和保留策略；packages 不要求使用内置账户或管理 SQLite。逐 volume 操作授权由[host Authorizer](../../implemented/feature/2026-09-10-host-provided-authorization.md)提供。
 
-[独立多用户服务](../feature/2026-10-12-standalone-volume-service.md)提供其部署形态的 SQLite 注册、稳定 owner、创建删除、管理员摘要和 Console/CLI。服务使用不复用 volume ID、immutable 内部存储名和根，显示名称可改；同一后端不能重复发布成两份独立 authority。部署方仍负责私有目录、配置和运维。
+[独立多用户服务](../../implemented/feature/2026-10-12-standalone-volume-service.md)提供其部署形态的 SQLite 注册、稳定 owner、创建删除、管理员摘要和 Console/CLI。服务使用不复用 volume ID、immutable 内部存储名和根，显示名称可改；同一后端不能重复发布成两份独立 authority。部署方仍负责私有目录、配置和运维。
 
 选择键不承载授权。服务和 embedding host 都必须显式确认实际实例与当前身份，不从名字前缀推断 user/project/权限。host 可以自定义组织名称，仍不能把名称当作凭据。
 
@@ -46,7 +46,7 @@ embedding host 继续持有身份、注册、创建、销毁、计费和保留�
 
 - 数据契约保持单 volume；日志、锁、会话、proof 和引用不能跨实例混用。
 - 发布方在实际操作前选择可信实例并授权，不从名称推断权限。
-- embedding host 不被迫使用独立服务用户或数据库；服务按[服务提案](../feature/2026-10-12-standalone-volume-service.md)验证 owner、管理和 Console/CLI。
+- embedding host 不被迫使用独立服务用户或数据库；服务按[独立服务决定](../../implemented/feature/2026-10-12-standalone-volume-service.md)保持 owner、管理和 Console/CLI 的归属。
 - 挂载、卸载、backend 初始化、文件删除和 volume 删除分别报告真实结果。
 
 ## 风险

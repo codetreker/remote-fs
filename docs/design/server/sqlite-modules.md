@@ -29,6 +29,12 @@
 
 SQL lease recovery 与 `LeaseRecovery` 留在根 package，原生 evidence I/O 在 `nativelease`。保留引用仍先退役再排空、触发已接受删除义务并回收；旧 incarnation 的 orphan/pending cleanup 使用重新绑定的 `PublicationAccountingChain`，不携带原请求的授权、scope 或 Strong proof。后端与 authority 的锁顺序、各阶段 context 和关闭失败时的所有权规则继续由原来的拥有者执行。
 
+## 单 volume 管理与传输能力
+
+`service_summary.go` 在同一 healthy snapshot 返回 named file/directory counters、allocation Used 和有效 quota/revision，strong recovery 不关闭健康读路径。durable quota 由显式 policy 选择，首次初始化后 reopen 读取已有值；fixed allowance 保持原行为。quota 更新与 exact action receipt 在原 coordinator/见证事务提交，管理库不替代 native 结果。
+
+`service_import.go` 持有未发布 object、固定输入、sealed 状态和 receipt，最终事务核对 child/scope/share/strong/quota 后提交新节点、名字、counter、allocation 与 log。`service_export.go` 同时保留节点和确切 immutable key；GC 不能删除 captured key，历史 key 不重复收费到 Used。`service_retirement.go` 在 admission 已由调用方封闭后拒绝仍有非终态责任的永久删除；普通 Close 可以保留 sealed import 给下一次 reopen。
+
 ## 公开类型与内部值
 
 公开 import path、类型定义身份、字段和方法集保留在根 package，包括 `DurableState`、`DurableStartup`、`Window`、lease 值与接口、`ObjectLimits` 和 `ObjectStatus`。传入组件的值显式转换成内部表示，组件结果再转换回公开值；内部类型不借 alias 成为公开类型的实际定义位置。
@@ -39,13 +45,15 @@ SQL lease recovery 与 `LeaseRecovery` 留在根 package，原生 evidence I/O �
 
 ## 资源与测试归属
 
-当前 schema 版本为 11。[`internal/schema/migrations`](../../../packages/metastore/sqlite/internal/schema/migrations) 的 `0001` 至 `0011` 按序嵌入并重放。6 把 mode 转为 NodeKind 与 `posix.permissions.v1`，增加共同时间、规范 metadata 与持久计量；7 增加 link target、pending generation 与 durable delete-intent 表。
+当前 schema 版本为 12。[`internal/schema/migrations`](../../../packages/metastore/sqlite/internal/schema/migrations) 的 `0001` 至 `0012` 按序嵌入并重放。6 把 mode 转为 NodeKind 与 `posix.permissions.v1`，增加共同时间、规范 metadata 与持久计量；7 增加 link target、pending generation 与 durable delete-intent 表。
 
 8 为现有目录建立初始 revision，并把 directory revision 纳入 nodes、新 changes、trigger 与持久计量。旧 retained changes 没有可信 revision，迁移在同一事务中清空它们、切换每个 log incarnation 并把 committed／trimmed 位置归零；当前树、NodeID、高水位、名字、内容与用量保持，旧 replica 通过 incarnation mismatch 进入 reseed。
 
 9 给 volume 增加 `delete_intent_high_water`，给义务增加 owner 与 sequence，并按每 volume 的旧记录顺序为 v8 记录分配序号；旧记录以原 intent ID 为 owner，已知 ID 的查询仍可继续。新接受在同一事务推进高水位，达到 `MaxInt64` 时以 `EOVERFLOW` 拒绝，ACK 不使高水位回退。10 给节点与 retained change 加入可缺席的分配量，为 volume 建立 `allocated_used`；在同一事务中为所有 authority volume 按 4096 字节 cluster 回填并验证现存、detached 节点与历史，旧 replica 行保持 NULL／未知。通用 replica 保留来源报告的分配量或未知，`used` 保持精确 payload。
 
 11 增加 `volumes.created_sec`／`created_nsec`。历史 volume 两字段保持 NULL，新 volume 在创建事务中写入实际时钟；创建事实不使用可修改 root BirthTime，也不因查询或重开更新。完整性检查拒绝混合 presence、非 INTEGER 秒／纳秒与超出 `[0,1e9)` 的纳秒。迁移提交继续由外部见证确认；可读 schema golden 与历史布局 fixture 位于 [`internal/integration/testdata`](../../../packages/metastore/sqlite/internal/integration/testdata)，测试数据不参与运行时初始化。
+
+12 增加 named file/directory counters、durable quota/revision、action namespace/receipt 和 private imports。migration 按 entries/node kind 建立计数，名字插入/删除/替换的 triggers 同事务维护；regular 和 symlink 各计一个 file，目录不计 root，detached allocation 仍收费。正常 summary 不遍历文件树补数。
 
 节点与 retained changes 的 metadata envelope、link target 及 directory revision 长度由 SQL triggers 同步计入 `volumes.metadata_used`，覆盖 detached/pending 节点与历史副本。完整性检查验证 trigger 定义、storage class、规范 envelope、目录／非目录 revision 组合、pending generation、intent 关联、计数与实际合计。`Options.MaxMetadataBytes` 默认每 volume 64 MiB，独立于内容 quota、单节点上限和 integrity 工作预算；载入 payload 前先核对大小，增长越界失败，replica ingest、日志裁剪和物理删除使用同一记账。
 

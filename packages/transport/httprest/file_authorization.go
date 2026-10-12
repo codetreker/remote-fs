@@ -111,7 +111,7 @@ func (h *Handler) authorizeFile(ctx context.Context, request fileRequest) error 
 		observation := request.MetadataObservation.storage().Clone()
 		accesses[0].MetadataObservation = &observation
 	}
-	effects, err := h.fileContentEffects(request)
+	effects, err := h.fileContentEffects(ctx, request)
 	if err != nil {
 		return err
 	}

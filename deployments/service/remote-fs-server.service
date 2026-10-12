@@ -1,0 +1,25 @@
+[Unit]
+Description=Remote volume service
+After=network.target
+
+[Service]
+Type=simple
+User=remote-fs
+Group=remote-fs
+UMask=0077
+StateDirectory=remote-fs
+StateDirectoryMode=0700
+ExecStart=/usr/local/bin/remote-fs-server serve --config /etc/remote-fs/config.yml
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=60s
+KillMode=mixed
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/remote-fs
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

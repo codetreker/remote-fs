@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/codetreker/remote-fs/packages/authz"
+	"github.com/codetreker/remote-fs/packages/storage"
 )
 
 const (
@@ -154,6 +155,14 @@ type HandlerOptions struct {
 	// host name; callbacks read authenticated identity from the request context.
 	Authorizer authz.Authorizer
 	Volume     string
+
+	// AccessBinding derives the immutable owner of stateful capabilities from
+	// trusted authentication context. Nil retains unbound embedding behavior.
+	AccessBinding storage.AccessBindingHook
+
+	// Transfers enables the native streaming transfer protocol when configured.
+	// The private spool directory belongs to the embedding application.
+	Transfers TransferOptions
 
 	// Files bounds retained sessions, references, and replay records. Zero selects DefaultFileLimits.
 	Files FileLimits
@@ -332,6 +341,9 @@ func (o HandlerOptions) settle() handlerOptions {
 // Check reports whether the options resolve to usable bounded settings. Callers may use
 // it before opening the storage that will be handed to NewHandlerWithOptions.
 func (o HandlerOptions) Check() error {
+	if err := o.Transfers.Check(); err != nil {
+		return err
+	}
 	if err := checkAuthorizationOptions(o.Authorizer, o.Volume); err != nil {
 		return err
 	}

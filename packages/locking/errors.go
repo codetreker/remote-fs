@@ -18,6 +18,7 @@ const (
 	UnrelatedProof    Code = "unrelatedProof"
 	Recovering        Code = "recovering"
 	Unavailable       Code = "unavailable"
+	Denied            Code = "denied"
 )
 
 type Error struct {
@@ -39,6 +40,8 @@ func (e *Error) Is(target error) bool {
 
 func Errno(code Code) syscall.Errno {
 	switch code {
+	case Denied:
+		return syscall.EACCES
 	case Invalid, RequestMismatch:
 		return syscall.EINVAL
 	case UnsupportedTarget:

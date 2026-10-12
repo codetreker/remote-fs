@@ -104,7 +104,7 @@ func TestHistoricalLeaseMigrationPreservesAcceptedDurableProof(t *testing.T) {
 	if len(accepted) != 1 || len(visible) != 1 || accepted[0] != want || visible[0] != want {
 		t.Fatalf("migration witness acceptance = %+v, visible = %+v; want %+v", accepted, visible, want)
 	}
-	assertHistoricalLeaseSchemaVersion(t, path, 11)
+	assertHistoricalLeaseSchemaVersion(t, path, 12)
 }
 
 func TestHistoricalLeaseMigrationRefusesRollbackBeforeChangingSchema(t *testing.T) {
@@ -168,7 +168,7 @@ func TestHistoricalLeaseMigrationProtectsEveryVolumeAcrossReopen(t *testing.T) {
 		}
 	})
 	assertHistoricalLeaseVolume(t, first.Store, "A")
-	assertHistoricalLeaseSchemaVersion(t, path, 11)
+	assertHistoricalLeaseSchemaVersion(t, path, 12)
 	acquireHistoricalLease(t, first.LockService(), "alpha.txt")
 	if err := first.Close(); err != nil {
 		t.Fatal(err)

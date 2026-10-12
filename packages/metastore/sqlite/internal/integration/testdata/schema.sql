@@ -5,6 +5,8 @@
 -- record what they now produce. A diff here without a new migration beside it means a landed
 -- migration was edited, which is the one thing the numbering forbids.
 
+CREATE INDEX authority_pending_by_volume ON authority_actions(volume) WHERE outcome IN(1,4);
+
 CREATE INDEX changes_by_node_identity ON changes (
 	CASE
 	WHEN typeof(parent) = 'integer'
@@ -38,6 +40,8 @@ CREATE INDEX entries_by_node_identity ON entries (
 	max(parent, node)
 );
 
+CREATE UNIQUE INDEX imports_by_object_key ON imports(object_key);
+
 CREATE INDEX logs_by_change_identity ON logs (
 	CASE
 	WHEN typeof(committed_position) = 'integer' AND typeof(trimmed_through) = 'integer'
@@ -62,6 +66,18 @@ CREATE INDEX volumes_by_root_identity ON volumes (
 	CASE WHEN typeof(root) = 'integer' THEN 0 ELSE 1 END,
 	root
 );
+
+CREATE TABLE action_namespaces(volume INTEGER NOT NULL,subject TEXT NOT NULL,sequence INTEGER NOT NULL,
+	accept_sec INTEGER NOT NULL,accept_nsec INTEGER NOT NULL,admission INTEGER NOT NULL DEFAULT 1 CHECK(admission IN(0,1)), PRIMARY KEY(volume,subject,sequence)) WITHOUT ROWID;
+
+CREATE TABLE action_subjects(volume INTEGER NOT NULL,subject TEXT NOT NULL,
+	floor INTEGER NOT NULL DEFAULT 0, highwater INTEGER NOT NULL DEFAULT 0, logical_sec INTEGER NOT NULL DEFAULT 0,logical_nsec INTEGER NOT NULL DEFAULT 0,
+	PRIMARY KEY(volume,subject)) WITHOUT ROWID;
+
+CREATE TABLE authority_actions(volume INTEGER NOT NULL,subject TEXT NOT NULL,namespace INTEGER NOT NULL,nonce TEXT NOT NULL,
+	kind INTEGER NOT NULL,fingerprint BLOB NOT NULL CHECK(length(fingerprint)=32),outcome INTEGER NOT NULL,
+	failure INTEGER NOT NULL DEFAULT 0,result BLOB,acceptance BLOB,created_sec INTEGER NOT NULL,
+	PRIMARY KEY(volume,subject,namespace,nonce)) WITHOUT ROWID;
 
 CREATE TABLE backing_store (
 	singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -132,6 +148,10 @@ CREATE TABLE entries (
 	PRIMARY KEY (volume, parent, name)
 ) WITHOUT ROWID;
 
+CREATE TABLE imports(volume INTEGER NOT NULL,subject TEXT NOT NULL,namespace INTEGER NOT NULL,nonce TEXT NOT NULL,
+	object_key TEXT NOT NULL,command BLOB NOT NULL,sealed INTEGER NOT NULL DEFAULT 0, access_binding BLOB NOT NULL DEFAULT X'7B7D',
+	PRIMARY KEY(volume,subject,namespace,nonce)) WITHOUT ROWID;
+
 CREATE TABLE lease_recovery (
 	singleton           INTEGER PRIMARY KEY CHECK (singleton = 1),
 	database_id         TEXT NOT NULL,
@@ -190,7 +210,7 @@ CREATE TABLE volumes (
 	CHECK (created_sec IS NULL OR typeof(created_sec) = 'integer'), created_nsec INTEGER
 	CHECK ((created_sec IS NULL AND created_nsec IS NULL) OR
 	(typeof(created_sec) = 'integer' AND typeof(created_nsec) = 'integer'
-	AND created_nsec >= 0 AND created_nsec < 1000000000)));
+	AND created_nsec >= 0 AND created_nsec < 1000000000)), named_files INTEGER NOT NULL DEFAULT 0 CHECK(typeof(named_files)='integer' AND named_files>=0), named_directories INTEGER NOT NULL DEFAULT 0 CHECK(typeof(named_directories)='integer' AND named_directories>=0), quota_bytes INTEGER CHECK(quota_bytes IS NULL OR (typeof(quota_bytes)='integer' AND quota_bytes>=0)), quota_revision INTEGER NOT NULL DEFAULT 0 CHECK(typeof(quota_revision)='integer' AND quota_revision>=0));
 
 CREATE TRIGGER changes_allocation_insert AFTER INSERT ON changes BEGIN
 	UPDATE changes SET allocation_size = CASE
@@ -217,6 +237,23 @@ CREATE TRIGGER changes_metadata_update AFTER UPDATE OF metadata, link_target, di
 	WHERE id = NEW.volume;
 	END;
 
+CREATE TRIGGER entries_summary_delete BEFORE DELETE ON entries BEGIN
+	UPDATE volumes SET named_files=named_files-(SELECT kind IN(1,3) FROM nodes WHERE id=OLD.node),
+	named_directories=named_directories-(SELECT kind=2 FROM nodes WHERE id=OLD.node) WHERE id=OLD.volume;
+	END;
+
+CREATE TRIGGER entries_summary_insert AFTER INSERT ON entries BEGIN
+	UPDATE volumes SET named_files=named_files+(SELECT kind IN(1,3) FROM nodes WHERE id=NEW.node),
+	named_directories=named_directories+(SELECT kind=2 FROM nodes WHERE id=NEW.node) WHERE id=NEW.volume;
+	END;
+
+CREATE TRIGGER entries_summary_update BEFORE UPDATE OF node,volume ON entries BEGIN
+	UPDATE volumes SET named_files=named_files-(SELECT kind IN(1,3) FROM nodes WHERE id=OLD.node),
+	named_directories=named_directories-(SELECT kind=2 FROM nodes WHERE id=OLD.node) WHERE id=OLD.volume;
+	UPDATE volumes SET named_files=named_files+(SELECT kind IN(1,3) FROM nodes WHERE id=NEW.node),
+	named_directories=named_directories+(SELECT kind=2 FROM nodes WHERE id=NEW.node) WHERE id=NEW.volume;
+	END;
+
 CREATE TRIGGER nodes_metadata_delete AFTER DELETE ON nodes BEGIN
 	UPDATE volumes SET metadata_used = metadata_used - length(OLD.metadata) - length(OLD.link_target) - length(OLD.directory_revision)
 	WHERE id = OLD.volume;
@@ -232,5 +269,12 @@ CREATE TRIGGER nodes_metadata_update AFTER UPDATE OF metadata, link_target, dire
 	WHERE id = OLD.volume;
 	UPDATE volumes SET metadata_used = metadata_used + length(NEW.metadata) + length(NEW.link_target) + length(NEW.directory_revision)
 	WHERE id = NEW.volume;
+	END;
+
+CREATE TRIGGER nodes_summary_kind BEFORE UPDATE OF kind ON nodes BEGIN
+	UPDATE volumes SET named_files=named_files+
+	((NEW.kind IN(1,3))-(OLD.kind IN(1,3)))*(SELECT count(*) FROM entries WHERE node=OLD.id),
+	named_directories=named_directories+((NEW.kind=2)-(OLD.kind=2))*(SELECT count(*) FROM entries WHERE node=OLD.id)
+	WHERE id=OLD.volume;
 	END;
 

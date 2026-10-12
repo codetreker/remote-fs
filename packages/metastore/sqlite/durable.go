@@ -13,6 +13,7 @@ import (
 
 	moderncsqlite "modernc.org/sqlite"
 
+	"github.com/codetreker/remote-fs/packages/metastore"
 	"github.com/codetreker/remote-fs/packages/metastore/sqlite/internal/dbstate"
 	"github.com/codetreker/remote-fs/packages/metastore/sqlite/internal/sqlerr"
 )
@@ -95,15 +96,17 @@ func (d durableOpen) check() error {
 }
 
 type databaseCoordinator struct {
-	commit  commitGate
-	health  sync.RWMutex
-	poison  error
-	refs    int
-	key     string
-	durable bool
-	closing bool
-	pins    map[retainedNode]int
-	domains map[int64]*fileDomain
+	commit       commitGate
+	health       sync.RWMutex
+	poison       error
+	refs         int
+	key          string
+	durable      bool
+	closing      bool
+	objectPinsMu sync.Mutex
+	objectPins   map[metastore.Key]int
+	pins         map[retainedNode]int
+	domains      map[int64]*fileDomain
 }
 
 type commitGate chan struct{}
@@ -143,7 +146,7 @@ func acquireCoordinator(database string, durable bool) (*databaseCoordinator, er
 	defer databaseCoordinators.Unlock()
 	coordinator := databaseCoordinators.byPath[key]
 	if coordinator == nil {
-		coordinator = &databaseCoordinator{key: key, durable: durable, commit: newCommitGate(), pins: make(map[retainedNode]int), domains: make(map[int64]*fileDomain)}
+		coordinator = &databaseCoordinator{key: key, durable: durable, commit: newCommitGate(), pins: make(map[retainedNode]int), objectPins: make(map[metastore.Key]int), domains: make(map[int64]*fileDomain)}
 		databaseCoordinators.byPath[key] = coordinator
 	} else if coordinator.durable || durable {
 		return nil, fmt.Errorf("a durably witnessed SQLite database cannot share its process with another opener: %w",

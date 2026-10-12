@@ -210,7 +210,7 @@ FUSE 将 `flock` 映射到 whole-file domain，将传统 POSIX `fcntl` 映射到
 
 ## 五、HTTP、复制与资源
 
-HTTP 文件请求先执行[业务授权](authorization.md)，再读取或触碰 Session、File、NodeReference、动作历史或 durable intent。OpenAt/OpenNodeRef/OpenChildRef 先授权自身 Operation 和导出的 OpenAccess，再按固定顺序授权实际包含的 remove、set-attr、set-metadata 或 set-pending 效果；全部允许后 native action 才执行。LookupAt、ReadDirNode、ObserveDirectoryMetadata、ObserveName、MutateName、条件 mutation、pending set/clear、action query、intent list/query/ACK 分别使用自己的规范 Operation。已有 bearer 引用、owner、action ID 或 durable intent ID 都不能绕过当前请求授权；authority 自主完成已经接受的固定删除效果时不重新解释成外部请求。
+HTTP 文件请求先执行[业务授权](authorization.md)，再读取或触碰 Session、File、NodeReference、动作历史或 durable intent。配置 AccessBinding 时，原 file registry 的 stateful 记录和 volatile terminal history 还核对可信 SubjectID/AccessID；未配置时保持既有模式。OpenAt/OpenNodeRef/OpenChildRef 先授权自身 Operation 和导出的 OpenAccess，再按固定顺序授权实际包含的 remove、set-attr、set-metadata 或 set-pending 效果；全部允许后 native action 才执行。LookupAt、ReadDirNode、ObserveDirectoryMetadata、ObserveName、MutateName、条件 mutation、pending set/clear、action query、intent list/query/ACK 分别使用自己的规范 Operation。已有引用、owner、action ID 或 durable intent ID 都不能绕过当前请求授权；authority 自主完成已经接受的固定删除效果时不重新解释成外部请求。
 
 HTTP v5 统一转发基础 volume、中立 Attr、metadata、文件引用、目录／名字观察、range 和强 S/X。请求的 `op` 直接使用 `storage.Operation` 的规范值；二进制内容、原始叶名、revision、metadata version 和 payload 使用 canonical base64。`file.open-at` 与 `file.open-child-ref` 保留既有顶层 `child` 并接受可选顶层 `guards`，server 把二者组装为 `ChildSelection`；OpenAt options 必须显式携带 lower-camel `metadataAccess`，零值按无权限处理。协议拒绝未知、重复、缺席、null 或无关字段，所有结果都携带 v5 marker 与封闭 errno 词汇；v3 路由不提供兼容旁路。
 

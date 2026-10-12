@@ -7,7 +7,9 @@ require github.com/hanwen/go-fuse/v2 v2.11.0
 require (
 	github.com/Azure/azure-sdk-for-go/sdk/azcore v1.22.0
 	github.com/Azure/azure-sdk-for-go/sdk/storage/azblob v1.6.2
+	golang.org/x/crypto v0.53.0
 	golang.org/x/sys v0.47.0
+	gopkg.in/yaml.v3 v3.0.1
 	modernc.org/sqlite v1.57.0
 )
 

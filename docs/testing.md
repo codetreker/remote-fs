@@ -18,6 +18,12 @@
 
 对拍失败保留双方原错误的类型与文本。模式修改复合步骤先 WriteFile 再 Chmod，失败后才用独立五秒 context 查询 backing 属性及至多 32 字节内容；这些是失败后的额外观察，不重试原操作、不改变原来的失败判定。仍未解释的 EIO 由[独立调查](../.agents/notes/proposed/testing/2026-09-09-trace-unexplained-fuse-eio.md)记录，不能从步骤名称或未复现的批次推断原因。
 
+## 独立服务
+
+服务沿用上述单元、故障注入和端到端分层。直接 API 用例验证 own-volume 成功及他人文件/stream/mount/transfer 拒绝，管理员只取得 ordinary-user 五项摘要；普通用户登录延期使用可信测试身份，不引入生产测试入口。[auth 用例](../internal/service/auth_test.go)覆盖 session/CSRF、credential 和持续授权；[native policy](../packages/metastore/sqlite/service_policy_test.go)覆盖计数、quota 与原 receipt；[transfer 用例](../packages/metastore/sqlite/service_transfer_test.go)验证原生 publication 和 immutable export，[真实 lifecycle 用例](../internal/service/lifecycle_native_test.go)验证创建删除与正常重启责任。
+
+Console/CLI 验证使用生产 assets 和真实服务，核对原始名字、大整数 identity、文件操作、Busy、统计失败和未知结果；构建成功或按钮隐藏不能证明授权。既有测试命令、覆盖率归属和 CI gate 保持原规则。
+
 ## CI 工具链与缓存
 
 四个作业使用[共享 setup action](../.github/actions/setup-go/action.yml)固定 Go 1.26.8，并按作业、工具链、依赖和源码 SHA 保存 module／编译缓存；同作业前缀及经校验的旧快照可作为种子。三个 Linux 作业分别运行非挂载的普通包、根 SQLite 包、挂载与端到端包；Windows 作业只运行 native SSPI package 的 race test 与 vet。缓存复用编译工作，`-count=1` 仍使每次调用实际执行测试。根 SQLite 包的单独调度不缩小 race、严格 verdict 或 module-wide 覆盖率门禁。缓存上传也消耗时间与空间，净收益须看完整作业；原因与兼容边界见[缓存决定](../.agents/notes/implemented/process/2026-09-09-refresh-ci-go-build-caches.md)。

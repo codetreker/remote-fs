@@ -42,3 +42,6 @@ bin/
 
 # Temporary files
 .tmp/
+
+# Console dependencies; the embedded dist assets are committed.
+node_modules/

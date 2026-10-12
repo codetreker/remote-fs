@@ -64,6 +64,10 @@ type Storage struct {
 	filesClosing       bool
 	fileCloseMu        sync.Mutex
 	fileCloseRetry     bool
+	transferMu         sync.Mutex
+	transfers          map[any]struct{}
+	importCancels      map[storage.ActionKey]*importCancelGate
+	transfersClosing   bool
 }
 
 var _ storage.Storage = (*Storage)(nil)
@@ -171,6 +175,11 @@ func newStorage(objects Objects, meta metastore.Store, interval time.Duration, b
 // A retained-file cleanup refusal preserves both halves and can be retried.
 func (s *Storage) Close() error {
 	s.closeMu.Lock()
+	if err := s.checkTransferSettlement(); err != nil {
+		s.closeMu.Unlock()
+		return err
+	}
+	s.transfersClosing = true
 	if s.closeDone != nil {
 		done := s.closeDone
 		select {
@@ -777,11 +786,21 @@ func isOnly(err, target error) bool {
 }
 
 func onlyLeaves(err error, targets ...error) bool {
+	return matchErrorLeaves(err, true, targets...)
+}
+
+func onlyUnwrappedLeaves(err error, targets ...error) bool {
+	return matchErrorLeaves(err, false, targets...)
+}
+
+func matchErrorLeaves(err error, classify bool, targets ...error) bool {
 	if err == nil {
 		return false
 	}
-	if classified, ok := err.(interface{ Classification() error }); ok {
-		return onlyLeaves(classified.Classification(), targets...)
+	if classify {
+		if classified, ok := err.(interface{ Classification() error }); ok {
+			return matchErrorLeaves(classified.Classification(), classify, targets...)
+		}
 	}
 	if joined, ok := err.(interface{ Unwrap() []error }); ok {
 		children := joined.Unwrap()
@@ -789,14 +808,14 @@ func onlyLeaves(err error, targets ...error) bool {
 			return false
 		}
 		for _, child := range children {
-			if !onlyLeaves(child, targets...) {
+			if !matchErrorLeaves(child, classify, targets...) {
 				return false
 			}
 		}
 		return true
 	}
 	if wrapped, ok := err.(interface{ Unwrap() error }); ok {
-		return onlyLeaves(wrapped.Unwrap(), targets...)
+		return matchErrorLeaves(wrapped.Unwrap(), classify, targets...)
 	}
 	for _, target := range targets {
 		if err == target {

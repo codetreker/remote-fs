@@ -19,7 +19,7 @@ func (a *Authority) Acquire(ctx context.Context, request AcquireRequest) (Action
 		return ActionResult{}, err
 	}
 	a.expireSessionsLocked(a.clock.Now())
-	o, err := a.ownerLocked(request.Owner)
+	o, err := a.ownerLocked(ctx, request.Owner)
 	if err != nil {
 		a.mu.Unlock()
 		return ActionResult{}, err
@@ -180,7 +180,7 @@ func (a *Authority) Renew(ctx context.Context, request RenewRequest) (ActionResu
 		return ActionResult{}, err
 	}
 	a.expireSessionsLocked(a.clock.Now())
-	o, err := a.ownerLocked(request.Owner)
+	o, err := a.ownerLocked(ctx, request.Owner)
 	if err != nil {
 		a.mu.Unlock()
 		return ActionResult{}, err

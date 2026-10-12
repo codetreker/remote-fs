@@ -378,6 +378,9 @@ func (s *Storage) callWithin(ctx context.Context, req Request, content []byte, s
 	if req.Op == OpFileControl {
 		limit = min(limit, MaxFileControlBytes)
 	}
+	if req.Op == OpFileTransferControl {
+		limit = min(limit, MaxFileControlBytes)
+	}
 	if int64(len(content)) > limit {
 		tooLarge := fmt.Errorf("the request body is %d bytes, above the configured limit of %d", len(content), limit)
 		if req.Op == OpWrite {
@@ -391,7 +394,7 @@ func (s *Storage) callWithin(ctx context.Context, req Request, content []byte, s
 		reservation = retainedResponseMultiplier * min(s.maxBodyBytes, MaxFileRecoveryBytes)
 		successLimit = min(successLimit, MaxFileRecoveryBytes)
 	}
-	if req.Op == OpFileControl {
+	if req.Op == OpFileControl || req.Op == OpFileTransferControl {
 		admission = s.lockControls
 		reservation = retainedResponseMultiplier * MaxFileControlBytes
 		successLimit = min(successLimit, MaxFileControlBytes)
@@ -430,7 +433,7 @@ func (s *Storage) callWithin(ctx context.Context, req Request, content []byte, s
 	if content != nil {
 		httpReq.Header.Set("Content-Type", req.ContentType())
 	}
-	if isVolumeMutation(req.Op) || (req.Op == OpFile || req.Op == OpFileControl || req.Op == OpFileRecovery) && fileScopeEnabled(ctx) {
+	if isVolumeMutation(req.Op) || req.Op == OpFileTransfer || req.Op == OpFileTransferControl || (req.Op == OpFile || req.Op == OpFileControl || req.Op == OpFileRecovery) && fileScopeEnabled(ctx) {
 		scope := locking.ScopeFromContext(ctx)
 		if !locking.HasScope(ctx) && s.scope != nil {
 			scope = *s.scope
@@ -477,7 +480,7 @@ func (s *Storage) callWithin(ctx context.Context, req Request, content []byte, s
 		if req.Op == OpFileRecovery {
 			errorLimit = min(errorLimit, MaxFileRecoveryBytes)
 		}
-		if req.Op == OpFileControl {
+		if req.Op == OpFileControl || req.Op == OpFileTransferControl {
 			errorLimit = min(errorLimit, MaxFileControlBytes)
 		}
 		body, err := readWhole(resp, errorLimit)

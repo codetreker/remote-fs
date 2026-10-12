@@ -46,6 +46,8 @@ const (
 	OpFileState                   Operation = "file.state"
 	OpFileRead                    Operation = "file.read"
 	OpFileWrite                   Operation = "file.write"
+	OpFileImport                  Operation = "file.import"
+	OpFileExport                  Operation = "file.export"
 	OpFileTruncate                Operation = "file.truncate"
 	OpFileSetAttr                 Operation = "file.set-attr"
 	OpFileSync                    Operation = "file.sync"

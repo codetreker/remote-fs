@@ -52,7 +52,7 @@ flowchart LR
 
 ## 三、同一个接口，两个模块
 
-client 侧的 remote storage 与 server 侧的 storage **实现同一份 `storage.Storage` 基础接口**，并提供有界结果扩展 `storage.BoundedStorage`。`FileStorage` 提供有限 FileSession 与保留 File；原子子项打开、NodeReference、身份 namespace、DirectoryReader 的 identity-bound enumeration、完整目录 metadata、reference current-name、action receipt、metadata、scope、pending deletion、条件 mutation、use owner 与 range 是可选能力。强 S/X 控制与 mutation scope 是另外的成对能力。
+client 侧的 remote storage 与 server 侧的 storage **实现同一份 `storage.Storage` 基础接口**，并提供有界结果扩展 `storage.BoundedStorage`。`FileStorage` 提供有限 FileSession 与保留 File；原子子项打开、NodeReference、身份 namespace、DirectoryReader 的 identity-bound enumeration、完整目录 metadata、reference current-name、action receipt、metadata、scope、pending deletion、条件 mutation、use owner 与 range 是可选能力。强 S/X 控制与 mutation scope 是另外的成对能力。VolumeSummary、QuotaControl 和 FileTransfer 提供单 volume 统计、持久配额与原生 import/export；[独立服务](server/service.md)通过它们管理原生事实，库不引入服务用户模型。
 
 它们**不是同一个模块**，也不在同一个角色里：server 侧的那个真正持有数据；client 侧的那个不保存权威内容，它把调用翻译为 HTTP 交换，并保存完成核对所需的有限能力与动作状态。
 
@@ -195,20 +195,21 @@ remote-fs ──▶ 建立 remote storage，先访问一次根，确认 server �
 
 | 角色 | 作为库嵌入 | 作为独立二进制 |
 |---|---|---|
-| server | `packages/transport/httprest` 提供一个 `http.Handler`，链接进集成方既有的 server | `cmd/remote-fs-server`：服务 Azure Blob + SQLite，或同一私有目录中的本地对象 + SQLite |
-| client | `packages/transport/httprest`、`packages/fuse` 或 `packages/smb` 链接进集成方既有的 daemon／Windows 进程 | `cmd/remote-fs`：把一个 server 的 volume 挂到 Linux 本地目录；不提供 Windows WNet 二进制 |
+| server | `packages/transport/httprest` 提供一个 `http.Handler`，链接进集成方既有的 server | `cmd/remote-fs-server serve`：多用户服务与同源 Console；`reference` 保留单 volume local/Azure 入口 |
+| client | `packages/transport/httprest`、`packages/fuse` 或 `packages/smb` 链接进集成方既有的 daemon／Windows 进程 | `cmd/remote-fs`：服务管理、文件 CLI 与 Linux foreground mount；不提供 Windows WNet 二进制 |
 
 client 侧还有第三种用法：只使用 remote storage，不挂载（R-INT-5）。这条路径不依赖 FUSE，因此不受 Linux 限制。
 
 独立二进制的进程与挂载生命周期通过本机信号管理。一个 `remote-fs` 进程就是一个挂载点，卸载靠向它发信号；独立 server 用信号停止或查询存储与锁状态，见 [`server/architecture.md`](server/architecture.md)。文件占有另有跨角色的网络控制接口，不承担进程管理。作为 package 使用时，调用方直接使用所组合 storage 的状态 API。
 
-身份认证、凭据签发与轮换、角色和 TLS 由业务方管理。嵌入式 handler 可配置可信 volume 与 Authorizer；不配置时保留外层访问控制，独立二进制没有认证配置入口。锁能力校验约束修改的原生占有顺序，业务授权控制哪些语义请求能够进入，两者不能互相替代。同一 mount／replica 固定属于同一访问身份；凭据轮换可保持身份与连接，切换身份则建立新的客户端状态。
+嵌入式 handler 的认证、credential、角色和 TLS 由业务方管理，host 配置可信 volume、Authorizer 和可选 AccessBinding。独立服务持有本地管理员登录、immutable owner 和只读普通用户摘要，普通用户外部登录尚未接入；文件访问仍执行相同的原生与业务检查，详见[服务架构](server/service.md)。锁能力校验约束修改的原生占有顺序，业务授权控制哪些语义请求能够进入，两者不能互相替代。同一 mount／replica 固定属于同一访问身份；凭据轮换可保持身份与连接，切换身份则建立新的客户端状态。
 
 ## 七、第二层
 
 各角色内部的设计各占一个目录，一个角色一份：
 
 - `server/architecture.md` —— HTTP 服务端、请求与响应的形状、错误如何离开 server
+- `server/service.md` —— 独立服务的身份、volume owner、Console/CLI 和管理生命周期
 - `server/local-disk-object-store.md` —— 本地持久 storage 的格式、打开与恢复、容量和维护
 - `server/file-locks.md` —— 显式占有、有限授予、最终发布顺序、重启保护与 HTTP 控制协议
 - `server/file-handles.md` —— 保留对象、同步修改、中立 metadata、Uses/range 与文件会话协议

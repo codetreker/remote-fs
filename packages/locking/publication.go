@@ -51,7 +51,7 @@ func (a *Authority) Publish(ctx context.Context, publication Publication, transi
 	var owner *ownerRecord
 	var err error
 	if publication.Scope.Owner.Owner != "" {
-		owner, err = a.ownerLocked(publication.Scope.Owner)
+		owner, err = a.ownerLocked(ctx, publication.Scope.Owner)
 		if err != nil {
 			a.mu.Unlock()
 			return err

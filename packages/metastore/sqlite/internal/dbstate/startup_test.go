@@ -111,7 +111,8 @@ func TestValidateLegacySequencesRejectsLostAndMalformedHistory(t *testing.T) {
 		{"malformed node sequence", `UPDATE sqlite_sequence SET seq='bad' WHERE name='nodes'`, "SQLite sequence"},
 		{"missing node sequence", `DELETE FROM sqlite_sequence WHERE name='nodes'`, "below existing node"},
 		{"malformed root", `UPDATE volumes SET root='bad'`, "node identities in invalid storage classes"},
-		{"entry above sequence", `UPDATE entries SET node=5`, "below existing node"},
+		// Disable summary enforcement so the sequence validator observes the dangling entry.
+		{"entry above sequence", `DROP TRIGGER entries_summary_update; UPDATE entries SET node=5`, "below existing node"},
 		{"malformed retained node", `UPDATE changes SET from_parent='bad'`, "retained node identities in invalid storage classes"},
 		{"retained node above sequence", `UPDATE changes SET node=5`, "below retained log identity"},
 		{"malformed change sequence", `UPDATE sqlite_sequence SET seq='bad' WHERE name='changes'`, "SQLite sequence"},

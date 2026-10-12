@@ -153,13 +153,14 @@ func (s *Store) backendNode(key locking.BackendKey) (int64, error) {
 }
 
 type volumeIntent struct {
-	kind    locking.MutationKind
-	paths   []string
-	node    int64
-	nodes   []int64
-	scope   storage.UseScope
-	cleanup bool
-	closing *retainedFile
+	addedBytes int64
+	kind       locking.MutationKind
+	paths      []string
+	node       int64
+	nodes      []int64
+	scope      storage.UseScope
+	cleanup    bool
+	closing    *retainedFile
 }
 
 type volumePublication struct {
@@ -321,6 +322,7 @@ func (s *Store) finishVolumePublication(ctx context.Context, tx *sql.Tx, publica
 		}
 		publication.next = retained
 	}
+	publication.next += publication.intent.addedBytes
 	return nil
 }
 

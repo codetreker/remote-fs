@@ -48,6 +48,7 @@ docs/design/
   server/
     README.md             server 目录的规则
     architecture.md       server 角色内部
+    service.md            独立服务的身份、owner、Console/CLI 与生命周期
     file-locks.md         文件占有、动作结果、发布顺序与重启恢复
     file-handles.md       保留对象、中立 metadata、Uses/range 与会话生命周期
     authorization.md      业务方策略、volume 语义操作与请求／流授权

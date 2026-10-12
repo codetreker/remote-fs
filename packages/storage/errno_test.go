@@ -1,6 +1,8 @@
 package storage_test
 
 import (
+	"context"
+	"errors"
 	"syscall"
 	"testing"
 
@@ -13,6 +15,7 @@ func TestContractErrnosAreInTheVocabulary(t *testing.T) {
 		syscall.EINVAL, syscall.ENOENT, syscall.EEXIST,
 		syscall.ENOTDIR, syscall.EISDIR, syscall.ENOTEMPTY,
 		syscall.EIO, syscall.EBADF, syscall.EDEADLK, syscall.ENOLCK,
+		syscall.ECANCELED,
 	} {
 		name, ok := storage.ErrnoName(e)
 		if !ok {
@@ -25,6 +28,25 @@ func TestContractErrnosAreInTheVocabulary(t *testing.T) {
 		if classified := storage.ErrnoOf(e); classified != e {
 			t.Fatalf("errno %v classified as %v", e, classified)
 		}
+	}
+}
+
+func TestConfirmedCancellationReceiptSurvivesNamingWithoutChangingRequestCancellation(t *testing.T) {
+	confirmed := errors.Join(syscall.ECANCELED, context.Canceled)
+	if name := storage.ErrnoNameOf(confirmed); name != "ECANCELED" {
+		t.Fatalf("confirmed cancellation named %q", name)
+	}
+	if errno := storage.ErrnoOf(confirmed); errno != syscall.ECANCELED {
+		t.Fatalf("confirmed cancellation classified as %v", errno)
+	}
+	if errno, known := storage.ErrnoByName(storage.ErrnoNameOf(confirmed)); !known || errno != syscall.ECANCELED {
+		t.Fatalf("confirmed cancellation roundtrip = %v, %v", errno, known)
+	}
+	if errno := storage.ErrnoOf(context.Canceled); errno != syscall.EINTR {
+		t.Fatalf("request cancellation classified as %v", errno)
+	}
+	if errno := storage.ErrnoOf(context.DeadlineExceeded); errno != syscall.EIO {
+		t.Fatalf("deadline classified as %v", errno)
 	}
 }
 

@@ -112,7 +112,7 @@ func TestHistoricalReplicaKeepsUnknownLargeAllocation(t *testing.T) {
 			t.Fatalf("migrated replica node %q = %+v, %v; want size %d with unknown allocation", test.name, node, err, test.size)
 		}
 	}
-	assertHistoricalLeaseSchemaVersion(t, databasePath, 11)
+	assertHistoricalLeaseSchemaVersion(t, databasePath, 12)
 }
 
 // fill puts one picture of the source into the copy, in pages, the way the transport delivers

@@ -127,6 +127,9 @@ func (s *Store) reserveObject(ctx context.Context, tx *sql.Tx, key metastore.Key
 // Quarantine retires a reservation whose Put did not establish ownership of the key.
 func (s *Store) Quarantine(ctx context.Context, key metastore.Key) error {
 	if err := s.mutate(ctx, func(tx *sql.Tx) error {
+		if err := s.checkOrdinaryObjectKey(ctx, tx, key); err != nil {
+			return err
+		}
 		var state int
 		switch err := tx.QueryRowContext(ctx,
 			`SELECT state FROM objects WHERE key = ? AND volume = ?`,
@@ -160,6 +163,9 @@ func (s *Store) Quarantine(ctx context.Context, key metastore.Key) error {
 // that the object store created the object under its key.
 func (s *Store) Abandon(ctx context.Context, key metastore.Key) error {
 	if err := s.mutate(ctx, func(tx *sql.Tx) error {
+		if err := s.checkOrdinaryObjectKey(ctx, tx, key); err != nil {
+			return err
+		}
 		var state int
 		switch err := tx.QueryRowContext(ctx,
 			`SELECT state FROM objects WHERE key = ? AND volume = ?`,
@@ -219,6 +225,9 @@ func (s *Store) Commit(ctx context.Context, path string, object metastore.Object
 }
 
 func (s *Store) commit(ctx context.Context, tx *sql.Tx, cleaned string, object metastore.Object) error {
+	if err := s.checkOrdinaryObjectKey(ctx, tx, object.Key); err != nil {
+		return err
+	}
 	// An empty key commits a file with no contents. Zero bytes are not worth an object, so
 	// nothing was reserved for them and there is nothing to look up.
 	if object.Key != "" {
@@ -369,7 +378,14 @@ func (s *Store) accountFileChange(ctx context.Context, tx *sql.Tx, oldSize, newS
 // A volume with no allowance is never refused, and neither is a change that shrinks one:
 // a volume already over its limit would otherwise have no way back under it.
 func (s *Store) roomFor(ctx context.Context, tx *sql.Tx, delta int64) error {
-	if s.allowance == 0 || delta <= 0 {
+	if delta <= 0 {
+		return nil
+	}
+	allowance, err := s.effectiveQuota(ctx, tx)
+	if err != nil {
+		return err
+	}
+	if s.quotaPolicy == FixedAllowancePolicy && allowance == 0 {
 		return nil
 	}
 	used, err := s.allocatedUsed(ctx, tx)
@@ -379,9 +395,9 @@ func (s *Store) roomFor(ctx context.Context, tx *sql.Tx, delta int64) error {
 	// Written as a subtraction from the allowance rather than an addition to the count, so
 	// that a volume holding close to what a byte count holds cannot wrap the sum into a
 	// figure that passes.
-	if delta > s.allowance-used {
+	if delta > allowance-used {
 		return fmt.Errorf("%d more bytes would carry the volume past its allowance of %d bytes, of which %d are taken: %w",
-			delta, s.allowance, used, syscall.EDQUOT)
+			delta, allowance, used, syscall.EDQUOT)
 	}
 	return nil
 }
@@ -541,7 +557,7 @@ func readPendingObjectStatus(
 // returned.
 const garbageQuery = `
 	SELECT key FROM objects INDEXED BY objects_by_state
-	WHERE volume = ? AND state = ?
+	WHERE volume = ? AND state = ? AND NOT EXISTS(SELECT 1 FROM imports i WHERE i.object_key=objects.key)
 	ORDER BY created_sec
 	LIMIT ?`
 
@@ -549,11 +565,13 @@ func (s *Store) Garbage(ctx context.Context, limit int) ([]metastore.Key, error)
 	if limit < 0 {
 		return nil, fmt.Errorf("a limit of %d objects is not a count: %w", limit, syscall.EINVAL)
 	}
+	s.coordinator.objectPinsMu.Lock()
+	defer s.coordinator.objectPinsMu.Unlock()
 	if err := s.beginHealthyRead(ctx); err != nil {
 		return nil, err
 	}
 	defer s.coordinator.endHealthyRead()
-	rows, err := s.read.QueryContext(ctx, garbageQuery, s.volume, stateGarbage, limit)
+	rows, err := s.read.QueryContext(ctx, garbageQuery, s.volume, stateGarbage, limit+len(s.coordinator.objectPins))
 	if err != nil {
 		return nil, fmt.Errorf("collecting objects nothing references: %w", sqlerr.ReadFailure(ctx, err))
 	}
@@ -565,7 +583,9 @@ func (s *Store) Garbage(ctx context.Context, limit int) ([]metastore.Key, error)
 		if err := rows.Scan(&key); err != nil {
 			return nil, fmt.Errorf("reading an object eligible for collection: %w", sqlerr.ReadFailure(ctx, err))
 		}
-		keys = append(keys, metastore.Key(key))
+		if s.coordinator.objectPins[metastore.Key(key)] == 0 && len(keys) < limit {
+			keys = append(keys, metastore.Key(key))
+		}
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("reading objects eligible for collection: %w", sqlerr.ReadFailure(ctx, err))
@@ -597,6 +617,15 @@ func (s *Store) Forget(ctx context.Context, keys []metastore.Key) error {
 	ctx = context.WithoutCancel(ctx)
 	if err := s.mutateTransaction(admission, ctx, nil, func(tx *sql.Tx) error {
 		for _, key := range keys {
+			if err := s.checkOrdinaryObjectKey(ctx, tx, key); err != nil {
+				return err
+			}
+			s.coordinator.objectPinsMu.Lock()
+			pinned := s.coordinator.objectPins[key] > 0
+			s.coordinator.objectPinsMu.Unlock()
+			if pinned {
+				return syscall.EBUSY
+			}
 			var state int
 			switch err := tx.QueryRowContext(ctx, `SELECT state FROM objects WHERE key = ? AND volume = ?`,
 				string(key), s.volume).Scan(&state); {
@@ -617,6 +646,20 @@ func (s *Store) Forget(ctx context.Context, keys []metastore.Key) error {
 		return nil
 	}); err != nil {
 		return fmt.Errorf("forgetting objects: %w", sqlerr.Failure(err))
+	}
+	return nil
+}
+
+func (s *Store) checkOrdinaryObjectKey(ctx context.Context, tx *sql.Tx, key metastore.Key) error {
+	if key == "" {
+		return nil
+	}
+	var imported bool
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM imports WHERE object_key=?)`, string(key)).Scan(&imported); err != nil {
+		return err
+	}
+	if imported {
+		return syscall.EBUSY
 	}
 	return nil
 }
