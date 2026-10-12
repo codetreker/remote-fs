@@ -81,7 +81,10 @@ data／execute／write／append／DELETE 权限参与 sharing；Use 非零时，
 
 CREATE 属性先接受支持的可设置位与 DIRECTORY，再去除 DIRECTORY/NORMAL，作为规范打开意图的属性集合。NORMAL 与其它位组合时忽略；DIRECTORY 不独立决定 kind，实际种类由目录／非目录 CreateOptions 和解析目标决定，不因属性与 options 不同而额外拒绝。DIRECTORY+FILE_DIRECTORY_FILE 可创建／打开目录，DIRECTORY+FILE_NON_DIRECTORY_FILE 仍按普通文件种类处理；响应结构位从捕获的 kind 派生，不写入 smb.windows。已有目标与目录／非目录 option 的类型冲突仍拒绝，未支持属性位仍在效果前拒绝，持久 metadata 编码保持严格。
 
-CREATE contexts 有严格数量、alignment、Next 范围、重复与 payload 检查。well-formed DHnQ、DH2Q、RqLs、AlSi 与协议 reserved GUID 仅解析并忽略，response 始终 oplock NONE、无 context，不建立 durable/persistent/lease 状态。畸形 recognized context 或互斥 durable 请求是 invalid parameter；well-formed reconnect、MxAc、QFid、以及 ExtA/SecD/TWrp、app-instance、virtual-disk 与未知 context 在效果前明确不支持。协议 reserved CREATE/CLOSE 字段按标准忽略。
+CREATE contexts 有严格数量、alignment、Next 范围、重复与 payload 检查。well-formed DHnQ、DH2Q、RqLs、AlSi 与协议 reserved GUID 仅解析并忽略，不建立 durable/persistent/lease 状态；已接受 BATCH 等请求仍返回 oplock NONE。QFid 只接受空 request data，成功绑定原引用后返回固定 56 字节 context：DiskFileId=已确认 NodeID、VolumeId=既有稳定 64-bit volume serial、Reserved16 全零；没有请求则没有该 context。
+
+`wire.CreateResponse.OnDiskID *wire.CreateOnDiskID` 只编码既有确认事实，CreateResponseBody 的入口保持原结构，不建立新 storage／HTTP 能力或额外 RPC。普通 CREATE 完整 frame 为 152，带 QFid 为 208；connection 的 responseBudget 按已解码 QFid request 预留完整结果，compound 也在 backing 效果前取得预算。非空／重复 QFid、其它畸形 recognized context 或互斥 durable 请求为 invalid parameter；well-formed reconnect、MxAc、ExtA/SecD/TWrp、app-instance、virtual-disk 与未知 context 保持效果前不支持。协议 reserved CREATE/CLOSE 字段按标准忽略。FILE_OPEN_FOR_BACKUP_INTENT `0x4000` 不授予额外 privilege，按原业务／storage 权限、share 与 READONLY 规则执行。
+
 
 动作保存原 action ID、方法、selection 与 options。引用身份、Outcome、已知 allocation 的精确字节值、共同时间和 Windows 属性从同次原子结果验证；不要求 4096 字节粒度，也不推断尚未取得的 volume geometry。Created 必须有 BirthTime/ChangeTime，Reset 必须有 ChangeTime；既有对象缺失的可选时间以 unknown 零值表达。ReferenceNodeID 必须等于 Attr.ID，不用后续 Stat 拼出成功响应。error 与非 nil 引用同时返回时，预留 owner 立即接管；无引用的未知结果保留同 ID、同输入恢复入口。只有绑定原动作的 NotExecuted 证明允许丢弃未执行意图或重新观察。内部恢复续查和 replay 使用原授权后的不可变意图，不重新执行 endpoint 当前策略检查；远端 HTTP 公共 RPC 继续各自授权。公布 FileId 前在本地锁外读取新的 raw Status，核对固定 session epoch 和 liveness；随后在 authority install、tree admission 与所属 session 锁内核对 context、tree/authority stopping、session retirement、本地确认期限和原预留槽，原子安装 Live。失败保留已获引用与 owner，不回滚已完成效果。Windows 应用收到 NTSTATUS，内部动作 ID 留在有界宿主诊断中。
 

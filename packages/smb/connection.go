@@ -584,6 +584,9 @@ func responseBudget(request wire.Request) int {
 	case wire.SessionSetup, wire.Negotiate:
 		return 72 + 65535
 	case wire.Create:
+		if parsed, err := request.Create(); err == nil && requestsOnDiskID(parsed) {
+			return 208
+		}
 		return 152
 	case wire.Read:
 		if parsed, err := request.Read(); err == nil {

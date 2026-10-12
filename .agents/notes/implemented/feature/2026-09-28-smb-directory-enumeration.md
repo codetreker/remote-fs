@@ -8,7 +8,7 @@ Windows 通过一个目录句柄多次领取有限大小的枚举结果。页间
 
 ## 决定
 
-QUERY_DIRECTORY 使用[有界目录引用](2026-09-28-smb-bounded-create-close.md)和[文件信息](2026-09-28-smb-file-information.md)的身份、StateScalars 与既有 FIFO。每次新 capture 在 `file.scope` 授权后调用原 NodeReference.Scope(ctx)，验证 Scope，再由 `DirectoryReader.ReadDirNodeBounded` 对 `DirectoryTarget{NodeID, Scope}` 完整捕获，Windows 名字和身份验证完成后才过滤、分页。该决定满足 R-FS-9、R-WIN-2／3、R-ERR-1／2／6、R-SEC-5 和 R-INT-3；结构与测试由[SMB 端点设计](../../../../docs/design/client/smb-endpoint.md)和[测试策略](../../../../docs/testing.md)拥有。
+QUERY_DIRECTORY 使用[有界目录引用](2026-09-28-smb-bounded-create-close.md)和[文件信息](2026-09-28-smb-file-information.md)的身份、StateScalars 与既有 FIFO。每次新 capture 在 `file.scope` 授权后调用原 NodeReference.Scope(ctx)，验证 Scope，再由 `DirectoryReader.ReadDirNodeBounded` 对 `DirectoryTarget{NodeID, Scope}` 完整捕获，Windows 名字和身份验证完成后才过滤、分页。实际目录打开的 BACKUP_INTENT 与空 QFid 仍由[CREATE/CLOSE 契约](2026-09-28-smb-bounded-create-close.md)拥有，复用原权限及已经确认的身份，不扩张目录 capture 或底层接口。该决定满足 R-FS-9、R-WIN-2／3、R-ERR-1／2／6、R-SEC-5 和 R-INT-3；结构与测试由[SMB 端点设计](../../../../docs/design/client/smb-endpoint.md)和[测试策略](../../../../docs/testing.md)拥有。
 
 ### 捕获、权限与健康
 

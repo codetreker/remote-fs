@@ -2,8 +2,11 @@ package wire
 
 import (
 	"bytes"
+	"encoding/hex"
 	"errors"
 	"testing"
+
+	"github.com/codetreker/remote-fs/packages/smb/internal/signing"
 )
 
 func createContextPacket(name, data []byte) []byte {
@@ -346,6 +349,62 @@ func TestFileResponseBodies(t *testing.T) {
 		le.Uint64(close[40:48]) != 6 || le.Uint64(close[48:56]) != 7 ||
 		le.Uint32(close[56:60]) != 8 {
 		t.Fatalf("CLOSE response = %x", close)
+	}
+}
+
+func TestCreateOnDiskIDResponseGoldenContext(t *testing.T) {
+	response := CreateResponse{CreateAction: 1, CreationTime: 3, LastAccessTime: 4,
+		LastWriteTime: 5, ChangeTime: 6, AllocationSize: 4096, EndOfFile: 8,
+		Attributes: 0x10, FileID: FileID{9}}
+	plain := CreateResponseBody(response)
+	identity := CreateOnDiskID{DiskFileID: 0x0807060504030201, VolumeID: 0x100f0e0d0c0b0a09}
+	response.OnDiskID = &identity
+	body := CreateResponseBody(response)
+	want := "000000001000040000001800200000005146696400000000" +
+		"0102030405060708090a0b0c0d0e0f10" + "00000000000000000000000000000000"
+	if len(body) != 144 || len(body)+HeaderSize != 208 || le.Uint16(body) != 89 ||
+		le.Uint32(body[80:84]) != 152 || le.Uint32(body[84:88]) != 56 ||
+		!bytes.Equal(body[:80], plain[:80]) || hex.EncodeToString(body[88:]) != want {
+		t.Fatalf("QFid response = %x; want context %s", body, want)
+	}
+	identity.DiskFileID, identity.VolumeID = 0, 0
+	if hex.EncodeToString(body[88:]) != want {
+		t.Fatal("QFid response borrows its identity source")
+	}
+	response.OnDiskID = &CreateOnDiskID{DiskFileID: ^uint64(0)}
+	body = CreateResponseBody(response)
+	if le.Uint64(body[112:120]) != ^uint64(0) || le.Uint64(body[120:128]) != 0 ||
+		!bytes.Equal(body[128:], make([]byte, 16)) {
+		t.Fatalf("opaque ID widths and zero volume serial = %x", body[88:])
+	}
+	response.OnDiskID = nil
+	if omitted := CreateResponseBody(response); len(omitted) != 88 || le.Uint32(omitted[80:84]) != 0 || le.Uint32(omitted[84:88]) != 0 {
+		t.Fatalf("absent context = %x", omitted)
+	}
+}
+
+func TestCreateOnDiskIDResponseIsCoveredBySignature(t *testing.T) {
+	key, err := signing.NewSession([64]byte{}, []byte("0123456789abcdef"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer key.Destroy()
+	body := CreateResponseBody(CreateResponse{CreateAction: 1, FileID: FileID{9},
+		OnDiskID: &CreateOnDiskID{DiskFileID: 17, VolumeID: 31}})
+	packet := EncodeResponse(Header{Command: Create, MessageID: 5, SessionID: 7, TreeID: 3, Credits: 1}, body)
+	if err := key.Sign(packet); err != nil {
+		t.Fatal(err)
+	}
+	header, err := ParseHeader(packet)
+	if err != nil || header.Flags != FlagResponse|FlagSigned || len(packet) != 208 {
+		t.Fatalf("signed QFid header = %+v, %v", header, err)
+	}
+	if err := key.Verify(packet); err != nil {
+		t.Fatal(err)
+	}
+	packet[184] ^= 1
+	if err := key.Verify(packet); !errors.Is(err, signing.ErrSignature) {
+		t.Fatalf("tampered QFid volume identity = %v", err)
 	}
 }
 

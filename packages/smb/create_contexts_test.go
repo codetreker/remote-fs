@@ -47,6 +47,7 @@ func TestValidateCreateContexts(t *testing.T) {
 		{"lease v1 ignored fields", []wire.CreateContext{leaseV1}, nil},
 		{"lease v2 ignored fields", []wire.CreateContext{leaseV2}, nil},
 		{"allocation ignored", []wire.CreateContext{allocation}, nil},
+		{"disk identity", []wire.CreateContext{testCreateContext("QFid", 0)}, nil},
 		{"reserved GUID empty", []wire.CreateContext{testCreateContext(reservedCreateContext, 0)}, nil},
 		{"reserved GUID arbitrary data", []wire.CreateContext{testCreateContext(reservedCreateContext, 19)}, nil},
 		{"arbitrary order", []wire.CreateContext{allocation, leaseV2, durableV2}, nil},
@@ -84,7 +85,7 @@ func TestUnsupportedCreateContextIntents(t *testing.T) {
 	for _, context := range []wire.CreateContext{
 		testCreateContext("DHnC", 16), testCreateContext("DH2C", 36),
 		contextField(testCreateContext("DH2C", 36), 32, 2),
-		testCreateContext("MxAc", 0), testCreateContext("MxAc", 8), testCreateContext("QFid", 0),
+		testCreateContext("MxAc", 0), testCreateContext("MxAc", 8),
 		testCreateContext("ExtA", 0), testCreateContext("SecD", 0), testCreateContext("TWrp", 0), testCreateContext("unknown", 0),
 		testCreateContext("\x45\xbc\xa6\x6a\xef\xa7\xf7\x4a\x90\x08\xfa\x46\x2e\x14\x4d\x74", 0),
 		testCreateContext("\xb9\x82\xd0\xb7\x3b\x56\x07\x4f\xa0\x7b\x52\x4a\x81\x16\xa0\x10", 0),
