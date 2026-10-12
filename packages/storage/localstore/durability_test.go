@@ -81,9 +81,6 @@ func runCrashHelper(t *testing.T) {
 	if _, err := fmt.Fprintln(os.Stdout, "acknowledged"); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Stdout.Sync(); err != nil {
-		t.Fatal(err)
-	}
 	select {}
 }
 
@@ -116,8 +113,14 @@ func killStoreWithPinnedWAL(t *testing.T, root string) {
 	if err := command.Process.Kill(); err != nil {
 		t.Fatal(err)
 	}
-	if err := command.Wait(); err == nil {
-		t.Fatal("killed crash helper exited successfully")
+	err = command.Wait()
+	var exit *exec.ExitError
+	if !errors.As(err, &exit) {
+		t.Fatalf("crash helper did not report a killed process: %v", err)
+	}
+	status, ok := exit.Sys().(syscall.WaitStatus)
+	if !ok || !status.Signaled() || status.Signal() != syscall.SIGKILL {
+		t.Fatalf("crash helper did not terminate by SIGKILL: %v", err)
 	}
 }
 
