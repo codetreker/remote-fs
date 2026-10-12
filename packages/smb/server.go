@@ -77,8 +77,12 @@ func New(config Config) (*Server, error) {
 	if err := config.Limits.check(); err != nil {
 		return nil, fmt.Errorf("SMB limits: %w", err)
 	}
+	compare, err := platformNameComparer()
+	if err != nil {
+		return nil, fmt.Errorf("SMB name comparison: %w", err)
+	}
 	s := &Server{
-		config: config, exports: make(map[string]*Export),
+		config: config, nameComparer: compare, exports: make(map[string]*Export),
 		connections: make(map[*connection]struct{}), sessions: newSessionRegistry(),
 		done: make(chan struct{}),
 	}

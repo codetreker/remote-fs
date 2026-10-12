@@ -126,6 +126,47 @@ func TestDirectorySnapshotCompleteCompactCapture(t *testing.T) {
 	}
 }
 
+func TestDirectorySnapshotPublicConstructorComparer(t *testing.T) {
+	server, err := New(endpointConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	tree, handle, source := directorySnapshotFixture()
+	tree.export.server = server
+	source.entries = []storage.Entry{
+		directoryTestEntry("z", 2, storage.NodeRegular),
+		directoryTestEntry("Alpha", 3, storage.NodeDirectory),
+		directoryTestEntry("link", 4, storage.NodeSymlink),
+		directoryTestEntry("visible", 5, storage.NodeRegular),
+	}
+	if err := reserveDirectoryCursor(tree, handle); err != nil {
+		t.Fatal(err)
+	}
+	defer handle.releaseDirectoryEnumeration()
+	snapshot, err := captureDirectorySnapshot(t.Context(), tree, handle, directorySnapshotScope, nameUnits("*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	handle.directory.snapshot = snapshot
+	if len(snapshot.entries) != 4 || snapshot.richStatus() != statusOK {
+		t.Fatalf("public constructor capture: %+v", snapshot)
+	}
+	for i, name := range []string{"Alpha", "link", "visible", "z"} {
+		if !reflect.DeepEqual(snapshot.entries[i].record.Name, nameUnits(name)) || !snapshot.entries[i].matched {
+			t.Fatalf("captured name %d changed: %+v", i, snapshot.entries[i])
+		}
+	}
+	releaseDirectorySnapshot(tree, handle)
+	source.entries = append(source.entries, directoryTestEntry("aLPHA", 6, storage.NodeRegular))
+	snapshot, err = captureDirectorySnapshot(t.Context(), tree, handle, directorySnapshotScope, nameUnits("visible"))
+	if snapshot != nil || !errors.Is(err, errNameAmbiguous) {
+		t.Fatalf("unmatched collision produced partial capture: %+v / %v", snapshot, err)
+	}
+	if got := server.Status().RetainedDirectoryBytes; got != directoryCursorBytes || tree.export.directoryBytes != directoryCursorBytes {
+		t.Fatalf("collision capture leaked charge: %d / %d", got, tree.export.directoryBytes)
+	}
+}
+
 func TestDirectorySnapshotFailureRefundsEveryReservation(t *testing.T) {
 	for _, mode := range []string{"read", "check", "missing-reader", "zero-id", "self-id", "invalid-kind", "negative-file", "last-invalid", "collision", "parent", "revision", "local-limit", "work", "cancel"} {
 		t.Run(mode, func(t *testing.T) {
