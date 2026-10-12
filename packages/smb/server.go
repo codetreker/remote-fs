@@ -16,11 +16,12 @@ import (
 )
 
 type Server struct {
-	writes       writeLedger
-	handleMu     sync.Mutex
-	handleOwners map[*fileHandle]struct{}
-	config       Config
-	nameComparer nameComparer
+	writes         writeLedger
+	handleMu       sync.Mutex
+	handleOwners   map[*fileHandle]struct{}
+	directoryBytes int
+	config         Config
+	nameComparer   nameComparer
 
 	mu              sync.Mutex
 	exports         map[string]*Export
@@ -40,17 +41,18 @@ type Server struct {
 }
 
 type Export struct {
-	ioGeneration uint64 // Protected by the server's write ledger.
-	server       *Server
-	share        Share
-	volumeSerial uint64
-	key          string
-	refs         int
-	trees        int
-	active       int
-	stopping     bool
-	published    bool
-	cleanupMu    cleanupGate
+	directoryBytes int    // Protected by Server.handleMu.
+	ioGeneration   uint64 // Protected by the server's write ledger.
+	server         *Server
+	share          Share
+	volumeSerial   uint64
+	key            string
+	refs           int
+	trees          int
+	active         int
+	stopping       bool
+	published      bool
+	cleanupMu      cleanupGate
 }
 
 func interfaceNil(value any) bool {
@@ -411,6 +413,9 @@ func (s *Server) Status() Status {
 	for _, connection := range connections {
 		connection.addStatus(&out)
 	}
+	s.handleMu.Lock()
+	out.RetainedDirectoryBytes = s.directoryBytes
+	s.handleMu.Unlock()
 	s.writes.addStatus(&out)
 	return out
 }

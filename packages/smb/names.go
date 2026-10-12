@@ -143,7 +143,7 @@ func projectDirectory(entries []storage.Entry, compare nameComparer) ([]projecte
 		if err := checkWindowsLeaf(entry.Name); err != nil {
 			return nil, err
 		}
-		if entry.Attr.ID == 0 || ids[entry.Attr.ID] || entry.Attr.Kind.Check() != nil || entry.Attr.Size < 0 {
+		if entry.Attr.ID == 0 || ids[entry.Attr.ID] || entry.Attr.Kind.Check() != nil || entry.Attr.Kind == storage.NodeRegular && entry.Attr.Size < 0 {
 			return nil, syscall.EIO
 		}
 		ids[entry.Attr.ID] = true

@@ -8,7 +8,7 @@ Windows 程序通过已有 FileId 查询 volume 身份、创建时间与容量�
 
 ## 决定
 
-SMB 提供五种 `InfoType=0x02` QUERY_INFO，复用[文件信息](2026-09-28-smb-file-information.md)的原引用准入、StateScalars、身份与 allocation unit，以及已有 `Storage.Space`。本决定服务 R-WIN-2、R-WS-5、R-ERR-1／2、R-SEC-5 和 R-INT-3；结构与验证分别由[SMB 端点设计](../../../../docs/design/client/smb-endpoint.md)、[文件契约](../../../../docs/design/server/file-handles.md)和[测试策略](../../../../docs/testing.md)拥有。
+SMB 提供五种 `InfoType=0x02` QUERY_INFO，复用[文件信息](2026-09-28-smb-file-information.md)的原引用准入、StateScalars、身份与 allocation unit，以及已有 `Storage.Space`。[目录枚举](2026-09-28-smb-directory-enumeration.md)独立拥有目录捕获与分页。本决定服务 R-WIN-2、R-WS-5、R-ERR-1／2、R-SEC-5 和 R-INT-3；结构与验证分别由[SMB 端点设计](../../../../docs/design/client/smb-endpoint.md)、[文件契约](../../../../docs/design/server/file-handles.md)和[测试策略](../../../../docs/testing.md)拥有。
 
 ### 五类查询与事实来源
 
@@ -50,7 +50,7 @@ Volume 的请求最小输出长度为 24，实际 serialized prefix 为 18；不
 |---|---|---|
 | 泛用物理 sector／geometry 能力 | 按真实消费者增加 capability；allocation 字节与 Space 计量不变，逻辑 tuple 不冒充物理事实 | 本决定只报告已验证的逻辑容量单位 |
 | volume label setter、security／quota 和 FS control | 独立增加授权与修改语义；查询没有发布效果 | 相应请求明确未支持 |
-| [目录枚举](../../proposed/feature/2026-09-28-smb-directory-enumeration.md)、[关闭删除](../../proposed/feature/2026-09-28-smb-close-delete-obligation.md)及[名字修改](../../proposed/feature/2026-09-28-smb-guarded-name-mutation.md) | 独立增加 snapshot／cursor、持久义务及 ancestry guards；原引用不转成旧路径 | 相应文件／目录命令按各自交付范围处理 |
+| [关闭删除](../../proposed/feature/2026-09-28-smb-close-delete-obligation.md)及[名字修改](../../proposed/feature/2026-09-28-smb-guarded-name-mutation.md) | 独立增加持久义务及 ancestry guards；原引用不转成旧路径 | 相应文件／目录命令按各自交付范围处理 |
 | [范围锁](../../proposed/feature/2026-09-28-smb-range-lock-cancel.md)与[通知／缓存](../../proposed/feature/2026-09-28-smb-change-notify-cache-coherence.md) | 增加跨入口保护、失效协议及原生证明；本次查询不宣称私有缓存一致 | 相应能力独立交付 |
 
 ## 备选方案

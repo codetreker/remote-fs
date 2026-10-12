@@ -490,6 +490,10 @@ func requiredCredits(request wire.Request) int {
 		if parsed, err := request.QueryInfo(); err == nil {
 			return max(1, int((max(uint64(parsed.InputBufferLength), uint64(parsed.OutputBufferLength))+65535)/65536))
 		}
+	case wire.QueryDirectory:
+		if parsed, err := request.QueryDirectory(); err == nil {
+			return max(1, int((uint64(parsed.OutputBufferLength)+65535)/65536))
+		}
 	case wire.Write:
 		if parsed, err := request.Write(); err == nil {
 			return max(1, int((uint64(parsed.Length)+65535)/65536))
@@ -595,6 +599,11 @@ func responseBudget(request wire.Request) int {
 			}
 		}
 		return 128
+	case wire.QueryDirectory:
+		if parsed, err := request.QueryDirectory(); err == nil {
+			return max(80, (72+int(parsed.OutputBufferLength)+7)&^7)
+		}
+		return 80
 	case wire.SetInfo:
 		return 80
 	case wire.Flush:
@@ -605,8 +614,9 @@ func responseBudget(request wire.Request) int {
 }
 
 func relatedOperationFailed(request wire.Request, status uint32, body []byte) bool {
-	return status != statusOK && !(status == statusBufferOverflow && request.Header.Command == wire.QueryInfo &&
-		len(request.Body) >= 3 && request.Body[2] == wire.InfoFilesystem && len(body) >= 8 &&
+	queryWarning := request.Header.Command == wire.QueryDirectory || request.Header.Command == wire.QueryInfo &&
+		len(request.Body) >= 3 && request.Body[2] == wire.InfoFilesystem
+	return status != statusOK && !(status == statusBufferOverflow && queryWarning && len(body) >= 8 &&
 		binary.LittleEndian.Uint16(body) == 9 && binary.LittleEndian.Uint16(body[2:]) == wire.HeaderSize+8 &&
 		binary.LittleEndian.Uint32(body[4:]) == uint32(len(body)-8))
 }

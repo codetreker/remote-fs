@@ -441,7 +441,7 @@ func TestAuthenticatedControlTranscriptAndUnsupportedCommands(t *testing.T) {
 		response = readFrame(t, connection)
 		header, _ = wire.ParseHeader(response)
 		expected := statusUnsupported
-		if command == wire.Create || command == wire.Close || command == wire.Read || command == wire.Write || command == wire.Flush || command == wire.QueryInfo || command == wire.SetInfo {
+		if command == wire.Create || command == wire.Close || command == wire.Read || command == wire.Write || command == wire.Flush || command == wire.QueryDirectory || command == wire.QueryInfo || command == wire.SetInfo {
 			expected = statusInvalid
 		}
 		if header.Status != expected || key.Verify(response) != nil {

@@ -6,7 +6,7 @@ Status: proposed
 
 SMB 客户端按 Windows 名字发起 rename、move、replace、unlink、supersede 和删除 disposition。名字在请求观察与 authority 提交之间可能被其它入口改动；只比较末级 raw slot，不能证明父目录仍在原祖先下，也不能证明大小写折叠后唯一。对旧观察执行名字效果可能越过 share 根、修改另一对象，或让已打开句柄错误地跟随同名替代物。网络响应丢失后重新查当前名字同样不能判断原动作是否执行。
 
-本提案落实 [Windows 网络驱动器总方案](2026-09-16-windows-network-drive-support.md)的 8.1，承接 [目录观察提案](2026-09-28-smb-directory-enumeration.md)提供的完整、有界名字事实及 [关闭删除义务提案](2026-09-28-smb-close-delete-obligation.md)的关联和 pending 状态。需求见 [R-FS-6、R-FS-8、R-FS-9、R-WIN-2、R-WIN-7](../../../../docs/spec/requirements.md)。这份工作只交付名字修改；范围锁、通知与缓存失效由后续独立提案承担。
+本提案落实 [Windows 网络驱动器总方案](2026-09-16-windows-network-drive-support.md)的 8.1，承接 [目录枚举](../../implemented/feature/2026-09-28-smb-directory-enumeration.md)提供的完整、有界名字验证规则；修改前仍须取得当前 ancestry guards，不能使用应用冻结 snapshot 代替。它同时使用 [关闭删除义务提案](2026-09-28-smb-close-delete-obligation.md)的关联和 pending 状态。需求见 [R-FS-6、R-FS-8、R-FS-9、R-WIN-2、R-WIN-7](../../../../docs/spec/requirements.md)。这份工作只交付名字修改；范围锁、通知与缓存失效由后续独立提案承担。
 
 ## 提案
 

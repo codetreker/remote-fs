@@ -119,6 +119,8 @@ OpenAt 的 ContentMetadataEffects 随实际 OpenAccess 交给策略，enrollment
 
 Namespace purpose 的 ObserveMetadata 使用 WriteMetadata，但不授予 ReadMetadata；每次 AccessRequest.MetadataObservation 携带实际 Namespace、MaxPayloadBytes 和明确 purpose，策略可逐 namespace／bound 批准或拒绝。它不在打开时 enrollment namespace scope，也不允许从另一个 purpose 推导权限。State 使用 OpFileState 与 AccessRequest.StateProjection，Full 仍需 ReadMetadata，Scalars 只读取低权限事实。分配单位或原错误作为授权 session enrollment 的不可变结果取得，不增加逐次单位观察 Operation；文件查询仍核对本次 State／Stat 的授权和健康。已有引用、固定 NodeID 或上次批准都不能跳过本次授权。selectors 与 callback 数据各自深复制，策略修改输入不能改变原请求。
 
+SMB QUERY_DIRECTORY 的每次新页面，包括 continuation 与 EOF，都执行当前 `file.read-dir-node` 与 `file.state` 策略；新 capture／restart 还在调用原引用 Scope 前授权 `file.scope`。实际 StateScalars 访问 authority，编码完成后再次核对当前策略及本地生命期；缓存 snapshot 不延续第一次允许的权限。HTTP 独立授权它本次实际收到的 capture／State 请求，不重解释已经交给 SMB 的目录数据，也不增加仅授权的 RPC；backend list policy 撤销不等于撤回该视图，宿主的 SMB Authorizer 控制继续输出。
+
 ## 三、请求、capability 与关闭
 
 请求按以下顺序进入受控操作：

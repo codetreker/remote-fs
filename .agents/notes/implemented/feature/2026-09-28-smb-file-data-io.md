@@ -82,4 +82,4 @@ Status 包含 WriteOwners、UnknownWrites、PendingFlushes、RetainedWriteBytes 
 
 package-local 正常、权限、CAS、byte-only、append、empty WRITE、wire／credits、未知恢复、并发 CLOSE 和真实 HTTP 链验证承担这些保证；完整测试策略与观察到的命令结果由当前验证记录提供。schema 未变，旧 FileOpenOptions 不因本能力改变；普通 File.WriteAt(empty) 的旧公开分支没有顺带重构。
 
-文件 QUERY_INFO 与 Basic／EOF SET_INFO 由[文件信息](2026-09-28-smb-file-information.md)拥有；volume presentation、目录枚举、directory FLUSH、range LOCK／CANCEL、名字／删除义务、通知／缓存及 WNet／原生支持资格仍由独立任务承担。真实 Windows redirector 的缓存可能遮蔽正确 backing 结果，本段 Go／wire 验证不等于完整 network-drive 资格。
+文件 QUERY_INFO 与 Basic／EOF SET_INFO 由[文件信息](2026-09-28-smb-file-information.md)拥有；[volume 信息](2026-09-28-smb-volume-information.md)与[目录枚举](2026-09-28-smb-directory-enumeration.md)分别拥有容量与目录查询；directory FLUSH、range LOCK／CANCEL、名字／删除义务、通知／缓存及 WNet／原生支持资格仍由独立任务承担。真实 Windows redirector 的缓存可能遮蔽正确 backing 结果，本段 Go／wire 验证不等于完整 network-drive 资格。

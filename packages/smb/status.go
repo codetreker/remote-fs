@@ -34,6 +34,8 @@ func statusError(err error) uint32 {
 }
 
 const (
+	statusNoSuchFile       uint32 = 0xc000000f
+	statusNoMoreFiles      uint32 = 0x80000006
 	statusSharingViolation uint32 = 0xc0000043
 	statusRetry            uint32 = 0xc000022d
 	statusDeletePending    uint32 = 0xc0000056

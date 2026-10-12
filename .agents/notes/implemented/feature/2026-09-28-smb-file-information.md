@@ -10,7 +10,7 @@ Windows 程序需要通过已打开的文件或目录查询信息，修改属性
 
 SMB 文件信息在[有界 CREATE/CLOSE](2026-09-28-smb-bounded-create-close.md)的 typed FileId 与[文件内容访问](2026-09-28-smb-file-data-io.md)的准入／恢复链上提供五种文件 QUERY_INFO 和 Basic／EOF SET_INFO。信息均来自原引用，本次查询验证当前生命期，不能用旧路径、打开时保存的属性或仅在退休后仍存在的固定 ID 回答。
 
-该决定服务 [R-FS-6 至 R-FS-9、R-ERR-1 至 R-ERR-4、R-INT-3、R-INT-8、R-INT-11、R-WIN-2、R-WIN-4、R-WIN-5、R-WS-5](../../../../docs/spec/requirements.md)。[volume 信息](2026-09-28-smb-volume-information.md)独立拥有 volume QUERY_INFO、label／creation fact、当前 Space 与逻辑容量投影；本决定只建立文件信息必需的 identity／allocation 单位事实。结构见[SMB 端点设计](../../../../docs/design/client/smb-endpoint.md)与[文件契约](../../../../docs/design/server/file-handles.md)，验证归[测试策略](../../../../docs/testing.md)。
+该决定服务 [R-FS-6 至 R-FS-9、R-ERR-1 至 R-ERR-4、R-INT-3、R-INT-8、R-INT-11、R-WIN-2、R-WIN-4、R-WIN-5、R-WS-5](../../../../docs/spec/requirements.md)。[volume 信息](2026-09-28-smb-volume-information.md)独立拥有 volume QUERY_INFO、label／creation fact、当前 Space 与逻辑容量投影；本决定只建立文件信息必需的 identity／allocation 单位事实。[目录枚举](2026-09-28-smb-directory-enumeration.md)独立拥有完整捕获、分页和目录 cursor。结构见[SMB 端点设计](../../../../docs/design/client/smb-endpoint.md)与[文件契约](../../../../docs/design/server/file-handles.md)，验证归[测试策略](../../../../docs/testing.md)。
 
 ### 逐类信息源与权限
 
@@ -58,7 +58,6 @@ QUERY_INFO／SET_INFO 的原签名字节不改写，related FileId 只在 frame-
 
 | 延后能力 | 延后代价与保持的结构 | 未交付请求的结果 |
 |---|---|---|
-| [7.5 目录枚举](../../proposed/feature/2026-09-28-smb-directory-enumeration.md) | 添加有界冻结快照与 cursor；目录引用保留稳定 identity | QUERY_DIRECTORY 明确 unsupported |
 | [7.6 关闭删除](../../proposed/feature/2026-09-28-smb-close-delete-obligation.md)与[8.1 名字修改](../../proposed/feature/2026-09-28-smb-guarded-name-mutation.md) | 增加持久义务与 ancestryguards；旧 CREATE 名字不当作当前事实 | disposition、rename／link、当前名字类明确 unsupported |
 | [8.2 范围锁](../../proposed/feature/2026-09-28-smb-range-lock-cancel.md) | 增加跨入口范围保护；EOF／Basic 继续走受控 reference 和 authority 最终检查 | LOCK／asyncCANCEL 按未交付协议结果处理 |
 | [8.3 通知与缓存](../../proposed/feature/2026-09-28-smb-change-notify-cache-coherence.md) | 增加失效协议与原生证明；不能将 Go／wire 查询成功当作 Windows 私有缓存资格 | CHANGE_NOTIFY 明确 unsupported |

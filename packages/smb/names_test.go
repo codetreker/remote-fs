@@ -96,6 +96,9 @@ func TestSMBNamesValidateWholeDirectoryBeforeSelection(t *testing.T) {
 		})
 	}
 	entries := []storage.Entry{entry("z", 2), entry("Actual", 3), entry("B", 4)}
+	if _, err := projectDirectory([]storage.Entry{{Name: "directory", Attr: storage.Attr{ID: 7, Kind: storage.NodeDirectory, Size: -1}}}, testNameCompare); err != nil {
+		t.Fatalf("unspecified directory size rejected: %v", err)
+	}
 	projection, err := projectDirectory(entries, testNameCompare)
 	if err != nil {
 		t.Fatal(err)

@@ -329,7 +329,7 @@ Pending 用例先占满 authority 的申请队列，随后确认 HTTP control ad
 
 ## SMB endpoint、认证与生命周期
 
-SMB 的协议 primitive 与 endpoint lifecycle 分层验证。`packages/smb/internal/wire` 直接覆盖 SMB2 header、Direct TCP payload、compound alignment、UTF-16、negotiate context、SESSION_SETUP、TREE_CONNECT、CREATE/CLOSE、READ/WRITE/FLUSH 与 QUERY_INFO/SET_INFO shape；畸形 offset、CREATE context 的 Next 越界／重叠、重复或互斥 context、混合 related compound、超量 command/context、半个 all-ones FileId 和截断 body 必须在消费受控状态前失败。`packages/smb/internal/signing` 使用 CMAC 标准向量核对 SP800-108 key derivation、SHA-512 preauthentication transcript、packet sign/verify，以及 signer destroy 与并发 sign 的互斥。
+SMB 的协议 primitive 与 endpoint lifecycle 分层验证。`packages/smb/internal/wire` 直接覆盖 SMB2 header、Direct TCP payload、compound alignment、UTF-16、negotiate context、SESSION_SETUP、TREE_CONNECT、CREATE/CLOSE、READ/WRITE/FLUSH 与 QUERY_INFO/SET_INFO、QUERY_DIRECTORY shape；畸形 offset、CREATE context 的 Next 越界／重叠、重复或互斥 context、混合 related compound、超量 command/context、半个 all-ones FileId 和截断 body 必须在消费受控状态前失败。`packages/smb/internal/signing` 使用 CMAC 标准向量核对 SP800-108 key derivation、SHA-512 preauthentication transcript、packet sign/verify，以及 signer destroy 与并发 sign 的互斥。
 
 `packages/smb` 的真实 TCP transcript 从 NEGOTIATE、两轮 SESSION_SETUP、ECHO 到 volume TREE_CONNECT／TREE_DISCONNECT／LOGOFF，逐帧验证签名和状态。协商只接受 SMB 3.1.1、SHA-512 与 AES-CMAC；client 未发送 signing-capabilities context 时 response 不虚构该 context，显式发送时只回显实际选择。unsigned session request 的拒绝保持 unsigned；带 signed flag 的坏 MAC 和已建立 session 的 malformed reauthentication 得到 signed denial，旧 session 仍可继续使用。sessionless ECHO 在 authentication 前后均不借用另一 session 的 signer。错误 session/tree、unsupported flag 与已识别但未实现的 file/directory command 都在 backing 之前拒绝；后者的用例同时核对 `STATUS_NOT_SUPPORTED` 与 backend data call 为零。CANCEL、未知 command 和畸形 request 的 fail-closed 用例断言连接终止且没有受控效果，不要求一个协议不定义的响应。
 
@@ -408,6 +408,22 @@ mutation_owner用例涵盖原Attr／Metadata／Data／token／effect深复制、
 [HTTP 创建事实用例](../packages/transport/httprest/file_volume_creation_test.go)核对 enrollment 恰好捕获一次已知时间或原错误、严格二选一 envelope、无额外 getter RPC、known year-1、取消与 cached fact 不证明当前引用生命期。完整 session response 在 allocation／creation 任一或两份诊断很大时保留错误分类并限制总字节；固定 envelope 自身超预算仍失败。objectstore、locked、limited 与 replicated 的 package-local 用例验证 optional getter 不扩大原身份 preflight，真实来源、context／health、原错误与规范 UTC 沿包装链转送；没有新 geometry／容量账本。
 
 这些用例验证五类查询、授权、数值表达、持久事实和容量局部失败，不构成 Windows redirector／WNet 或私有缓存资格。执行 verdict 与资源清理由当次验证收据给出。
+
+### 完整目录捕获、分页与当前健康
+
+[query_directory wire 用例](../packages/smb/internal/wire/query_directory_test.go)对 Names、Directory、Full、Both、IdFull、IdBoth 核对固定 header、时间／属性／allocation／ID、FileIndex=0、保留位、空 short name、UTF-16 字节长度及条目 alignment。非 reparse EaSize=0，symlink 的 Full／Both 系列 EaSize 为 `0xA000000C`；目录 EOF 按 kind 报零，不把未指定 Size 当作文件负长度。短于首项 header 时无 cursor 进展；header 可容纳而首项名字不足时，BUFFER_OVERFLOW 的正常 body 保持完整 FileNameLength、原始 byte prefix 和 NextEntryOffset=0，包括奇数字节和半 surrogate，较大重试输出同一完整项。后续记录必须完整，只有已完整编码项推进。
+
+[真实目录用例](../packages/smb/commands_directory_integration_linux_test.go)在 direct／HTTP 上完整捕获后保持 raw-name 顺序，并在真实内容修改、目录 rename、unlink／replacement 后核对普通 continuation 和 class 切换仍使用原 frozen children；restart／reopen 重新观察。所有名字、身份和 kind 在任何条目可见前验证，最后一项不匹配的非法 UTF-8、禁止形式或大小写冲突也使全捕获失败。Names 可继续报告名字而不依赖不可用的 rich Windows metadata／时间／allocation；rich class 对全部快照项验证其所需事实，未匹配坏字段也失败，失败不跳过 cursor。不会改写其它入口的名字。
+
+分页矩阵覆盖 six-class 固定边界、partial-first 后的完整 retry、RETURN_SINGLE_ENTRY、FileIndex 零与 INDEX_SPECIFIED 忽略、ordinary expression 忽略和 restart／reopen replacement。`.`／`..` expression 无合成 child。初次无匹配与后续 EOF 使用独立 settled 状态，partial warning 不结算 EOF；class 切换不能重建 capture 或重置 ordinal。[DOS matcher 用例](../packages/smb/directory_pattern_test.go)覆盖 UTF-16 units、surrogate pair、大小写等价、`*`／`*.*`、DOS_STAR／QM／DOT、255-unit 上限与全过滤累计工作耗尽，不用 regex 或递归回溯。
+
+每页、最后一页和 EOF 都要检查当前 SMB list／state 授权及实际 StateScalars。direct 用例撤销当前策略；HTTP 用例只使 State 请求失败而保留已成功 capture，断言 continuation／EOF 明确失败并实际发出 StateScalars，不能只检查缓存 Scope。每次新 capture／restart 的 Scope 来自原 NodeReference，并在读取前接受当前 `file.scope` 授权；ordinary continuation 不额外取 Scope。backend HTTP 独立授权它的实际请求，先前交给 SMB 的视图不被后来 backend list-policy 撤销收回，宿主 SMB Authorizer 仍控制新页面。
+
+[快照费用用例](../packages/smb/directory_snapshot_test.go)检查 capture 前固定／HTTP staging reservation、entry callback 的累计费用、最终紧凑费用、Server／Export 同一归属、较小可用 L、collector 本地拒绝最后一项、authority 部分失败和 matcher 耗尽的完整退款。跨句柄累计饱和拒绝新 capture，但 restart／CLOSE／tree／session／断线／停止保留原清理进展；失败 restart 清除旧 entries 后只保留 1024-byte expression 状态，最终归零。受控 CLOSE 先 fence／drain，超时保留 state 和费用；排空后先于 pending Basic reconcile 释放已不可输出的本地 snapshot，即使原修改恢复或 native close 未知也不继续持有该 cache，不新增 mutation owner。该费用不是整个 Go heap 的精确测量。
+
+[签名目录 transcript](../packages/smb/protocol_directory_linux_test.go)区分正常 warning 与结束状态：related CREATE→partial QUERY_DIRECTORY→CLOSE 对每项检查 body、extent、签名、最后引用及费用归还；NO_SUCH_FILE／NO_MORE_FILES 抑制 related CLOSE 时，ownership 和 cache charge 保留，随后独立 CLOSE 或正常 shutdown 确认释放。协议错误不能通过任意 warning 绕过前驱失败判定。
+
+[Windows 目录用例](../packages/smb/protocol_directory_windows_test.go)通过真实 SSPI、loopback 映射、Win32 FindFirstFile 与 NT QueryDirectory／QueryDirectoryEx 发起请求，观察实际 QUERY_DIRECTORY classes／flags／expression／buffer 和分页结果。测试使用[专用只读 backend](../packages/smb/native_directory_fixture_test.go)，其字段与能力为本协议夹具提供真实数据，不承担 native SQLite 持久性或 Windows 11 普通用户发布资格。它由既有 Windows root SMB strict suite 收集；实际执行 verdict、协议 receipt 与映射清理由当次 CI 证据给出，不能用 Go／wire 模拟推导 native PASS。
 
 ### SMB 与 FUSE 的同 volume 联合验收
 
