@@ -67,7 +67,7 @@ MaxIntegrityRecords 同时限制 candidate 与 ancestry 工作量；超限 EFBIG
 
 class 10 TYPE_2 按首字节 Boolean 解释 ReplaceIfExists，非零为 true；七字节 reserved 与合法 padding 忽略。固定头、空／odd／越界 counted UTF-16、非零 RootDirectory、leading backslash 目标按各自长度或参数状态拒绝。目标 share-relative，source 来自原句柄当前关联。exact raw 同名是经过全部条件的成功 no-op，case-only 是保持 NodeID 的真实 rename。
 
-source READONLY 本身不禁止 rename；不同已存在目标在 ReplaceIfExists=false 时 collision，目录或 READONLY replacement target 为 ACCESS_DENIED，pending 为 DELETE_PENDING。Windows metadata CAS 固化准入观察；Linux／SDK raw 名字和属性解释不改变。相容旧目标引用继续访问旧对象是项目身份保证，与 MS-FSA ordinary rename 的 opened-target 条件须在原生资格中区分。
+source READONLY 本身不禁止 rename；不同已存在目标在 ReplaceIfExists=false 时 collision，目录或 READONLY replacement target 为 ACCESS_DENIED，pending 为 DELETE_PENDING。Windows metadata CAS 固化准入观察；Linux／SDK raw 名字和属性解释不改变。相容旧目标引用继续访问旧对象由真实 direct／HTTP 与签名 mounted-FUSE 组合验证；ordinary native opened-target replacement 在 class 10 SET_INFO 前拒绝，标准 native replacement 使用已关闭 target handle。READONLY 的原生 EACCES 也不必有 class 10，server 的对应拒绝由显式签名 peer 证明。这些 oracle 区分不增加 extended POSIX rename；NtNormalized 的应用 UNC 前缀不改变 class 48 的严格 share-relative wire。原生证据与资格边界见[测试策略](../../../../docs/testing.md)。
 
 class 13 buffer 长度零为 INFO_LENGTH_MISMATCH；长度至少一字节只读取首 Boolean、忽略 surplus。TRUE 与 FALSE 都要求原 FileId 的 DELETE 以及当前授权／live DeleteName use。TRUE 检查 READONLY 与目录为空；FALSE 不执行这两项检查。
 

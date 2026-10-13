@@ -24,7 +24,7 @@ import (
 )
 
 func TestNativeWindowsNameMutation(t *testing.T) {
-	drive, backend, receipts := nativeNameProbe(t)
+	drive, remote, backend, receipts, server := nativeNameProbe(t)
 	const deleteAccess = uint32(0x10000)
 	open := func(t *testing.T, leaf string, access uint32, disposition uint32, flags uint32) *nativeDeleteHandle {
 		return nativeDeleteOpen(t, drive+`\`+leaf, access, 7, disposition, flags)
@@ -50,10 +50,20 @@ func TestNativeWindowsNameMutation(t *testing.T) {
 			}
 		}
 	})
-	t.Run("replacement-keeps-old-target-reference", func(t *testing.T) {
+	t.Run("ordinary-replacement-closes-target-before-effect", func(t *testing.T) {
 		source := open(t, "source.txt", deleteAccess|win.FILE_READ_ATTRIBUTES, win.CREATE_NEW, 0)
 		target := open(t, "target.txt", win.GENERIC_READ|win.FILE_READ_ATTRIBUTES, win.CREATE_NEW, 0)
 		sourceID, targetID := nativeNameIdentity(t, source.Handle), nativeNameIdentity(t, target.Handle)
+		defer receipts.begin(t, wire.SetInfo, wire.FileRenameInformation)()
+		receipts.expectRename("target.txt", true)
+		if err := nativeRenameFile(source.Handle, drive+`\target.txt`, true); !errors.Is(err, win.ERROR_ACCESS_DENIED) {
+			t.Fatalf("ordinary replacement with native target still open error=%v", err)
+		}
+		facts := receipts.finish(t, 0, false)
+		nativeDeniedRename(t, server, sourceID, facts, false)
+		nativeAuthorityName(t, backend, 1, "target.txt", targetID, true)
+		nativeAuthorityName(t, backend, 1, "source.txt", sourceID, true)
+		nativeNameClose(t, target, receipts)
 		defer receipts.begin(t, wire.SetInfo, wire.FileRenameInformation)()
 		receipts.expectRename("target.txt", true)
 		if err := nativeRenameFile(source.Handle, drive+`\target.txt`, true); err != nil {
@@ -62,13 +72,9 @@ func TestNativeWindowsNameMutation(t *testing.T) {
 		receipts.finish(t, 0, true)
 		nativeAuthorityName(t, backend, 1, "target.txt", sourceID, true)
 		nativeAuthorityName(t, backend, 1, "source.txt", sourceID, false)
-		if nativeNameIdentity(t, target.Handle) != targetID || sourceID == targetID {
-			t.Fatal("replacement reassigned the old target reference identity")
-		}
-		var data [1]byte
-		var count uint32
-		if err := win.ReadFile(target.Handle, data[:], &count, nil); err != nil || count != 0 {
-			t.Fatalf("old replacement target read=%d error=%v", count, err)
+		reopened := open(t, "target.txt", win.FILE_READ_ATTRIBUTES, win.OPEN_EXISTING, 0)
+		if nativeNameIdentity(t, source.Handle) != sourceID || nativeNameIdentity(t, reopened.Handle) != sourceID || sourceID == targetID {
+			t.Fatal("ordinary replacement changed source identity or reopened the replaced target")
 		}
 	})
 	t.Run("readonly-source-rename-and-target-denial", func(t *testing.T) {
@@ -83,12 +89,14 @@ func TestNativeWindowsNameMutation(t *testing.T) {
 		nativeAuthorityName(t, backend, 1, "readonly-moved.txt", sourceID, true)
 		target := open(t, "readonly-target.txt", win.FILE_READ_ATTRIBUTES, win.CREATE_NEW, win.FILE_ATTRIBUTE_READONLY)
 		targetID := nativeNameIdentity(t, target.Handle)
+		nativeNameClose(t, target, receipts)
 		defer receipts.begin(t, wire.SetInfo, wire.FileRenameInformation)()
 		receipts.expectRename("readonly-target.txt", true)
 		if err := nativeRenameFile(source.Handle, drive+`\readonly-target.txt`, true); !errors.Is(err, win.ERROR_ACCESS_DENIED) {
 			t.Fatalf("readonly replacement error=%v", err)
 		}
-		receipts.finish(t, 0xc0000022, true)
+		facts := receipts.finish(t, 0, false)
+		nativeDeniedRename(t, server, sourceID, facts, false)
 		nativeAuthorityName(t, backend, 1, "readonly-moved.txt", sourceID, true)
 		nativeAuthorityName(t, backend, 1, "readonly-target.txt", targetID, true)
 	})
@@ -100,7 +108,8 @@ func TestNativeWindowsNameMutation(t *testing.T) {
 		if err := nativeRenameFile(directory.Handle, drive+`\folder-moved`, false); !errors.Is(err, win.ERROR_ACCESS_DENIED) {
 			t.Fatalf("directory with open descendant rename error=%v", err)
 		}
-		receipts.finish(t, 0xc0000022, true)
+		facts := receipts.finish(t, 0xc0000022, true)
+		nativeDeniedRename(t, server, 2, facts, true)
 		nativeAuthorityName(t, backend, 1, "folder", 2, true)
 		nativeNameClose(t, child, receipts)
 		defer receipts.begin(t, wire.SetInfo, wire.FileRenameInformation)()
@@ -167,7 +176,10 @@ func TestNativeWindowsNameMutation(t *testing.T) {
 	})
 	t.Run("normalized-name-full-minimum-overflow", func(t *testing.T) {
 		h := open(t, "long-😀-name.txt", deleteAccess, win.OPEN_EXISTING, 0)
-		want := wire.EncodeUTF16(`\long-😀-name.txt`)
+		wireName := `\long-😀-name.txt`
+		// Native full network names include the opened server/share prefix.
+		// https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/wdm/nf-wdm-zwqueryinformationfile
+		want := wire.EncodeUTF16(remote[1:] + `\` + wireName)
 		for _, length := range []int{512, 7, 8} {
 			defer receipts.begin(t, wire.QueryInfo, wire.FileNormalizedNameInformation)()
 			status, data := nativeNameQuery(t, h.Handle, uint32(wire.FileNormalizedNameInformation), length)
@@ -189,7 +201,7 @@ func TestNativeWindowsNameMutation(t *testing.T) {
 				t.Fatalf("native normalized overflow status=%#x bytes=%x", status, data)
 			}
 			for _, fact := range facts {
-				expected, overflow, err := wire.FileNormalizedNameInformationBody(`\long-😀-name.txt`, fact.outputCapacity)
+				expected, overflow, err := wire.FileNormalizedNameInformationBody(wireName, fact.outputCapacity)
 				if err != nil || fact.outputBytes != uint32(len(expected)) || fact.outputDigest != sha256.Sum256(expected) || fact.status != nativeNameWireStatus(overflow) {
 					t.Fatalf("normalized signed wire projection=%+v error=%v", fact, err)
 				}
@@ -198,7 +210,7 @@ func TestNativeWindowsNameMutation(t *testing.T) {
 	})
 }
 
-func nativeNameProbe(t *testing.T) (string, storage.FileStorage, *nativeNameReceipts) {
+func nativeNameProbe(t *testing.T) (string, string, storage.FileStorage, *nativeNameReceipts, *smb.Server) {
 	t.Helper()
 	identity, err := smbwindows.CurrentIdentity()
 	if err != nil {
@@ -262,7 +274,7 @@ func nativeNameProbe(t *testing.T) (string, storage.FileStorage, *nativeNameRece
 	port := listener.Addr().(*net.TCPAddr).Port
 	t.Cleanup(func() { nativeMappingCommand(t, drive, remote, port, true) })
 	nativeMappingCommand(t, drive, remote, port, false)
-	return drive, backend, receipts
+	return drive, remote, backend, receipts, server
 }
 
 func nativeNameIdentity(t *testing.T, handle win.Handle) uint64 {
@@ -477,6 +489,62 @@ func nativeNameClose(t *testing.T, handle *nativeDeleteHandle, receipts *nativeN
 		t.Fatal(err)
 	}
 	receipts.finish(t, 0, true)
+}
+
+func nativeDeniedRename(t *testing.T, server *smb.Server, nodeID uint64, facts []nativeNameFact, requireRecord bool) {
+	t.Helper()
+	if len(facts) == 0 {
+		if requireRecord || len(server.Status().WriteFailures) != 0 {
+			t.Fatal("expected rename refusal lacks its signed request or has unrelated diagnostics")
+		}
+		t.Log("Win32 denial produced no rename SET_INFO request; authority bindings are checked separately")
+		return
+	}
+	generation := binary.LittleEndian.Uint64(facts[0].fileID[8:])
+	for _, fact := range facts {
+		if fact.command != wire.SetInfo || fact.class != wire.FileRenameInformation || fact.status != 0xc0000022 || !fact.renameMatches || !fact.renameAdmitted || fact.fileID != facts[0].fileID || generation == 0 {
+			t.Fatalf("native denied rename has unrelated wire facts: %+v", fact)
+		}
+	}
+	deadline := time.NewTimer(10 * time.Second)
+	defer deadline.Stop()
+	for {
+		failures := server.Status().WriteFailures
+		if len(failures) == 0 && !requireRecord {
+			return
+		}
+		if len(failures) != 0 {
+			if len(failures) != len(facts) {
+				t.Fatalf("expected rename refusals have unrelated diagnostic count: %d", len(failures))
+			}
+			owners := make([]smb.WriteOwnerID, 0, len(failures))
+			ready := true
+			for _, failure := range failures {
+				if failure.Operation != storage.OpFileMutateName || failure.NodeID != nodeID || failure.FileGeneration != generation || failure.Action.Check() != nil || failure.Execution != smb.WriteExecutionNotExecuted || failure.ErrorCategory != smb.WriteErrorDenied || !failure.ChainSettled || !failure.PayloadReleased {
+					t.Fatalf("expected rename refusal has an unsettled or unrelated diagnostic: %+v", failure)
+				}
+				if !failure.ResponseFinal {
+					ready = false
+					continue
+				}
+				if failure.Response != smb.ResponseSent || !failure.Terminal {
+					t.Fatalf("expected rename refusal has an incomplete response diagnostic: %+v", failure)
+				}
+				owners = append(owners, failure.Owner)
+			}
+			if ready {
+				if err := server.AcknowledgeWriteFailures(owners); err != nil {
+					t.Fatalf("acknowledge exact terminal native rename refusals: %v", err)
+				}
+				return
+			}
+		}
+		select {
+		case <-deadline.C:
+			t.Fatal("expected native rename refusal did not finish its exact diagnostic")
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
 }
 
 type nativeNameFact struct {
