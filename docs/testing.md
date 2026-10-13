@@ -507,6 +507,18 @@ SMB Basic 设置共享时间与 HIDDEN／SYSTEM 后，Linux 原 fd 的 fstat 必
 
 独立 HTTP server 的资源用例使用真实 TCP listener：占满 accepted-connection 名额后底层 `Accept` 不再前进，connection 的单次与重复 `Close` 只释放一份名额，关闭饱和的 listener 会唤醒正在等待的 `Accept`。两种 mode 都要求至少两条 connection，并在取得 listener 前拒绝非正 timeout。只发一部分 header 的连接在 `ReadHeaderTimeout` 内被关闭，keep-alive connection 超过 `IdleTimeout` 后被关闭；同一用例断言 request-wide `ReadTimeout` 与 `WriteTimeout` 保持为零。shutdown 用例覆盖已经存在和尚未被 tracker 观察到的 `StateNew` connection，确保 stopping state 会关闭 late notification，不把退出安全性押在 header timeout 上。
 
+## 服务发布
+
+R-SVC-9 的发布验证分为流程与运行两层。流程检查使用 actionlint 验证 [release workflow](../.github/workflows/release.yml)，核对 prod 依赖 build 与 staging，两个部署都使用同一 build 输出 digest。shell 语法检查和 ShellCheck 验证[部署脚本](../.github/scripts/deploy-service.sh)与[聚焦用例](../.github/scripts/test-deploy-service.sh)。用例执行远端 Bash 命令，在 Docker 命令边界注入失败，核对错误使部署失败、失败后原 `release.env` 保留、成功后记录本次 digest，以及私有 registry 登录目录随成功或失败清理。环境配置、state 和端口设置在部署前准备，用例核对更新 Compose 与镜像选择不会修改这些内容。
+
+```sh
+bash .github/scripts/test-deploy-service.sh
+```
+
+Compose 配置检查分别渲染本地默认值、staging 和 prod，核对 image digest、project name、loopback 端口与既有 bind mounts。部署流程改动只运行覆盖这些文件的检查。
+
+运行验收使用实际构建的服务镜像和 Compose：初始化独立的私有 state，创建管理员，启动后通过 `/health/ready` 确认就绪，再替换容器并验证原用户和 volumes 保留。staging 与 production 使用不同 project name、配置、state 和同机端口；一个环境的部署不能修改另一个环境的目录。失败的启动或健康检查必须由 Compose 就绪等待报告。流程替身证明命令顺序和错误传递，真实 Compose 验收证明镜像、挂载和健康检查的组合，两者的结论分别报告。生产 VM 的 SSH、私有 GHCR 权限和 HTTPS 入口仍须在实际发布中确认。
+
 ## 每次改动必须带什么
 
 **任何非平凡改动都要在同一次改动里新增或更新测试。** 判据与 Agent Note 相同。

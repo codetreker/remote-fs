@@ -5,13 +5,13 @@ services:
     build:
       context: ../..
       dockerfile: deployments/service/Dockerfile
-    image: remote-fs-service:local
+    image: ${RFS_IMAGE:-remote-fs-service:local}
     user: "10001:10001"
     read_only: true
     restart: unless-stopped
     stop_grace_period: 60s
     ports:
-      - "127.0.0.1:8080:8080"
+      - "127.0.0.1:${RFS_HTTP_PORT:-8080}:8080"
     volumes:
       - type: bind
         source: ${RFS_STATE_ROOT:?set RFS_STATE_ROOT to an existing private directory owned by UID 10001}

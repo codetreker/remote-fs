@@ -59,4 +59,16 @@ Console 和 CLI 通过同一管理 API 执行 owner 校验，提供自己的 vol
 
 ## 部署
 
-Compose/systemd 使用 listen、external_origin、state_root、trusted_proxy_cidrs、shutdown_timeout。一个进程使用本机私有持久目录。Compose 包含一个 app 容器，容器内监听 `0.0.0.0:8080`，HTTP 入口发布到宿主 `127.0.0.1:8080`；systemd 直接运行时监听本机 loopback。部署方提供匹配 external_origin 的同源 HTTPS 代理，Console 与 API 共用该 origin，浏览器会话使用 Secure cookie。配置示例的 trusted_proxy_cidrs 为空；接收代理转发的客户端地址时，该字段配置应用所见的受信直接代理地址 CIDR。server 不需要 FUSE 权限。健康入口仅报告进程/服务状态；reference 模式仍提供既有单 volume 文件服务，权限由其部署方负责。
+Compose/systemd 使用 listen、external_origin、state_root、trusted_proxy_cidrs、shutdown_timeout。一个进程使用本机私有持久目录。Compose 包含一个 app 容器，UID/GID 为 10001，容器内监听 `0.0.0.0:8080`，state root 为 `/var/lib/remote-fs`；HTTP 入口发布到宿主 loopback，宿主端口由 `RFS_HTTP_PORT` 选择。systemd 直接运行时监听本机 loopback。部署方提供匹配 external_origin 的同源 HTTPS 代理，Console 与 API 共用该 origin，浏览器会话使用 Secure cookie。配置示例的 trusted_proxy_cidrs 为空；接收代理转发的客户端地址时，该字段配置应用所见的受信直接代理地址 CIDR。server 不需要 FUSE 权限。
+
+Compose 将已准备的私有 state 目录和只读 YAML 配置 bind mount 到容器，缺少宿主路径时拒绝启动。`/health/ready` 是 Compose 的健康检查入口；就绪确认表示服务已完成启动，不替代登录、owner 校验或文件存储的业务验收。reference 模式仍提供既有单 volume 文件服务，权限由其部署方负责。
+
+### staging 与 production 发布
+
+R-SVC-9 由手动触发的 [release workflow](../../../.github/workflows/release.yml) 实现。build 作业只构建一次服务镜像，推送私有 `ghcr.io/codetreker/remote-fs`，并将得到的不可变 digest 传给 staging 和 prod 作业。staging 部署成功并通过 Compose 就绪等待后，prod 才使用同一 digest 部署。构建、拉取、启动或就绪等待失败均使发布失败。
+
+staging 和 prod 两个 GitHub Environments 使用已有 `OC_VM_HOST`、`OC_VM_USER` 和 `OC_VM_SSH_KEY` 连接部署机，`OC_VM_KNOWN_HOSTS` 提供经核验的 SSH host 公钥记录。各自的 `DEPLOY_PATH` 指向独立环境目录，持有本环境的 `.env`、YAML 配置和私有 state；镜像不包含这些内容。两套环境使用 `remote-fs-staging` 和 `remote-fs-prod` Compose project name，同机部署的 HTTP 端口也必须不同。
+
+[部署脚本](../../../.github/scripts/deploy-service.sh) 用 SSH/SCP 更新 `DEPLOY_PATH/compose.yml`，将本次 digest 作为 `RFS_IMAGE` 传给 Compose。命令读取已有 `.env` 与临时镜像选择文件，执行 `up --pull always --no-build --wait --wait-timeout 180 app`；健康检查成功后才将选择文件写为 `release.env`。后续维护同时读取 `.env` 和 `release.env`。发布保留目录中的数据与配置，不执行初始化或管理员维护命令。
+
+GHCR 权限通过各作业自己的 `GITHUB_TOKEN` 提供；构建作业可写 package，部署作业只读 package。SSH key 和 known_hosts 临时文件位于 runner 工作区的 `.tmp`，registry 登录状态位于 `DEPLOY_PATH` 内的私有临时目录，两者随部署命令结束清理。部署方准备 Docker Compose plugin、环境目录、HTTPS 入口和初始管理员；操作方式见[README](../../../README.md)，范围与代价见[发布决定](../../../.agents/notes/implemented/process/2026-10-13-stage-service-image-release.md)。
