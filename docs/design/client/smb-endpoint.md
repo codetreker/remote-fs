@@ -2,13 +2,15 @@
 
 `packages/smb` 是 Windows client 进程内的本机呈现层。Windows 系统 SMB client 通过 loopback TCP 连接它；端点把认证后的 share 连接绑定到调用方提供的 `storage.FileStorage`。SMB 只存在于 client 与同机操作系统之间，client 到远端 authority 的边界仍是平台中立的 storage／HTTP 契约。
 
-端点支持 SMB 3.1.1 协商、认证、消息签名、share 连接、CREATE/CLOSE、regular-file READ／flags=0 WRITE／FLUSH、五类文件 QUERY_INFO、Basic／EOF SET_INFO、五类 volume QUERY_INFO、六类 QUERY_DIRECTORY 与会话清理。五种非 supersede disposition 建立稳定 FileId 和权威 share claim；名字修改和锁命令返回明确的不支持结果。该命令集合不构成完整 Windows network drive。
+端点支持 SMB 3.1.1 协商、认证、消息签名、share 连接、CREATE/CLOSE、regular-file READ／flags=0 WRITE／FLUSH、五类文件 QUERY_INFO、Basic／EOF SET_INFO、五类 volume QUERY_INFO、六类 QUERY_DIRECTORY 与会话清理。五种非 supersede disposition 建立稳定 FileId 和权威 share claim，并可原子接受 FILE_DELETE_ON_CLOSE；名字修改和锁命令返回明确的不支持结果。该命令集合不构成完整 Windows network drive。
 
 ## 一、嵌入与发布
 
 `smb.New` 接受 `Config{Authenticator, AuthorizeIdentity, Authorize, Limits, Logger}`。构造函数验证两个授权接口、认证 provider 和全部资源上限，并初始化按名选择与目录捕获共用的平台名字比较器；初始化失败保留原错误链并拒绝构造。构造不取得 Windows credential、不启动 goroutine，也不打开 listener。`packages/smb/windows` 提供 SSPI `Authenticator`、读取进程身份的 `CurrentIdentity` 和只允许该确切身份的 `AllowIdentity`；非 Windows 构建保留同一 API，并在实际取得平台能力时返回不支持。
 
-一个 `Server` 可以发布有限个 `Share`。每个 share 携带不区分大小写的 SMB 名字、业务授权 label `Volume`、实际存储 pin `BackendVolume storage.VolumeID`／`RootNodeID` 、可选 `VolumeLabel *string` 和一份调用方拥有的 `storage.FileStorage`。发布时验证这些配置及 `CheckFileStorage`，但不建立 FileSession，也不接管 backend 的关闭责任。名字为空、过长、含 SMB 分隔／保留字符、前后空白或与 `IPC$` 冲突时拒绝。VolumeLabel 的 nil 表示来源缺席，已知空值表示无 label；已知值必须为无 NUL 的有效 UTF-8，最多 32 个 UTF-16 code unit。Export 独立复制 label，后续宿主修改原值不改变已发布事实。
+一个 `Server` 可以发布有限个 `Share`。每个 share 携带不区分大小写的 SMB 名字、业务授权 label `Volume`、实际存储 pin `BackendVolume storage.VolumeID`／`RootNodeID`、可选 `VolumeLabel *string`、可选稳定 `DeleteIntentOwner` 和一份调用方拥有的 `storage.FileStorage`。发布时验证这些配置及 `CheckFileStorage`，但不建立 FileSession，也不接管 backend 的关闭责任。名字为空、过长、含 SMB 分隔／保留字符、前后空白或与 `IPC$` 冲突时拒绝。VolumeLabel 的 nil 表示来源缺席，已知空值表示无 label；已知值必须为无 NUL 的有效 UTF-8，最多 32 个 UTF-16 code unit。Export 独立复制 label，后续宿主修改原值不改变已发布事实。
+
+关闭删除 owner 为空时普通访问可用，FILE_DELETE_ON_CLOSE 返回不支持。非空 owner 必须通过中立格式检查，并由宿主与可信 Volume、BackendVolume、RootNodeID 一起持久保存；同 Server 重复 owner 或相同恢复绑定的重复发布返回 ErrConfig。宿主承担跨进程互斥及原配置恢复，share 名字和 authority incarnation 不进入持久绑定。Publish 为每个 enabled Export 从既有 unresolved／diagnostic 额度预留一个恢复槽；容量不足返回 EMFILE，移除 Export 时归还。发布不建立恢复 session，首次完整恢复前关闭删除未就绪。
 
 `Serve` 只接受已经绑定到 loopback TCP 地址的 listener，并在验证成功后取得其所有权。每条 accepted connection 还要再次核对 peer 是 loopback；其它来源在进入协议处理前关闭。Server 不创建 WNet 映射、不安装驱动、不修改防火墙、系统 SMB 配置或全局缓存策略。
 
@@ -58,7 +60,8 @@ authentication exchange 受 `HandshakeTimeout` 约束，完成后的 identity �
 | `commands_file_io.go`、`commands_file_info.go`、`commands_volume_info.go`、`commands_directory.go`、`file_io_gate.go` | 内容／文件／volume／目录命令、File／NodeReference 共用 FIFO、授权／身份复核与关闭排空 |
 | `directory_snapshot.go`、`directory_pattern.go` | 完整有界捕获、紧凑保留表示、raw-order 分页、DOS matcher 和累计费用 |
 | `mutation_owner.go`、`flush_owner.go`、`write_diagnostics.go` | immutable WRITE／Basic／EOF 条件动作与 FLUSH confirmation、同动作恢复、有界失败事实与宿主责任转移 |
-| `file_handles.go`、`commands_close.go`、`authority_recovery.go`、`handle_diagnostics.go` | typed owner、准入／容量、恢复、关闭尝试与结算 |
+| `file_handles.go`、`commands_close.go`、`authority_recovery.go`、`handle_diagnostics.go` | typed owner、准入／容量、关闭尝试、intent 责任及结算 |
+| `delete_intent.go`、`delete_intent_recovery.go` | 原子关闭删除准入、同引用结算、authority handoff、有限发现及精确 ACK |
 | `session_cleanup.go`、`connection.go`、`server.go` | tree/session/export 退休、compound 执行与 signer 所有权 |
 
 每个 authority session 保存不可变 `FileSessionIdentityResult{Backend, SessionEpoch}`。Backend 的 Volume、Authority 与 RootNodeID 全部必须和经验证 backend 相同，Volume／Root 还须匹配宿主 pin，SessionEpoch 必须等于其 Status.Epoch。Share.Volume 只用于业务授权。新的 tree 在公布成功前完成 AtomicFileOpener、NodeReferences、DirectoryMetadataObserver、StableReferenceIdentity、OpenMetadataAccess、OpenContentMetadata、FileActions、AllocationReporting 与 RecoverableReferenceClose 的完整链检查；wrapper 缺失能力时明确拒绝。身份与中立能力的定义见[文件句柄设计](../server/file-handles.md#一身份与会话)。
@@ -73,7 +76,11 @@ SMB 名字是严格 UTF-16，转换为可逆 raw leaf；NUL、孤立 surrogate�
 
 FILE_OPEN 要求已有目标，FILE_CREATE 要求缺席，FILE_OPEN_IF 保持已有目标或创建。FILE_OVERWRITE 要求已有普通文件并清空，FILE_OVERWRITE_IF 清空已有文件或创建；两种清空都必须有字节写权。DataFile 的 READONLY 检查与 metadata predicate 在同一 guarded authority 动作内提交；只读已有文件的 DELETE-only FILE_OPEN 仍可取得 NodeReference。overwrite 把请求属性集合加 ARCHIVE 作为原子结果；已有 HIDDEN/SYSTEM 位必须也出现在请求中，否则在清空前拒绝。已有对象的 smb.windows namespace 版本或缺席条件同样固定在原意图中，不能依据旧 metadata 清空后来变为只读的对象。
 
-有字节权限的普通文件经 OpenAt 返回 File；目录、metadata-only、DELETE-only、execute-only 经 OpenChildRef 返回 NodeReference。空名字只打开固定根目录：OPEN/OPEN_IF 通过同一 FileSession 的 OpenNodeRef 和 SameNode 条件取得引用，OPEN_IF 不创建；CREATE 撞名，overwrite／非目录意图拒绝。SUPERSEDE、delete-on-close 和未支持效果在 backend 前拒绝。
+有字节权限的普通文件经 OpenAt 返回 File；目录、metadata-only、DELETE-only、execute-only 经 OpenChildRef 返回 NodeReference。空名字只打开固定根目录：OPEN/OPEN_IF 通过同一 FileSession 的 OpenNodeRef 和 SameNode 条件取得引用，OPEN_IF 不创建；CREATE 撞名，overwrite／非目录意图拒绝。share root 的关闭删除在对象效果前拒绝；SUPERSEDE 和未支持效果在 backend 前拒绝。
+
+FILE_DELETE_ON_CLOSE 必须具有规范化 DELETE；缺失返回 STATUS_INVALID_PARAMETER。请求自身不必允许 SHARE_DELETE，原双向共享检查决定与其它持有者的兼容性。已有对象及新建／reset 结果的 READONLY 在接受前拒绝。Windows metadata 的版本或缺席条件保留在 Target.ExpectedMetadata，CloseIntent 不重复旧 token；原子 reset 的 metadata 效果与接受 intent 属于同一结果。文件使用 UnlinkFile，目录使用 UnlinkIfEmpty；非空目录可以接受，触发时仍非空才明确未执行。
+
+CREATE 在 backing 前生成固定 intent ID 与 action，关联原 handle owner，并把 CloseIntent 放入 OpenAt 或 OpenChildRef 的不可变选项。原名字 guards、Target CAS、Use、初始属性、创建／截断及 intent 同次提交。无引用未知、error+引用、取消、编码或发送失败继续使用原 pending-open 与关闭链；intent 缺席不能证明 CREATE 未接受，也不能单独证明引用释放。
 
 Generic rights 按规范完整展开，MAXIMUM_ALLOWED 和未支持权限拒绝。GENERIC_ALL 展开为 FILE_ALL_ACCESS（0x001f01ff），包含未交付的 DELETE_CHILD、WRITE_DAC 和 WRITE_OWNER，因此返回 STATUS_NOT_SUPPORTED；不能删掉这些权限后部分授予。READ_DATA 授予字节读，WRITE_DATA/APPEND_DATA 授予字节写；EXECUTE 声明 ReadData share Use，却不授予字节读。目录 LIST_DIRECTORY/TRAVERSE 声明 ReadEntries，ADD_FILE/ADD_SUBDIRECTORY 声明 WriteData；目录引用没有字节方法。DELETE 声明 DeleteName，打开不删除。READ_ATTRIBUTES/READ_EA、WRITE_ATTRIBUTES/WRITE_EA 分别授予独立 ReadMetadata、WriteMetadata，不参加 data/write/delete share 分类。
 
@@ -140,6 +147,20 @@ QUERY_DIRECTORY 支持 Names `0x0C`（12-byte header）、Directory `0x01`（64�
 
 fresh search 无匹配为 NO_SUCH_FILE，随后由独立 settled 状态返回 NO_MORE_FILES；partial warning 不结算 EOF。健康、授权或 capture 失败不转成这两个结果。HTTP 单独授权实际 capture／State RPC，后来的 backend list-policy 撤销不收回已经交给 SMB 的完整 capture；宿主当前 SMB Authorizer 控制每个新页面，不增加 recapture 或只检查授权的 RPC。
 
+### 关闭删除与有限恢复
+
+引用关闭、失活或内部退休触发原 intent；有效原关联进入 pending，冲突新打开和名字效果被阻挡，旧相容引用继续访问原对象，最后相关引用结束才移除名字。原关联分离或目录触发时非空为 NotExecuted；后者在活跃 CLOSE 映射 STATUS_DIRECTORY_NOT_EMPTY。Standard QUERY_INFO 每次从 StateScalars 取得 DeletePending，pending／detached 的 links 为零，Armed 未触发保持非 pending。真实观察失败不退回本地状态。
+
+原引用与完整 adapter chain 结算后 FileId 退休；尚需 query／ACK 的记录留在原 handleOwners，沿同一 charge 投影为 delete-intent-only。Export busy gate 串行化句柄 query／ACK 与恢复；扫描占用时原引用仍可关闭，恢复接管其原尝试。确认 authority 持有 Armed／Pending 且无本地请求或 ACK 责任后可以 handoff；terminal 先 ACK 再释放本地记录。
+
+宿主显式调用 Export.RecoverDeleteIntents，并用 WithPrincipal 提供当前主体。每次验证 AuthorizeIdentity，实际 identity、session、status、query/list、ACK、action-query 和 session-close 按各自 Operation 当前授权。远端 adapter 的授权独立保留；owner 和旧 SID 不授予权限。恢复使用 Export 自己的 session，宿主保证至少一个 backend enrollment 名额；不足报告真实错误。
+
+扫描先关闭新的关闭删除准入并排空此前准入的 CREATE，普通 I/O 继续。每轮最多处理 MaxUnresolvedOwners 条、每页最多 256 条，并受 caller context／CleanupTimeout 约束。先处理原 registry 中引用已结算的 intent 尝试，再按持久 owner／序号分页；只有处理成功才推进，错误或 EAGAIN 保留 page、cursor 和原 ACK。空页再次检查迟到的本地尝试，完整遍历且当前 session 释放及 settlement 后才 ready，并把 cursor 归零。Armed／Pending 不阻止 ready；失败、未知或当前 session 未结算均保留错误。
+
+ACK 保存固定 owner／intent、terminal outcome、原 action 及 issued witness。已发 ACK 的未知回执先查询原动作；当前持久 Query 仍给出同一终态，才可利用其幂等语义换当前 action，原未知 ID 保留。仅“先观察终态且已发 ACK，随后 Query 缺失”证明该记录已回收；单独缺失不证明任何 CREATE 结果。CREATE／WRITE／CLOSE 的原动作重投规则保持各自语义。
+
+恢复 session 的 identity 查询返回 ESTALE 时，原错误返回且 current 标为 closing；后续调用先用原 CloseWithResult 和完整 settlement 核对该确切 session。未结算继续保留 owner／charge、cursor／page 及 ACK witness，并返回实际错误。确认结算后才退休 current，部分遍历返回 EAGAIN，再建立新 session 续作保留状态；同 authority 到期不新增槽，ready 仍要求完整遍历和当前 session 关闭结算。backend incarnation 改变时，旧恢复 session 的精确关闭未结算则保留原错误，并从同一全局额度另取一个槽供当前发现。最多 current／retired 两份 session，禁止第三份；当前发现 ready 和旧 cleanup 分开记录。Stop 保留 issued Unknown ACK，先核对其原 witness，再关闭恢复 session；旧 HTTP session 的 ESTALE 或新 incarnation 不证明 adapter settlement。未结算继续导致 stopping 错误；已确认 authority handoff 后不等待其它客户端的合法引用。具体责任和宿主代价由[关闭删除决定](../../../.agents/notes/implemented/feature/2026-09-28-smb-close-delete-obligation.md)拥有。
+
 ## 五、容量与 FileId owner
 
 Limits 分别限制 export、connection、session、tree、pending request、compound/context、frame/I/O/token、完整目录观察、handle、未结清 owner 与诊断字节。所有值显式选择，零值不表示无界。MaxIOBytes 同时成为协商公布的 transact/read/write 上限；协商后完整 request 受 I/O 加固定 envelope 约束，control command 另受 68 KiB 上限且只消耗一个 credit，READ/WRITE 的 credit charge 为 max(1,ceil(requested Length/65536))，不把 header／compound padding 算作 payload；READ 在 backing 前预留 requested Length 的完整响应。FileSessionOptions 另限制原生引用、owner、range、等待与动作历史。
@@ -150,11 +171,11 @@ capture 的 F=64 KiB 包含 cursor／matcher 固定 allowance，L 根据可用�
 
 restart 先释放旧 entries；失败不留可服务 snapshot，仍为需要保留的 expression 计费。CLOSE fence／drain 后，在 pending Basic reconcile 和 native close 之前释放 read-only cache；drain 超时保留原 state／charge，native close 未知不使已经排空的 cache 继续保留。tree／session／disconnect／shutdown 和最终 owner removal 使用同一幂等释放路径，资源饱和仍保留清理与状态能力。
 
-CREATE 在对象效果前预留 response frame 空间、FileId 与 owner。server 全局 owner registry 包含 reserved/opening、live、cleanup-only、barrier-only；其上限为 min(MaxHandles, MaxUnresolvedOwners, MaxDiagnosticBytes/256)，每份可能未结清的 owner 在效果前预留固定 256 字节诊断槽。原生／HTTP 的 close receipt 历史继续按自身期限计费；端点回收一个 FileId 不使该容量提前可复用。容量不足在创建／清空前失败。
+CREATE 在对象效果前预留 response frame 空间、FileId 与 owner。server 全局 owner registry 包含 reserved/opening、live、cleanup-only、barrier-only 与引用已结算的 delete-intent-only；每份原 owner 受 MaxHandles 限制，owner 与恢复预留合计受 MaxUnresolvedOwners 限制，另与 write diagnostic 槽一起受 MaxDiagnosticBytes/256 限制。每份可能未结清的 owner 在效果前预留固定 256 字节诊断槽。原生／HTTP 的 close receipt 历史继续按自身期限计费；端点回收一个 FileId 不使该容量提前可复用。容量不足在创建／清空前失败。
 
-FileId 使用不复用的 session 实例与单调计数，避开全部或半个 all-ones 值；查找同时验证 session、tree 与固定 identity descriptor。owner 拥有一份 File 或 NodeReference、固定 NodeID、实际 access、Use、open action 和当前 close attempt。状态为 Reserved、Live、CleanupOnly 或 BarrierOnly；取消、编码／发送失败和 tree 退休不能丢弃已取得引用或未知动作。
+FileId 使用不复用的 session 实例与单调计数，避开全部或半个 all-ones 值；查找同时验证 session、tree 与固定 identity descriptor。owner 拥有一份 File 或 NodeReference、固定 NodeID、实际 access、Use、open action、当前 close attempt 和可选 delete intent／ACK 尝试。状态为 Reserved、Live、CleanupOnly 或 BarrierOnly；取消、编码／发送失败和 tree 退休不能丢弃已取得引用或未知动作。
 
-每个 tree 单独登记文件操作。retirement 先 fence 新准入，取消 pending request，等此前已接纳操作结束，再按确切引用清理该 tree 的 FileId。backend I/O 与等待不持有 tree/session map lock。同一 SMB session/export 的多个 tree 共用 authority session，FileId 不在 tree 间迁移；单个 tree 退出而兄弟 tree 仍 live 时，未结清 owner 保留，不关闭兄弟的 FileSession。整份 authority 退休的父释放证明可以结清剩余 typed 或匿名 owner，随后减少 tree/authority refs。
+每个 tree 单独登记文件操作。retirement 先 fence 新准入，取消 pending request，等此前已接纳操作结束，再按确切引用清理该 tree 的 FileId。backend I/O 与等待不持有 tree/session map lock。同一 SMB session/export 的多个 tree 共用 authority session，FileId 不在 tree 间迁移；单个 tree 退出而兄弟 tree 仍 live 时，未结清 owner 保留，不关闭兄弟的 FileSession。整份 authority 退休的父释放证明可以结清剩余 typed 或匿名引用责任，随后减少 tree/authority refs；尚未查询／ACK 的 intent 继续保留原 diagnostic charge。
 
 一次 connection 持有 negotiate transcript、credit 集合、pending requests 和 session table；全局 registry 另计所有 connection 的 session charge。仅从 connection map 删除 session 不释放全局容量。TreeId/SessionId 单调分配并检查耗尽。每份 response frame 在 session retirement 前登记为 signer 使用者；native/auth/tree 退休与最后 response 构造／签名均结束后，才移除 registry owner 并清零 signing key。
 
@@ -168,7 +189,7 @@ Released=true 但错误含 CloseSettlementError 时，owner 转为 BarrierOnly�
 
 CREATE 丢失响应、没有 typed reference 且原 action 因 lease 到期持续 ESTALE，或已有引用在父 HTTP session 退休后无法取得精确结果时，端点保留原未知错误与 owner。authority retirement gate 固定 tree membership，验证它与 refs 完全对应、没有 opening tree，全部共享 tree 已 fenced/drained，authority 禁止新 tree/open。恢复器先推进各 owner 的原引用／pending-open 精确清理，再串行取得全部 closeLifetime gate，调用确切 raw FileSession.CloseWithResult。
 
-result.Check 有效、Released=true 且无 CloseSettlementError 是整个父 session 全部引用与完整链 settlement 的终结证明，不额外要求 Determined。恢复器在每个 handle cleanup 内终结全部剩余 typed/匿名 owner、清除 callback、归还 charge 一次；逐引用的 terminalErr、缓存 SemanticErr、原 open Unknown 和 close attempt/history 继续保留，迟到调用返回错误而不重投。父语义错误也缓存并报告，原动作不被改写为成功或未执行。父 Unknown／未释放／Pending／Unknown settlement 保留剩余责任并重试同一 parent。
+result.Check 有效、Released=true 且无 CloseSettlementError 是整个父 session 全部引用与完整链 settlement 的终结证明，不额外要求 Determined。恢复器在每个 handle cleanup 内终结全部剩余 typed/匿名引用责任并清除 callback；没有 intent 才归还 charge，有 intent 则转入同一查询／ACK 结算。逐引用的 terminalErr、缓存 SemanticErr、原 open Unknown 和 close attempt/history 继续保留，迟到调用返回错误而不重投。父语义错误也缓存并报告，原动作不被改写为成功或未执行。父 Unknown／未释放／Pending／Unknown settlement 保留剩余责任并重试同一 parent。
 
 隐式 HTTP FileSession.CloseWithResult 仅在原精确动作路径返回 ESTALE 且缺失 typed close result 时，以内部 file.session-release-result 读取确切 session capability 的有限终态。投影只返回已验证 native 全父释放／inline settlement、当前 server barrier 与原 releaseErr，不新建 action/receipt、延长 history 或再次 native close；不存在、到期、未验证终态或 barrier 故障仍报错。显式动作接口与 receipt 结果保持原语义，投影不提供逐动作结论。
 
@@ -176,7 +197,7 @@ TREE_DISCONNECT 清理自己的 handles，再释放共享 authority ref；有 li
 
 Export.Unpublish 对 live tree 或正在取得 export 的 connect/request 返回 busy，原 mapping、tree 与 FileSession 保持有效；没有使用者后才清理并移除。export cleanup 只加入持有目标 export 的 connection/session/authority；不等待另一 export 的清理。退休 session 中已经关闭的非最后 authority 立即释放自己的 entry/export ref，其余 authority 继续承担 session retirement。最后 authority 即使 raw session 已关闭，也保留 entry/ref，直到在调用方 context 内取得 authentication lock，并以不可取消 commit 同时移除 authority、记录 resourcesClosed 和释放 export ref。超时保留该已关闭 owner，后续重试不重复 raw close。等待同一 owner 的 authentication/cleanup 服从调用方 context。
 
-Server.Shutdown 永久停止 listener 与新工作，等待 connection 退出，清理 tree/handles/FileSession，移除确认静止并结清的 export；失败项保留供重试。调用方 backend 始终由调用方拥有。Status 报告 serving/stopping/stopped、export、live/cleanup-only connection、session、identity-expired session、tree、pending request、fenced authority、cleanup failure，以及 Handles、OpeningHandles、CleanupOnlyHandles、BarrierOnlyHandles。Server.HandleOwners() 受预留条数／字节预算约束，只暴露 opaque FileId/session/tree/NodeID、open action、close attempt、owner 状态和 LastStatus uint32，不保存 SID、密钥、路径、内容或原始 backend 错误。协议表项退役不能替代 native 释放与 settlement。
+Server.Shutdown 永久停止 listener 与新工作，等待 connection 退出，清理 tree/handles/FileSession，移除确认静止并结清的 export；失败项保留供重试。调用方 backend 始终由调用方拥有。Status 报告 serving/stopping/stopped、export、live/cleanup-only connection、session、identity-expired session、tree、pending request、fenced authority、cleanup failure，以及 Handles、OpeningHandles、CleanupOnlyHandles、BarrierOnlyHandles、DeleteRecoveryReadyExports、DeleteRecoveryPendingExports、LocalDeleteOwners 与 DeleteRecoveryCleanupOwners。Server.HandleOwners() 受预留条数／字节预算约束，只暴露 opaque FileId/session/tree/NodeID、open action、close attempt、DeleteIntent／DeleteOutcome、owner 状态和 LastStatus uint32，不保存 SID、密钥、路径、内容或原始 backend 错误。协议表项退役不能替代 native 释放与 settlement。
 
 ### 内容失败事实与宿主责任
 
@@ -192,4 +213,4 @@ WriteFailure 保存 typed WriteOwnerID 的随机 incarnation／单调 generation
 
 文件 I/O 已确认的 EDQUOT 映射 STATUS_QUOTA_EXCEEDED，与底层 ENOSPC 区分；含 EIO 的未知结果优先保持 STATUS_IO_DEVICE_ERROR，不能凭 joined quota errno 宣称明确未执行。
 
-这套结构对应 R-FS-5 至 R-FS-9 的打开／引用部分，R-CC-14／R-WIN-6 的共享准入，R-INT-1 至 R-INT-3 的嵌入和资源，以及 R-ERR-1、R-ERR-2、R-WIN-9 的真实错误与安全准入。范围锁、持久关闭删除、名字修改、通知／缓存、WNet 和完整 Windows 资格仍由独立能力实现。取舍与依赖见[有界 CREATE/CLOSE](../../../.agents/notes/implemented/feature/2026-09-28-smb-bounded-create-close.md)、[文件内容访问](../../../.agents/notes/implemented/feature/2026-09-28-smb-file-data-io.md)、[文件信息](../../../.agents/notes/implemented/feature/2026-09-28-smb-file-information.md)、[volume 信息](../../../.agents/notes/implemented/feature/2026-09-28-smb-volume-information.md)及[目录枚举](../../../.agents/notes/implemented/feature/2026-09-28-smb-directory-enumeration.md)。
+这套结构对应 R-FS-5 至 R-FS-9 的打开／引用部分，R-CC-14／R-WIN-6 的共享准入，R-INT-1 至 R-INT-3 的嵌入和资源，以及 R-ERR-1、R-ERR-2、R-WIN-9 的真实错误与安全准入。范围锁、名字修改、通知／缓存、WNet 和完整 Windows 资格仍由独立能力实现；关闭删除的持久责任由原 CloseIntent 接入。取舍与依赖见[有界 CREATE/CLOSE](../../../.agents/notes/implemented/feature/2026-09-28-smb-bounded-create-close.md)、[文件内容访问](../../../.agents/notes/implemented/feature/2026-09-28-smb-file-data-io.md)、[文件信息](../../../.agents/notes/implemented/feature/2026-09-28-smb-file-information.md)、[volume 信息](../../../.agents/notes/implemented/feature/2026-09-28-smb-volume-information.md)、[目录枚举](../../../.agents/notes/implemented/feature/2026-09-28-smb-directory-enumeration.md)及[关闭删除](../../../.agents/notes/implemented/feature/2026-09-28-smb-close-delete-obligation.md)。

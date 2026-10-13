@@ -77,10 +77,15 @@ type Share struct {
 	// volume-label information unavailable; a present empty string is a known
 	// empty label. Publish copies the value for the export's lifetime.
 	VolumeLabel *string
+	// DeleteIntentOwner is the host-persisted discovery namespace bound to this
+	// volume and root. Enablement requires RecoverDeleteIntents after Publish.
+	DeleteIntentOwner storage.DeleteIntentOwner
 }
 
 // Status reports resources still owned, including cleanup-only owners.
 type Status struct {
+	DeleteRecoveryReadyExports, DeleteRecoveryPendingExports        int
+	LocalDeleteOwners, DeleteRecoveryCleanupOwners                  int
 	WriteOwners, UnknownWrites, PendingFlushes, RetainedWriteBytes  int
 	WriteFailures                                                   []WriteFailure
 	RetainedDirectoryBytes                                          int

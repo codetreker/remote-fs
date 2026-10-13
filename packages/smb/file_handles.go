@@ -25,46 +25,49 @@ const (
 )
 
 type fileHandle struct {
-	state           atomic.Uint32
-	lastStatus      atomic.Uint32
-	treeID          uint32
-	sessionID       uint64
-	ownerSession    *session
-	identity        storage.FileSessionIdentityResult
-	nodeID          uint64
-	nodeKind        storage.NodeKind
-	diagnostic      atomic.Pointer[HandleOwnerStatus]
-	capacity        *Server
-	use             storage.UseClaim
-	attempt         *storage.CloseAttempt
-	attemptAdmitted bool
-	remintEpoch     uint64
-	priorAttempt    *storage.CloseAttempt
-	released        bool
-	published       bool
-	semanticErr     error
-	id              wire.FileID
-	file            storage.File
-	node            storage.NodeReference
-	pendingOpen     func(context.Context) (bool, error)
-	access          uint32
-	action          storage.FileActionID
-	closing         bool
-	requestCloseMu  contextLock
-	cleanup         cleanupGate
-	closeLifetime   contextLock
-	terminalErr     error
-	terminal        bool
-	ioMu            sync.Mutex
-	ioSequence      uint64
-	ioQueue         []*fileIOTicket
-	ioRunning       *fileIOTicket
-	ioIdle          chan struct{}
-	ioFenced        bool
-	contentEffects  []storage.ContentMetadataEffect
-	pendingWrite    *mutationOwner
-	pendingFlush    *flushOwner
-	directory       *directoryCursor
+	state            atomic.Uint32
+	lastStatus       atomic.Uint32
+	treeID           uint32
+	sessionID        uint64
+	ownerSession     *session
+	identity         storage.FileSessionIdentityResult
+	nodeID           uint64
+	nodeKind         storage.NodeKind
+	diagnostic       atomic.Pointer[HandleOwnerStatus]
+	capacity         *Server
+	export           *Export
+	deleteAttempt    *deleteIntentAttempt
+	deleteRefSettled atomic.Bool
+	use              storage.UseClaim
+	attempt          *storage.CloseAttempt
+	attemptAdmitted  bool
+	remintEpoch      uint64
+	priorAttempt     *storage.CloseAttempt
+	released         bool
+	published        bool
+	semanticErr      error
+	id               wire.FileID
+	file             storage.File
+	node             storage.NodeReference
+	pendingOpen      func(context.Context) (bool, error)
+	access           uint32
+	action           storage.FileActionID
+	closing          bool
+	requestCloseMu   contextLock
+	cleanup          cleanupGate
+	closeLifetime    contextLock
+	terminalErr      error
+	terminal         bool
+	ioMu             sync.Mutex
+	ioSequence       uint64
+	ioQueue          []*fileIOTicket
+	ioRunning        *fileIOTicket
+	ioIdle           chan struct{}
+	ioFenced         bool
+	contentEffects   []storage.ContentMetadataEffect
+	pendingWrite     *mutationOwner
+	pendingFlush     *flushOwner
+	directory        *directoryCursor
 }
 
 func (t *tree) beginFileWork(s *session) bool {
@@ -154,7 +157,7 @@ func (t *tree) reserveFileHandle(s *session, limit int) (*fileHandle, error) {
 	id := wire.FileID{}
 	binary.LittleEndian.PutUint64(id[:8], incarnation)
 	binary.LittleEndian.PutUint64(id[8:], sequence)
-	handle := &fileHandle{id: id, treeID: t.id, sessionID: s.id, ownerSession: s}
+	handle := &fileHandle{id: id, treeID: t.id, sessionID: s.id, ownerSession: s, export: t.export}
 	if t.authority != nil {
 		handle.identity = t.authority.identity
 	}
@@ -162,8 +165,8 @@ func (t *tree) reserveFileHandle(s *session, limit int) (*fileHandle, error) {
 		server := t.export.server
 		server.handleMu.Lock()
 		limits := server.config.Limits
-		if len(server.handleOwners) >= min(limits.MaxHandles, limits.MaxUnresolvedOwners) ||
-			len(server.handleOwners)+server.writes.usedDiagnosticSlots() >= limits.MaxDiagnosticBytes/diagnosticOwnerBytes {
+		if len(server.handleOwners) >= limits.MaxHandles || len(server.handleOwners)+server.deleteRecoverySlots >= limits.MaxUnresolvedOwners ||
+			len(server.handleOwners)+server.deleteRecoverySlots+server.writes.usedDiagnosticSlots() >= limits.MaxDiagnosticBytes/diagnosticOwnerBytes {
 			server.handleMu.Unlock()
 			return nil, syscall.EMFILE
 		}
@@ -195,7 +198,9 @@ func (t *tree) releaseFileHandle(handle *fileHandle) {
 		delete(t.handles, handle.id)
 		if handle.capacity != nil {
 			handle.capacity.handleMu.Lock()
-			delete(handle.capacity.handleOwners, handle)
+			if handle.deleteAttempt == nil {
+				delete(handle.capacity.handleOwners, handle)
+			}
 			handle.capacity.handleMu.Unlock()
 		}
 	}
@@ -229,7 +234,7 @@ func (h *fileHandle) bindReference(ctx context.Context, t *tree, attr storage.At
 		return syscall.ESTALE
 	}
 	h.nodeID, h.nodeKind, h.use = attr.ID, attr.Kind, use
-	h.diagnostic.Store(&HandleOwnerStatus{FileID: h.id, TreeID: h.treeID, SessionID: h.sessionID, NodeID: h.nodeID, OpenAction: h.action})
+	h.diagnostic.Store(&HandleOwnerStatus{FileID: h.id, TreeID: h.treeID, SessionID: h.sessionID, NodeID: h.nodeID, OpenAction: h.action, DeleteIntent: h.deleteIntentID()})
 	h.published = true
 	h.state.Store(uint32(handleLive))
 	return nil
@@ -285,6 +290,7 @@ func (t *tree) closeFileHandlePrepared(ctx context.Context, handle *fileHandle, 
 		if handle.pendingOpen != nil {
 			noReference, recoverErr := handle.pendingOpen(ctx)
 			if noReference {
+				handle.deleteAttempt = nil
 				t.releaseFileHandle(handle)
 				return recoverErr
 			}
@@ -309,7 +315,7 @@ func (t *tree) closeFileHandlePrepared(ctx context.Context, handle *fileHandle, 
 			default:
 				return errors.Join(pendingErr, syscall.EIO)
 			}
-			return errors.Join(pendingErr, t.acceptCloseResult(handle, result, closeErr))
+			return errors.Join(pendingErr, t.acceptCloseResult(ctx, handle, result, closeErr))
 		}
 		if handle.attempt == nil {
 			status, err := actions.CloseOwnerStatus(ctx)
@@ -332,7 +338,7 @@ func (t *tree) closeFileHandlePrepared(ctx context.Context, handle *fileHandle, 
 					} else {
 						result, settled = handle.node.CloseWithResult(ctx)
 					}
-					return errors.Join(pendingErr, t.acceptCloseResult(handle, result, settled))
+					return errors.Join(pendingErr, t.acceptCloseResult(ctx, handle, result, settled))
 				}
 				if !status.Ready {
 					return errors.Join(pendingErr, syscall.EIO)
@@ -392,7 +398,7 @@ func (t *tree) closeFileHandlePrepared(ctx context.Context, handle *fileHandle, 
 				}
 			}
 		}
-		return errors.Join(pendingErr, t.acceptCloseResult(handle, result, closeErr))
+		return errors.Join(pendingErr, t.acceptCloseResult(ctx, handle, result, closeErr))
 	})
 }
 
@@ -437,7 +443,7 @@ func (h *fileHandle) remintCloseAttempt() error {
 	return nil
 }
 
-func (t *tree) acceptCloseResult(handle *fileHandle, result storage.ReferenceCloseResult, closeErr error) error {
+func (t *tree) acceptCloseResult(ctx context.Context, handle *fileHandle, result storage.ReferenceCloseResult, closeErr error) error {
 	if err := result.Check(closeErr); err != nil {
 		return errors.Join(closeErr, err, syscall.EIO)
 	}
@@ -451,8 +457,9 @@ func (t *tree) acceptCloseResult(handle *fileHandle, result storage.ReferenceClo
 			}
 			return closeErr
 		}
+		handle.deleteRefSettled.Store(true)
 		t.releaseFileHandle(handle)
-		return errors.Join(closeErr, handle.semanticErr, retirePendingFileIO(handle, true, true))
+		return errors.Join(closeErr, handle.semanticErr, retirePendingFileIO(handle, true, true), t.settleHandleDeleteIntent(ctx, handle))
 	}
 	if handle.released {
 		return errors.Join(closeErr, syscall.EIO)

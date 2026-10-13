@@ -181,7 +181,7 @@ schema migration `0004_lease_recovery.sql` 为整份数据库保存 database ID�
 
 这项校验阻止信任边界外的 principal 在打开期间替换路径分量。root、同 UID 进程和管理员仍能改名或替换这些分量，属于部署信任边界；部署必须在 store 的整个 lifetime 内约束它们。组合层在打开各个 pathname-based component 前后比对根目录的 device 与 inode，但这不是跨整个运行期的 rename lease。
 
-对象层同时对根目录描述符与 `OWNER.lock` 取得 non-blocking exclusive `flock`。localstore 的 durable SQLite opener 还持有数据库文件的原生 `LOCK_EX`；原始非独占 SQLite opener 持有同一 native file 上的 `LOCK_SH`，使同进程与跨进程的既存 raw handle 都不能与独占 owner 并存。冲突 opener 得到 `EBUSY`，这些所有权只在全部 SQLite connection 成功关闭后释放。保留文件引用要求实际 EX ownership，只有 SH 的 Store 以 `EOPNOTSUPP` 拒绝这项能力；进程内 pin 不能保护另一写进程的回收。`ConfigureLeaseRecovery` 验证实际 EX owner 与绑定的原生 `LeaseAnchor`，`EnableLocks` 只接受已配置该恢复状态且仍持有 EX 的 Store；调用方提供一个持久化接口不能代替这些条件。完整规则见[文件占有](file-locks.md)和[文件句柄](file-handles.md)。
+对象层同时对根目录描述符与 `OWNER.lock` 取得 non-blocking exclusive `flock`。localstore 的 durable SQLite opener 还持有数据库文件的原生 `LOCK_EX`；原始非独占 SQLite opener 持有同一 native file 上的 `LOCK_SH`，使同进程与跨进程的既存 raw handle 都不能与独占 owner 并存。冲突 opener 得到 `EBUSY`，这些所有权只在全部 SQLite connection 成功关闭后释放。保留文件引用要求实际 EX ownership，只有 SH 的 Store 以 `EOPNOTSUPP` 拒绝这项能力；进程内 pin 不能保护另一写进程的回收。`ConfigureLeaseRecovery` 验证实际 EX owner 与绑定的原生 `LeaseAnchor`，`EnableLocks` 只接受已配置该恢复状态且仍持有 EX 的 Store；调用方提供一个持久化接口不能代替这些条件。未配置 Locks 的 localstore 使用非 lease-recovery 的 EX durable 构造，在 attachFileDomain 后、Store 返回前复用原 helper 分类当前 volume 全部旧 Armed；失败沿原 pool／ownership 清理规则返回，不暴露部分恢复的 Store。配置 Strong 时，EnableLocks 在 authority 附加后、Store 对外可用前分类旧 Armed；同一私有 acquisition 中逐节点经过正常 Strong／publication gate，Recovering 用真实剩余窗口与原启动 context 等待，Conflict 或取消真实失败。重试不重新取得 ownership 或重置 Strong window；无旧 Armed 时不增加等待，pending 的 bounded reclaim 仍独立执行。完整规则见[文件占有](file-locks.md)和[文件句柄](file-handles.md)。
 
 ## 五、key、分片与对象 envelope
 
@@ -257,13 +257,13 @@ shard identity 或对象 publication 已经发生后，任何无法证明 direct
 
 `metastore.FileStore` 在同一原生 gate 内完成路径或节点身份核对、创建／截断、InitialMetadata、Use claim 与引用保留。`ExpectedID` 不匹配以 `ESTALE` 失败；创建不存在的文件、排他创建判断、初始节点事实与返回引用属于同一次结果。保留引用绑定 node ID，改名不改变它；unlink 或 rename 替换目的地时，仍有 pin 的普通文件成为 `detached`，其当前 object 引用、属性、metadata 与配额继续保留。路径查询与 named snapshot 不暴露 detached 节点，其后修改不产生 named change event；句柄仍可读取、修改当前状态。
 
-DirectoryTarget/ChildName 把子项操作绑定到父 NodeID、可选活 Scope 和原始叶名；OpenAt/OpenChildRef 进一步使用 `ChildSelection` 携带可选 `NamespaceGuards`。有界 preflight 只验证父 DirectoryTarget／Scope；SQLite 最终 authority transaction 再次验证父／Scope，一次性核对 guards，随后核对目标身份和 metadata predicates，不从旧路径重建父对象。子项选定后才推导动态 publication intent；Keep 打开已有对象不发布，创建、清空、替换及其它实际 mutation 才进入发布。NodeReference 与 File 共用 pin、Use claim、session action history 和关闭排空；NodeReference 没有内容方法。
+DirectoryTarget/ChildName 把子项操作绑定到父 NodeID、可选活 Scope 和原始叶名；OpenAt/OpenChildRef 进一步使用 `ChildSelection` 携带可选 `NamespaceGuards`。有界 preflight 只验证父 DirectoryTarget／Scope；SQLite 最终 authority transaction 再次验证父／Scope，一次性核对 guards，随后核对目标身份和 metadata predicates，不从旧路径重建父对象。子项选定后才推导动态 publication intent；Keep 打开已有对象不发布，创建、清空、替换及其它实际 mutation 才进入发布。NodeReference 与 File 共用 pin、Use claim、session action history 和关闭排空；NodeReference 没有内容方法。shared tree.link 在新增 entry 前复用 checkNameAddition，SDK Write／Commit 的创建也不能越过 pending 父目录。
 
 句柄的 `ReadAt` 每次从一份 `FileState` 取得 node、size、object key 和 content revision，再在原生 gate 外读取该不可变对象。返回的属性、范围与 EOF 来自这同一状态。旧对象已被清扫且节点已指向另一对象时有界重试；节点仍指向缺失对象时以 `EIO` 失败。一次调用可以输给持续覆盖而返回 `EAGAIN`，不会拼接两份状态。
 
 `WriteAt` 与 `Truncate` 先读取当前完整对象，在有界内存中生成下一份完整内容：范围之外保留当前字节，扩展部分为零。随后按 `Reserve → Put → Commit` 发布，以读取时的 `content_revision` 做原生 CAS；revision 不符表示未提交，成功清理本次新对象后才能重新读取并尝试。真实提交、持久确认或 cleanup 结果未知时立即报错并保留失败隔离，不重放可能已生效的写入。普通重叠写入可依实际顺序各自成功；这项内部重试不是调用方显式内容版本校验的承诺。每次写入和截断成功前完成服务端确认，关闭不补交旧整文件快照。
 
-关闭或会话退役先封住该引用的新操作，在最终发布 gate 内退休引用并触发或消费它已经接受的 CloseIntent，然后排空已接纳的 materialization／上传并清理辅助 owner。原共享 Use claim 保持安装，直到最后一个 pin 的 pending 名字删除或 detached 节点回收在同一权威发布路径中确认完成。pending 名字删除核对关闭 owner 的 NodeID、Scope 与完整 claim，仅排除它自己的 DeleteName deny；其它 holder 的拒绝仍生效，已接受的删除义务不要求最后引用另具 DeleteName use。没有原引用的恢复使用普通匿名 Use 检查。节点回收按实际剩余分配量释放配额，并把当前对象标为 garbage，真正对象删除由 sweeper 执行。最终化确认后，SQLite 在同一 commit gate 内严格核对并解除原 Use，再无失败地释放 pin 和引用容量；明确未释放时，原 claim 仍阻止冲突准入。`CloseWithResult` 报告 `Released` 与 `Determined`，语义错误可与已释放结果共存；提交不明或 claim 不符时保持未知和 authority fence，不提前释放责任。旧 epoch 的引用明确失效，但 durable intent 由新 authority 按 owner 发现、查询和清理，不按原路径重建。
+关闭或会话退役先封住该引用的新操作，在最终发布 gate 内退休引用并触发或消费它已经接受的 CloseIntent，然后排空已接纳的 materialization／上传并清理辅助 owner。原共享 Use claim 保持安装，直到最后一个 pin 的 pending 名字删除或 detached 节点回收在同一权威发布路径中确认完成。pending 名字删除核对关闭 owner 的 NodeID、Scope 与完整 claim，仅排除它自己的 DeleteName deny；其它 holder 的拒绝仍生效，已接受的删除义务不要求最后引用另具 DeleteName use。没有原引用的恢复使用普通匿名 Use 检查。无 pin 节点的 shared discard 在同一事务先将 Armed 置为 NotExecuted，再物理删除；仍有 pin 的节点保持 detached 和原 Armed，不能提前消费其义务。节点回收按实际剩余分配量释放配额，并把当前对象标为 garbage，真正对象删除由 sweeper 执行。最终化确认后，SQLite 在同一 commit gate 内严格核对并解除原 Use，再无失败地释放 pin 和引用容量；明确未释放时，原 claim 仍阻止冲突准入。`CloseWithResult` 报告 `Released` 与 `Determined`，语义错误可与已释放结果共存；提交不明或 claim 不符时保持未知和 authority fence，不提前释放责任。旧 epoch 的引用明确失效，但 durable intent 由新 authority 按 owner 发现、查询和清理，不按原路径重建。
 
 原请求消失后的清理使用 `PublicationAccountingChain` 的不可变快照。恢复 context 只保留自己的取消／deadline 和该 accounting chain，丢弃原业务授权、Scope、Strong proof 与其它 request value。`MaintenanceAccounting` 在恢复开始前核对完整包装链和实际 Used，再原子安装当前维护链；活引用继续使用创建时捕获的链，二者不会重复结算。
 
@@ -399,7 +399,7 @@ remote-fs-server \
 
 `-local-store` 与 `-blob-container` 二选一。`-volume` 与 `-quota` 在 local-store 形态中必填；local-only flag 用在 Azure 形态会在 storage 被打开前拒绝。对应默认值来自上一节与 server HTTP handler 的默认值，flag 只负责把显式覆盖传给拥有该限制的 package。省略 `-http-max-write-bytes` 时继承 `-http-max-body-bytes`；显式的零值与其它非正值一样被拒绝。local-store 在打开任何磁盘资源前验证 effective write 上限不大于 effective `-local-max-object-bytes`。`-http-max-body-bytes` 仍可更大，因为 listing、错误与其它 non-write body 使用它。
 
-两种 server 形态都启用文件占有。`-initialize-lock-state` 只允许首次绑定或恢复匹配的初始化 intent；普通启动验证已有证据。localstore 在自己的私有 root 内保存证据，Azure 形态在 metastore 数据库旁保存证据。通用 `-lock-*` 上限与独立 HTTP control admission 见[文件占有](file-locks.md)。启动状态可为 recovering：server 已能回答读取和控制状态，新的授权与修改仍受恢复屏障阻止。
+两种 server 形态都启用文件占有。`-initialize-lock-state` 只允许首次绑定或恢复匹配的初始化 intent；普通启动验证已有证据。localstore 在自己的私有 root 内保存证据，Azure 形态在 metastore 数据库旁保存证据。通用 `-lock-*` 上限与独立 HTTP control admission 见[文件占有](file-locks.md)。没有待分类旧 Armed 时，启动状态可为 recovering：server 已能回答读取和控制状态，新的授权与修改仍受恢复屏障阻止；旧 Armed 的构造期分类须先通过该屏障。
 
 下列 local-store 与 metastore 资源 flags 与 package option 一一对应；`-max-pending-*`、两个 reader-connection flags、`-max-integrity-records`、`-max-integrity-bytes` 与 `-sweep-*` 由 Azure 与 local 两种 metastore/objectstore-backed 形态共用，`-local-*` 只对 local store 有效。HTTP request、non-streaming response 与 replication-frame flags 及默认值由 [`architecture.md`](architecture.md#五复制那三个操作)和[同文第六节](architecture.md#六请求与响应的内存边界)定义。
 

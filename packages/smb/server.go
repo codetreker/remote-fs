@@ -16,12 +16,13 @@ import (
 )
 
 type Server struct {
-	writes         writeLedger
-	handleMu       sync.Mutex
-	handleOwners   map[*fileHandle]struct{}
-	directoryBytes int
-	config         Config
-	nameComparer   nameComparer
+	writes              writeLedger
+	handleMu            sync.Mutex
+	handleOwners        map[*fileHandle]struct{}
+	deleteRecoverySlots int
+	directoryBytes      int
+	config              Config
+	nameComparer        nameComparer
 
 	mu              sync.Mutex
 	exports         map[string]*Export
@@ -41,17 +42,21 @@ type Server struct {
 }
 
 type Export struct {
-	ioGeneration uint64 // Protected by the server's write ledger.
-	server       *Server
-	share        Share
-	volumeSerial uint64
-	key          string
-	refs         int
-	trees        int
-	active       int
-	stopping     bool
-	published    bool
-	cleanupMu    cleanupGate
+	ioGeneration           uint64 // Protected by the server's write ledger.
+	server                 *Server
+	share                  Share
+	volumeSerial           uint64
+	key                    string
+	refs                   int
+	trees                  int
+	active                 int
+	stopping               bool
+	published              bool
+	cleanupMu              cleanupGate
+	deleteRecovery         deleteRecoveryState
+	deleteRecoveryReserved bool
+	deleteActive           int
+	deleteIdle             chan struct{}
 }
 
 func interfaceNil(value any) bool {
@@ -106,6 +111,9 @@ func (s *Server) Publish(share Share) (*Export, error) {
 	if err != nil || key == "IPC$" || share.Volume == "" || share.BackendVolume == "" || share.RootNodeID == 0 || interfaceNil(share.Backend) {
 		return nil, ErrConfig
 	}
+	if share.DeleteIntentOwner != "" && share.DeleteIntentOwner.Check() != nil {
+		return nil, ErrConfig
+	}
 	if share.VolumeLabel != nil {
 		label := *share.VolumeLabel
 		if len(label) > 4*maxVolumeLabelUnits || !utf8.ValidString(label) || strings.ContainsRune(label, '\x00') || utf16Length(label) > maxVolumeLabelUnits {
@@ -128,10 +136,21 @@ func (s *Server) Publish(share Share) (*Export, error) {
 		return nil, ErrBusy
 	}
 	for _, existing := range s.exports {
+		if share.DeleteIntentOwner != "" && existing.share.DeleteIntentOwner != "" && (existing.share.DeleteIntentOwner == share.DeleteIntentOwner || existing.share.Volume == share.Volume && existing.share.BackendVolume == share.BackendVolume && existing.share.RootNodeID == share.RootNodeID) {
+			s.mu.Unlock()
+			return nil, ErrConfig
+		}
 		if existing.volumeSerial == volumeSerial && existing.share.BackendVolume != share.BackendVolume {
 			s.mu.Unlock()
 			return nil, fmt.Errorf("SMB volume serial collision: %w", ErrConfig)
 		}
+	}
+	if share.DeleteIntentOwner != "" {
+		if err := s.reserveDeleteRecoverySlot(); err != nil {
+			s.mu.Unlock()
+			return nil, err
+		}
+		e.deleteRecoveryReserved = true
 	}
 	s.exports[key] = e
 	s.mu.Unlock()
@@ -152,6 +171,10 @@ func (s *Server) Publish(share Share) (*Export, error) {
 	}
 	if err != nil && s.exports[key] == e {
 		delete(s.exports, key)
+		if e.deleteRecoveryReserved {
+			s.releaseDeleteRecoverySlot()
+			e.deleteRecoveryReserved = false
+		}
 	}
 	if err == nil {
 		e.published = true
@@ -187,6 +210,7 @@ func (e *Export) Unpublish(ctx context.Context) error {
 	s.mu.Lock()
 	if s.exports[e.key] == e && e.refs == 0 && e.active == 0 {
 		delete(s.exports, e.key)
+		e.releaseDeleteRecoveryReservation()
 	}
 	s.mu.Unlock()
 	return nil
@@ -339,6 +363,7 @@ func (s *Server) retryCleanup(ctx context.Context) error {
 			s.mu.Lock()
 			if s.exports[export.key] == export && export.refs == 0 && export.active == 0 {
 				delete(s.exports, export.key)
+				export.releaseDeleteRecoveryReservation()
 			}
 			s.mu.Unlock()
 		}
@@ -369,6 +394,17 @@ func (e *Export) close(ctx context.Context) error {
 		s.mu.Unlock()
 		if busy && len(errs) == 0 {
 			errs = append(errs, ErrBusy)
+		}
+		if e.pendingDeleteError() != nil || !e.deleteRecovery.ready.Load() && e.deleteRecovery.cleanupOwners.Load() > 0 {
+			if err := e.RecoverDeleteIntents(ctx); err != nil {
+				errs = append(errs, err)
+			}
+		}
+		if err := e.closeDeleteRecovery(ctx); err != nil {
+			errs = append(errs, err)
+		}
+		if err := e.pendingDeleteError(); err != nil {
+			errs = append(errs, err)
 		}
 		if err := s.writes.pendingError(e); err != nil {
 			errs = append(errs, err)
@@ -404,6 +440,7 @@ func (s *Server) Status() Status {
 		CleanupFailures: s.cleanupFailures,
 	}
 	for _, export := range s.exports {
+		export.addDeleteStatus(&out)
 		if export.stopping {
 			out.StoppingExports++
 		}
@@ -417,6 +454,11 @@ func (s *Server) Status() Status {
 		connection.addStatus(&out)
 	}
 	s.handleMu.Lock()
+	for h := range s.handleOwners {
+		if d := h.diagnostic.Load(); d != nil && d.DeleteIntent != "" {
+			out.LocalDeleteOwners++
+		}
+	}
 	out.RetainedDirectoryBytes = s.directoryBytes
 	s.handleMu.Unlock()
 	s.writes.addStatus(&out)

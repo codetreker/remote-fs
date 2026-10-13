@@ -14,9 +14,10 @@ import (
 	"github.com/codetreker/remote-fs/packages/storage"
 )
 
-// EnableLocks attaches one authority before this Store is exposed to callers. Native
-// exclusive ownership and canonical lease recovery must already be configured. An
-// authority cannot be replaced during the Store's lifetime.
+// EnableLocks attaches one authority and classifies the previous file domain's
+// armed deletion obligations before this Store is exposed to callers. Native
+// exclusive ownership and canonical lease recovery must already be configured.
+// An authority cannot be replaced during the Store's lifetime.
 func (s *Store) EnableLocks(ctx context.Context, options locking.Options) error {
 	s.closeMu.Lock()
 	defer s.closeMu.Unlock()
@@ -26,7 +27,10 @@ func (s *Store) EnableLocks(ctx context.Context, options locking.Options) error 
 	if err := nativelease.VerifyExclusiveOwnership(s.leaseOwner); err != nil {
 		return err
 	}
-	return s.attachLocksLocked(ctx, options, s)
+	if err := s.attachLocksLocked(ctx, options, s); err != nil {
+		return err
+	}
+	return s.recoverArmedDeleteIntents(ctx)
 }
 
 func (s *Store) enableLocks(ctx context.Context, options locking.Options, persistence locking.Persistence) error {

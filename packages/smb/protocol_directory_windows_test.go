@@ -509,16 +509,21 @@ func (l nativeDirectoryListener) Accept() (net.Conn, error) {
 		return nil, err
 	}
 	return &nativeDirectoryConnection{Conn: c,
-		input: nativeDirectoryStream{receipts: l.receipts}}, nil
+		input: nativeFrameStream{record: l.receipts.record, fail: func(err error) {
+			l.receipts.mu.Lock()
+			l.receipts.err = err
+			l.receipts.mu.Unlock()
+		}}}, nil
 }
 
 type nativeDirectoryConnection struct {
 	net.Conn
-	input nativeDirectoryStream
+	input nativeFrameStream
 }
 
-type nativeDirectoryStream struct {
-	receipts *nativeDirectoryReceipts
+type nativeFrameStream struct {
+	record   func([]byte)
+	fail     func(error)
 	frame    []byte
 	length   int
 	disabled bool
@@ -530,7 +535,7 @@ func (c *nativeDirectoryConnection) Read(p []byte) (int, error) {
 	return n, err
 }
 
-func (c *nativeDirectoryStream) capture(input []byte) {
+func (c *nativeFrameStream) capture(input []byte) {
 	if c.disabled {
 		return
 	}
@@ -545,16 +550,14 @@ func (c *nativeDirectoryStream) capture(input []byte) {
 		if len(c.frame) == 4 && c.length == 0 {
 			c.length = int(c.frame[1])<<16 | int(c.frame[2])<<8 | int(c.frame[3])
 			if c.frame[0] != 0 || c.length < 4 || c.length > 2<<20 {
-				c.receipts.mu.Lock()
-				c.receipts.err = fmt.Errorf("invalid native SMB trace frame length: %d", c.length)
-				c.receipts.mu.Unlock()
+				c.fail(fmt.Errorf("invalid native SMB trace frame length: %d", c.length))
 				clear(c.frame)
 				c.frame, c.disabled = nil, true
 				return
 			}
 		}
 		if c.length != 0 && len(c.frame) == c.length+4 {
-			c.receipts.record(c.frame[4:])
+			c.record(c.frame[4:])
 			clear(c.frame)
 			c.frame, c.length = c.frame[:0], 0
 		}

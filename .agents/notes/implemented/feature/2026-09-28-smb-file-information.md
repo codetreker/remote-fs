@@ -58,7 +58,7 @@ QUERY_INFO／SET_INFO 的原签名字节不改写，related FileId 只在 frame-
 
 | 延后能力 | 延后代价与保持的结构 | 未交付请求的结果 |
 |---|---|---|
-| [7.6 关闭删除](../../proposed/feature/2026-09-28-smb-close-delete-obligation.md)与[8.1 名字修改](../../proposed/feature/2026-09-28-smb-guarded-name-mutation.md) | 增加持久义务与 ancestryguards；旧 CREATE 名字不当作当前事实 | disposition、rename／link、当前名字类明确 unsupported |
+| [7.6 关闭删除](../../implemented/feature/2026-09-28-smb-close-delete-obligation.md)与[8.1 名字修改](../../proposed/feature/2026-09-28-smb-guarded-name-mutation.md) | 增加持久义务与 ancestryguards；旧 CREATE 名字不当作当前事实 | disposition、rename／link、当前名字类明确 unsupported |
 | [8.2 范围锁](../../proposed/feature/2026-09-28-smb-range-lock-cancel.md) | 增加跨入口范围保护；EOF／Basic 继续走受控 reference 和 authority 最终检查 | LOCK／asyncCANCEL 按未交付协议结果处理 |
 | [8.3 通知与缓存](../../proposed/feature/2026-09-28-smb-change-notify-cache-coherence.md) | 增加失效协议与原生证明；不能将 Go／wire 查询成功当作 Windows 私有缓存资格 | CHANGE_NOTIFY 明确 unsupported |
 
