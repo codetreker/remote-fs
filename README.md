@@ -16,9 +16,11 @@ make build
 
 ## 部署
 
-[Compose](deployments/service/compose.yml) 提供应用容器和同源 TLS proxy。准备 UID/GID 10001 所有、0700 的私有 state 目录，复制[配置示例](deployments/service/config.example.yml)，设置 HTTPS `external_origin`。容器内保留 `state_root: /var/lib/remote-fs`。
+[Compose](deployments/service/compose.yml) 提供应用容器，将 HTTP 入口发布到宿主 `127.0.0.1:8080`。准备 UID/GID 10001 所有、0700 的私有 state 目录，复制[配置示例](deployments/service/config.example.yml)，设置 HTTPS `external_origin`。容器内使用 `listen: 0.0.0.0:8080` 和 `state_root: /var/lib/remote-fs`。由部署方配置同源 TLS proxy，将该 HTTPS origin 的请求转发到 `http://127.0.0.1:8080`；Console 与 API 使用同一个 origin，浏览器登录需要 HTTPS。
 
-设置 `RFS_STATE_ROOT` 为宿主 state 目录绝对路径，`RFS_CONFIG` 为配置文件绝对路径，`RFS_SITE` 为匹配 origin 的 hostname，然后执行：
+配置示例的 `trusted_proxy_cidrs` 为空。如果 proxy 转发客户端地址，通过此字段配置应用实际收到连接的受信直接代理地址 CIDR；Docker bridge 下该地址通常不是宿主 loopback 地址。
+
+设置 `RFS_STATE_ROOT` 为宿主 state 目录绝对路径，`RFS_CONFIG` 为配置文件绝对路径，然后执行：
 
 ```sh
 docker compose -f deployments/service/compose.yml build app
@@ -29,7 +31,7 @@ docker compose -f deployments/service/compose.yml up -d
 
 管理员命令从 no-echo 终端读取密码，自动化可用 `--password-file` 指向仅 owner 可读的普通文件。初始化、离线管理员维护与服务运行竞争同一个独占锁；维护管理员时先停止服务。新部署没有普通用户注册入口。
 
-[systemd unit](deployments/service/remote-fs-server.service) 和 [sysusers 配置](deployments/service/remote-fs.sysusers) 使用 UID/GID 10001 的 `remote-fs` 账号与同名组，以及私有 `/var/lib/remote-fs`。安装 binary、配置同源 TLS proxy 后，以同一 service account 执行：
+[systemd unit](deployments/service/remote-fs-server.service) 和 [sysusers 配置](deployments/service/remote-fs.sysusers) 使用 UID/GID 10001 的 `remote-fs` 账号与同名组，以及私有 `/var/lib/remote-fs`。直接运行 binary 时将配置示例的 `listen` 改为 `127.0.0.1:8080`。安装 binary、配置同源 TLS proxy 后，以同一 service account 执行：
 
 ```sh
 remote-fs-server init --config /etc/remote-fs/config.yml
