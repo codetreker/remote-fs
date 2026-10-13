@@ -309,9 +309,20 @@ func (fs *fileSession) pruneFileActionsLocked(now time.Time) {
 	}
 }
 
-func knownFileActionRefusal(err error) bool {
+type nodeOpenActionError struct {
+	cause       error
+	notExecuted bool
+}
+
+func (e *nodeOpenActionError) Error() string { return e.cause.Error() }
+func (e *nodeOpenActionError) Unwrap() error { return e.cause }
+
+func knownFileActionRefusal(operation storage.Operation, err error) bool {
 	if err == nil {
 		return false
+	}
+	if outcome, proved := err.(*nodeOpenActionError); proved {
+		return outcome.notExecuted && (operation == storage.OpFileOpenNodeRef || operation == storage.OpFileOpenChildRef)
 	}
 	if errors.Is(err, storage.ErrConditionConflict) || errors.Is(err, storage.ErrUseConflict) || errors.Is(err, storage.ErrRangeConflict) || errors.Is(err, storage.ErrInvalidScope) {
 		return true
@@ -433,7 +444,7 @@ func runFileAction[T any](
 		outcome := storage.FileActionCompleted
 		if callErr != nil {
 			outcome = storage.FileActionUnknown
-			if !hasEffect(result) && knownFileActionRefusal(callErr) {
+			if !hasEffect(result) && knownFileActionRefusal(operation, callErr) {
 				outcome = storage.FileActionNotExecuted
 			}
 		}

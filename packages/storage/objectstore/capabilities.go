@@ -2,6 +2,8 @@ package objectstore
 
 import (
 	"context"
+	"errors"
+	"reflect"
 	"syscall"
 
 	"github.com/codetreker/remote-fs/packages/metastore"
@@ -173,10 +175,17 @@ func (fs *fileSession) openNodeReference(ctx context.Context, options storage.No
 	ctx = metastore.WithFilePublicationGuard(ctx, fs.publicationAllowed)
 	done, err := fs.beginOpen(ctx)
 	if err != nil {
-		return storage.NodeOpenResult{}, err
+		return storage.NodeOpenResult{}, &nodeOpenActionError{cause: err, notExecuted: true}
 	}
 	defer done()
 	result, err := open(ctx)
+	if result.NotExecuted {
+		if err != nil && result.Reference == nil && reflect.ValueOf(result.State).IsZero() && result.Outcome == 0 {
+			err = &nodeOpenActionError{cause: err, notExecuted: true}
+		} else {
+			err = &nodeOpenActionError{cause: errors.Join(err, syscall.EIO)}
+		}
+	}
 	opened := storage.NodeOpenResult{Attr: result.State.Attr(), Outcome: result.Outcome}
 	if result.Reference == nil {
 		return opened, fs.finishOpen(nil, err)
