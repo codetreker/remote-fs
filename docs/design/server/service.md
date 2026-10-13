@@ -59,4 +59,4 @@ Console 和 CLI 通过同一管理 API 执行 owner 校验，提供自己的 vol
 
 ## 部署
 
-Compose/systemd 使用 listen、external_origin、state_root、trusted_proxy_cidrs、shutdown_timeout。一个进程使用本机私有持久目录，同源 TLS proxy 提供 HTTPS。server 不需要 FUSE 权限。健康入口仅报告进程/服务状态；reference 模式仍提供既有单 volume 文件服务，权限由其部署方负责。
+Compose/systemd 使用 listen、external_origin、state_root、trusted_proxy_cidrs、shutdown_timeout。一个进程使用本机私有持久目录。Compose 包含一个 app 容器，容器内监听 `0.0.0.0:8080`，HTTP 入口发布到宿主 `127.0.0.1:8080`；systemd 直接运行时监听本机 loopback。部署方提供匹配 external_origin 的同源 HTTPS 代理，Console 与 API 共用该 origin，浏览器会话使用 Secure cookie。配置示例的 trusted_proxy_cidrs 为空；接收代理转发的客户端地址时，该字段配置应用所见的受信直接代理地址 CIDR。server 不需要 FUSE 权限。健康入口仅报告进程/服务状态；reference 模式仍提供既有单 volume 文件服务，权限由其部署方负责。

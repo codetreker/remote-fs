@@ -11,8 +11,7 @@ services:
     restart: unless-stopped
     stop_grace_period: 60s
     ports:
-      - "80:80"
-      - "443:443"
+      - "127.0.0.1:8080:8080"
     volumes:
       - type: bind
         source: ${RFS_STATE_ROOT:?set RFS_STATE_ROOT to an existing private directory owned by UID 10001}
@@ -31,21 +30,3 @@ services:
       timeout: 3s
       start_period: 30s
       retries: 3
-
-  proxy:
-    image: caddy:2-alpine@sha256:d8542f48d34a9cf4e4c11a478865229840e87e4c96ea3f439101f31a5d35f75f
-    network_mode: service:app
-    depends_on:
-      app:
-        condition: service_healthy
-    environment:
-      RFS_SITE: ${RFS_SITE:?set RFS_SITE to the public hostname matching external_origin}
-    volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile:ro
-      - caddy_data:/data
-      - caddy_config:/config
-    restart: unless-stopped
-
-volumes:
-  caddy_data:
-  caddy_config:

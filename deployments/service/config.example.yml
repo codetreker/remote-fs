@@ -1,7 +1,5 @@
-listen: 127.0.0.1:8080
+listen: 0.0.0.0:8080
 external_origin: https://files.example.com
 state_root: /var/lib/remote-fs
-trusted_proxy_cidrs:
-  - 127.0.0.1/32
-  - ::1/128
+trusted_proxy_cidrs: []
 shutdown_timeout: 30s

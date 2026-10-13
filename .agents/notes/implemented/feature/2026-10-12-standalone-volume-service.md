@@ -10,7 +10,7 @@ Status: implemented
 
 服务使用一份管理 SQLite，复用现有 localstore 的 List/Stat/Space、metadata snapshot 和创建时的 quota 配置。管理库保存用户、credential、immutable owner、volume 名称与存储配置。用户创建、改名和删除自己的 volumes，只读浏览自己的目录/文件元数据；管理员额外读取 ordinary-user 列表和 name/files/directories/Used/quota 摘要。普通用户登录等待身份系统接入，本地管理员使用账号密码。
 
-单 Go module 中，`internal/service` 组合认证、管理 API 和现有 stores；`internal/management` 是具体 SQLite store；`internal/serviceapi` 保存 wire/client；`internal/console` 保存 TS UI 与 Go embed。文件 packages 和原协议不引入账号、服务 registry 或新原生能力。目录与运行机制见[服务架构](../../../../docs/design/server/service.md)，部署和命令见[README](../../../../README.md)。
+单 Go module 中，`internal/service` 组合认证、管理 API 和现有 stores；`internal/management` 是具体 SQLite store；`internal/serviceapi` 保存 wire/client；`internal/console` 保存 TS UI 与 Go embed。文件 packages 和原协议不引入账号、服务 registry 或新原生能力。Compose 部署一个 app 容器，HTTP 入口发布到宿主 loopback；同源 HTTPS 入口由部署方提供。目录与运行机制见[服务架构](../../../../docs/design/server/service.md)，部署和命令见[README](../../../../README.md)。
 
 文件元数据和摘要通过现有接口读取。服务遍历 Log.Snapshot/Next 计 regular+symlink 文件数与目录数，不跟随链接且不计 root；Used/quota 单独读取 Space。读取/关闭失败不回零，两次读取不承诺跨调用原子。所有接口在打开目标前校验当前身份和实际 owner；摘要不披露他人路径、属性、内容或文件入口。
 
