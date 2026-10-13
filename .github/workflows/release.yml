@@ -17,7 +17,8 @@ jobs:
       contents: read
       packages: write
     outputs:
-      image: ghcr.io/codetreker/remote-fs@${{ steps.build.outputs.digest }}
+      image: ${{ steps.image.outputs.image }}
+      digest: ${{ steps.build.outputs.digest }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -28,6 +29,11 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Choose service image tag
+        id: image
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 .github/scripts/service-image-tag.py
       - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         id: build
         with:
@@ -35,7 +41,7 @@ jobs:
           file: deployments/service/Dockerfile
           push: true
           provenance: false
-          tags: ghcr.io/codetreker/remote-fs:${{ github.sha }}
+          tags: ${{ steps.image.outputs.image }}
           labels: org.opencontainers.image.source=https://github.com/${{ github.repository }}
 
   staging:
@@ -58,6 +64,7 @@ jobs:
           DEPLOY_PATH: ${{ vars.DEPLOY_PATH }}
           ENVIRONMENT: staging
           IMAGE: ${{ needs.build.outputs.image }}
+          EXPECTED_DIGEST: ${{ needs.build.outputs.digest }}
           GHCR_USERNAME: ${{ github.actor }}
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: bash .github/scripts/deploy-service.sh
@@ -82,6 +89,7 @@ jobs:
           DEPLOY_PATH: ${{ vars.DEPLOY_PATH }}
           ENVIRONMENT: prod
           IMAGE: ${{ needs.build.outputs.image }}
+          EXPECTED_DIGEST: ${{ needs.build.outputs.digest }}
           GHCR_USERNAME: ${{ github.actor }}
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: bash .github/scripts/deploy-service.sh

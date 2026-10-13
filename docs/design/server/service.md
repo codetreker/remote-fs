@@ -65,10 +65,12 @@ Compose 将已准备的私有 state 目录和只读 YAML 配置 bind mount 到�
 
 ### staging 与 production 发布
 
-R-SVC-9 由手动触发的 [release workflow](../../../.github/workflows/release.yml) 实现。build 作业只构建一次服务镜像，推送私有 `ghcr.io/codetreker/remote-fs`，并将得到的不可变 digest 传给 staging 和 prod 作业。staging 部署成功并通过 Compose 就绪等待后，prod 才使用同一 digest 部署。构建、拉取、启动或就绪等待失败均使发布失败。
+R-SVC-9 由手动触发的 [release workflow](../../../.github/workflows/release.yml) 实现。build 作业通过 [tag 分配脚本](../../../.github/scripts/service-image-tag.py) 读取 GHCR Registry V2 的已发布 tag，生成 `<yymmdd>-<seq>-<hash-8>`。日期为分配时的 UTC 日期，序号为当天格式正确的已发布 tag 中最大序号加一，首次为 1；hash 为 `GITHUB_SHA` 前 8 位。workflow 串行运行，并独占此镜像的发布；当天已发布的 tag 保留，已有 tag 不覆盖，重新执行 build 时取得下一个序号。
+
+build 只构建一次服务镜像，向私有 `ghcr.io/codetreker/remote-fs` 推送分配的 tag，将完整 tag 引用与 build 输出 digest 传给 staging 和 prod 作业。staging 部署成功并通过 Compose 就绪等待后，prod 才部署同一产物。tag 分配、构建、拉取、digest 校验、启动或就绪等待失败均使发布失败。
 
 staging 和 prod 两个 GitHub Environments 使用已有 `OC_VM_HOST`、`OC_VM_USER` 和 `OC_VM_SSH_KEY` 连接部署机，`OC_VM_KNOWN_HOSTS` 提供经核验的 SSH host 公钥记录。各自的 `DEPLOY_PATH` 指向独立环境目录，持有本环境的 `.env`、YAML 配置和私有 state；镜像不包含这些内容。两套环境使用 `remote-fs-staging` 和 `remote-fs-prod` Compose project name，同机部署的 HTTP 端口也必须不同。
 
-[部署脚本](../../../.github/scripts/deploy-service.sh) 用 SSH/SCP 更新 `DEPLOY_PATH/compose.yml`，将本次 digest 作为 `RFS_IMAGE` 传给 Compose。命令读取已有 `.env` 与临时镜像选择文件，执行 `up --pull always --no-build --wait --wait-timeout 180 app`；健康检查成功后才将选择文件写为 `release.env`。后续维护同时读取 `.env` 和 `release.env`。发布保留目录中的数据与配置，不执行初始化或管理员维护命令。
+[部署脚本](../../../.github/scripts/deploy-service.sh) 用 SSH/SCP 更新 `DEPLOY_PATH/compose.yml`，拉取本次 tag，并从本地 image 的 `RepoDigests` 核对本仓库的 digest 等于 build 输出的 `EXPECTED_DIGEST`；不匹配时在启动前失败。脚本将完整 tag 引用作为 `RFS_IMAGE` 传给 Compose，读取已有 `.env` 与临时镜像选择文件，执行 `up --pull never --no-build --wait --wait-timeout 180 app`；健康检查成功后才将选择文件写为 `release.env`。后续维护同时读取 `.env` 和 `release.env`。发布保留目录中的数据与配置，不执行初始化或管理员维护命令。
 
 GHCR 权限通过各作业自己的 `GITHUB_TOKEN` 提供；构建作业可写 package，部署作业只读 package。SSH key 和 known_hosts 临时文件位于 runner 工作区的 `.tmp`，registry 登录状态位于 `DEPLOY_PATH` 内的私有临时目录，两者随部署命令结束清理。部署方准备 Docker Compose plugin、环境目录、HTTPS 入口和初始管理员；操作方式见[README](../../../README.md)，范围与代价见[发布决定](../../../.agents/notes/implemented/process/2026-10-13-stage-service-image-release.md)。

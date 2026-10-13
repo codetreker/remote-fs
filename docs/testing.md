@@ -509,15 +509,18 @@ SMB Basic 设置共享时间与 HIDDEN／SYSTEM 后，Linux 原 fd 的 fstat 必
 
 ## 服务发布
 
-R-SVC-9 的发布验证分为流程与运行两层。流程检查使用 actionlint 验证 [release workflow](../.github/workflows/release.yml)，核对 prod 依赖 build 与 staging，两个部署都使用同一 build 输出 digest。shell 语法检查和 ShellCheck 验证[部署脚本](../.github/scripts/deploy-service.sh)与[聚焦用例](../.github/scripts/test-deploy-service.sh)。用例执行远端 Bash 命令，在 Docker 命令边界注入失败，核对错误使部署失败、失败后原 `release.env` 保留、成功后记录本次 digest，以及私有 registry 登录目录随成功或失败清理。环境配置、state 和端口设置在部署前准备，用例核对更新 Compose 与镜像选择不会修改这些内容。
+R-SVC-9 的发布验证分为流程与运行两层。流程检查使用 actionlint 验证 [release workflow](../.github/workflows/release.yml)，核对 prod 依赖 build 与 staging，两个部署都取得同一 build 输出 tag 与 `EXPECTED_DIGEST`。shell 语法检查和 ShellCheck 验证[部署脚本](../.github/scripts/deploy-service.sh)与[聚焦用例](../.github/scripts/test-deploy-service.sh)。用例执行远端 Bash 命令，核对拉取 tag 后从 `RepoDigests` 匹配预期 digest，再以 `--pull never` 启动 Compose；拉取、inspect、digest 不匹配和健康等待失败时不推进 `release.env`。成功后记录本次完整 tag，私有 registry 登录目录随成功或失败清理。环境配置、state 和端口设置在部署前准备，用例核对部署不会修改这些内容。
+
+[tag 分配用例](../.github/scripts/test-service-image-tag.py) 使用标准库 HTTP 替身验证 [tag 脚本](../.github/scripts/service-image-tag.py)：分页取得全部 tag 后按当天序号的数值取最大值，忽略旧日期和格式错误的 tag，首次编号为 1，已发布构建的重试取下一编号，hash 取源码 SHA 前 8 位。只有首次枚举明确返回 `NAME_UNKNOWN` 的 404 才表示尚无 tag；认证、网络、解析、类型和分页错误必须失败。用例还核对 UTC 日期、GHCR HTTPS 目标限制和输出不泄漏 token。
 
 ```sh
+python3 .github/scripts/test-service-image-tag.py
 bash .github/scripts/test-deploy-service.sh
 ```
 
-Compose 配置检查分别渲染本地默认值、staging 和 prod，核对 image digest、project name、loopback 端口与既有 bind mounts。部署流程改动只运行覆盖这些文件的检查。
+Compose 配置检查分别渲染本地默认值、staging 和 prod，核对完整 tag、project name、loopback 端口与既有 bind mounts。部署流程改动只运行覆盖这些文件的检查。
 
-运行验收使用实际构建的服务镜像和 Compose：初始化独立的私有 state，创建管理员，启动后通过 `/health/ready` 确认就绪，再替换容器并验证原用户和 volumes 保留。staging 与 production 使用不同 project name、配置、state 和同机端口；一个环境的部署不能修改另一个环境的目录。失败的启动或健康检查必须由 Compose 就绪等待报告。流程替身证明命令顺序和错误传递，真实 Compose 验收证明镜像、挂载和健康检查的组合，两者的结论分别报告。生产 VM 的 SSH、私有 GHCR 权限和 HTTPS 入口仍须在实际发布中确认。
+运行验收使用实际构建的服务镜像和 Compose：初始化独立的私有 state，创建管理员，启动后通过 `/health/ready` 确认就绪，再替换容器并验证原用户和 volumes 保留。staging 与 production 使用不同 project name、配置、state 和同机端口；一个环境的部署不能修改另一个环境的目录。失败的启动或健康检查必须由 Compose 就绪等待报告。流程替身证明命令顺序和错误传递，真实 Compose 验收证明镜像、挂载和健康检查的组合，两者的结论分别报告。生产 VM 的 SSH、私有 GHCR 的首次发布与 tag 枚举、package 权限和 HTTPS 入口仍须在实际发布中确认。
 
 ## 每次改动必须带什么
 
