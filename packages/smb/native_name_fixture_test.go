@@ -197,7 +197,7 @@ func (r *nativeDeleteReference) ObserveName(ctx context.Context, guards *storage
 	return b.name(ctx, r.id)
 }
 
-func (s *nativeDeleteSession) MutateName(ctx context.Context, command storage.NameCommand) (storage.NameResult, error) {
+func (s *nativeDeleteSession) MutateName(ctx context.Context, command storage.NameCommand) (result storage.NameResult, returned error) {
 	b := s.mutable
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -207,6 +207,21 @@ func (s *nativeDeleteSession) MutateName(ctx context.Context, command storage.Na
 	if err := command.Check(); err != nil {
 		return storage.NameResult{}, err
 	}
+	if previous, exists := b.actions[command.Action]; exists {
+		if previous.Operation != storage.OpFileMutateName {
+			return storage.NameResult{}, syscall.EINVAL
+		}
+		if previous.Outcome == storage.FileActionNotExecuted {
+			return storage.NameResult{}, previous.failure
+		}
+		return storage.NameResult{}, syscall.EINVAL
+	}
+	effectStarted := false
+	defer func() {
+		if returned != nil && !effectStarted {
+			b.recordNameRefusal(command.Action, storage.OpFileMutateName, returned)
+		}
+	}()
 	if command.Kind != storage.NameRename {
 		return storage.NameResult{}, syscall.EOPNOTSUPP
 	}
@@ -264,8 +279,10 @@ func (s *nativeDeleteSession) MutateName(ctx context.Context, command storage.Na
 				return storage.NameResult{}, storage.ErrUseConflict
 			}
 		}
+		effectStarted = true
 		b.unlink(target.ID)
 	}
+	effectStarted = true
 	b.unlink(id)
 	b.views[destination.Parent.NodeID] = append(b.views[destination.Parent.NodeID], storage.Entry{Name: string(destination.OutputLeaf), Attr: attr.Clone()})
 	for ref := range b.refs {
@@ -273,7 +290,7 @@ func (s *nativeDeleteSession) MutateName(ctx context.Context, command storage.Na
 			ref.parent, ref.name = destination.Parent.NodeID, string(destination.OutputLeaf)
 		}
 	}
-	b.actions[command.Action] = storage.FileActionReceipt{Action: command.Action, Operation: storage.OpFileMutateName, Outcome: storage.FileActionCompleted}
+	b.actions[command.Action] = nativeDeleteAction{FileActionReceipt: storage.FileActionReceipt{Action: command.Action, Operation: storage.OpFileMutateName, Outcome: storage.FileActionCompleted}}
 	return storage.NameResult{Attr: &attr}, nil
 }
 
@@ -334,7 +351,7 @@ func (r *nativeDeleteReference) pendingState() storage.ReferenceState {
 	return state
 }
 
-func (r *nativeDeleteReference) SetPendingUnlink(ctx context.Context, command storage.PendingUnlinkCommand) (storage.ReferenceState, error) {
+func (r *nativeDeleteReference) SetPendingUnlink(ctx context.Context, command storage.PendingUnlinkCommand) (state storage.ReferenceState, returned error) {
 	b := r.owner.mutable
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -344,6 +361,18 @@ func (r *nativeDeleteReference) SetPendingUnlink(ctx context.Context, command st
 	if err := command.Check(); err != nil {
 		return storage.ReferenceState{}, err
 	}
+	if previous, exists := b.actions[command.Action]; exists {
+		if previous.Operation == storage.OpFileSetPendingUnlink && previous.Outcome == storage.FileActionNotExecuted {
+			return storage.ReferenceState{}, previous.failure
+		}
+		return storage.ReferenceState{}, syscall.EINVAL
+	}
+	effectStarted := false
+	defer func() {
+		if returned != nil && !effectStarted {
+			b.recordNameRefusal(command.Action, storage.OpFileSetPendingUnlink, returned)
+		}
+	}()
 	if err := b.use(r.id, command.Uses); err != nil {
 		return storage.ReferenceState{}, err
 	}
@@ -353,15 +382,16 @@ func (r *nativeDeleteReference) SetPendingUnlink(ctx context.Context, command st
 	if command.Condition == storage.UnlinkIfEmpty && len(b.views[r.id]) != 0 {
 		return storage.ReferenceState{}, syscall.ENOTEMPTY
 	}
+	effectStarted = true
 	if !b.ordinary[r.id] {
 		b.generations[r.id]++
 		b.ordinary[r.id] = true
 	}
-	b.actions[command.Action] = storage.FileActionReceipt{Action: command.Action, Operation: storage.OpFileSetPendingUnlink, Outcome: storage.FileActionCompleted}
+	b.actions[command.Action] = nativeDeleteAction{FileActionReceipt: storage.FileActionReceipt{Action: command.Action, Operation: storage.OpFileSetPendingUnlink, Outcome: storage.FileActionCompleted}}
 	return r.pendingState(), nil
 }
 
-func (r *nativeDeleteReference) ClearPendingUnlink(ctx context.Context, command storage.ClearPendingUnlinkCommand) (storage.ReferenceState, error) {
+func (r *nativeDeleteReference) ClearPendingUnlink(ctx context.Context, command storage.ClearPendingUnlinkCommand) (state storage.ReferenceState, returned error) {
 	b := r.owner.mutable
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -371,16 +401,35 @@ func (r *nativeDeleteReference) ClearPendingUnlink(ctx context.Context, command 
 	if err := command.Check(); err != nil {
 		return storage.ReferenceState{}, err
 	}
+	if previous, exists := b.actions[command.Action]; exists {
+		if previous.Operation == storage.OpFileClearPendingUnlink && previous.Outcome == storage.FileActionNotExecuted {
+			return storage.ReferenceState{}, previous.failure
+		}
+		return storage.ReferenceState{}, syscall.EINVAL
+	}
+	effectStarted := false
+	defer func() {
+		if returned != nil && !effectStarted {
+			b.recordNameRefusal(command.Action, storage.OpFileClearPendingUnlink, returned)
+		}
+	}()
 	if err := b.use(r.id, command.Uses); err != nil {
 		return storage.ReferenceState{}, err
 	}
-	state := r.pendingState()
+	state = r.pendingState()
 	if !bytes.Equal(command.Generation, state.PendingGeneration) {
 		return storage.ReferenceState{}, storage.ErrConditionConflict
 	}
+	effectStarted = true
 	delete(b.ordinary, r.id)
-	b.actions[command.Action] = storage.FileActionReceipt{Action: command.Action, Operation: storage.OpFileClearPendingUnlink, Outcome: storage.FileActionCompleted}
+	b.actions[command.Action] = nativeDeleteAction{FileActionReceipt: storage.FileActionReceipt{Action: command.Action, Operation: storage.OpFileClearPendingUnlink, Outcome: storage.FileActionCompleted}}
 	return r.pendingState(), nil
+}
+
+func (b *nativeDeleteBackend) recordNameRefusal(action storage.FileActionID, operation storage.Operation, cause error) {
+	if _, exists := b.actions[action]; !exists {
+		b.actions[action] = nativeDeleteAction{FileActionReceipt: storage.FileActionReceipt{Action: action, Operation: operation, Outcome: storage.FileActionNotExecuted}, failure: cause}
+	}
 }
 
 func TestNativeNameProbeFixture(t *testing.T) {
@@ -440,11 +489,18 @@ func TestNativeNameProbeFixture(t *testing.T) {
 	if err != nil || scalars.CheckProjection(3, storage.StateScalars) != nil || !bytes.Equal(scalars.PendingGeneration, state.PendingGeneration) {
 		t.Fatalf("fixture scalar token=%+v error=%v", scalars, err)
 	}
-	if _, err := ref.ClearPendingUnlink(t.Context(), storage.ClearPendingUnlinkCommand{Action: action(), Uses: uses}); !errors.Is(err, storage.ErrConditionConflict) {
+	refusedClear := storage.ClearPendingUnlinkCommand{Action: action(), Uses: uses}
+	if _, err := ref.ClearPendingUnlink(t.Context(), refusedClear); !errors.Is(err, storage.ErrConditionConflict) {
 		t.Fatalf("fixture nil CAS cleared pending: %v", err)
+	}
+	if receipt, err := session.QueryFileAction(t.Context(), refusedClear.Action); err != nil || receipt.Action != refusedClear.Action || receipt.Operation != storage.OpFileClearPendingUnlink || receipt.Outcome != storage.FileActionNotExecuted {
+		t.Fatalf("fixture CLEAR refusal receipt=%+v error=%v", receipt, err)
 	}
 	if _, err := ref.ClearPendingUnlink(t.Context(), storage.ClearPendingUnlinkCommand{Action: action(), Generation: state.PendingGeneration, Uses: uses}); err != nil {
 		t.Fatal(err)
+	}
+	if _, err := ref.ClearPendingUnlink(t.Context(), refusedClear); !errors.Is(err, storage.ErrConditionConflict) {
+		t.Fatalf("fixture replay changed its original CLEAR refusal: %v", err)
 	}
 	second, err := ref.SetPendingUnlink(t.Context(), storage.PendingUnlinkCommand{Action: action(), Condition: storage.UnlinkFile, Uses: uses})
 	if err != nil || bytes.Equal(state.PendingGeneration, second.PendingGeneration) {
@@ -455,5 +511,63 @@ func TestNativeNameProbeFixture(t *testing.T) {
 	}
 	if backend.binding(3).State != storage.NameDetached {
 		t.Fatal("ordinary last-reference close did not detach renamed object")
+	}
+}
+
+func TestNativeNameProbeDescendantRefusalReceipt(t *testing.T) {
+	backend := NewNativeDeleteProbeBackend()
+	raw, err := backend.NewFileSession(t.Context(), storage.DefaultFileSessionOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := raw.(*nativeDeleteSession)
+	t.Cleanup(func() {
+		if err := session.Close(context.Background()); err != nil {
+			t.Error(err)
+		}
+	})
+	action := func() storage.FileActionID {
+		id, err := storage.NewFileActionID(1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	open := func(parent, id uint64, leaf string, kind storage.NodeKind, uses storage.Uses) storage.NodeReference {
+		opened, err := session.OpenChildRef(t.Context(), storage.ChildSelection{Name: storage.ChildName{Parent: storage.DirectoryTarget{NodeID: parent}, RawLeaf: []byte(leaf)}},
+			storage.NodeRefOptions{Kind: kind, Action: action(), Target: storage.ChildCondition{State: storage.SameNode, NodeID: id}, Use: storage.UseClaim{Uses: uses}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return opened.Reference
+	}
+	directory := open(1, 2, "folder", storage.NodeDirectory, storage.DeleteName)
+	child := open(2, 6, "nested.txt", storage.NodeRegular, 0)
+	scope, err := directory.Scope(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := storage.NameCommand{Kind: storage.NameRename, Action: action(), Name: storage.ChildName{Parent: storage.DirectoryTarget{NodeID: 1}, RawLeaf: []byte("folder")},
+		Target: storage.ChildCondition{State: storage.SameNode, NodeID: 2}, RequireNoOpenDescendants: true, Uses: []storage.TargetUse{{NodeID: 2, Scope: scope}},
+		Destination: &storage.RenameTarget{Parent: storage.DirectoryTarget{NodeID: 1}, ObservedLeaf: []byte("moved"), OutputLeaf: []byte("moved"), Expected: storage.ChildCondition{State: storage.Absent}}}
+	if _, err := session.MutateName(t.Context(), command); !errors.Is(err, syscall.EACCES) {
+		t.Fatalf("fixture descendant refusal=%v", err)
+	}
+	receipt, err := session.QueryFileAction(t.Context(), command.Action)
+	if err != nil || receipt.Action != command.Action || receipt.Operation != storage.OpFileMutateName || receipt.Outcome != storage.FileActionNotExecuted {
+		t.Fatalf("fixture descendant refusal receipt=%+v error=%v", receipt, err)
+	}
+	if err := child.Close(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := session.MutateName(t.Context(), command); !errors.Is(err, syscall.EACCES) || string(backend.binding(2).RawLeaf) != "folder" {
+		t.Fatalf("fixture replay performed refused rename: %v", err)
+	}
+	if after, err := session.QueryFileAction(t.Context(), command.Action); err != nil || after != receipt {
+		t.Fatalf("fixture replay changed refusal receipt=%+v error=%v", after, err)
+	}
+	command.Action = action()
+	if _, err := session.MutateName(t.Context(), command); err != nil || string(backend.binding(2).RawLeaf) != "moved" {
+		t.Fatalf("fresh fixture action after descendant closed: %v", err)
 	}
 }

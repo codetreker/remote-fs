@@ -48,7 +48,7 @@ func NewNativeDeleteProbeBackend() *nativeDeleteBackend {
 	b.views[1][4].Attr.ID = 7
 	b.views[7] = nil
 	return &nativeDeleteBackend{nativeDirectoryBackend: b, refs: make(map[*nativeDeleteReference]struct{}),
-		intents: make(map[storage.DeleteIntentID]*nativeDeleteIntent), actions: make(map[storage.FileActionID]storage.FileActionReceipt), nextNode: 100,
+		intents: make(map[storage.DeleteIntentID]*nativeDeleteIntent), actions: make(map[storage.FileActionID]nativeDeleteAction), nextNode: 100,
 		ordinary: make(map[uint64]bool), generations: make(map[uint64]uint64), revision: 1}
 }
 
@@ -58,12 +58,17 @@ type nativeDeleteIntent struct {
 	cursor storage.DeleteIntentCursor
 }
 
+type nativeDeleteAction struct {
+	storage.FileActionReceipt
+	failure error
+}
+
 type nativeDeleteBackend struct {
 	*nativeDirectoryBackend
 	mu           sync.Mutex
 	refs         map[*nativeDeleteReference]struct{}
 	intents      map[storage.DeleteIntentID]*nativeDeleteIntent
-	actions      map[storage.FileActionID]storage.FileActionReceipt
+	actions      map[storage.FileActionID]nativeDeleteAction
 	sequence     storage.DeleteIntentCursor
 	nextNode     uint64
 	acknowledged []storage.DeleteIntentStatus
@@ -200,7 +205,7 @@ func (s *nativeDeleteSession) OpenAt(ctx context.Context, selection storage.Chil
 		s.mutable.updateAttr(attr)
 		outcome = storage.Reset
 	}
-	s.mutable.actions[options.Action] = storage.FileActionReceipt{Action: options.Action, Operation: storage.OpFileOpenAt, Outcome: storage.FileActionCompleted}
+	s.mutable.actions[options.Action] = nativeDeleteAction{FileActionReceipt: storage.FileActionReceipt{Action: options.Action, Operation: storage.OpFileOpenAt, Outcome: storage.FileActionCompleted}}
 	return storage.OpenResult{File: &nativeDeleteFile{nativeDeleteReference: ref, readable: options.Read, writable: options.Write}, Attr: attr, Outcome: outcome}, nil
 }
 
@@ -305,7 +310,7 @@ func (s *nativeDeleteSession) open(ctx context.Context, selection storage.ChildS
 		ref.intent = intent.ID
 		b.intents[intent.ID] = &nativeDeleteIntent{DeleteIntentStatus: storage.DeleteIntentStatus{ID: intent.ID, NodeID: attr.ID, Outcome: storage.DeleteIntentArmed}, owner: intent.Owner, cursor: b.sequence}
 	}
-	b.actions[options.Action] = storage.FileActionReceipt{Action: options.Action, Operation: storage.OpFileOpenChildRef, Outcome: storage.FileActionCompleted}
+	b.actions[options.Action] = nativeDeleteAction{FileActionReceipt: storage.FileActionReceipt{Action: options.Action, Operation: storage.OpFileOpenChildRef, Outcome: storage.FileActionCompleted}}
 	return ref, attr.Clone(), outcome, nil
 }
 
@@ -316,7 +321,7 @@ func (s *nativeDeleteSession) QueryFileAction(ctx context.Context, id storage.Fi
 		return storage.FileActionReceipt{}, err
 	}
 	if result, found := s.mutable.actions[id]; found {
-		return result, nil
+		return result.FileActionReceipt, nil
 	}
 	return storage.FileActionReceipt{Action: id, Outcome: storage.FileActionUnknown}, nil
 }
@@ -376,7 +381,7 @@ func (s *nativeDeleteSession) AcknowledgeDeleteIntent(ctx context.Context, comma
 		s.mutable.acknowledged = append(s.mutable.acknowledged, intent.DeleteIntentStatus)
 		delete(s.mutable.intents, command.Intent)
 	}
-	s.mutable.actions[command.Action] = storage.FileActionReceipt{Action: command.Action, Operation: storage.OpFileAcknowledgeDeleteIntent, Outcome: storage.FileActionCompleted}
+	s.mutable.actions[command.Action] = nativeDeleteAction{FileActionReceipt: storage.FileActionReceipt{Action: command.Action, Operation: storage.OpFileAcknowledgeDeleteIntent, Outcome: storage.FileActionCompleted}}
 	return nil
 }
 
