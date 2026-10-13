@@ -126,7 +126,7 @@ native 仍返回 Reset 和原 NodeID；只有 CREATE disposition 0 把它投影 
 | `sqlite/namespace_guards.go`、`namespace_mutations.go`、`durable.go`、`files.go` | rooted command coverage、最终名字效果、同一 pins 清单及后代关联检查。 |
 | `sqlite/atomic_open.go`、`publication.go`、`file_access.go`、`node_references.go`、`pending_unlink.go`、`options.go` | reset effect use、原 publication、ordinary／DOC 状态和现有工作上限。 |
 
-wrappers 保留已有生产接口与完整参数透传；没有新 wrapper capability。相关接受／错误／竞争／预算验证由[测试策略](../../../../docs/testing.md)拥有，原有观察、子项选择和 CloseIntent 决定保留各自理由及范围。
+wrappers 保留已有生产接口与完整参数透传；没有新 wrapper capability。验证按事实所属层划分：完整 SMB access／字段／policy／FIFO／retry／projection／assembly 向量使用现有 callback／窄 mutable fixtures，原子状态、共享、grant、发布、严格 RPC 和 journal 由真实 SQLite／objectstore／HTTP 包用例承担。实际 direct／HTTP 组合仍覆盖 current identity／replacement、Unknown 原 action replay、DOC clear、zero-data existing／missing、selection race 与 mixed data grants，签名 peer、SSE／mounted FUSE 与原生 oracle 保持。真实 backend／schema 每个 transport／family 只构造一次，每个 case 有新 FileSession／server／tree／config／policy／ledger 和受检验 cleanup；不把未结清状态复用给下一 case。该分层保留原累计 watchdog 与全部边界／错误断言，避免每个 host 向量为同一 schema 和存储事实重复准备。完整归属见[测试策略](../../../../docs/testing.md)；原观察、子项选择和 CloseIntent 决定保留各自理由及范围。
 
 ## 备选方案
 
