@@ -63,3 +63,57 @@ func (s *Store) checkNamespaceGuards(ctx context.Context, tx *sql.Tx, guards *st
 	}
 	return nil
 }
+
+func (s *Store) checkNoOpenDescendants(ctx context.Context, tx *sql.Tx, source int64) error {
+	pins := s.coordinator.pins[s.volume]
+	if len(pins) > s.fileDomain.maxFiles {
+		return syscall.EFBIG
+	}
+	remaining := s.maxIntegrityRecords
+	charge := func() error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if remaining == 0 {
+			return syscall.EFBIG
+		}
+		remaining--
+		return nil
+	}
+	for candidate, count := range pins {
+		if count <= 0 || candidate == source {
+			continue
+		}
+		if err := charge(); err != nil {
+			return err
+		}
+		seen := make(map[int64]struct{})
+		for id := candidate; ; {
+			if err := charge(); err != nil {
+				return err
+			}
+			if _, duplicate := seen[id]; duplicate {
+				return syscall.EIO
+			}
+			seen[id] = struct{}{}
+			observed, _, err := s.nameObservationHeader(ctx, tx, id)
+			if err != nil {
+				return err
+			}
+			if observed.State == storage.NameDetached {
+				if id != candidate {
+					return syscall.EIO
+				}
+				break
+			}
+			if observed.State == storage.NameRoot {
+				break
+			}
+			if int64(observed.ParentID) == source {
+				return syscall.EACCES
+			}
+			id = int64(observed.ParentID)
+		}
+	}
+	return nil
+}

@@ -153,8 +153,9 @@ type NodeReferences interface {
 
 // ReferenceStateAccess captures identity state and pending deletion together.
 // StateFull requires ReadMetadata. StateScalars exposes only identity, kind, size,
-// allocation and deletion facts through a live reference; it grants no metadata
-// permission. The projection is explicit, and every failed query returns zero.
+// allocation and deletion facts, including the bounded pending generation,
+// through a live reference; it grants no metadata permission. The projection is
+// explicit, and every failed query returns zero.
 type ReferenceStateAccess interface {
 	CheckReferenceState() error
 	State(context.Context, StateProjection) (ReferenceState, error)
@@ -229,8 +230,9 @@ type RangeControl interface {
 }
 
 // DeleteIntent changes node-level pending deletion under native admission.
-// Clearing requires the current generation and does not erase another
-// reference's accepted close intent.
+// Clearing compares the current aggregate generation, where an empty token
+// requires no pending deletion, and does not erase another reference's accepted
+// close intent.
 type DeleteIntent interface {
 	CheckDeleteIntent() error
 	SetPendingUnlink(context.Context, PendingUnlinkCommand) (ReferenceState, error)
@@ -436,8 +438,11 @@ type OpenAtOptions struct {
 	Action                 FileActionID
 	Use                    UseClaim
 	Existing               ExistingEffect
-	Initial                InitialState
-	CloseIntent            *CloseIntent `json:",omitempty"`
+	// Zero authorizes ResetContent through WriteData. DeleteName authorizes an
+	// existing SameNode reset without granting data access; Create must be false.
+	ResetUse    Uses
+	Initial     InitialState
+	CloseIntent *CloseIntent `json:",omitempty"`
 }
 
 // A nonnil File transfers cleanup ownership even when OpenAt returns an error.
@@ -502,6 +507,11 @@ type NameCommand struct {
 	Destination *RenameTarget `json:",omitempty"`
 	Initial     InitialFields
 	Uses        []TargetUse `json:",omitempty"`
+	// Nonnil guards cover both parent paths and exact SameNode terminal bindings.
+	// The authority binds RootID and revalidates all evidence at the effect point.
+	Guards *NamespaceGuards `json:",omitempty"`
+	// Rename admission includes every authority-retained descendant reference.
+	RequireNoOpenDescendants bool `json:",omitempty"`
 }
 
 // Attr identifies the affected node. Successful removal may omit it. Attr with

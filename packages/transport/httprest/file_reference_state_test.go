@@ -18,6 +18,7 @@ func (r *scalarStateFlagsReference) State(ctx context.Context, projection storag
 	if err == nil && projection == storage.StateScalars {
 		state.Detached = true
 		state.PendingUnlink = true
+		state.PendingGeneration = []byte{1}
 	}
 	return state, err
 }

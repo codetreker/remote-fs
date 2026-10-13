@@ -223,6 +223,7 @@ func (r *nodeReference) SetPendingUnlink(ctx context.Context, command storage.Pe
 	if err := command.Check(); err != nil {
 		return storage.ReferenceState{}, err
 	}
+	command = canonicalFileActionInput(command).(storage.PendingUnlinkCommand)
 	target, err := r.session.referenceActionTarget(ctx, r)
 	if err != nil {
 		return storage.ReferenceState{}, err
@@ -250,6 +251,7 @@ func (r *nodeReference) ClearPendingUnlink(ctx context.Context, command storage.
 	if err := command.Check(); err != nil {
 		return storage.ReferenceState{}, err
 	}
+	command = canonicalFileActionInput(command).(storage.ClearPendingUnlinkCommand)
 	target, err := r.session.referenceActionTarget(ctx, r)
 	if err != nil {
 		return storage.ReferenceState{}, err
@@ -378,13 +380,16 @@ func observeNativeState(ctx context.Context, session *fileSession, capability me
 		if state.State.Metadata != nil || state.State.BirthTime != nil || state.State.ChangeTime != nil ||
 			!state.State.AccessTime.IsZero() || !state.State.ModTime.IsZero() || state.State.LinkTarget != nil ||
 			state.State.DirectoryRevision != nil || state.State.Content != "" || state.State.Revision != 0 ||
-			state.LinkTarget != nil || state.PendingGeneration != nil {
+			state.LinkTarget != nil {
 			return storage.ReferenceState{}, syscall.EIO
 		}
-		result = storage.ReferenceState{Attr: storage.Attr{ID: uint64(state.State.ID), Kind: state.State.Kind, Size: state.State.Size, AllocationSize: state.State.AllocationSize, AllocationKnown: state.State.AllocationKnown}, Detached: state.State.Detached, PendingUnlink: state.PendingUnlink}
+		result = storage.ReferenceState{Attr: storage.Attr{ID: uint64(state.State.ID), Kind: state.State.Kind, Size: state.State.Size, AllocationSize: state.State.AllocationSize, AllocationKnown: state.State.AllocationKnown}, Detached: state.State.Detached, PendingUnlink: state.PendingUnlink, PendingGeneration: state.PendingGeneration}
 	}
 	if err := result.CheckProjection(id, projection); err != nil {
 		return storage.ReferenceState{}, err
+	}
+	if projection == storage.StateScalars {
+		result.PendingGeneration = bytes.Clone(result.PendingGeneration)
 	}
 	if err := checkObservedReference(ctx, session, id, active); err != nil {
 		return storage.ReferenceState{}, err

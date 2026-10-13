@@ -79,7 +79,7 @@ func TestMutationOwnerNodeReferenceReplaysExactDeepCopiedIntent(t *testing.T) {
 			if err != nil || attr.ID != h.nodeID || attr.Kind != kind || calls != 2 {
 				t.Fatalf("metadata replay: attr=%+v err=%v calls=%d", attr, err, calls)
 			}
-			if !owner.command.Attr.Empty() || owner.command.Metadata != nil || owner.command.ExpectedMetadata != nil || server.Status().RetainedWriteBytes != 0 {
+			if !owner.command.file.Attr.Empty() || owner.command.file.Metadata != nil || owner.command.file.ExpectedMetadata != nil || server.Status().RetainedWriteBytes != 0 {
 				t.Fatal("settled metadata owner retained payload")
 			}
 			owner.recordResponse(ResponseSent)
@@ -176,11 +176,11 @@ func TestMutationOwnerNodeUnknownPreservesAllPayloadUntilSettledRelease(t *testi
 	}
 	owner.recordResponse(ResponseSent)
 	_ = owner.retire(true, false)
-	if server.Status().RetainedWriteBytes != charged || !reflect.DeepEqual(owner.command, command) {
+	if server.Status().RetainedWriteBytes != charged || !reflect.DeepEqual(*owner.command.file, command) {
 		t.Fatal("partial release discarded metadata intent")
 	}
 	_ = owner.retire(true, true)
-	if server.Status().RetainedWriteBytes != 0 || !owner.command.Attr.Empty() || owner.command.Metadata != nil || owner.command.ExpectedMetadata != nil {
+	if server.Status().RetainedWriteBytes != 0 || !owner.command.file.Attr.Empty() || owner.command.file.Metadata != nil || owner.command.file.ExpectedMetadata != nil {
 		t.Fatal("terminal release kept metadata payload")
 	}
 	if len(server.Status().WriteFailures) != 1 {

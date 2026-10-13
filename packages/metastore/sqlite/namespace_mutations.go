@@ -20,19 +20,12 @@ type namespaceMutation struct {
 	outputIsSource      bool
 }
 
-func (s *Store) checkPendingNameTarget(ctx context.Context, tx *sql.Tx, node int64, uses []storage.TargetUse) error {
+func (s *Store) checkPendingNameTarget(ctx context.Context, tx *sql.Tx, node int64) error {
 	pending, err := s.nodePendingUnlink(ctx, tx, node)
 	if err != nil || !pending {
 		return err
 	}
-	scope, err := s.targetScope(ctx, uint64(node), storage.DeleteName, uses)
-	if err != nil {
-		return err
-	}
-	if scope.Token == "" {
-		return storage.ErrPendingDelete
-	}
-	return nil
+	return storage.ErrPendingDelete
 }
 
 func (s *Store) checkNameMutationUses(ctx context.Context, uses []storage.TargetUse, nodes ...int64) error {
@@ -76,6 +69,12 @@ func (s *Store) checkNameAddition(ctx context.Context, tx *sql.Tx, parent int64)
 
 func (s *Store) prepareNamespaceMutation(ctx context.Context, tx *sql.Tx, command storage.NameCommand) (namespaceMutation, error) {
 	var mutation namespaceMutation
+	if command.Guards != nil && command.Guards.RootID != uint64(s.root) {
+		return mutation, storage.ErrConditionConflict
+	}
+	if err := s.checkNamespaceGuards(ctx, tx, command.Guards); err != nil {
+		return mutation, err
+	}
 	var err error
 	mutation.parent, _, err = s.directoryTarget(ctx, tx, command.Name.Parent, 0)
 	if err != nil {
@@ -103,7 +102,7 @@ func (s *Store) prepareNamespaceMutation(ctx context.Context, tx *sql.Tx, comman
 		return mutation, err
 	}
 	if found {
-		if err := s.checkPendingNameTarget(ctx, tx, mutation.source.ID, command.Uses); err != nil {
+		if err := s.checkPendingNameTarget(ctx, tx, mutation.source.ID); err != nil {
 			return mutation, err
 		}
 	}
@@ -173,7 +172,7 @@ func (s *Store) prepareNamespaceRename(ctx context.Context, tx *sql.Tx, command 
 		return mutation, err
 	}
 	if occupied && mutation.displaced.ID != mutation.source.ID {
-		if err := s.checkPendingNameTarget(ctx, tx, mutation.displaced.ID, command.Uses); err != nil {
+		if err := s.checkPendingNameTarget(ctx, tx, mutation.displaced.ID); err != nil {
 			return mutation, err
 		}
 	}
@@ -190,6 +189,11 @@ func (s *Store) prepareNamespaceRename(ctx context.Context, tx *sql.Tx, command 
 	}
 	if err := s.checkNameMutationUses(ctx, command.Uses, mutation.source.ID, mutation.displaced.ID); err != nil {
 		return mutation, err
+	}
+	if command.RequireNoOpenDescendants && mutation.source.IsDir() {
+		if err := s.checkNoOpenDescendants(ctx, tx, mutation.source.ID); err != nil {
+			return mutation, err
+		}
 	}
 	if mutation.outputIsSource && (!occupied || mutation.displaced.ID == mutation.source.ID) {
 		return mutation, nil

@@ -39,6 +39,7 @@ type openIntent struct {
 	access                         uint32
 	read, write, create, exclusive bool
 	reset, directory               bool
+	resetUse                       storage.Uses
 	use                            storage.UseClaim
 	metadataOnly                   bool
 	metadata                       storage.MetadataPermissions
@@ -109,18 +110,11 @@ func classifyCreate(request wire.CreateRequest) (openIntent, error) {
 	if intent.deleteOnClose && access&accessDelete == 0 {
 		return intent, syscall.EACCES
 	}
-	intent.access = access
 	intent.directory = request.Options&createDirectory != 0
-	intent.read = access&accessReadData != 0
-	intent.write = access&(accessWriteData|accessAppend) != 0
-	intent.metadataOnly = !intent.read && !intent.write
-	if access&(accessReadEA|accessReadAttr) != 0 {
-		intent.metadata |= storage.ReadMetadata
-	}
-	if access&(accessWriteEA|accessWriteAttr) != 0 {
-		intent.metadata |= storage.WriteMetadata
-	}
+	intent.setAccess(access, request.ShareAccess)
 	switch request.Disposition {
+	case 0: // FILE_SUPERSEDE fixes the reset branch after observing the target.
+		intent.create = true
 	case 1: // FILE_OPEN
 	case 2: // FILE_CREATE
 		intent.create, intent.exclusive = true, true
@@ -133,8 +127,24 @@ func classifyCreate(request wire.CreateRequest) (openIntent, error) {
 	default:
 		return intent, syscall.EOPNOTSUPP
 	}
-	if intent.reset && (!intent.write || intent.directory) || intent.directory && request.Disposition >= 4 || intent.metadataOnly && intent.reset {
+	if intent.reset && (!intent.write || intent.directory) || intent.directory && (request.Disposition == 0 || request.Disposition >= 4) || intent.metadataOnly && intent.reset {
 		return intent, syscall.EACCES
+	}
+	return intent, nil
+}
+
+func (intent *openIntent) setAccess(access, share uint32) {
+	intent.access = access
+	intent.read = access&accessReadData != 0
+	intent.write = access&(accessWriteData|accessAppend) != 0
+	intent.metadataOnly = !intent.read && !intent.write
+	intent.metadata = 0
+	intent.use = storage.UseClaim{}
+	if access&(accessReadEA|accessReadAttr) != 0 {
+		intent.metadata |= storage.ReadMetadata
+	}
+	if access&(accessWriteEA|accessWriteAttr) != 0 {
+		intent.metadata |= storage.WriteMetadata
 	}
 	if access&(accessReadData|accessExecute) != 0 {
 		if intent.directory {
@@ -149,16 +159,15 @@ func classifyCreate(request wire.CreateRequest) (openIntent, error) {
 	if access&accessDelete != 0 {
 		intent.use.Uses |= storage.DeleteName
 	}
-	if intent.use.Uses != 0 && request.ShareAccess&1 == 0 {
+	if intent.use.Uses != 0 && share&1 == 0 {
 		intent.use.Deny |= storage.ReadData | storage.ReadEntries
 	}
-	if intent.use.Uses != 0 && request.ShareAccess&2 == 0 {
+	if intent.use.Uses != 0 && share&2 == 0 {
 		intent.use.Deny |= storage.WriteData
 	}
-	if intent.use.Uses != 0 && request.ShareAccess&4 == 0 {
+	if intent.use.Uses != 0 && share&4 == 0 {
 		intent.use.Deny |= storage.DeleteName
 	}
-	return intent, nil
 }
 
 func (c *connection) authorizeOpen(ctx context.Context, t *tree, operation storage.Operation, intent openIntent, initial storage.InitialState) error {
@@ -167,8 +176,17 @@ func (c *connection) authorizeOpen(ctx context.Context, t *tree, operation stora
 			ContentMetadataEffects: storage.CloneContentMetadataEffects(effects)}
 		return c.server.config.Authorize.Authorize(ctx, request.Clone())
 	}
-	if err := authorize(operation, storage.OpenAccess{Read: intent.read || intent.access&accessExecute != 0 || intent.metadata&storage.ReadMetadata != 0, Write: intent.write || intent.metadata&storage.WriteMetadata != 0, Create: intent.create, Exclusive: intent.exclusive, Truncate: intent.reset, ContentMetadataEffects: storage.CloneContentMetadataEffects(intent.contentEffects)}, nil); err != nil {
+	write := intent.write || intent.metadata&storage.WriteMetadata != 0
+	if intent.resetUse == storage.DeleteName {
+		write = intent.write
+	}
+	if err := authorize(operation, storage.OpenAccess{Read: intent.read || intent.access&accessExecute != 0 || intent.metadata&storage.ReadMetadata != 0, Write: write, Create: intent.create, Exclusive: intent.exclusive, Truncate: intent.reset, ContentMetadataEffects: storage.CloneContentMetadataEffects(intent.contentEffects)}, nil); err != nil {
 		return err
+	}
+	if intent.resetUse == storage.DeleteName {
+		if err := authorize(storage.OpVolumeRemove, storage.OpenAccess{}, nil); err != nil {
+			return err
+		}
 	}
 	if len(initial.OnCreate.Metadata)+len(initial.OnReset.Metadata) != 0 {
 		if err := authorize(storage.OpFileSetMetadata, storage.OpenAccess{}, nil); err != nil {
@@ -227,7 +245,7 @@ func (c *connection) createFile(ctx context.Context, s *session, t *tree, reques
 			releaseReservation()
 			return nil, createStatusError(syscall.EEXIST), wire.FileID{}
 		}
-		if intent.reset || parsed.Options&createNonDirectory != 0 {
+		if intent.reset || parsed.Disposition == 0 || parsed.Options&createNonDirectory != 0 {
 			releaseReservation()
 			return nil, createStatusError(syscall.EISDIR), wire.FileID{}
 		}
@@ -236,6 +254,10 @@ func (c *connection) createFile(ctx context.Context, s *session, t *tree, reques
 	if resolved.DirectoryRequired && parsed.Options&createNonDirectory != 0 {
 		releaseReservation()
 		return nil, createStatusError(syscall.ENOTDIR), wire.FileID{}
+	}
+	if parsed.Disposition == 0 && resolved.Attr != nil {
+		intent.create, intent.reset, intent.resetUse = false, true, storage.DeleteName
+		intent.setAccess(intent.access|accessDelete|accessWriteAttr|accessWriteEA, parsed.ShareAccess)
 	}
 	if resolved.Attr == nil && !intent.create && !resolved.Root {
 		releaseReservation()
@@ -250,7 +272,7 @@ func (c *connection) createFile(ctx context.Context, s *session, t *tree, reques
 		releaseReservation()
 		return nil, createStatusError(syscall.ENOTDIR), wire.FileID{}
 	}
-	if isDirectory && intent.reset {
+	if isDirectory && (intent.reset || parsed.Disposition == 0) {
 		releaseReservation()
 		return nil, createStatusError(syscall.EISDIR), wire.FileID{}
 	}
@@ -301,7 +323,7 @@ func (c *connection) createFile(ctx context.Context, s *session, t *tree, reques
 		intent.contentEffects = windowsContentEffects()
 	}
 	var operation storage.Operation
-	if isDirectory || intent.metadataOnly {
+	if isDirectory || intent.metadataOnly && !intent.reset {
 		operation = storage.OpFileOpenChildRef
 	} else {
 		operation = storage.OpFileOpenAt
@@ -347,7 +369,7 @@ func (c *connection) createFile(ctx context.Context, s *session, t *tree, reques
 	var attr storage.Attr
 	var outcome storage.OpenOutcome
 	var open func(context.Context) (storage.Attr, storage.OpenOutcome, error)
-	if resolved.Root || isDirectory || intent.metadataOnly {
+	if resolved.Root || isDirectory || intent.metadataOnly && !intent.reset {
 		references := t.authority.raw.(storage.NodeReferences)
 		options := storage.NodeRefOptions{Kind: storage.NodeRegular, Target: resolved.Condition, Action: action, Use: intent.use,
 			MetadataAccess: intent.metadata, Create: intent.create, Exclusive: intent.exclusive, InitialState: initial, CloseIntent: closeIntent}
@@ -373,6 +395,7 @@ func (c *connection) createFile(ctx context.Context, s *session, t *tree, reques
 			Target: resolved.Condition, Action: action, Use: intent.use, Existing: storage.Keep, Initial: initial, CloseIntent: closeIntent, ContentMetadataEffects: storage.CloneContentMetadataEffects(intent.contentEffects)}
 		if intent.reset {
 			options.Existing = storage.ResetContent
+			options.ResetUse = intent.resetUse
 		}
 		selection := resolved.Selection.Clone()
 		open = func(call context.Context) (storage.Attr, storage.OpenOutcome, error) {
@@ -430,7 +453,11 @@ func (c *connection) createFile(ctx context.Context, s *session, t *tree, reques
 	if err := handle.bindReference(ctx, t, attr, intent.use); err != nil {
 		return nil, c.finishFailedOpen(ctx, t, handle, err), wire.FileID{}
 	}
-	response := wire.CreateResponse{CreateAction: uint32(outcome), CreationTime: metadata.CreationTime,
+	createAction := uint32(outcome)
+	if parsed.Disposition == 0 && outcome == storage.Reset {
+		createAction = 0 // FILE_SUPERSEDED
+	}
+	response := wire.CreateResponse{CreateAction: createAction, CreationTime: metadata.CreationTime,
 		LastAccessTime: metadata.LastAccessTime, LastWriteTime: metadata.LastWriteTime, ChangeTime: metadata.ChangeTime,
 		AllocationSize: metadata.AllocationSize, EndOfFile: metadata.EndOfFile, Attributes: metadata.Attributes, FileID: handle.id}
 	if intent.queryOnDiskID {
@@ -441,6 +468,8 @@ func (c *connection) createFile(ctx context.Context, s *session, t *tree, reques
 
 func validCreateOutcome(disposition uint32, outcome storage.OpenOutcome) bool {
 	switch disposition {
+	case 0:
+		return outcome == storage.Created || outcome == storage.Reset
 	case 1:
 		return outcome == storage.Opened
 	case 2:

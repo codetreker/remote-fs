@@ -52,6 +52,11 @@ type protocolClient struct {
 
 func startSMB(t *testing.T, backend storage.FileStorage) *protocolClient {
 	t.Helper()
+	return startSMBObserved(t, backend, nil)
+}
+
+func startSMBObserved(t *testing.T, backend storage.FileStorage, observe func(*smb.Server)) *protocolClient {
+	t.Helper()
 	server, err := smb.New(smb.Config{
 		Authenticator: authenticator{},
 		AuthorizeIdentity: smb.IdentityAuthorizerFunc(func(_ context.Context, p smb.Principal) error {
@@ -71,6 +76,9 @@ func startSMB(t *testing.T, backend storage.FileStorage) *protocolClient {
 	})
 	if err != nil {
 		t.Fatal(err)
+	}
+	if observe != nil {
+		observe(server)
 	}
 	identity, err := backend.(storage.BackendIdentity).BackendIdentity(t.Context())
 	if err != nil {

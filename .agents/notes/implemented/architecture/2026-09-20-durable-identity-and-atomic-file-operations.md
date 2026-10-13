@@ -22,7 +22,7 @@ Status: implemented
 
 `AtomicFileOpener.OpenAt` 使用 `ChildSelection` 在同一次原生顺序中解析父身份与叶名，核对可选 `NamespaceGuards` 和 `ChildCondition`，执行 Keep、ResetContent 或 ReplaceNode，应用对应 initial fields，登记 Use claim 和可选关闭删除义务，再返回捕获的 Attr、Outcome 与 File。`NodeReferences.OpenChildRef` 对普通文件、目录和符号链接执行同样的子项选择，`OpenNodeRef` 直接按 NodeID 选择已有节点。guard 接入的决定与边界见[权威子项选择](2026-09-22-guard-authoritative-child-selection.md)。
 
-`NodeReference` 没有字节方法，但编译期保证 `ScopedReference` 与 `ReferenceStateAccess`：成功 preflight 后，调用方一定能取得确切活引用的 Scope，并能通过明确 StateFull 原子读取 Attr、符号链接目标、detached 状态和 pending-delete generation；Full 遵守 ReadMetadata，StateScalars 只返回低权限对象与删除事实。metadata 与删除修改仍按引用的 MetadataAccess 权限及可选能力分别检查。NodeReference 可以声明 ReadData／WriteData 作为与其它入口兼容的 Use claim，这些声明不授予字节方法。
+`NodeReference` 没有字节方法，但编译期保证 `ScopedReference` 与 `ReferenceStateAccess`：成功 preflight 后，调用方一定能取得确切活引用的 Scope，并能通过明确 StateFull 原子读取 Attr、符号链接目标、detached 状态和 pending-delete generation；Full 遵守 ReadMetadata，StateScalars 只返回低权限对象与删除事实，其中 aggregate pending 的既有 generation 有界暴露，不含 metadata／时间／link。metadata 与删除修改仍按引用的 MetadataAccess 权限及可选能力分别检查。NodeReference 可以声明 ReadData／WriteData 作为与其它入口兼容的 Use claim，这些声明不授予字节方法。
 
 所有三种打开都带 `FileActionID`。ID 使用 FileSession 当前 action epoch 与随机 nonce；同 ID、同输入返回原结果，同 ID、不同输入拒绝。`FileActions.QueryFileAction` 报告 pending、completed、not-executed、unknown 或 retired。只有存在保留记录时 receipt 才带 Operation；没有记录或旧 authority 无法证明原操作时，空 Operation 只与 not-executed、unknown 或 retired 一起出现。unknown 与 retired 都不能解释为未执行。
 
@@ -38,7 +38,7 @@ Status: implemented
 
 `CloseIntent` 带 128-bit 随机、规范小写十六进制 `DeleteIntentID`，当前还带调用方持久保存的 `DeleteIntentOwner`。它在原子打开中接受并绑定原 NodeID、名字关联、条件与预授权固定效果；相同 ID 不能代表另一个 intent。引用关闭或退役时，authority 在释放 Use claim 和物理 pin 前持久触发或消费该义务。owner、发现顺序及关闭释放事实由[可恢复的引用关闭与删除义务归属](2026-09-23-recoverable-close-ownership.md)接续。
 
-节点 pending 状态与每个 armed intent 分开保存。显式 `SetPendingUnlink` 原子核对节点、metadata、Use/share、种类与目录为空条件后推进 generation；`ClearPendingUnlink` 必须给出当前 generation，只清除节点当前 pending 状态，不删除其它引用尚未触发的义务。pending 节点拒绝冲突的新打开与名字修改。
+节点 pending 状态与每个 armed intent 分开保存。显式 SetPendingUnlink 原子核对原节点、当前唯一关联、metadata、DeleteName／sharing、种类与目录为空；ordinary false→true 在 DOC 已 pending 时仍推进共用 generation，DOC trigger／startup 的原增量保持。ClearPendingUnlink 以当前 aggregate token CAS；空 token 明确要求 aggregate false，匹配而 ordinary false 的实际授权 no-op 不产生发布，只清 ordinary true，不删除任何 CloseIntent。具体接纳和结果预算见[名字修改](../feature/2026-09-28-smb-guarded-name-mutation.md)。pending 节点拒绝冲突的新打开与名字修改。
 
 删除 intent 的持久状态区分 armed、pending、completed、明确未执行与 cleanup failed；失败状态保存封闭 errno 分类。`QueryDeleteIntent` 以 owner 和 durable ID 查询，新的 FileSession 在 authority 重启后仍可取得原义务；`ListDeleteIntents` 按 owner 和持久序号发现未知 ID。终态记录继续占用有界历史，只有带 owner 与独立 `FileActionID` 的 `AcknowledgeDeleteIntent` 可以幂等删除记录并释放容量；ACK 自己进入普通 action replay/query。成功 ACK 后 authority 不保留 tombstone，也不再承诺拒绝该 ID 的重用，后续查询返回 unknown；调用方必须永久不复用已经 ACK 的 DeleteIntentID。名字已与原对象分离或目录触发时非空会成为明确未执行，绝不删除后来占据同名位置的对象。可重试清理失败继续由 authority 持有。
 
@@ -66,4 +66,4 @@ FUSE 的已有 inode Open 使用 OpenNode，Create 使用 OpenAt，Opendir 与 R
 
 本决定部分取代[文件目标、显式内容依据与目录父身份](../../proposed/architecture/2026-08-20-nothing-pins-an-open-file.md)中的目录父身份部分。该提案关于 R-CC-1 调用方显式内容版本依据的部分仍是 proposed；这里的 metadata/size 条件和内部 content revision 都不宣称完成那项工作流。
 
-[有界权威名字观察](2026-09-20-bounded-authoritative-name-observations.md)另行交付目录 metadata observation、reference current-name 和只读 guard；[权威子项选择](2026-09-22-guard-authoritative-child-selection.md)随后把这些 guards 接入 OpenAt 与 OpenChildRef，不改变这里定义的 action 与原子效果边界。[安全且有界的本机 SMB 端点](2026-09-21-secure-bounded-smb-endpoint.md)提供协议、安全会话与 share 生命周期，[有界 CREATE/CLOSE](../feature/2026-09-28-smb-bounded-create-close.md)与[文件内容访问](../feature/2026-09-28-smb-file-data-io.md)接续 Windows 文件打开及内容路径。其余 guarded mutation、信息和目录／名字能力仍由后续任务交付，系统不因此宣称 Windows 支持已经完成。
+[有界权威名字观察](2026-09-20-bounded-authoritative-name-observations.md)另行交付目录 metadata observation、reference current-name 和只读 guard；[权威子项选择](2026-09-22-guard-authoritative-child-selection.md)随后把这些 guards 接入 OpenAt 与 OpenChildRef，不改变这里定义的 action 与原子效果边界。[安全且有界的本机 SMB 端点](2026-09-21-secure-bounded-smb-endpoint.md)提供协议、安全会话与 share 生命周期，[有界 CREATE/CLOSE](../feature/2026-09-28-smb-bounded-create-close.md)与[文件内容访问](../feature/2026-09-28-smb-file-data-io.md)接续 Windows 文件打开及内容路径。[SMB 名字修改](../feature/2026-09-28-smb-guarded-name-mutation.md)接续 NameCommand 的最终 guard／后代条件、ResetUse 与 ordinary disposition；本决定的身份、action、schema 和原子效果理由保持。范围锁、通知／缓存、WNet 与原生资格仍独立交付，系统不因此宣称 Windows 支持已经完成。

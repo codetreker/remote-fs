@@ -114,6 +114,7 @@ func canonicalFileActionInput(input any) any {
 	case storage.NameCommand:
 		value.Name = canonicalChildName(value.Name)
 		value.Target = canonicalChildCondition(value.Target)
+		value.Guards = canonicalNamespaceGuards(value.Guards)
 		if value.Destination != nil {
 			destination := *value.Destination
 			destination.ObservedLeaf = bytes.Clone(destination.ObservedLeaf)
@@ -180,27 +181,30 @@ func canonicalChildName(name storage.ChildName) storage.ChildName {
 }
 
 func canonicalChildSelection(selection storage.ChildSelection) storage.ChildSelection {
-	selection = selection.Clone()
-	if selection.Guards != nil {
-		if selection.Guards.RootID == 0 && len(selection.Guards.Directories) == 0 && len(selection.Guards.Edges) == 0 {
-			selection.Guards = nil
-			return selection
-		}
-		sort.Slice(selection.Guards.Directories, func(left, right int) bool {
-			return selection.Guards.Directories[left].ParentID < selection.Guards.Directories[right].ParentID
-		})
-		sort.Slice(selection.Guards.Edges, func(left, right int) bool {
-			leftEdge, rightEdge := selection.Guards.Edges[left], selection.Guards.Edges[right]
-			if leftEdge.ParentID != rightEdge.ParentID {
-				return leftEdge.ParentID < rightEdge.ParentID
-			}
-			if compared := bytes.Compare(leftEdge.RawLeaf, rightEdge.RawLeaf); compared != 0 {
-				return compared < 0
-			}
-			return leftEdge.ChildID < rightEdge.ChildID
-		})
-	}
+	selection.Name = canonicalChildName(selection.Name)
+	selection.Guards = canonicalNamespaceGuards(selection.Guards)
 	return selection
+}
+
+func canonicalNamespaceGuards(guards *storage.NamespaceGuards) *storage.NamespaceGuards {
+	if guards == nil || guards.RootID == 0 && len(guards.Directories) == 0 && len(guards.Edges) == 0 {
+		return nil
+	}
+	guards = guards.Clone()
+	sort.Slice(guards.Directories, func(left, right int) bool {
+		return guards.Directories[left].ParentID < guards.Directories[right].ParentID
+	})
+	sort.Slice(guards.Edges, func(left, right int) bool {
+		leftEdge, rightEdge := guards.Edges[left], guards.Edges[right]
+		if leftEdge.ParentID != rightEdge.ParentID {
+			return leftEdge.ParentID < rightEdge.ParentID
+		}
+		if compared := bytes.Compare(leftEdge.RawLeaf, rightEdge.RawLeaf); compared != 0 {
+			return compared < 0
+		}
+		return leftEdge.ChildID < rightEdge.ChildID
+	})
+	return guards
 }
 
 func canonicalChildCondition(condition storage.ChildCondition) storage.ChildCondition {

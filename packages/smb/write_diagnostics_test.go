@@ -68,3 +68,60 @@ func TestWriteOwnerReservationBoundsPayloadAndDiagnosticsBeforeDispatch(t *testi
 		t.Fatalf("slot bound: %v", err)
 	}
 }
+
+func TestWriteLedgerConcurrentRetryReservationsRespectServerPeak(t *testing.T) {
+	server, baseTree, h, _, _, command := typedOwnerFixture(t, "rename")
+	first, err := server.reserveMutationCommand(baseTree, h, 1, command, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherTree := &tree{export: &Export{server: server, share: Share{Volume: "other"}}, authority: baseTree.authority}
+	second, err := server.reserveMutationCommand(otherTree, h, 2, command, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldBytes := command.payloadBytes(nil)
+	freshBytes := largerOwnerNameCommand(command).payloadBytes(nil)
+	limit := 2*oldBytes + freshBytes
+	start := make(chan struct{})
+	type result struct {
+		owner *mutationOwner
+		old   int
+		err   error
+	}
+	results := make(chan result, 2)
+	for _, owner := range []*mutationOwner{first, second} {
+		go func() {
+			<-start
+			old, err := server.writes.reserveReplacementPayload(owner.id, freshBytes, limit)
+			results <- result{owner, old, err}
+		}()
+	}
+	close(start)
+	accepted := 0
+	var winner *mutationOwner
+	for range 2 {
+		result := <-results
+		if result.err == nil {
+			accepted++
+			winner = result.owner
+			if result.old != oldBytes {
+				t.Fatalf("wrong original charge: %d", result.old)
+			}
+		} else if !errors.Is(result.err, syscall.ENOMEM) {
+			t.Fatal(result.err)
+		}
+	}
+	if accepted != 1 || server.Status().RetainedWriteBytes != limit {
+		t.Fatalf("concurrent replacement exceeded server peak: accepted=%d bytes=%d", accepted, server.Status().RetainedWriteBytes)
+	}
+	server.writes.setPayloadCharge(winner.id, oldBytes)
+	if server.Status().RetainedWriteBytes != 2*oldBytes {
+		t.Fatal("rollback did not restore both original charges")
+	}
+	server.writes.releasePayload(first.id)
+	server.writes.releasePayload(second.id)
+	if server.Status().RetainedWriteBytes != 0 {
+		t.Fatal("original charges survived release")
+	}
+}

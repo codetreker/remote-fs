@@ -83,14 +83,13 @@ func (fs *fileSession) OpenAt(ctx context.Context, selection storage.ChildSelect
 	if err := options.Check(); err != nil {
 		return storage.OpenResult{}, err
 	}
-	selection = selection.Clone()
-	options.ContentMetadataEffects = storage.CloneContentMetadataEffects(options.ContentMetadataEffects)
 	if len(options.ContentMetadataEffects) != 0 {
 		if err := fs.CheckOpenContentMetadata(); err != nil {
 			return storage.OpenResult{}, err
 		}
 	}
-	input := openAtActionInput{Selection: selection, Options: options}
+	input := canonicalFileActionInput(openAtActionInput{Selection: selection, Options: options}).(openAtActionInput)
+	selection, options = input.Selection, input.Options
 	return runFileAction(ctx, fs, options.Action, storage.OpFileOpenAt, input, cloneOpenResult,
 		func(result storage.OpenResult) bool {
 			return result.File != nil || result.Attr.ID != 0 || result.Outcome != 0
@@ -266,6 +265,7 @@ func (fs *fileSession) MutateName(ctx context.Context, command storage.NameComma
 	if err := command.Check(); err != nil {
 		return storage.NameResult{}, err
 	}
+	command = canonicalFileActionInput(command).(storage.NameCommand)
 	return runFileAction(ctx, fs, command.Action, storage.OpFileMutateName, command, cloneNameResult,
 		func(result storage.NameResult) bool { return result.Attr != nil },
 		func() (storage.NameResult, error) { return fs.mutateName(ctx, command) })
@@ -373,6 +373,7 @@ func (f *openFile) SetPendingUnlink(ctx context.Context, command storage.Pending
 	if err := command.Check(); err != nil {
 		return storage.ReferenceState{}, err
 	}
+	command = canonicalFileActionInput(command).(storage.PendingUnlinkCommand)
 	target, err := f.session.referenceActionTarget(ctx, f)
 	if err != nil {
 		return storage.ReferenceState{}, err
@@ -400,6 +401,7 @@ func (f *openFile) ClearPendingUnlink(ctx context.Context, command storage.Clear
 	if err := command.Check(); err != nil {
 		return storage.ReferenceState{}, err
 	}
+	command = canonicalFileActionInput(command).(storage.ClearPendingUnlinkCommand)
 	target, err := f.session.referenceActionTarget(ctx, f)
 	if err != nil {
 		return storage.ReferenceState{}, err

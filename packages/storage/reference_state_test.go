@@ -1,6 +1,7 @@
 package storage_test
 
 import (
+	"bytes"
 	"errors"
 	"syscall"
 	"testing"
@@ -13,8 +14,9 @@ func TestReferenceStateScalarsKeepIdentityAndExcludeProtectedFields(t *testing.T
 	valid := storage.ReferenceState{Attr: storage.Attr{ID: 7, Kind: storage.NodeRegular, Size: 3, AllocationKnown: true, AllocationSize: 4096}}
 	for _, state := range []storage.ReferenceState{
 		valid,
-		{Attr: storage.Attr{ID: 7, Kind: storage.NodeDirectory, Size: -1}, Detached: true, PendingUnlink: true},
+		{Attr: storage.Attr{ID: 7, Kind: storage.NodeDirectory, Size: -1}, Detached: true, PendingUnlink: true, PendingGeneration: []byte{1}},
 		{Attr: storage.Attr{ID: 7, Kind: storage.NodeSymlink, Size: 8}},
+		{Attr: valid.Attr, PendingUnlink: true, PendingGeneration: bytes.Repeat([]byte{1}, storage.MaxObservationTokenBytes)},
 	} {
 		if err := state.CheckProjection(7, storage.StateScalars); err != nil {
 			t.Fatalf("valid scalar state %+v = %v", state, err)
@@ -32,7 +34,12 @@ func TestReferenceStateScalarsKeepIdentityAndExcludeProtectedFields(t *testing.T
 		func(s *storage.ReferenceState) { s.Attr.AccessTime = time.Unix(1, 0) },
 		func(s *storage.ReferenceState) { s.Attr.ModTime = time.Unix(1, 0) },
 		func(s *storage.ReferenceState) { s.LinkTarget = []byte{} },
-		func(s *storage.ReferenceState) { s.PendingGeneration = []byte{} },
+		func(s *storage.ReferenceState) { s.PendingGeneration = []byte{1} },
+		func(s *storage.ReferenceState) { s.PendingUnlink = true },
+		func(s *storage.ReferenceState) {
+			s.PendingUnlink = true
+			s.PendingGeneration = make([]byte, storage.MaxObservationTokenBytes+1)
+		},
 	} {
 		state := valid
 		mutate(&state)

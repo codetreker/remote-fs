@@ -680,7 +680,7 @@ func (s *Store) RemoveDir(ctx context.Context, path string) error {
 // Physical pins keep the current object and its charge after volume removal.
 // The caller holds the same gate as file open and final physical release.
 func (s *Store) discard(ctx context.Context, tx *sql.Tx, node metastore.Node, at ...time.Time) error {
-	if s.coordinator.pins[retainedNode{s.volume, node.ID}] > 0 {
+	if s.nodePinCountLocked(node.ID) > 0 {
 		now := time.Now()
 		if len(at) != 0 {
 			now = at[0]

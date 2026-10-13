@@ -205,6 +205,7 @@ func TestDeleteRecoveryReservationAlsoBoundsWrites(t *testing.T) {
 func TestDeletePendingInformationHasNoLinkedName(t *testing.T) {
 	file := validInfoFileProbe()
 	file.info.PendingUnlink = true
+	file.info.PendingGeneration = []byte("pending-generation")
 	c, s, tree, h := newInfoCommandFixture(t, file, accessReadAttr)
 	body, status := c.queryFileInfo(t.Context(), s, tree, queryInfoRequestForTest(h.id, wire.FileStandardInformation, 24))
 	if status != statusOK || len(body) != 32 || binary.LittleEndian.Uint32(body[24:]) != 0 || body[28] != 1 {

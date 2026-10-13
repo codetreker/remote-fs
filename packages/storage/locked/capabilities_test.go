@@ -13,16 +13,18 @@ import (
 
 type capabilitySessionProbe struct {
 	storage.FileSession
-	checkErr  error
-	failure   error
-	attempt   storage.RangeAttempt
-	observed  locking.MutationScope
-	open      storage.OpenResult
-	node      storage.NodeOpenResult
-	name      storage.NameResult
-	action    storage.FileActionReceipt
-	deleted   storage.DeleteIntentStatus
-	selection storage.ChildSelection
+	checkErr    error
+	failure     error
+	attempt     storage.RangeAttempt
+	observed    locking.MutationScope
+	open        storage.OpenResult
+	node        storage.NodeOpenResult
+	name        storage.NameResult
+	action      storage.FileActionReceipt
+	deleted     storage.DeleteIntentStatus
+	selection   storage.ChildSelection
+	openOptions storage.OpenAtOptions
+	nameCommand storage.NameCommand
 }
 
 type directoryReaderOnlyProbe struct{ storage.FileSession }
@@ -153,9 +155,10 @@ func TestNamespaceWrapperRejectsSubstitutedDirectoryIdentity(t *testing.T) {
 	}
 }
 func (p *capabilitySessionProbe) CheckAtomicFileOpen() error { return p.checkErr }
-func (p *capabilitySessionProbe) OpenAt(ctx context.Context, selection storage.ChildSelection, _ storage.OpenAtOptions) (storage.OpenResult, error) {
+func (p *capabilitySessionProbe) OpenAt(ctx context.Context, selection storage.ChildSelection, options storage.OpenAtOptions) (storage.OpenResult, error) {
 	p.capture(ctx)
 	p.selection = selection
+	p.openOptions = options
 	return p.open, p.failure
 }
 func (p *capabilitySessionProbe) CheckNamespaceAccess() error { return p.checkErr }
@@ -175,8 +178,9 @@ func (p *capabilitySessionProbe) ReadDirNodeBounded(ctx context.Context, _ stora
 	}
 	return storage.DirectoryObservation{ParentID: 3, Revision: []byte{1}}, p.failure
 }
-func (p *capabilitySessionProbe) MutateName(ctx context.Context, _ storage.NameCommand) (storage.NameResult, error) {
+func (p *capabilitySessionProbe) MutateName(ctx context.Context, command storage.NameCommand) (storage.NameResult, error) {
 	p.capture(ctx)
+	p.nameCommand = command
 	return p.name, p.failure
 }
 func (p *capabilitySessionProbe) CheckNodeReferences() error { return p.checkErr }
@@ -391,12 +395,16 @@ func TestIdentityWrappersSeparateReadAndMutationScopes(t *testing.T) {
 		}
 	}
 	openSelection := storage.ChildSelection{Name: storage.ChildName{RawLeaf: []byte("open")}, Guards: &storage.NamespaceGuards{RootID: 7}}
-	opened, err := session.OpenAt(t.Context(), openSelection, storage.OpenAtOptions{})
+	openOptions := storage.OpenAtOptions{Existing: storage.ResetContent, ResetUse: storage.DeleteName, Use: storage.UseClaim{Uses: storage.DeleteName}, Initial: storage.InitialState{OnReset: storage.InitialFields{Metadata: map[string][]byte{"app.flags": {1}}}}}
+	opened, err := session.OpenAt(t.Context(), openSelection, openOptions)
 	if !errors.Is(err, failure) || opened.File == nil || !reflect.DeepEqual(probe.observed, proof) {
 		t.Fatalf("atomic open=%+v error=%v scope=%+v", opened, err, probe.observed)
 	}
 	if !reflect.DeepEqual(probe.selection, openSelection) {
 		t.Fatalf("atomic open selection=%+v, want %+v", probe.selection, openSelection)
+	}
+	if !reflect.DeepEqual(probe.openOptions, openOptions) {
+		t.Fatalf("atomic reset options=%+v, want %+v", probe.openOptions, openOptions)
 	}
 	if _, err := session.LookupAt(locking.WithScope(t.Context(), proof), storage.ChildName{}); !errors.Is(err, failure) || !reflect.DeepEqual(probe.observed, locking.MutationScope{}) {
 		t.Fatalf("lookup error=%v scope=%+v", err, probe.observed)
@@ -416,8 +424,12 @@ func TestIdentityWrappersSeparateReadAndMutationScopes(t *testing.T) {
 	if entries, err := bounded.Entries(); entries != nil || !errors.Is(err, failure) {
 		t.Fatalf("failed bounded directory exposed %+v, %v", entries, err)
 	}
-	if result, err := session.MutateName(t.Context(), storage.NameCommand{}); !errors.Is(err, failure) || result.Attr == nil || result.Attr.ID != attr.ID || !reflect.DeepEqual(probe.observed, proof) {
+	nameCommand := storage.NameCommand{Kind: storage.NameRename, Action: action, Guards: openSelection.Guards, RequireNoOpenDescendants: true, Target: storage.ChildCondition{State: storage.SameNode, NodeID: attr.ID, ExpectedMetadata: map[string][]byte{"app.flags": {2}}}}
+	if result, err := session.MutateName(t.Context(), nameCommand); !errors.Is(err, failure) || result.Attr == nil || result.Attr.ID != attr.ID || !reflect.DeepEqual(probe.observed, proof) {
 		t.Fatalf("name mutation=%+v error=%v scope=%+v", result, err, probe.observed)
+	}
+	if !reflect.DeepEqual(probe.nameCommand, nameCommand) {
+		t.Fatalf("name mutation=%+v, want %+v", probe.nameCommand, nameCommand)
 	}
 	result, err := session.OpenNodeRef(t.Context(), attr.ID, storage.NodeRefOptions{})
 	if !errors.Is(err, failure) || result.Reference == nil || !reflect.DeepEqual(probe.observed, locking.MutationScope{}) {

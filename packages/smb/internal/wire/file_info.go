@@ -12,12 +12,16 @@ const (
 )
 
 const (
-	FileBasicInformation       byte = 4
-	FileStandardInformation    byte = 5
-	FileInternalInformation    byte = 6
-	FileEndOfFileInformation   byte = 20
-	FileNetworkOpenInformation byte = 34
-	FileIdInformation          byte = 59
+	FileBasicInformation          byte = 4
+	FileStandardInformation       byte = 5
+	FileInternalInformation       byte = 6
+	FileNameInformation           byte = 9
+	FileRenameInformation         byte = 10
+	FileDispositionInformation    byte = 13
+	FileEndOfFileInformation      byte = 20
+	FileNetworkOpenInformation    byte = 34
+	FileNormalizedNameInformation byte = 48
+	FileIdInformation             byte = 59
 )
 
 const (
@@ -192,6 +196,50 @@ func ParseFileEndOfFileInformation(data []byte) (int64, error) {
 		return 0, ErrMalformed
 	}
 	return int64(le.Uint64(data)), nil
+}
+
+type FileRenameInfo struct {
+	ReplaceIfExists bool
+	Name            string
+}
+
+func ParseFileRenameInformation(data []byte) (FileRenameInfo, error) {
+	if len(data) < 20 || le.Uint64(data[8:16]) != 0 {
+		return FileRenameInfo{}, ErrMalformed
+	}
+	length := le.Uint32(data[16:20])
+	if length == 0 || length&1 != 0 || uint64(length) > uint64(len(data)-20) {
+		return FileRenameInfo{}, ErrMalformed
+	}
+	name, err := DecodeUTF16(data[20 : 20+int(length)])
+	if err != nil || strings.HasPrefix(name, "\\") {
+		return FileRenameInfo{}, ErrMalformed
+	}
+	return FileRenameInfo{ReplaceIfExists: data[0] != 0, Name: name}, nil
+}
+
+func ParseFileDispositionInformation(data []byte) (bool, error) {
+	if len(data) == 0 {
+		return false, ErrMalformed
+	}
+	return data[0] != 0, nil
+}
+
+// The full counted length survives truncation. A prefix can end between UTF-16
+// surrogate units, because the available byte count is rounded only to even.
+func FileNormalizedNameInformationBody(name string, outputBufferLength uint32) ([]byte, bool, error) {
+	if outputBufferLength < 8 || name == "" {
+		return nil, false, ErrMalformed
+	}
+	encoded, err := filesystemInformationName(name, 4)
+	if err != nil {
+		return nil, false, err
+	}
+	length := min(uint32(len(encoded)), (outputBufferLength-4)&^1)
+	body := make([]byte, 4+length)
+	le.PutUint32(body[:4], uint32(len(encoded)))
+	copy(body[4:], encoded[:length])
+	return body, length != uint32(len(encoded)), nil
 }
 
 type FileFsVolumeInfo struct {

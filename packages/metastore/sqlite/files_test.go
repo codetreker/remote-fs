@@ -90,7 +90,7 @@ func TestMissingExactUseClaimMakesCloseUnknownAndFencesConflictingOpen(t *testin
 					t.Errorf("cleanup poisoned reference: %v", err)
 				} else {
 					delete(store.files, file)
-					delete(store.coordinator.pins, retainedNode{store.volume, file.id})
+					store.unpinNodeLocked(file.id)
 					store.fileDomain.files--
 					store.coordinator.commit.release()
 				}
@@ -169,7 +169,7 @@ func TestCommittedFinalizationDoesNotRepeatAfterFailedExactUseDrop(t *testing.T)
 	if first.Released || !first.Determined || !errors.Is(err, context.Canceled) || finalizations != 1 {
 		t.Fatalf("post-commit exact use failure = %+v, %v, finalizations %d", first, err, finalizations)
 	}
-	if count := store.coordinator.pins[retainedNode{store.volume, file.id}]; count != 1 {
+	if count := store.nodePinCountLocked(file.id); count != 1 {
 		t.Fatalf("failed exact drop released physical pin: %d", count)
 	}
 	if err := store.fileDomain.coordinator.CheckUse(t.Context(), uint64(file.id), file.scope, storage.ReadData); err != nil {
@@ -258,7 +258,7 @@ func TestPendingCloseIntentFinalizationSurvivesFailedExactUseDrop(t *testing.T) 
 	if err != nil || status.Outcome != storage.DeleteIntentCompleted {
 		t.Fatalf("durable intent after committed finalization = %+v, %v", status, err)
 	}
-	if count := store.coordinator.pins[retainedNode{store.volume, file.id}]; count != 1 {
+	if count := store.nodePinCountLocked(file.id); count != 1 {
 		t.Fatalf("failed exact drop released pin: %d", count)
 	}
 	if err := store.fileDomain.coordinator.CheckUse(t.Context(), uint64(file.id), file.scope, storage.DeleteName); err != nil {
@@ -455,7 +455,7 @@ func TestRetainedCleanupUnknownAcceptanceKeepsPhysicalOwnership(t *testing.T) {
 	if again := f.Close(ctx); !errors.Is(again, acceptErr) || settlements.Load() != 1 {
 		t.Fatalf("repeated cleanup=%v settlements=%d", again, settlements.Load())
 	}
-	if s.coordinator.pins[retainedNode{s.volume, ref.id}] != 1 || len(s.files) != 1 || s.leaseOwner.FD() < 0 {
+	if s.nodePinCountLocked(ref.id) != 1 || len(s.files) != 1 || s.leaseOwner.FD() < 0 {
 		t.Fatal("unknown cleanup released native retention")
 	}
 	if err := s.Close(); !errors.Is(err, syscall.EBUSY) {

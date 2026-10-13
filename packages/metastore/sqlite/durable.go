@@ -102,7 +102,7 @@ type databaseCoordinator struct {
 	key     string
 	durable bool
 	closing bool
-	pins    map[retainedNode]int
+	pins    map[int64]map[int64]int
 	domains map[int64]*fileDomain
 }
 
@@ -143,7 +143,7 @@ func acquireCoordinator(database string, durable bool) (*databaseCoordinator, er
 	defer databaseCoordinators.Unlock()
 	coordinator := databaseCoordinators.byPath[key]
 	if coordinator == nil {
-		coordinator = &databaseCoordinator{key: key, durable: durable, commit: newCommitGate(), pins: make(map[retainedNode]int), domains: make(map[int64]*fileDomain)}
+		coordinator = &databaseCoordinator{key: key, durable: durable, commit: newCommitGate(), pins: make(map[int64]map[int64]int), domains: make(map[int64]*fileDomain)}
 		databaseCoordinators.byPath[key] = coordinator
 	} else if coordinator.durable || durable {
 		return nil, fmt.Errorf("a durably witnessed SQLite database cannot share its process with another opener: %w",

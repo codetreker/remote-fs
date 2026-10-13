@@ -62,12 +62,20 @@ func resolveCreateName(ctx context.Context, t *tree, name string) (resolvedCreat
 	if t == nil || t.export == nil || t.authority == nil || t.authority.raw == nil {
 		return resolvedCreateName{}, ErrConfig
 	}
+	capture := &referenceNameSelection{export: t.export}
+	defer capture.release()
+	return resolveCreateNameCaptured(ctx, t, name, capture)
+}
+
+func resolveCreateNameCaptured(ctx context.Context, t *tree, name string, capture *referenceNameSelection) (resolvedCreateName, error) {
 	server := t.export.server
 	authorize := func(ctx context.Context, operation storage.Operation) error {
 		return server.config.Authorize.Authorize(ctx, authz.AccessRequest{Volume: t.export.share.Volume, Operation: operation})
 	}
-	return resolveName(ctx, t.export.share.Backend, t.authority.raw, t.authority.identity.Backend.RootNodeID, name, server.config.Limits, authorize, server.nameComparer)
+	return resolveName(context.WithValue(ctx, nameCaptureKey{}, capture), t.export.share.Backend, t.authority.raw, t.authority.identity.Backend.RootNodeID, name, server.config.Limits, authorize, server.nameComparer)
 }
+
+type nameCaptureKey struct{}
 
 func resolveName(ctx context.Context, backend storage.FileStorage, session storage.FileSession, pinnedRootNodeID uint64, name string, limits Limits, authorize func(context.Context, storage.Operation) error, compare nameComparer) (resolvedCreateName, error) {
 	path, err := parseSMBPath(name)
@@ -115,6 +123,11 @@ func resolveNameWithComparer(ctx context.Context, backend storage.FileStorage, s
 		if charge+256 > limit {
 			return syscall.EFBIG
 		}
+		if capture, ok := ctx.Value(nameCaptureKey{}).(*referenceNameSelection); ok {
+			if err := capture.reserve(int(charge) + 256); err != nil {
+				return err
+			}
+		}
 		return nil
 	})
 	root, err := backend.Stat(rootContext, "")
@@ -158,36 +171,10 @@ func resolveNameWithComparer(ctx context.Context, backend storage.FileStorage, s
 		if err := guards.Check(); err != nil {
 			return resolvedCreateName{}, err
 		}
-		result, err := newNameObservationResult(limit, parent.NodeID, guards)
-		if err != nil {
-			return resolvedCreateName{}, err
-		}
 		if err := authorize(ctx, storage.OpFileObserveDirectoryMetadata); err != nil {
 			return resolvedCreateName{}, namespaceFailure(err)
 		}
-		options := storage.DirectoryMetadataOptions{Guards: cloneNamespaceGuards(guards)}
-		observation, err := observer.ObserveDirectoryMetadata(ctx, parent, options, result)
-		if err != nil {
-			result.Fail(err)
-			return resolvedCreateName{}, namespaceFailure(err)
-		}
-		if err := ctx.Err(); err != nil {
-			result.Fail(err)
-			return resolvedCreateName{}, err
-		}
-		if err := observation.Check(parent, options); err != nil {
-			result.Fail(err)
-			return resolvedCreateName{}, err
-		}
-		entries, err := result.Entries()
-		if err != nil {
-			return resolvedCreateName{}, namespaceFailure(err)
-		}
-		projected, err := projectDirectory(entries, compare)
-		if err != nil {
-			return resolvedCreateName{}, err
-		}
-		selected, present, err := selectName(projected, nameUnits(part), compare)
+		observation, entry, present, err := captureForwardNameComponent(ctx, observer, parent, guards, part, compare, limit)
 		if err != nil {
 			return resolvedCreateName{}, err
 		}
@@ -206,7 +193,6 @@ func resolveNameWithComparer(ctx context.Context, backend storage.FileStorage, s
 			selection := storage.ChildSelection{Name: storage.ChildName{Parent: parent, RawLeaf: []byte(part)}, Guards: cloneNamespaceGuards(guards)}
 			return resolvedCreateName{RootID: rootID, Selection: selection, Condition: storage.ChildCondition{State: storage.Absent}, DirectoryRequired: path.directoryRequired}, nil
 		}
-		entry := entries[selected]
 		if entry.Attr.Kind == storage.NodeSymlink {
 			return resolvedCreateName{}, syscall.EOPNOTSUPP
 		}
@@ -250,7 +236,7 @@ func cloneNamespaceGuards(guards storage.NamespaceGuards) *storage.NamespaceGuar
 	return copy
 }
 
-func newNameObservationResult(limit int64, parent uint64, guards storage.NamespaceGuards) (*storage.ListResult, error) {
+func nameObservationResult(limit int64, parent uint64, guards storage.NamespaceGuards, excludeAncestors bool, reserve func(int64) error) (*storage.ListResult, error) {
 	fixed := int64(512 + 128*(len(guards.Directories)+len(guards.Edges)))
 	for _, directory := range guards.Directories {
 		fixed += 8 * int64(len(directory.Revision))
@@ -265,11 +251,11 @@ func newNameObservationResult(limit int64, parent uint64, guards storage.Namespa
 		if attr.ID == 0 || attr.ID == parent || attr.Kind.Check() != nil || attr.Size < 0 {
 			return 0, syscall.EIO
 		}
-		if attr.ID == guards.RootID {
+		if excludeAncestors && attr.ID == guards.RootID {
 			return 0, syscall.EIO
 		}
 		for _, directory := range guards.Directories {
-			if attr.ID == directory.ParentID {
+			if excludeAncestors && attr.ID == directory.ParentID {
 				return 0, syscall.EIO
 			}
 		}
@@ -279,6 +265,89 @@ func newNameObservationResult(limit int64, parent uint64, guards storage.Namespa
 		}
 		// UTF-16 never needs more than two bytes per UTF-8 byte. Index and
 		// duplicate-identity bookkeeping are charged before any leaf is loaded.
-		return charge + 128 + 2*nameBytes, nil
+		captureCharge := 2*charge + 1536 + 2*nameBytes
+		charge += 128 + 2*nameBytes
+		if reserve != nil {
+			if err := reserve(captureCharge); err != nil {
+				return 0, err
+			}
+		}
+		return charge, nil
 	})
+}
+
+func captureForwardNameComponent(ctx context.Context, observer storage.DirectoryMetadataObserver, parent storage.DirectoryTarget, guards storage.NamespaceGuards, part string, compare nameComparer, limit int64) (storage.DirectoryMetadataObservation, storage.Entry, bool, error) {
+	var reserve func(int64) error
+	if capture, ok := ctx.Value(nameCaptureKey{}).(*referenceNameSelection); ok {
+		var staging int
+		var err error
+		limit, staging, err = reserveDirectoryCapture(capture.export)
+		if err != nil {
+			return storage.DirectoryMetadataObservation{}, storage.Entry{}, false, err
+		}
+		charged := staging
+		defer func() { releaseDirectoryBytes(capture.export, charged) }()
+		reserve = func(amount int64) error {
+			if err := reserveDirectoryBytes(capture.export, int(amount)); err != nil {
+				return err
+			}
+			charged += int(amount)
+			return nil
+		}
+	}
+	result, err := nameObservationResult(limit, parent.NodeID, guards, true, reserve)
+	if err != nil {
+		return storage.DirectoryMetadataObservation{}, storage.Entry{}, false, err
+	}
+	options := storage.DirectoryMetadataOptions{Guards: cloneNamespaceGuards(guards)}
+	observation, err := observer.ObserveDirectoryMetadata(ctx, parent, options, result)
+	if err != nil {
+		result.Fail(err)
+		return storage.DirectoryMetadataObservation{}, storage.Entry{}, false, namespaceFailure(err)
+	}
+	if err = ctx.Err(); err != nil {
+		result.Fail(err)
+		return storage.DirectoryMetadataObservation{}, storage.Entry{}, false, err
+	}
+	if err = observation.Check(parent, options); err != nil {
+		result.Fail(err)
+		return storage.DirectoryMetadataObservation{}, storage.Entry{}, false, err
+	}
+	entries, err := result.Entries()
+	if err != nil {
+		return storage.DirectoryMetadataObservation{}, storage.Entry{}, false, namespaceFailure(err)
+	}
+	projected, err := projectDirectory(entries, compare)
+	if err != nil {
+		return storage.DirectoryMetadataObservation{}, storage.Entry{}, false, err
+	}
+	selected, present, err := selectName(projected, nameUnits(part), compare)
+	if err != nil {
+		return storage.DirectoryMetadataObservation{}, storage.Entry{}, false, err
+	}
+	entry := storage.Entry{}
+	charge := 1024 + 8*len(observation.Observation.Revision)
+	if present {
+		entry = entries[selected]
+		metadataBytes, err := storage.MetadataSize(entry.Attr.Metadata)
+		if err != nil {
+			return storage.DirectoryMetadataObservation{}, storage.Entry{}, false, err
+		}
+		metadataCharge, err := storage.MetadataRetentionBytes(int64(metadataBytes))
+		if err != nil {
+			return storage.DirectoryMetadataObservation{}, storage.Entry{}, false, err
+		}
+		charge += 8*len(entry.Name) + int(metadataCharge)
+	}
+	if capture, ok := ctx.Value(nameCaptureKey{}).(*referenceNameSelection); ok {
+		if err := capture.reserve(charge); err != nil {
+			return storage.DirectoryMetadataObservation{}, storage.Entry{}, false, err
+		}
+	}
+	observation.Observation.Revision = bytes.Clone(observation.Observation.Revision)
+	if present {
+		entry.Name = string(bytes.Clone([]byte(entry.Name)))
+		entry.Attr = entry.Attr.Clone()
+	}
+	return observation, entry, present, nil
 }

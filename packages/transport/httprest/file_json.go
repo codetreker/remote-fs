@@ -28,11 +28,15 @@ func decodeFileJSON(data []byte, target any) error {
 }
 
 func canonicalFileRequestBody(body []byte, request fileRequest) ([]byte, error) {
-	if request.Op != storage.OpFileOpenAt && request.Op != storage.OpFileOpenChildRef {
+	switch request.Op {
+	case storage.OpFileOpenAt, storage.OpFileOpenChildRef:
+		selection := childSelectionStorage(request.Child, request.Guards)
+		request.Child, request.Guards = childSelectionWire(selection)
+	case storage.OpFileMutateName:
+		request.Name = nameCommandOf(request.Name.storage())
+	default:
 		return body, nil
 	}
-	selection := childSelectionStorage(request.Child, request.Guards)
-	request.Child, request.Guards = childSelectionWire(selection)
 	return json.Marshal(request)
 }
 
@@ -559,6 +563,10 @@ func validateFileResponse(req fileRequest, r fileResponse) error {
 			return err
 		}
 		switch req.Op {
+		case storage.OpFileMutateName:
+			if err := validateNameResultIdentity(req.Name, r.Attr); err != nil {
+				return err
+			}
 		case storage.OpFileOpenAt, storage.OpFileRead, storage.OpFileWrite, storage.OpFileTruncate:
 			if r.Attr.Kind != storage.NodeRegular {
 				return errors.New("file operation returned nonregular attributes")
@@ -662,6 +670,11 @@ func validatePartialFileResponse(req fileRequest, response fileResponse) error {
 		if response.Attr != nil {
 			if err := response.Attr.check(); err != nil {
 				return err
+			}
+			if req.Op == storage.OpFileMutateName {
+				if err := validateNameResultIdentity(req.Name, response.Attr); err != nil {
+					return err
+				}
 			}
 		}
 	case storage.OpFileSetPendingUnlink, storage.OpFileClearPendingUnlink:
@@ -822,4 +835,19 @@ func fileReadLimit(limit int64) int64 {
 		return -1
 	}
 	return (limit - fileReadEnvelopeBytes) / 4 * 3
+}
+
+func validateNameResultIdentity(command *nameCommand, attr *Attr) error {
+	if command == nil {
+		return errors.New("name response has no command")
+	}
+	if command.Target.State == storage.SameNode {
+		switch command.Kind {
+		case storage.NameRename, storage.NameRemove, storage.NameRemoveDir:
+			if attr.ID != command.Target.NodeID {
+				return errors.New("name mutation substituted its source identity")
+			}
+		}
+	}
+	return nil
 }

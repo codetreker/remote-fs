@@ -51,7 +51,7 @@ func namespaceObservationRequest() storage.MetadataObservationRequest {
 }
 
 func TestReferenceScalarStateKeepsIdentityAndHidesMetadata(t *testing.T) {
-	want := storage.ReferenceState{Attr: storage.Attr{ID: 19, Kind: storage.NodeRegular, Size: 7, AllocationKnown: true, AllocationSize: 4096}, Detached: true, PendingUnlink: true}
+	want := storage.ReferenceState{Attr: storage.Attr{ID: 19, Kind: storage.NodeRegular, Size: 7, AllocationKnown: true, AllocationSize: 4096}, Detached: true, PendingUnlink: true, PendingGeneration: []byte{1}}
 	probe := &referenceObservationProbe{fileAuthorityStub: &fileAuthorityStub{}, id: 19, state: want}
 	file := &retainedFile{session: retainedTestSession(t, &fileSessionStub{}), remote: probe}
 	if err := file.CheckReferenceState(); err != nil {

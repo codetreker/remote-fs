@@ -11,7 +11,12 @@ func referenceStateOfProjection(value storage.ReferenceState, projection storage
 	if projection == storage.StateFull {
 		return referenceStateOf(value)
 	}
-	return &referenceState{Attr: &stateAttrJSON{ID: value.Attr.ID, Kind: value.Attr.Kind, Size: value.Attr.Size, AllocationSize: value.Attr.AllocationSize, AllocationKnown: value.Attr.AllocationKnown}, Detached: value.Detached, PendingUnlink: value.PendingUnlink}
+	state := &referenceState{Attr: &stateAttrJSON{ID: value.Attr.ID, Kind: value.Attr.Kind, Size: value.Attr.Size, AllocationSize: value.Attr.AllocationSize, AllocationKnown: value.Attr.AllocationKnown}, Detached: value.Detached, PendingUnlink: value.PendingUnlink}
+	if value.PendingUnlink {
+		generation := metadataVersion(bytes.Clone(value.PendingGeneration))
+		state.PendingGeneration = &generation
+	}
+	return state
 }
 
 func validateReferenceStateProjection(state *referenceState, projection storage.StateProjection) error {
@@ -25,8 +30,11 @@ func validateReferenceStateProjection(state *referenceState, projection storage.
 		return validateReferenceState(state)
 	}
 	attr := state.Attr
-	if attr.AccessTime != nil || attr.ModTime != nil || attr.BirthTime != nil || attr.ChangeTime != nil || attr.Metadata != nil || state.LinkTarget != nil || state.PendingGeneration != nil {
+	if attr.AccessTime != nil || attr.ModTime != nil || attr.BirthTime != nil || attr.ChangeTime != nil || attr.Metadata != nil || state.LinkTarget != nil {
 		return errors.New("scalar reference state exposes protected facts")
+	}
+	if (state.PendingGeneration != nil) != state.PendingUnlink {
+		return errors.New("scalar reference state carries inconsistent pending generation")
 	}
 	return state.storage().CheckProjection(attr.ID, projection)
 }

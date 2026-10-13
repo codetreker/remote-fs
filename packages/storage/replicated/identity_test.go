@@ -100,6 +100,7 @@ func TestOpenAtPreservesIndependentMetadataOptionsAndReferenceIdentity(t *testin
 		{Read: true, Use: storage.UseClaim{Uses: storage.ReadData}, MetadataAccess: storage.WriteMetadata, Existing: storage.Keep},
 		{Write: true, Use: storage.UseClaim{Uses: storage.ReadData | storage.WriteData}, MetadataAccess: storage.ReadMetadata, Existing: storage.Keep},
 		{Read: true, Use: storage.UseClaim{Uses: storage.ReadData}, Existing: storage.Keep},
+		{Use: storage.UseClaim{Uses: storage.DeleteName}, Existing: storage.ResetContent, ResetUse: storage.DeleteName, Initial: storage.InitialState{OnReset: storage.InitialFields{Metadata: map[string][]byte{"app.flags": {1}}}}},
 	} {
 		result, err := wrapper.OpenAt(t.Context(), storage.ChildSelection{}, options)
 		if err != nil || !reflect.DeepEqual(probe.options, options) {

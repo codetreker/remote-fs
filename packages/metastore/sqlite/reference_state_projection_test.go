@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"encoding/binary"
 	"errors"
 	"reflect"
 	"syscall"
@@ -231,6 +232,7 @@ func TestReferenceScalarStateProjectsPendingGenerationWithoutPayloads(t *testing
 		t.Fatal(err)
 	}
 	want.PendingUnlink = true
+	want.PendingGeneration = binary.BigEndian.AppendUint64(nil, 7)
 	if got, err := file.State(t.Context(), storage.StateScalars); err != nil || !reflect.DeepEqual(got, want) {
 		t.Fatalf("explicit pending = %+v, %v", got, err)
 	}
@@ -273,7 +275,7 @@ func TestReferenceScalarStateProjectsAcceptedIntentAndRejectsMalformedOutcome(t 
 			t.Fatalf("outcome %d information = %+v, %v", outcome, got, err)
 		}
 		state, err := file.State(t.Context(), storage.StateFull)
-		if err != nil || state.PendingUnlink != got.PendingUnlink || state.PendingUnlink && len(state.PendingGeneration) != 8 {
+		if err != nil || state.PendingUnlink != got.PendingUnlink || !bytes.Equal(state.PendingGeneration, got.PendingGeneration) || state.PendingUnlink && len(state.PendingGeneration) != 8 {
 			t.Fatalf("outcome %d full state = %+v, %v", outcome, state, err)
 		}
 	}

@@ -40,7 +40,7 @@ func (h *Handler) authorizeFile(ctx context.Context, request fileRequest) error 
 			appendOperation(storage.OpFileSetAttr)
 			appendOperation(storage.OpFileSetMetadata)
 		}
-		if options.Existing == storage.ReplaceNode {
+		if options.Existing == storage.ReplaceNode || options.ResetUse == storage.DeleteName {
 			appendOperation(storage.OpVolumeRemove)
 		}
 		if !options.Initial.OnCreate.Attr.Empty() || !options.Initial.OnReset.Attr.Empty() || !options.Initial.OnReplace.Attr.Empty() {

@@ -22,7 +22,7 @@ SMB 文件信息在[有界 CREATE/CLOSE](2026-09-28-smb-bounded-create-close.md)
 | `FileNetworkOpenInformation` `0x22` | FILE_READ_ATTRIBUTES；同一次 Stat | 56 字节，四个时间、EOF／allocation、Windows 属性 |
 | `FileIdInformation` `0x3B` | 活引用与当前查询授权；本次 StateScalars、固定可信 volume identity | 24 字节，稳定 64-bit volume serial 与 128-bit 对象 ID |
 
-Basic／NetworkOpen 不能拼接多次 Stat 的字段。Standard／Internal／Id 不要求 FILE_READ_ATTRIBUTES，复用 `ReferenceStateAccess.State(ctx, StateScalars)` 返回同一 snapshot 的 Attr.ID／Kind／Size／AllocationSize／AllocationKnown 和 Detached／PendingUnlink；四类时间、opaque metadata、link target 与 pending generation 必须缺席，也不先载入完整 State 再裁字段。`StateFull` 保留完整结果并要求 ReadMetadata，FUSE 明确使用 Full。投影零值非法，当前业务授权携带实际投影，引用生命期和 NodeID 仍逐次验证。普通文件 Size 非负，目录 Size 未指定；Windows 按目录 kind 报告 EOF=0。
+Basic／NetworkOpen 不能拼接多次 Stat 的字段。Standard／Internal／Id 不要求 FILE_READ_ATTRIBUTES，复用 `ReferenceStateAccess.State(ctx, StateScalars)` 返回同一 snapshot 的 Attr.ID／Kind／Size／AllocationSize／AllocationKnown 和 Detached／PendingUnlink；四类时间、opaque metadata 与 link target 必须缺席；已有 bounded PendingGeneration 随 aggregate pending 返回，由[名字修改](2026-09-28-smb-guarded-name-mutation.md)用于 ordinary CLEAR，也不先载入完整 State 再裁字段。`StateFull` 保留完整结果并要求 ReadMetadata，FUSE 明确使用 Full。投影零值非法，当前业务授权携带实际投影，引用生命期和 NodeID 仍逐次验证。普通文件 Size 非负，目录 Size 未指定；Windows 按目录 kind 报告 EOF=0。
 
 NodeID 在同一 volume 内不可复用；128-bit ID 对 uint64 NodeID 做无损单射编码，不增加另一份持久 ID map。64-bit serial 从 canonical durable VolumeID 稳定投影，不同发布 volume 的投影碰撞在发布准入拒绝；SMB 每次打开的 FileId 只标识 capability，与对象 ID 分离。[volume 信息](2026-09-28-smb-volume-information.md)使用该 serial 的低 32 位；该字段不承担唯一性保证，原 64-bit reservation 保留。
 
@@ -58,7 +58,7 @@ QUERY_INFO／SET_INFO 的原签名字节不改写，related FileId 只在 frame-
 
 | 延后能力 | 延后代价与保持的结构 | 未交付请求的结果 |
 |---|---|---|
-| [7.6 关闭删除](../../implemented/feature/2026-09-28-smb-close-delete-obligation.md)与[8.1 名字修改](../../proposed/feature/2026-09-28-smb-guarded-name-mutation.md) | 增加持久义务与 ancestryguards；旧 CREATE 名字不当作当前事实 | disposition、rename／link、当前名字类明确 unsupported |
+| [7.6 关闭删除](../../implemented/feature/2026-09-28-smb-close-delete-obligation.md)与[8.1 名字修改](2026-09-28-smb-guarded-name-mutation.md) | 增加持久义务与 ancestryguards；旧 CREATE 名字不当作当前事实 | ordinary disposition、rename 与 normalized current name 由各自独立决定拥有；link 保持 unsupported |
 | [8.2 范围锁](../../proposed/feature/2026-09-28-smb-range-lock-cancel.md) | 增加跨入口范围保护；EOF／Basic 继续走受控 reference 和 authority 最终检查 | LOCK／asyncCANCEL 按未交付协议结果处理 |
 | [8.3 通知与缓存](../../proposed/feature/2026-09-28-smb-change-notify-cache-coherence.md) | 增加失效协议与原生证明；不能将 Go／wire 查询成功当作 Windows 私有缓存资格 | CHANGE_NOTIFY 明确 unsupported |
 

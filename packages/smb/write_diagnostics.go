@@ -157,6 +157,39 @@ func (l *writeLedger) update(id WriteOwnerID, fn func(*writeRecord)) {
 	}
 }
 
+// The old payload stays charged until its replacement has been cloned and
+// installed. This reservation covers both payloads at the transition peak.
+func (l *writeLedger) reserveReplacementPayload(id WriteOwnerID, freshBytes, limit int) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	record := l.records[id]
+	if record == nil || record.terminal || record.fact.PayloadReleased || freshBytes < 0 {
+		return 0, syscall.EINVAL
+	}
+	exportBytes := 0
+	for _, retained := range l.records {
+		if retained.export == record.export {
+			exportBytes += retained.payloadBytes
+		}
+	}
+	if freshBytes > limit-l.bytes || freshBytes > limit-exportBytes {
+		return 0, syscall.ENOMEM
+	}
+	old := record.payloadBytes
+	record.payloadBytes += freshBytes
+	l.bytes += freshBytes
+	return old, nil
+}
+
+func (l *writeLedger) setPayloadCharge(id WriteOwnerID, bytes int) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if record := l.records[id]; record != nil {
+		l.bytes += bytes - record.payloadBytes
+		record.payloadBytes = bytes
+	}
+}
+
 func (l *writeLedger) releasePayload(id WriteOwnerID) {
 	l.mu.Lock()
 	defer l.mu.Unlock()

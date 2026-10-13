@@ -90,10 +90,14 @@ func (s *Store) referenceScalarState(ctx context.Context, tx *sql.Tx, id int64) 
 	if (name.State == storage.NameDetached) != (detached == 1) {
 		return metastore.ReferenceState{}, syscall.EIO
 	}
-	return metastore.ReferenceState{State: metastore.FileState{
+	result := metastore.ReferenceState{State: metastore.FileState{
 		Node:     metastore.Node{ID: id, Kind: storage.NodeKind(kind), Size: size, AllocationSize: allocation, AllocationKnown: true},
 		Detached: detached == 1,
-	}, PendingUnlink: pending.pending}, nil
+	}, PendingUnlink: pending.pending}
+	if pending.pending {
+		result.PendingGeneration = binary.BigEndian.AppendUint64(nil, uint64(pending.generation))
+	}
+	return result, nil
 }
 
 func (f *retainedFile) State(ctx context.Context, projection storage.StateProjection) (metastore.ReferenceState, error) {
@@ -336,11 +340,15 @@ func (s *Store) armCloseIntent(ctx context.Context, tx *sql.Tx, f *retainedFile,
 }
 
 func (s *Store) activateExplicitPendingUnlink(ctx context.Context, tx *sql.Tx, id int64) error {
-	blocked, err := s.nodePendingUnlink(ctx, tx, id)
+	var explicit bool
+	err := tx.QueryRowContext(ctx, `SELECT pending_unlink FROM nodes WHERE volume=? AND id=?`, s.volume, id).Scan(&explicit)
+	if errors.Is(err, sql.ErrNoRows) {
+		return syscall.ESTALE
+	}
 	if err != nil {
 		return err
 	}
-	if !blocked {
+	if !explicit {
 		if err := s.advancePendingGeneration(ctx, tx, id); err != nil {
 			return err
 		}
@@ -421,31 +429,47 @@ func (f *retainedFile) ClearPendingUnlink(ctx context.Context, command storage.C
 	}
 	var state metastore.ReferenceState
 	s := f.store
-	err := s.mutateTransactionLocked(ctx, ctx, &volumeIntent{kind: locking.SetAttrMutation, node: f.id}, func(tx *sql.Tx) error {
+	var explicit bool
+	plan := func(tx *sql.Tx) (*volumeIntent, bool, error) {
 		if err := f.checkDeleteUse(ctx, command.Uses); err != nil {
-			return err
+			return nil, false, err
 		}
-		before, err := s.referenceState(ctx, tx, f.id)
+		pending, err := s.capturePendingDeletion(ctx, tx, f.id)
 		if err != nil {
-			return err
+			return nil, false, err
 		}
-		var explicit bool
+		var generation []byte
+		if pending.pending {
+			generation = binary.BigEndian.AppendUint64(nil, uint64(pending.generation))
+		}
+		if !bytes.Equal(command.Generation, generation) {
+			return nil, false, storage.ErrConditionConflict
+		}
 		if err := tx.QueryRowContext(ctx, `SELECT pending_unlink FROM nodes WHERE volume=? AND id=?`, s.volume, f.id).Scan(&explicit); err != nil {
-			return err
+			return nil, false, err
 		}
-		if !explicit || !bytes.Equal(command.Generation, before.PendingGeneration) {
-			return storage.ErrConditionConflict
+		if !explicit {
+			return nil, false, nil
 		}
-		if _, err := tx.ExecContext(ctx, `UPDATE nodes SET pending_unlink=0 WHERE volume=? AND id=?`, s.volume, f.id); err != nil {
-			return err
+		return &volumeIntent{kind: locking.SetAttrMutation, node: f.id}, true, nil
+	}
+	err := s.mutatePlannedTransactionLocked(ctx, ctx, plan, func(tx *sql.Tx) error {
+		if explicit {
+			if _, err := tx.ExecContext(ctx, `UPDATE nodes SET pending_unlink=0 WHERE volume=? AND id=?`, s.volume, f.id); err != nil {
+				return err
+			}
+			if err := s.setNodeChangeTime(ctx, tx, f.id, time.Now()); err != nil {
+				return err
+			}
+			if err := s.recordNamedChanged(ctx, tx, f.id); err != nil {
+				return err
+			}
 		}
-		if err := s.setNodeChangeTime(ctx, tx, f.id, time.Now()); err != nil {
-			return err
-		}
-		if err := s.recordNamedChanged(ctx, tx, f.id); err != nil {
-			return err
-		}
+		var err error
 		state, err = s.returnedReferenceState(ctx, tx, f.id)
+		if err == nil && !explicit {
+			err = metastore.CheckFilePublication(ctx)
+		}
 		return err
 	})
 	return state, sqlerr.Failure(err)
@@ -700,7 +724,7 @@ func (s *Store) markNodeDeleteIntents(ctx context.Context, tx *sql.Tx, node int6
 }
 
 func (s *Store) finalizePendingUnlinkLocked(ctx context.Context, id int64, closing *retainedFile) error {
-	if s.coordinator.pins[retainedNode{s.volume, id}] > 1 {
+	if s.nodePinCountLocked(id) > 1 {
 		return syscall.EBUSY
 	}
 	var state metastore.ReferenceState
@@ -863,7 +887,7 @@ func (s *Store) RetryPendingUnlinks(ctx context.Context, limit int) error {
 	var failures []error
 	for _, id := range nodes {
 		s.fileDomain.pendingUnlinkCursor = id
-		if s.coordinator.pins[retainedNode{s.volume, id}] != 0 {
+		if s.nodePinCountLocked(id) != 0 {
 			continue
 		}
 		if err := s.activateRecoveredIntentsLocked(ctx, id); err != nil {
