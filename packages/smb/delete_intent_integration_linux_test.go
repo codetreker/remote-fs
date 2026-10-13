@@ -628,3 +628,69 @@ func TestDeleteOnCloseRecoveryReportsRealHTTPEnrollmentSaturation(t *testing.T) 
 		t.Fatal(err)
 	}
 }
+
+func TestDeleteOnCloseRecoveryRetiresExpiredDirectIdentity(t *testing.T) {
+	f := enableDeleteIntentsForTest(t, newRealSMBFixture(t))
+	ctx := WithPrincipal(t.Context(), f.session.principal)
+	f.server.config.Limits.FileSession.Lease = time.Second
+	denied := true
+	f.server.config.Authorize = authz.AuthorizerFunc(func(_ context.Context, request authz.AccessRequest) error {
+		if denied && request.Operation == storage.OpFileListDeleteIntents {
+			return authz.ErrDenied
+		}
+		return nil
+	})
+	e := f.tree.export
+	if err := e.RecoverDeleteIntents(ctx); !errors.Is(err, authz.ErrDenied) {
+		t.Fatal(err)
+	}
+	original := e.deleteRecovery.current
+	if original == nil {
+		t.Fatal("interrupted discovery lost its session")
+	}
+	expiry, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for {
+		_, err := original.raw.(storage.FileSessionIdentity).FileSessionIdentity(expiry)
+		if errors.Is(err, syscall.ESTALE) {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case <-ticker.C:
+		case <-expiry.Done():
+			t.Fatal(expiry.Err())
+		}
+	}
+	denied = false
+	if err := e.RecoverDeleteIntents(ctx); !errors.Is(err, syscall.ESTALE) {
+		t.Fatal(err)
+	}
+	if err := e.RecoverDeleteIntents(ctx); !errors.Is(err, syscall.EAGAIN) {
+		t.Fatal(err)
+	}
+	if e.deleteRecovery.current != nil || e.deleteRecovery.ready.Load() || f.server.Status().DeleteRecoveryCleanupOwners != 0 {
+		t.Fatal("expired session was not settled before replacement")
+	}
+	if err := e.RecoverDeleteIntents(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !e.deleteRecovery.ready.Load() {
+		t.Fatal("fresh direct discovery did not restore readiness")
+	}
+	_, status, id := f.connection.createFile(ctx, f.session, f.tree, deleteCreateRequestForTest("after-expiry", 2, accessReadData|accessDelete, 0))
+	if status != statusOK {
+		t.Fatalf("DOC admission after direct expiry=%#x", status)
+	}
+	closeDeleteFixtureHandle(t, f, id)
+	if _, err := f.volume.Stat(ctx, "after-expiry"); !errors.Is(err, syscall.ENOENT) {
+		t.Fatalf("restored DOC did not delete: %v", err)
+	}
+	if err := e.Unpublish(ctx); err != nil {
+		t.Fatal(err)
+	}
+}

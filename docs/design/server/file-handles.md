@@ -100,7 +100,7 @@ SQLite authority schema v11 在 v7 的符号链接目标、节点 pending genera
 
 `SQLiteOptions.MaxRetainedFiles` 默认 65536，按 volume 共享。退役引用仍占物理名额，直到最后释放完成。满额时创建并打开必须在产生 volume 副作用之前拒绝。多个 objectstore 包装同一 volume 时使用同一份引用、Use 与 range 预算，不能借另建包装器绕过上限。
 
-拥有数据库原生 EX 锁的启动过程先有界验证所有 volume，包括 detached/pending 节点、delete intent、对象关系和配额。没有 durable obligation 的旧 epoch 无主引用可以回收；公开 EnableLocks 在同一私有 native acquisition 内，先按节点经受 Strong／publication guard 保护的 activation transaction 分类全部旧 Armed，再开放普通准入；OpenLocking 与 localstore.Open 共用该入口。Recovering 按真实 RecoveryRemainingMillis 与原 startup context 等待，重试不重置 Strong window，Conflict 或取消使构造失败；没有旧 Armed 不增加等待。旧 pending 的物理回收继续采用 bounded maintenance，分类不受 reclaim batch 限制。使用量、垃圾记录和提交代际通过同一个 Commit/Accept 结果生效。验证失败不先回收一部分；普通共享 opener 不执行恢复清理。持久见证、数据库所有权和关闭失败的处理见[本地持久对象存储](local-disk-object-store.md)。
+拥有数据库原生 EX 锁的启动过程先有界验证所有 volume，包括 detached/pending 节点、delete intent、对象关系和配额。没有 durable obligation 的旧 epoch 无主引用可以回收；独占 durable 构造没有 lease-recovery owner 时，在 attachFileDomain 后用原 helper 分类当前 volume 的全部旧 Armed，Locks=nil 的 localstore 同样在 Store 返回前完成。启用 Strong 的 OpenLocking 与 localstore.Open 在 EnableLocks 附加 authority 后，以同一私有 native acquisition 经逐节点 Strong／publication guard 分类，再开放普通准入；分类失败保持原构造清理及 ownership 错误规则，不返回 Store。Recovering 按真实 RecoveryRemainingMillis 与原 startup context 等待，重试不重置 Strong window，Conflict 或取消使构造失败；没有旧 Armed 不增加等待。旧 pending 的物理回收继续采用 bounded maintenance，分类不受 reclaim batch 限制。使用量、垃圾记录和提交代际通过同一个 Commit/Accept 结果生效。验证失败不先回收一部分；普通共享 opener 不执行恢复清理。持久见证、数据库所有权和关闭失败的处理见[本地持久对象存储](local-disk-object-store.md)。
 
 ### 身份 namespace
 

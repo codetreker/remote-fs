@@ -159,7 +159,7 @@ fresh search 无匹配为 NO_SUCH_FILE，随后由独立 settled 状态返回 NO
 
 ACK 保存固定 owner／intent、terminal outcome、原 action 及 issued witness。已发 ACK 的未知回执先查询原动作；当前持久 Query 仍给出同一终态，才可利用其幂等语义换当前 action，原未知 ID 保留。仅“先观察终态且已发 ACK，随后 Query 缺失”证明该记录已回收；单独缺失不证明任何 CREATE 结果。CREATE／WRITE／CLOSE 的原动作重投规则保持各自语义。
 
-backend incarnation 改变时，旧恢复 session 的精确关闭未结算则保留原错误，并从同一全局额度另取一个槽供当前发现。最多 current／retired 两份 session，禁止第三份；当前发现 ready 和旧 cleanup 分开记录。Stop 保留 issued Unknown ACK，先核对其原 witness，再关闭恢复 session；旧 HTTP session 的 ESTALE 或新 incarnation 不证明 adapter settlement。未结算继续导致 stopping 错误；已确认 authority handoff 后不等待其它客户端的合法引用。具体责任和宿主代价由[关闭删除决定](../../../.agents/notes/implemented/feature/2026-09-28-smb-close-delete-obligation.md)拥有。
+恢复 session 的 identity 查询返回 ESTALE 时，原错误返回且 current 标为 closing；后续调用先用原 CloseWithResult 和完整 settlement 核对该确切 session。未结算继续保留 owner／charge、cursor／page 及 ACK witness，并返回实际错误。确认结算后才退休 current，部分遍历返回 EAGAIN，再建立新 session 续作保留状态；同 authority 到期不新增槽，ready 仍要求完整遍历和当前 session 关闭结算。backend incarnation 改变时，旧恢复 session 的精确关闭未结算则保留原错误，并从同一全局额度另取一个槽供当前发现。最多 current／retired 两份 session，禁止第三份；当前发现 ready 和旧 cleanup 分开记录。Stop 保留 issued Unknown ACK，先核对其原 witness，再关闭恢复 session；旧 HTTP session 的 ESTALE 或新 incarnation 不证明 adapter settlement。未结算继续导致 stopping 错误；已确认 authority handoff 后不等待其它客户端的合法引用。具体责任和宿主代价由[关闭删除决定](../../../.agents/notes/implemented/feature/2026-09-28-smb-close-delete-obligation.md)拥有。
 
 ## 五、容量与 FileId owner
 

@@ -103,7 +103,7 @@ ACK 仅针对 `Completed`／`NotExecuted`。端点先证明原本地引用、pen
 
 ### 恢复 session、停止与崩溃
 
-恢复 session 先验证实际 backend volume／root、FileSession descriptor、epoch、活跃状态和完整能力。当前 session 可按原身份继续处理未知尝试。backend incarnation 改变时，旧 session 的精确关闭先重试；未结算则保留其原 owner、语义错误和 cause，并从同一全局责任额度额外取得一个槽供当前发现。最多 current 与 retired 两份 session；没有第三份，也不按重试新增槽。
+恢复 session 先验证实际 backend volume／root、FileSession descriptor、epoch、活跃状态和完整能力。当前 session 可按原身份继续处理未知尝试；identity 查询返回 ESTALE 时，保存原错误并将该 session 标为 closing。后续调用先走原 CloseWithResult、结果检查与完整 settlement，未结算保留同一 owner、容量、cursor／page 和 terminal／issued ACK witness，返回实际关闭错误；确认结算后才退休 current，部分遍历返回 EAGAIN，再由新 session 续作原扫描与 ACK。同 authority 的到期换 session 不新增责任槽，ready 仍要求完整遍历和当前 session 关闭结算，ESTALE 本身不证明释放。backend incarnation 改变时，旧 session 的精确关闭先重试；未结算则保留其原 owner、语义错误和 cause，并从同一全局责任额度额外取得一个槽供当前发现。最多 current 与 retired 两份 session；没有第三份，也不按重试新增槽。
 
 新 incarnation 使旧 native 引用失效，但不能证明 HTTP／replica 的 adapter settlement。当前发现 ready 与旧恢复 session 的 cleanup 分开计数；当前扫描完整不能清空旧错误。旧 session 确认关闭后归还额外槽。停止保留 issued Unknown ACK，在原 witness 上核对后才能关闭自己的 session；授权或查询失败继续保持 stopping。已有删除是被 authority 接受的固定效果，后续权限撤销不能取消它；新 query/list/ACK/session 工作仍重新授权。
 
@@ -113,13 +113,13 @@ SMB 进程异常终止时，authority 根据 session 生命周期与 durable int
 
 ### SQLite 启动与共享名字事务
 
-公开 `EnableLocks` 是 OpenLocking 与 localstore.Open 共用的 authority 附加入口。在 Store 暴露给普通调用方前，它用私有 native acquisition 分类所有上一进程的 Armed 节点，再由原 bounded maintenance 回收。分类逐节点复用现有受 Strong／publication guard 保护的 activation transaction；原 publication 每次最多两个目标，不能把任意历史塞进一次 aggregate transaction。
+持有 EX ownership 的 durable Store 在对外暴露前分类当前 volume 的全部旧 Armed，再由原 bounded maintenance 回收。没有 lease-recovery owner 的独占 durable 构造在 attachFileDomain 后调用原 recoverArmedDeleteIntents，涵盖 localstore 的 Locks=nil；分类失败沿原 pool 清理及 ownership 保留／释放规则返回错误，不交出 Store。启用 Strong 的 OpenLocking 与 localstore.Open 通过公开 EnableLocks 附加 authority 后分类，不能在 Strong 恢复安装前抢先触发。两条入口复用同一私有分类 helper 与 activation transaction；Strong 路径经过原 publication guard，每次最多两个目标，不能把任意历史塞进一次 aggregate transaction。
 
 遇到 `locking.Recovering` 时，读取真实 `RecoveryRemainingMillis`，在原 startup context 下等待并重试同一个 authority。ownership acquisition 与 Strong recovery window 不重建；Conflict、取消或其它错误使构造真实失败并走原清理。没有旧 Armed 不增加恢复等待。分类不受物理 reclaim batch 限制，普通 reference／name 准入不能插入尚未分类的历史；当前 live Armed 仍只由原引用关闭触发。
 
 shared `discardNode` 在无 pin、确实物理删除节点时，同一事务先将该节点 Armed 置为 NotExecuted，再 DELETE；仍有合法 pin 的节点只 detached，保持 live Armed 等发起引用结算。该路径覆盖 Remove、NameRemove、replacement 和原子打开回收，原完整性检查保持严格。
 
-shared `tree.link` 在 INSERT 前复用 `checkNameAddition`，SDK Write／Commit 的具名创建不能绕过 pending 父目录。它与 NamespaceAccess 共用原 guard，没有新增机制。源位置为 [publication.go](../../../../packages/metastore/sqlite/publication.go)、[pending_unlink.go](../../../../packages/metastore/sqlite/pending_unlink.go)与 [tree.go](../../../../packages/metastore/sqlite/tree.go)；schema、迁移、storage／HTTP 接口和外键保持原形。
+shared `tree.link` 在 INSERT 前复用 `checkNameAddition`，SDK Write／Commit 的具名创建不能绕过 pending 父目录。它与 NamespaceAccess 共用原 guard，没有新增机制。源位置为 [sqlite.go](../../../../packages/metastore/sqlite/sqlite.go)、[publication.go](../../../../packages/metastore/sqlite/publication.go)、[pending_unlink.go](../../../../packages/metastore/sqlite/pending_unlink.go)与 [tree.go](../../../../packages/metastore/sqlite/tree.go)；schema、迁移、storage／HTTP 接口和外键保持原形。
 
 ### 资源与诊断
 
@@ -162,11 +162,15 @@ packages/smb/
   protocol_delete_windows_test.go
                               实际 SSPI／映射／Win32 CREATE、CLOSE 和断线
 packages/metastore/sqlite/
-  publication.go              共用 EnableLocks 启动分类
+  sqlite.go                   非 lease-recovery 的 EX durable 启动分类
+  publication.go              Strong EnableLocks 启动分类
   pending_unlink.go            同 acquisition 的旧 Armed activation
   tree.go                     discard 终态与 shared link pending guard
   delete_intent_recovery_test.go
                               启动、Strong、discard、pin 与 SDK 准入回归
+packages/storage/localstore/
+  delete_intent_crash_linux_test.go
+                              Locks=nil 的 SIGKILL、全量分类及构造失败清理
 ```
 
 新增文件只拆分当前 SMB 内部职责；wire CREATE／CLOSE 编码、原 FileActions 和 wrapper 继续使用现有接口。原生 probe 的请求 frame 捕获与目录 probe 共用现有重组辅助；没有通用协议 telemetry、长期测试服务或 FUSE 删除机制。

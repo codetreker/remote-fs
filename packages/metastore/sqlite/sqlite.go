@@ -470,6 +470,11 @@ func openConfiguredWithHooks(
 	if err != nil {
 		return nil, cleanup(err, openPoolHandle{"snapshot reader pool", snapshotRead}, openPoolHandle{"reader pool", read}, openPoolHandle{"writer pool", write})
 	}
+	if durable != nil && owner != nil && owner.Exclusive() && !options.leaseRecoveryOwner {
+		if err := store.recoverArmedDeleteIntents(ctx); err != nil {
+			return nil, cleanup(err, openPoolHandle{"snapshot reader pool", snapshotRead}, openPoolHandle{"reader pool", read}, openPoolHandle{"writer pool", write})
+		}
+	}
 	releaseOnFailure = false
 	return store, nil
 }

@@ -52,9 +52,13 @@ type deleteRecoverySessionStub struct {
 	closeResult       storage.ReferenceCloseResult
 	settlementErr     error
 	queryReceipt      storage.FileActionOutcome
+	identityErr       error
 }
 
 func (s *deleteRecoverySessionStub) FileSessionIdentity(context.Context) (storage.FileSessionIdentityResult, error) {
+	if s.identityErr != nil {
+		return storage.FileSessionIdentityResult{}, s.identityErr
+	}
 	return storage.FileSessionIdentityResult{Backend: s.identity, SessionEpoch: s.status.Epoch}, nil
 }
 
@@ -480,23 +484,50 @@ func TestDeleteRecoveryLocalAckLossSurvivesEmptyDurableList(t *testing.T) {
 }
 
 func TestDeleteRecoverySessionExpirationKeepsFiniteScan(t *testing.T) {
-	_, export, backend, ctx := deleteRecoveryFixture(t, endpointConfig(), storage.DeleteIntentPending)
-	backend.newSession = func(raw *deleteRecoverySessionStub) { raw.status.Remaining = 0 }
-	if err := export.RecoverDeleteIntents(ctx); !errors.Is(err, syscall.ESTALE) {
-		t.Fatal(err)
-	}
-	if err := export.RecoverDeleteIntents(ctx); !errors.Is(err, syscall.EAGAIN) {
-		t.Fatal(err)
-	}
-	if export.deleteRecovery.ready.Load() || len(backend.sessions) != 1 {
-		t.Fatal("expired scan claimed readiness")
-	}
-	backend.newSession = nil
-	if err := export.RecoverDeleteIntents(ctx); err != nil {
-		t.Fatal(err)
-	}
-	if !export.deleteRecovery.ready.Load() || len(backend.sessions) != 2 {
-		t.Fatal("settled old session did not allow finite retry")
+	for _, phase := range []string{"status", "identity", "partial-identity"} {
+		t.Run(phase, func(t *testing.T) {
+			config := endpointConfig()
+			config.Limits.MaxUnresolvedOwners = 1
+			_, export, backend, ctx := deleteRecoveryFixture(t, config, storage.DeleteIntentPending)
+			if phase == "partial-identity" {
+				if err := export.RecoverDeleteIntents(ctx); !errors.Is(err, syscall.EAGAIN) {
+					t.Fatal(err)
+				}
+				if export.deleteRecovery.cursor != 1 {
+					t.Fatal("bounded scan lost its first page")
+				}
+				backend.sessions[0].identityErr = syscall.ESTALE
+			}
+			backend.newSession = func(raw *deleteRecoverySessionStub) {
+				if phase == "status" {
+					raw.status.Remaining = 0
+				} else {
+					raw.identityErr = syscall.ESTALE
+				}
+			}
+			if err := export.RecoverDeleteIntents(ctx); !errors.Is(err, syscall.ESTALE) {
+				t.Fatal(err)
+			}
+			if err := export.RecoverDeleteIntents(ctx); !errors.Is(err, syscall.EAGAIN) {
+				t.Fatal(err)
+			}
+			if export.deleteRecovery.ready.Load() || len(backend.sessions) != 1 {
+				t.Fatal("expired scan claimed readiness")
+			}
+			backend.newSession = nil
+			for range 2 {
+				err := export.RecoverDeleteIntents(ctx)
+				if err == nil {
+					break
+				}
+				if !errors.Is(err, syscall.EAGAIN) {
+					t.Fatal(err)
+				}
+			}
+			if !export.deleteRecovery.ready.Load() || len(backend.sessions) != 2 {
+				t.Fatal("settled old session did not allow finite retry")
+			}
+		})
 	}
 }
 
@@ -598,5 +629,54 @@ func TestDeleteRecoveryStopCannotDiscardUnknownAck(t *testing.T) {
 	}
 	if !attempt.acked || export.deleteRecovery.attempt != nil || export.deleteRecovery.current != nil || server.Status().DeleteRecoveryCleanupOwners != 0 {
 		t.Fatal("fixed-ID stop retry did not settle original ACK")
+	}
+}
+
+func TestDeleteRecoveryIdentityExpiryPreservesPageAndUnknownAck(t *testing.T) {
+	for _, removed := range []bool{false, true} {
+		t.Run(fmt.Sprintf("removed-%v", removed), func(t *testing.T) {
+			server, export, backend, ctx := deleteRecoveryFixture(t, endpointConfig(), storage.DeleteIntentCompleted, storage.DeleteIntentPending)
+			backend.newSession = func(raw *deleteRecoverySessionStub) { raw.ackErr, raw.deleteBeforeError = syscall.EIO, removed }
+			if err := export.RecoverDeleteIntents(ctx); !errors.Is(err, syscall.EIO) {
+				t.Fatal(err)
+			}
+			r := &export.deleteRecovery
+			attempt, original := r.attempt, r.current
+			first := attempt.action
+			originalRaw := backend.sessions[0]
+			originalRaw.identityErr = syscall.ESTALE
+			backend.newSession = nil
+			if err := export.RecoverDeleteIntents(ctx); !errors.Is(err, syscall.ESTALE) {
+				t.Fatal(err)
+			}
+			originalRaw.closeResult = storage.ReferenceCloseResult{Released: true, Determined: true}
+			originalRaw.settlementErr = &storage.CloseSettlementError{State: storage.CloseSettlementUnknown, Cause: syscall.EIO}
+			if err := export.RecoverDeleteIntents(ctx); !errors.Is(err, syscall.EIO) {
+				t.Fatal(err)
+			}
+			if r.current != original || len(backend.sessions) != 1 || server.Status().DeleteRecoveryCleanupOwners != 1 || server.deleteRecoverySlots != 1 || r.ready.Load() || r.attempt != attempt || r.cursor != 0 || r.index != 0 || len(r.page.Intents) != 2 || !attempt.terminalObserved || !attempt.issued || attempt.acked {
+				t.Fatal("expired identity or Released=true erased original page, ACK or cleanup charge")
+			}
+			originalRaw.settlementErr = nil
+			if err := export.RecoverDeleteIntents(ctx); !errors.Is(err, syscall.EAGAIN) {
+				t.Fatal(err)
+			}
+			if r.current != nil || r.attempt != attempt || len(r.page.Intents) != 2 || len(backend.sessions) != 1 {
+				t.Fatal("settlement discarded unfinished scan or enrolled replacement prematurely")
+			}
+			if err := export.RecoverDeleteIntents(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if !r.ready.Load() || !attempt.acked || len(backend.sessions) != 2 || server.Status().DeleteRecoveryCleanupOwners != 0 || server.deleteRecoverySlots != 1 {
+				t.Fatal("settled replacement did not finish original scan")
+			}
+			if removed && len(backend.sessions[1].acks) != 0 || !removed && (len(backend.sessions[1].acks) != 1 || backend.sessions[1].acks[0].Action == first || attempt.priorUnknown != first) {
+				t.Fatal("replacement lost terminal witness or repeated acknowledged intent")
+			}
+			if err := export.admitDeleteOpen(); err != nil {
+				t.Fatal("DOC admission not restored", err)
+			}
+			export.endDeleteOpen()
+		})
 	}
 }

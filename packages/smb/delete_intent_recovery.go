@@ -347,6 +347,9 @@ func (e *Export) prepareDeleteRecoverySession(ctx context.Context, backend stora
 	}
 	descriptor, err := identity.FileSessionIdentity(ctx)
 	if err != nil {
+		if errors.Is(err, syscall.ESTALE) {
+			r.current.closing = true
+		}
 		return err
 	}
 	if descriptor.Check() != nil || descriptor.Backend != backend {
