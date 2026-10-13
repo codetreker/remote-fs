@@ -186,6 +186,7 @@ func receiveOpenResult(t *testing.T, source <-chan openSignalResult) openSignalR
 }
 
 type openInterruptTrace struct {
+	operation   string
 	mu          sync.Mutex
 	output      bytes.Buffer
 	first       uint64
@@ -199,8 +200,13 @@ func (p *openInterruptTrace) Write(b []byte) (int, error) {
 	defer p.mu.Unlock()
 	p.output.Write(b)
 	var unique, target uint64
-	// go-fuse opens its epoll sentinel during mounting; only the RDWR file is under test.
-	if n, _ := fmt.Sscanf(string(b), "rx %d: OPEN", &unique); n == 1 && bytes.Contains(b, []byte(": OPEN ")) && bytes.Contains(b, []byte("RDWR")) {
+	operation := p.operation
+	if operation == "" {
+		operation = "OPEN"
+	}
+	// The mounting epoll sentinel is a read-only OPEN; regular-file signal cases target RDWR.
+	match := bytes.Contains(b, []byte(": "+operation+" ")) && (operation != "OPEN" || bytes.Contains(b, []byte("RDWR")))
+	if n, _ := fmt.Sscanf(string(b), "rx %d: "+operation, &unique); n == 1 && match {
 		if p.first == 0 {
 			p.first = unique
 		}

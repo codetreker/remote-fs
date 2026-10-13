@@ -149,7 +149,9 @@ FUSE 不保存全文件缓冲区，objectstore 仍可能完整读取、重建不
 
 remote storage 在 HTTP `Do` 前接受取消时返回 `EINTR`，已发出的只读操作也可放弃读取。修改进入 dispatch 后，请求取消不能证明未执行；文件动作通过有界历史核对，仍不能确定的结果以 `EIO` 报告。打开的响应与确认失败必须清理或退役相应引用，不能留下调用方未知的无限引用。没有 Create／Truncate 的已有文件打开，在 ACK 为带 context.Canceled 的规范 EINTR、且同一能力的 Close 清理原始结果为 nil 时，返回无 File 的 EINTR；其余 ACK 失败保持 EIO，完整条件见[文件确认协议](../server/file-handles.md#五http复制与资源)。这不把任意打开变成可重试操作，也不改变丢失 ACK 的既有核对。成功修改未取得副本 barrier 确认时同样为 `EIO`。网络 errno 不进入 volume 错误链。
 
-到达挂载层的错误不会改写成空目录或不存在。第二节保留的副本重建缺口仍可能使按名字查询作出过早的旧答案；文件 direct I/O 不替代副本连续性。分类与阶段判定见[请求中断](../../../.agents/notes/implemented/bug-fix/2026-08-22-eio-from-a-freshly-mounted-mountpoint.md)。
+目录打开以同一 action 核对结果。在效果前拒绝且回执明确 not-executed 时，原纯取消保持 EINTR，调用方可发起新的打开；同 ID 仍返回原拒绝。unknown 或 retired 不能据取消原因改为未执行，仍以 EIO 作答。native 的效果前证明与消费规则见[文件动作](../server/file-handles.md#文件动作与结果核对)。
+
+到达挂载层的错误不会改写成空目录或不存在。第二节保留的副本重建缺口仍可能使按名字查询作出过早的旧答案；文件 direct I/O 不替代副本连续性。分类与阶段判定见[请求中断](../../../.agents/notes/implemented/bug-fix/2026-08-22-eio-from-a-freshly-mounted-mountpoint.md)，节点打开的效果前拒绝见[未执行证明](../../../.agents/notes/implemented/bug-fix/2026-10-13-preserve-unexecuted-node-open.md)。
 
 ## 六、volume 答不上来的，挂载呈现层不代答
 

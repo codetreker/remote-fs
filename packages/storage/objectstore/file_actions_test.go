@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/codetreker/remote-fs/packages/advisory"
+	"github.com/codetreker/remote-fs/packages/metastore"
 	"github.com/codetreker/remote-fs/packages/storage"
 )
 
@@ -77,6 +78,43 @@ func TestFileActionJournalReplaysOneTypedResultAndRejectsChangedIntent(t *testin
 	}
 }
 
+func TestFileActionOpenAdmissionCancellationIsNotExecuted(t *testing.T) {
+	for _, operation := range []storage.Operation{storage.OpFileOpenNodeRef, storage.OpFileOpenChildRef} {
+		t.Run(string(operation), func(t *testing.T) {
+			session := actionTestSession(t, 2)
+			id := actionID(t, session)
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			result, err := runFileAction(ctx, session, id, operation, "directory", cloneNodeOpenResult,
+				func(result storage.NodeOpenResult) bool {
+					return result.Reference != nil || result.Attr.ID != 0 || result.Outcome != 0
+				},
+				func() (storage.NodeOpenResult, error) {
+					session.mu.Lock()
+					pending := session.actions[id].outcome
+					session.mu.Unlock()
+					if pending != storage.FileActionPending {
+						t.Fatalf("open callback started with outcome %v", pending)
+					}
+					cancel()
+					return session.openNodeReference(ctx, storage.NodeRefOptions{}, func(context.Context) (metastore.NodeOpenResult, error) {
+						t.Fatal("canceled open reached the native authority")
+						return metastore.NodeOpenResult{}, nil
+					})
+				})
+			if !errors.Is(err, context.Canceled) || storage.ErrnoOf(err) != syscall.EINTR || result.Reference != nil || result.Attr.ID != 0 || result.Outcome != 0 {
+				t.Fatalf("canceled open: result=%+v error=%T: %v", result, err, err)
+			}
+			if session.operations != 0 || session.opening != 0 || len(session.files) != 0 || len(session.closeRefs) != 0 {
+				t.Fatalf("canceled admission retained resources: operations=%d opening=%d files=%d close references=%d", session.operations, session.opening, len(session.files), len(session.closeRefs))
+			}
+			receipt, err := session.QueryFileAction(t.Context(), id)
+			if err != nil || receipt.Outcome != storage.FileActionNotExecuted {
+				t.Fatalf("open rejected before admission: receipt=%+v error=%v", receipt, err)
+			}
+		})
+	}
+}
 func TestFileActionJournalBoundsHistoryAndKeepsUnknownOutcomes(t *testing.T) {
 	session := actionTestSession(t, 1)
 	first := actionID(t, session)
@@ -102,6 +140,46 @@ func TestFileActionJournalBoundsHistoryAndKeepsUnknownOutcomes(t *testing.T) {
 	receipt, err = session.QueryFileAction(t.Context(), missing)
 	if err != nil || receipt.Outcome != storage.FileActionNotExecuted || receipt.Operation != "" {
 		t.Fatalf("missing receipt=%+v error=%v", receipt, err)
+	}
+}
+
+func TestFileActionNodeOpenRefusalPreservesUnknownOutcomes(t *testing.T) {
+	unknown := errors.New("authority result unknown")
+	for _, test := range []struct {
+		name      string
+		operation storage.Operation
+		result    storage.NodeOpenResult
+		err       error
+	}{
+		{"cancellation without proof", storage.OpFileOpenNodeRef, storage.NodeOpenResult{}, context.Canceled},
+		{"joined uncertain failure", storage.OpFileOpenNodeRef, storage.NodeOpenResult{}, errors.Join(&nodeOpenActionError{cause: context.Canceled, notExecuted: true}, unknown)},
+		{"different operation", storage.OpFileMutate, storage.NodeOpenResult{}, &nodeOpenActionError{cause: context.Canceled, notExecuted: true}},
+		{"returned identity", storage.OpFileOpenNodeRef, storage.NodeOpenResult{Attr: storage.Attr{ID: 7}}, &nodeOpenActionError{cause: context.Canceled, notExecuted: true}},
+		{"declared effect", storage.OpFileOpenNodeRef, storage.NodeOpenResult{Outcome: storage.Opened}, &nodeOpenActionError{cause: context.Canceled, notExecuted: true}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			session := actionTestSession(t, 2)
+			id := actionID(t, session)
+			var calls int
+			invoke := func() (storage.NodeOpenResult, error) {
+				return runFileAction(t.Context(), session, id, test.operation, "same", cloneNodeOpenResult,
+					func(result storage.NodeOpenResult) bool {
+						return result.Reference != nil || result.Attr.ID != 0 || result.Outcome != 0
+					}, func() (storage.NodeOpenResult, error) {
+						calls++
+						return test.result, test.err
+					})
+			}
+			for range 2 {
+				if _, err := invoke(); !errors.Is(err, test.err) {
+					t.Fatalf("original error was lost: %v", err)
+				}
+			}
+			receipt, err := session.QueryFileAction(t.Context(), id)
+			if err != nil || receipt.Outcome != storage.FileActionUnknown || calls != 1 {
+				t.Fatalf("uncertain action: receipt=%+v error=%v executions=%d", receipt, err, calls)
+			}
+		})
 	}
 }
 

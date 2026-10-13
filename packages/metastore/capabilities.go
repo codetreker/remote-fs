@@ -44,6 +44,11 @@ type NodeOpenResult struct {
 	Reference NodeReference
 	State     FileState
 	Outcome   storage.OpenOutcome
+	// NotExecuted proves that admission ended before any reference, use claim,
+	// namespace change, or close intent was accepted, with no cleanup outstanding.
+	// It requires a nonnil error and zero Reference, State, and Outcome. The proof
+	// applies only to this call; cancellation by itself does not establish it.
+	NotExecuted bool
 }
 
 type NodeReferences interface {

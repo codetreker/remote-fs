@@ -132,6 +132,10 @@ File 与 NodeReference 的 `ReferenceNameObserver` 复用既有 session、引用
 
 `FileActions.QueryFileAction` 返回 pending、completed、not-executed、unknown 或 retired。保留记录携带规范 `storage.Operation`；找不到或无法归属旧记录时 Operation 为空，且只能与 not-executed、unknown 或 retired 配对。history 到期、session 退役或 authority 重启后，有限 action receipt 可以变成 retired/unknown；这两者都不是安全重投的未执行证明。
 
+节点引用打开在效果前被拒绝时，可以保留明确未执行的结果。native `metastore.NodeOpenResult.NotExecuted` 要求原错误非 nil，Reference、完整 State 与 Outcome 都为零，并且未接受引用、Use claim、名字或关闭删除效果，清理已结算。SQLite 只在 `OpenNodeRef` 未取得提交门时设置该证明。objectstore 将校验结果放入私有 `nodeOpenActionError{cause, notExecuted}`：有效证明和自身 `beginOpen` 在 native 调用前的拒绝为 true；矛盾证明为 false，cause 合并 EIO 并保留已有引用。
+
+动作记录先直接读取该私有错误的分类，再处理普通已知拒绝。只有 OpenNodeRef／OpenChildRef、`notExecuted=true` 和无效果结果同时成立时，才保存为既有 not-executed；false 保持 unknown，即使原 cause 含条件、Use、range 或 scope 拒绝。分类器不会从包装或 join 的错误树中寻找该证明。原错误、action ID、输入摘要与结果保留，同 ID 重投返回原拒绝，不重新执行。该证明不进入公开 storage 结果、wire 或磁盘格式；取消与空结果本身不构成证明。
+
 打开返回 error 但仍带非 nil File/NodeReference 时，调用方拥有该引用并须继续清理。Attr 与 OpenOutcome 属于原 action receipt，不能用后续 Stat 猜测。HTTP pending ACK、limited、locked、objectstore 与 replicated wrapper 都保留同一所有权。
 
 ### pending deletion 与 durable intent

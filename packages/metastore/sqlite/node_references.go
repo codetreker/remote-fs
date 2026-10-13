@@ -49,7 +49,7 @@ func (s *Store) OpenNodeRef(ctx context.Context, id uint64, options storage.Node
 		return metastore.NodeOpenResult{}, err
 	}
 	if err := s.coordinator.commit.acquire(ctx); err != nil {
-		return metastore.NodeOpenResult{}, err
+		return metastore.NodeOpenResult{NotExecuted: true}, err
 	}
 	defer s.coordinator.commit.release()
 	if err := s.checkFileOwnership(); err != nil {

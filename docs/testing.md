@@ -232,6 +232,10 @@ HTTP 用例区分 `Do` 前取消、已发出的只读请求与已发出的 mutat
 
 FileAction 用例对 OpenAt/OpenNodeRef/OpenChildRef、MutateName、conditional mutation、pending set/clear 与 delete-intent ACK 注入回复丢失和取消：同 ID、同语义输入只执行一次并返回原结果，不同输入拒绝；objectstore 与 HTTP 对 ChildSelection 使用同一集中式 canonicalization，只重排 guards 或在 nil／present-empty 之间变化仍重放原结果，改变 guard 事实、ChildName 或目标条件则以 `EINVAL` 拒绝。查询保留记录带原 Operation，缺失记录只能返回空 Operation 的 not-executed/unknown/retired。completed 或 pending 不得缺失 Operation。authority epoch 前进后旧动作不能重新执行，只有明确 not-executed 允许调用方创建新的逻辑动作。
 
+[节点打开准入用例](../packages/storage/objectstore/file_actions_test.go)在动作已经 pending 后取消调用方，确认 native 调用尚未发生、原 context.Canceled 与 EINTR 保留，回执为 not-executed，引用与准入名额未残留。拒绝证明必须与节点引用打开操作和无效果结果同时成立；无证明的取消、与独立未知错误 join、不同操作、返回身份或打开效果仍为 unknown。同 ID 重投保留原结果并只执行一次。
+
+[native 准入证明用例](../packages/metastore/sqlite/node_reference_admission_test.go)分别以取消和 deadline 拒绝 SQLite 提交门，覆盖带与不带 CloseIntent 的打开，核对原错误和完全空的结果；取得准入后的失败不能设置 `NotExecuted`。objectstore 的[公开打开用例](../packages/storage/objectstore/node_open_refusal_test.go)核对取消、deadline 和容量拒绝的 errno 与执行状态分别保留；无错误、非零 State／Outcome 或真实引用与证明矛盾时保留 EIO 与 unknown，返回的真实引用仍成功清理。State 非零但 ID 为零的矛盾证明分别携带条件、Use、range 和 scope 拒绝，仍须保留原 cause、EIO 与 unknown；未提供 native 证明的普通条件拒绝保持 EAGAIN 与 not-executed。同 ID 重投保留原结果和错误文本，改变输入拒绝，新动作仍能取得互斥的目录引用。真实容量饱和还验证本地拒绝未派发 native 调用，容量释放后同 ID 仍返回旧拒绝，新 ID 才重新执行。
+
 [HTTP 关闭恢复用例](../packages/transport/httprest/file_close_recovery_test.go)把引用释放、删除语义错误与 barrier 查询失败组合起来验证：已确认释放可与原错误及 `barrierPending=true` 共存；`CloseBarrierPendingError` 保留 cause、action ID 和 generation，后续同 ID 重投只结算 barrier。`Determined=true, Released=false` 保持引用和清理责任，新的 generation 才能再执行 native close；未知结果只核对或安全续行原尝试；权威删除和引用释放效果不能重复。终态会话回执在能力退役后仍可由原动作取回完整结果，旧 action 到期不能被重新执行。原有 `2 × MaxSessions` 合计 registry 上限与历史到期后的重新接纳仍须验证；本节上方的可恢复关闭矩阵拥有跨 native、HTTP 和 wrapper 的完整断言。
 
 [SQLite 删除义务 owner 用例](../packages/metastore/sqlite/delete_intent_owner_test.go)用两个 owner 建立多条义务，核对按 owner 的 list/query/ACK 隔离、游标单调推进、ACK 后空洞不重用、重启后继续分页及错误 owner 零效果。边界用例另核对 256 条页上限与 `MaxInt64` 高水位拒绝。ACK 丢失仍通过原 FileActionID 核对，已 ACK 的 ID 不被当作未发生的旧义务。
@@ -245,6 +249,8 @@ FileAction 用例对 OpenAt/OpenNodeRef/OpenChildRef、MutateName、conditional 
 [读取信号探针](../packages/fuse/interruption_linux_test.go)在实际 HTTP 读取已进入服务端后，向执行系统调用的子进程线程发送 `SIGUSR1`，同时观察原 FUSE 与 HTTP 请求 context 被取消。原始 `Fstatat` 必须得到 `EINTR`，普通 `os.Stat` 依靠标准库处理中断后成功，两个调用方随后都须读到完整内容。[关闭与写入探针](../packages/fuse/interruption_write_linux_test.go)分别暂停 owner 清理与 retained WriteAt。Close 收到中断后清理 context 仍有效，普通关闭成功，Write 加 Close 总计只发出一次 WriteAt，随后重新读到已确认内容；不重试已经消耗的描述符。原始 Write 在进入下游前得到 `EINTR`，Go Write 重试后由实际 quota 以 `EDQUOT` 拒绝；两条路径分别核对调用次数和目标仍为空。
 
 [打开信号探针](../packages/fuse/interruption_open_linux_test.go)暂停真实 HTTP Open 的完整成功响应，在 ACK 前向执行打开的子进程线程发送 SIGURG，并关联原始 FUSE OPEN／INTERRUPT 及 FUSE、HTTP context 的取消。原始 unix.Open 一次调用得到 EINTR；普通 os.OpenFile 依靠标准库重试后成功，没有应用层重试循环。两条路径都确认首个引用已经清理：raw 模式一次 Open、零次 ACK，Go 模式两次 Open、一次 ACK，全部引用最终关闭，原属性与内容不变。
+
+[目录打开信号探针](../packages/fuse/interruption_directory_linux_test.go)使用真实 SQLite 与 objectstore，在原 action 已 pending、节点引用尚未取得时向调用线程发送 SIGURG，关联同一次 FUSE OPENDIR／INTERRUPT 与 native context 的取消。SQLite 提交门拒绝打开后，原错误保持 context.Canceled、回执为 not-executed，原始 O_DIRECTORY 返回 EINTR；Go ReadDir 通过标准库处理 EINTR 后取得预先写入的 artifact 条目。中断后再次列目录仍取得该条目，成功引用全部关闭，挂载会话未隔离或退役且剩余期限仍为正；空目录答案不能通过此探针。
 
 信号探针独立于纯映射测试，也不把 SIGURG 当作所有历史失败已经证实的原因。四项历史 `cmd` 用例曾分别以 `-race` 固定采样 100 次，共 400 次；其失败记录和结果只对应当时实现，不能充当当前文件句柄路径的验收。当前验证同样不增加应用层 `EIO` 重试，不关闭异步抢占，不预热被测操作；每条阶段断言取得自己的执行证据，不以重跑整个无关命令套件代替它。
 
