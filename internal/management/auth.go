@@ -580,7 +580,9 @@ func credentialTx(ctx context.Context, tx *sql.Tx, id ID, maxVolumes int) (Crede
 	if err := rows.Err(); err != nil {
 		return Credential{}, err
 	}
-	if !validCredentialResources(c.Scopes, c.AllOwnedVolumes, c.VolumeIDs) {
+	// Deleting the last explicitly selected volume leaves this credential with
+	// no volume authority. Issuance still requires a nonempty selection.
+	if c.AllOwnedVolumes && len(c.VolumeIDs) > 0 {
 		return Credential{}, fmt.Errorf("%w: ambiguous credential resource restrictions", ErrCorrupt)
 	}
 	return c, nil

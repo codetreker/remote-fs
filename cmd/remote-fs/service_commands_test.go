@@ -103,6 +103,107 @@ func TestLoginPersistsPrivateSecretWithoutPrintingIt(t *testing.T) {
 		t.Fatal("credential not persisted")
 	}
 }
+
+func TestLogoutRemovesRejectedCredentialAndAllowsLogin(t *testing.T) {
+	for _, reason := range []string{"expired", "revoked", "password reset"} {
+		t.Run(reason, func(t *testing.T) {
+			newID := strings.Repeat("c", 32)
+			secret := base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{1}, 32))
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.Method + " " + r.URL.Path {
+				case "DELETE " + serviceapi.Prefix + "/auth/cli-credentials/" + strings.Repeat("a", 32):
+					w.WriteHeader(http.StatusUnauthorized)
+					json.NewEncoder(w).Encode(serviceapi.ErrorResponse{Error: serviceapi.ErrorDetail{Code: "authentication_required"}})
+				case "POST " + serviceapi.Prefix + "/auth/cli-credentials":
+					if r.Header.Get("Authorization") != "" {
+						t.Error("replacement login sent the unusable credential")
+					}
+					var input serviceapi.CreateCredentialRequest
+					if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+						t.Error(err)
+					}
+					if input.LoginName != "root" || input.Password != "current password" {
+						t.Error("replacement login omitted the current administrator credentials")
+					}
+					w.WriteHeader(http.StatusCreated)
+					json.NewEncoder(w).Encode(serviceapi.CredentialLogin{Credential: serviceapi.CredentialInfo{ID: newID, Generation: "1", Scopes: []string{"files"}, VolumeIDs: []string{}, ExpiresAt: time.Now().Add(time.Hour)}, Secret: secret, User: serviceapi.User{ID: strings.Repeat("b", 32), DisplayName: "Root", Role: "admin"}})
+				default:
+					t.Errorf("unexpected logout/relogin request: %s %s", r.Method, r.URL.Path)
+					w.WriteHeader(http.StatusNotFound)
+				}
+			}))
+			defer server.Close()
+			file, old := credentialFixture(t, server.URL)
+			var output bytes.Buffer
+			err := runServiceCommand([]string{"logout", "-credential-file", file, "-json"}, strings.NewReader(""), &output, io.Discard)
+			var problem *serviceapi.APIError
+			if !errors.As(err, &problem) || problem.Status != http.StatusUnauthorized || problem.Code != "authentication_required" {
+				t.Fatalf("logout lost authentication rejection: %v", err)
+			}
+			if !strings.Contains(err.Error(), "local credential removed; remote revocation was not confirmed") || output.Len() != 0 {
+				t.Fatalf("logout misreported remote revocation: %v %q", err, output.String())
+			}
+			if _, err := os.Stat(file); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("logout retained an unusable credential: %v", err)
+			}
+			if strings.Contains(err.Error(), old.Secret) {
+				t.Fatal("logout error exposed the old credential secret")
+			}
+			err = runServiceCommand([]string{"login", "-server", server.URL, "-allow-insecure-http", "-login", "root", "-password-stdin", "-credential-file", file, "-json"}, strings.NewReader("current password\n"), &output, io.Discard)
+			if err != nil {
+				t.Fatalf("login stayed blocked after local logout: %v", err)
+			}
+			replacement, err := loadCredential(file)
+			if err != nil || replacement.ID != newID || replacement.Secret != secret {
+				t.Fatalf("replacement login did not persist a new credential: %v", err)
+			}
+			if strings.Contains(output.String(), secret) || strings.Contains(output.String(), "current password") {
+				t.Fatal("replacement login exposed a secret")
+			}
+		})
+	}
+}
+
+func TestLogoutRetainsCredentialWhenRevocationIsUnconfirmed(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		status int
+		body   string
+	}{
+		{name: "forbidden", status: http.StatusForbidden, body: `{"error":{"code":"access_denied"}}`},
+		{name: "service unavailable", status: http.StatusServiceUnavailable, body: `{"error":{"code":"authentication_unavailable"}}`},
+		{name: "malformed authentication rejection", status: http.StatusUnauthorized, body: `{"error":{"code":"unknown"}}`},
+		{name: "mismatched authentication rejection", status: http.StatusUnauthorized, body: `{"error":{"code":"access_denied"}}`},
+		{name: "connection failed"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodDelete || r.URL.Path != serviceapi.Prefix+"/auth/cli-credentials/"+strings.Repeat("a", 32) {
+					t.Errorf("unexpected logout request: %s %s", r.Method, r.URL.Path)
+				}
+				w.WriteHeader(test.status)
+				io.WriteString(w, test.body)
+			}))
+			defer server.Close()
+			file, original := credentialFixture(t, server.URL)
+			if test.status == 0 {
+				server.Close()
+			}
+			var output bytes.Buffer
+			err := runServiceCommand([]string{"logout", "-credential-file", file, "-json"}, strings.NewReader(""), &output, io.Discard)
+			if err == nil || output.Len() != 0 || strings.Contains(err.Error(), "local credential removed") {
+				t.Fatalf("logout hid unconfirmed revocation: %v %q", err, output.String())
+			}
+			retained, loadErr := loadCredential(file)
+			if loadErr != nil || retained != original {
+				t.Fatalf("logout discarded a potentially usable credential: %v", loadErr)
+			}
+			if strings.Contains(err.Error(), original.Secret) {
+				t.Fatal("logout error exposed the credential secret")
+			}
+		})
+	}
+}
 func TestServiceURLRequiresExplicitHTTPAndRejectsEmbeddedCredentials(t *testing.T) {
 	for _, raw := range []string{"http://localhost:8080", "https://user:secret@example.org", "https://example.org/path", "https://example.org?secret=x", "https://example.org#x"} {
 		if _, err := validateServiceURL(raw, false); err == nil {

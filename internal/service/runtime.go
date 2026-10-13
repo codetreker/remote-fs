@@ -3,10 +3,13 @@ package service
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
 	"syscall"
+
+	"golang.org/x/sys/unix"
 
 	"github.com/codetreker/remote-fs/internal/management"
 	"github.com/codetreker/remote-fs/packages/metastore"
@@ -88,6 +91,12 @@ func (m *runtimeManager) acquireState(ctx context.Context, volume management.Vol
 			m.mu.Unlock()
 			return nil, syscall.EBUSY
 		}
+		if state == management.VolumeActive {
+			if err := requireInitializedVolume(m.volumeRoot(volume.ID)); err != nil {
+				m.mu.Unlock()
+				return nil, fmt.Errorf("active volume storage is unavailable: %w", errors.Join(syscall.EIO, err))
+			}
+		}
 		entry := m.entries[volume.ID]
 		if entry != nil && entry.frozen {
 			m.mu.Unlock()
@@ -122,6 +131,9 @@ func (m *runtimeManager) acquireState(ctx context.Context, volume management.Vol
 			}
 		}
 		store, err := localstore.Open(ctx, volumeConfig(m.volumeRoot(volume.ID), volume))
+		if err != nil && state == management.VolumeActive {
+			err = fmt.Errorf("open active volume storage: %w", errors.Join(syscall.EIO, err))
+		}
 		m.mu.Lock()
 		entry.opening = false
 		if err != nil {
@@ -170,6 +182,39 @@ func (m *runtimeManager) volumeRoot(id management.ID) string {
 
 func volumeConfig(root string, volume management.Volume) localstore.Config {
 	return localstore.Config{Root: root, Volume: string(volume.ID), Quota: volume.InitialQuotaBytes, Window: sqlite.DefaultWindow(), Maintenance: objectstore.DefaultOptions()}
+}
+
+// Native Open can initialize an empty directory or finish a pending initialization.
+// Active catalog entries require the native completion evidence before using that path.
+func requireInitializedVolume(root string) (returned error) {
+	fd, err := unix.Open(root, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return err
+	}
+	directory := os.NewFile(uintptr(fd), root)
+	defer func() { returned = errors.Join(returned, directory.Close()) }()
+	if err := requirePrivateDirectory(directory); err != nil {
+		return err
+	}
+	for _, name := range []string{"LOCALSTORE", "FORMAT", "metastore.sqlite"} {
+		fd, err := unix.Openat(int(directory.Fd()), name, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+		if err != nil {
+			return fmt.Errorf("open native volume %s: %w", name, err)
+		}
+		file := os.NewFile(uintptr(fd), filepath.Join(root, name))
+		err = requirePrivateFile(file, "native volume "+name)
+		if err == nil {
+			var info os.FileInfo
+			info, err = file.Stat()
+			if err == nil && info.Size() == 0 {
+				err = fmt.Errorf("native volume %s is empty: %w", name, syscall.EIO)
+			}
+		}
+		if err := errors.Join(err, file.Close()); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (m *runtimeManager) Initialize(ctx context.Context, volume management.Volume) error {

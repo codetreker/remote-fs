@@ -31,7 +31,9 @@ packages/           # 既有文件系统库
 
 ## 登录与授权
 
-管理员通过离线命令创建/重设账号，密码保存 Argon2id hash。browser 使用 Secure/HttpOnly/SameSite cookie，mutation 检查同源 Origin 与 CSRF token；GET auth/session 恢复当前登录。CLI secret 保存在项目私有文件，服务保存 verifier。普通用户登录等待外部身份系统接入，没有生产临时登录入口。
+管理员通过离线命令创建/重设账号，密码保存 Argon2id hash。browser 使用 Secure/HttpOnly/SameSite cookie，mutation 检查同源 Origin 与 CSRF token；GET auth/session 恢复当前登录。CLI secret 保存在项目私有文件，服务保存 verifier。CLI logout 在远端撤销成功后删除本地 credential；收到确切 `401/authentication_required` 时也删除本地文件，允许重新登录，但返回远端撤销未确认的错误。其它远端失败保留本地文件。普通用户登录等待外部身份系统接入，没有生产临时登录入口。
+
+credential 可以选择明确的 volume 集合。成功删除 volume 同时移除其选择绑定；已持久化 credential 的最后一个 volume 被删除后，空集合表示没有 volume 访问权限，不升级为 all-owned，也不使 credential 记录损坏。签发新的显式选择 credential 仍拒绝空集合。
 
 每个管理或文件元数据请求先认证、读取实际 owner，再取得 store。管理员对自己的资源使用相同 owner 检查；额外只读权限是 ordinary-user 列表和 volume 名称/文件数/目录数/Used/配额摘要。目标 role 和当前 admin 权限在摘要扫描前检查。他人文件路径、属性、内容和文件 API 不进入摘要 DTO，隐藏页面入口不代替 API 拒绝。
 
@@ -39,7 +41,7 @@ packages/           # 既有文件系统库
 
 ## volume 和文件事实
 
-创建使用现有 localstore 配置初始化唯一 volume 根，容量上限在此时指定。reopen 使用管理库中相同配置。显示名可以改，在线 quota 修改入口不存在。
+creating 状态使用现有 localstore 配置初始化 volume 根，容量上限在此时指定。active 状态在每次取得缓存或未缓存 store 前，检查私有根和其中已有的普通、非空、私有 `LOCALSTORE`、`FORMAT`、`metastore.sqlite` 文件；缺失或不完整 evidence 返回 EIO，API 为 `503/storage_unavailable`，摘要为 `metadata_unavailable`，不走初始化路径。该 presence 检查不替代 native Open 的绑定与完整性验证。reopen 使用管理库中相同配置。显示名可以改，在线 quota 修改入口不存在。
 
 文件浏览通过既有 List/Stat 取得路径、种类、大小和可用元数据，不读取内容。服务 DTO 用 decimal strings 保存整数，raw 名字与显示转义分开；显示字符串不替代实际请求路径。Console 文件页只有目录浏览和元数据。
 
@@ -47,11 +49,11 @@ packages/           # 既有文件系统库
 
 ## 创建、改名和删除
 
-管理 SQLite 保存 owner、配置和 state。创建和改名完成后才返回成功；存储故障直接报告。删除先关闭服务持有的现有 store，再对可信 volume 根执行整目录 RemoveAll，确认成功后更新管理状态；这是删除整份存储，不是逐文件 mutation。close 或删除失败保留错误，不宣称成功，不引入 quarantine、native proof 或 action namespace 框架。
+管理 SQLite 保存 owner、配置和 state。创建和改名完成后才返回成功；存储故障直接报告。删除先关闭服务持有的现有 store，再对可信 volume 根执行整目录 RemoveAll；两者成功后，在一个管理事务中删除 catalog row 和对应的 credential_volumes 绑定，完成才报告成功。列表和注册 volume 数量上限只计算当前行；failed/deleting 行仍保留并占用名额。close/remove/catalog 提交失败保留实际错误，不宣称成功。这是删除整份存储，不是逐文件 mutation，不引入 quarantine、native proof 或 action namespace 框架。
 
 正常重启读取已有管理行和 localstore，缺绑定或残存数据不初始化为空 volume。Stop 停止新请求，Close 排空并关闭服务拥有的 store，失败保留实际错误。
 
-管理 prefix 为 `/api/service/v1`。POST volumes `{name,quotaBytes}` 创建并返回 201 active Volume；PATCH volumes/{id} `{name}` 改名返回 200；DELETE volumes/{id} 没有 body，完成 close/RemoveAll/catalog 更新后返回 204。GET volumes/{id}/files 的 path query 是 raw relative path 的 base64，返回只读目录 DTO：目录级 pathBase64 和 entries 的 nameBase64、name、nodeId、kind、sizeBytes、modifiedAt。CLI/Console 由目录 raw path 和条目 raw leaf 拼接子路径 token，wire 不逐项重复完整路径；显示 name 不作为请求路径。
+管理 prefix 为 `/api/service/v1`。POST volumes `{name,quotaBytes}` 创建并返回 201 active Volume；PATCH volumes/{id} `{name}` 改名返回 200；DELETE volumes/{id} 没有 body，完成 close/RemoveAll 和管理行/credential 绑定删除后返回 204。GET volumes/{id}/files 的 path query 是 raw relative path 的 base64，返回只读目录 DTO：目录级 pathBase64 和 entries 的 nameBase64、name、nodeId、kind、sizeBytes、modifiedAt。CLI/Console 由目录 raw path 和条目 raw leaf 拼接子路径 token，wire 不逐项重复完整路径；显示 name 不作为请求路径。
 
 Console 和 CLI 通过同一管理 API 执行 owner 校验，提供自己的 volume 列表/创建/改名/删除、文件元数据查询和管理员摘要。创建中或删除中的管理行在 Open 时通过同一同步流程继续处理，没有 operation journal 或后台 action worker。认证、输入错误、越权和存储不可用各自报告。
 

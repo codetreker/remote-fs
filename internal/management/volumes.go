@@ -184,6 +184,9 @@ func (s *Store) DeleteVolume(ctx context.Context, actor, id ID, revision int64) 
 	})
 }
 
+// SetVolumeState records storage completion. VolumeDeleted requires the volume's
+// store to be closed and its storage removed; the catalog row and credential
+// selections are then deleted atomically, and the returned Volume describes the result.
 func (s *Store) SetVolumeState(ctx context.Context, actor, id ID, revision int64, state VolumeState, errorCode string) (Volume, error) {
 	if len(errorCode) > 128 || (state != VolumeFailed && errorCode != "") || (state == VolumeFailed && errorCode == "") {
 		return Volume{}, fmt.Errorf("invalid volume outcome: %w", syscall.EINVAL)
@@ -217,6 +220,13 @@ func (s *Store) updateVolume(ctx context.Context, actor, id ID, revision int64, 
 		}
 		volume.ManagementRevision++
 		volume.UpdatedAt = s.now().UTC()
+		if volume.State == VolumeDeleted {
+			if _, err := tx.ExecContext(ctx, "DELETE FROM credential_volumes WHERE volume_id=?", volume.ID); err != nil {
+				return err
+			}
+			_, err = tx.ExecContext(ctx, "DELETE FROM volumes WHERE id=?", volume.ID)
+			return err
+		}
 		_, err = tx.ExecContext(ctx, "UPDATE volumes SET display_name=?,state=?,management_revision=?,error_code=?,updated_at=? WHERE id=?", volume.DisplayName, volume.State, volume.ManagementRevision, volume.ErrorCode, unixMillis(volume.UpdatedAt), volume.ID)
 		return err
 	})

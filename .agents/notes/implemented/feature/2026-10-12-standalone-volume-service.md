@@ -14,7 +14,7 @@ Status: implemented
 
 文件元数据和摘要通过现有接口读取。服务遍历 Log.Snapshot/Next 计 regular+symlink 文件数与目录数，不跟随链接且不计 root；Used/quota 单独读取 Space。读取/关闭失败不回零，两次读取不承诺跨调用原子。所有接口在打开目标前校验当前身份和实际 owner；摘要不披露他人路径、属性、内容或文件入口。
 
-quota 在创建时配置，不提供在线调整。删除关闭现有 store 后直接 RemoveAll 整份可信 volume 根；close/remove 失败不报告成功。正常重启沿用管理行和原 native binding，不引入 quarantine、native receipt/proof、action namespace 或迁移计数器。
+quota 在 creating 时配置并初始化；active 在缓存或未缓存 store acquisition 前要求根中已有普通、非空、私有的 LOCALSTORE/FORMAT/metastore.sqlite evidence，缺失或不完整报错，不重新初始化。该 presence 检查不替代 native Open 的验证。删除关闭现有 store 后直接 RemoveAll 整份可信根，再于一个管理事务删除 volume 行及 credential_volumes 绑定；当前列表和注册名额只计算当前行，failed/deleting 保留。受限 credential 的最后一个 volume 被删后是零 volume 权限，签发新的显式选择仍拒绝空集合。close/remove/catalog 失败不报告成功。正常重启沿用管理行和原 native binding，不引入 quarantine、native receipt/proof、action namespace 或迁移计数器。
 
 ## 备选方案
 
@@ -26,6 +26,6 @@ quota 在创建时配置，不提供在线调整。删除关闭现有 store 后�
 
 ## 后果
 
-管理服务与文件系统库各自保留清楚的职责。文件页只读元数据，没有上传、下载、逐文件修改、内容读取或编辑；管理服务没有挂载或在线 quota 修改。既有 reference/embedding 文件能力继续由原入口提供。
+管理服务与文件系统库各自保留清楚的职责。文件页只读元数据，没有上传、下载、逐文件修改、内容读取或编辑；管理服务没有挂载或在线 quota 修改。既有 reference/embedding 文件能力继续由原入口提供。CLI logout 在撤销成功或确切 401/authentication_required 后清除本地 credential，后者仍返回远端撤销未确认的错误；其它远端失败保留本地文件。本地清除允许重新登录，不证明远端已撤销。
 
 目录统计需要完整读取现有 snapshot，可能耗时或失败。服务不新增原生 snapshot/counter 保证；容量读取独立执行。普通用户登录延期仍要求稳定 UserID/owner，后续外部身份不能以可变邮箱或自行声明角色替代归属。

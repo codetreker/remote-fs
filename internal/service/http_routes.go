@@ -85,6 +85,8 @@ func writeManagementError(w http.ResponseWriter, err error) {
 		status, code = http.StatusUnauthorized, "authentication_required"
 	case errors.Is(err, ErrForbidden), errors.Is(err, management.ErrDenied):
 		status, code = http.StatusForbidden, "access_denied"
+	case errors.Is(err, syscall.EIO):
+		status, code = http.StatusServiceUnavailable, "storage_unavailable"
 	case errors.Is(err, errAuthRequest), errors.Is(err, syscall.EINVAL), errors.Is(err, syscall.ENOTDIR):
 		status, code = http.StatusBadRequest, "invalid_request"
 	case errors.Is(err, management.ErrNotFound), errors.Is(err, syscall.ENOENT):

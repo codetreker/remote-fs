@@ -29,7 +29,7 @@ docker compose -f deployments/service/compose.yml up -d
 
 管理员命令从 no-echo 终端读取密码，自动化可用 `--password-file` 指向仅 owner 可读的普通文件。初始化、离线管理员维护与服务运行竞争同一个独占锁；维护管理员时先停止服务。新部署没有普通用户注册入口。
 
-[systemd unit](deployments/service/remote-fs-server.service) 和 [sysusers 配置](deployments/service/remote-fs.sysusers) 使用受限账号及私有 `/var/lib/remote-fs`。安装 binary、配置同源 TLS proxy 后，以同一 service account 执行：
+[systemd unit](deployments/service/remote-fs-server.service) 和 [sysusers 配置](deployments/service/remote-fs.sysusers) 使用 UID/GID 10001 的 `remote-fs` 账号与同名组，以及私有 `/var/lib/remote-fs`。安装 binary、配置同源 TLS proxy 后，以同一 service account 执行：
 
 ```sh
 remote-fs-server init --config /etc/remote-fs/config.yml
@@ -41,7 +41,7 @@ remote-fs-server serve --config /etc/remote-fs/config.yml
 
 ## CLI 和 Console
 
-CLI credential 默认保存在当前目录的私有 `.remote-fs/credentials.json`，可通过 `-credential-file` 选择显式路径。login 默认读取 no-echo 终端密码，自动化可用 `-password-stdin` 或私有 `-password-file`。
+CLI credential 默认保存在当前目录的私有 `.remote-fs/credentials.json`，可通过 `-credential-file` 选择显式路径。login 默认读取 no-echo 终端密码，自动化可用 `-password-stdin` 或私有 `-password-file`。`logout` 在远端撤销成功后清除本地文件；确切 `401/authentication_required` 也清除本地文件以便重新登录，同时以错误说明远端撤销未确认。其它远端失败保留本地 credential。
 
 ```sh
 remote-fs login -server https://files.example.com -login admin
@@ -57,9 +57,9 @@ remote-fs user list -json
 remote-fs user volumes -json <user-id>
 ```
 
-配额在创建时指定。volume 删除先关闭现有 store，再删除整份存储目录；失败报告错误，不表示已经删除。Console 的 Files 页面只读展示自己的目录和现有元数据，管理员 Users 页面只展示普通用户与五项 volume 摘要。
+配额在创建时指定。volume 删除先关闭现有 store，再删除整份存储目录，最后原子移除管理行和 credential 的 volume 选择绑定。成功后不再出现在当前列表或占用注册名额，failed/deleting 行仍占名额；失败报告错误，不表示已经删除。已有 credential 的最后一个所选 volume 被删除后没有 volume 权限，签发新的显式选择 credential 仍拒绝空集合。Console 的 Files 页面只读展示自己的目录和现有元数据，管理员 Users 页面只展示普通用户与五项 volume 摘要。
 
-`files ls` 的目录 token 由前一次列表的目录 pathBase64 和条目 nameBase64 原始字节组成，显示名不作为请求路径。文件数与目录数从现有 metadata snapshot 统计，符号链接计一个文件且不展开；Used 与配额单独读取 Space。读取或关闭失败显示明确错误，不回零或旧数据；统计不承诺与容量查询跨调用原子。raw 名字/路径和 decimal-string 数字独立于显示文本保存。
+`files ls` 的目录 token 由前一次列表的目录 pathBase64 和条目 nameBase64 原始字节组成，显示名不作为请求路径。active volume 的必要存储 evidence 缺失或不完整时，metadata API 返回 `503/storage_unavailable`，摘要显示 `metadata_unavailable`，不会初始化成空 volume。文件数与目录数从现有 metadata snapshot 统计，符号链接计一个文件且不展开；Used 与配额单独读取 Space。读取或关闭失败显示明确错误，不回零或旧数据；统计不承诺与容量查询跨调用原子。raw 名字/路径和 decimal-string 数字独立于显示文本保存。
 
 ## 既有文件系统入口
 

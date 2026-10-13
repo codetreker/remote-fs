@@ -7,14 +7,89 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"testing"
 	"time"
 
+	"github.com/codetreker/remote-fs/internal/management"
 	"github.com/codetreker/remote-fs/internal/serviceapi"
 	"github.com/codetreker/remote-fs/packages/storage"
 )
+
+func TestServiceActiveVolumeMissingStorageKeepsCatalogAndReportsUnavailable(t *testing.T) {
+	config := rootTestConfig(t)
+	if err := InitState(t.Context(), config); err != nil {
+		t.Fatal(err)
+	}
+	admin, err := InitializeAdmin(t.Context(), config, "root", "Administrator", testAuthPassword)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := Open(t.Context(), config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := s.Close(ctx); err != nil {
+			t.Error(err)
+		}
+	})
+	f := &authFixture{t: t, store: s.maintenance.store, auth: s.auth, admin: admin, database: s.maintenance.root.ManagementPath}
+	_, bearer := routeCredential(t, f, admin, []string{ScopeVolumesRead, ScopeFiles}, true, nil)
+	volume, err := f.store.CreateVolume(t.Context(), admin.ID, "Existing volume", 4096)
+	if err != nil {
+		t.Fatal(err)
+	}
+	volume, err = s.processVolume(t.Context(), volume)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := s.runtimes.volumeRoot(volume.ID)
+	if err := s.Close(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(root); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(root, 0700); err != nil {
+		t.Fatal(err)
+	}
+	s, err = Open(t.Context(), config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := routeRequest(s, http.MethodGet, "/volumes/"+string(volume.ID), bearer, "")
+	if response.Code != http.StatusOK {
+		t.Fatalf("volume catalog response: %d %s", response.Code, response.Body.String())
+	}
+	var result serviceapi.Volume
+	if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.State != string(management.VolumeActive) || result.Summary != nil || result.SummaryError == nil || result.SummaryError.Code != "metadata_unavailable" {
+		t.Fatalf("missing storage reported a successful summary: %+v", result)
+	}
+	current, err := s.maintenance.store.GetVolume(t.Context(), admin.ID, volume.ID)
+	if err != nil || current.State != management.VolumeActive || current.ManagementRevision != volume.ManagementRevision {
+		t.Fatalf("storage failure changed catalog: %+v %v", current, err)
+	}
+	response = routeRequest(s, http.MethodGet, "/volumes/"+string(volume.ID)+"/files", bearer, "")
+	if response.Code != http.StatusServiceUnavailable || !strings.Contains(response.Body.String(), "storage_unavailable") {
+		t.Fatalf("file listing reported storage as missing path: %d %s", response.Code, response.Body.String())
+	}
+	if _, err := os.Stat(filepath.Join(root, "metastore.sqlite")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("active metadata database recreated: %v", err)
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("active volume storage initialized: %v %v", entries, err)
+	}
+}
 
 func TestServiceReadOnlyFilesOwnerIsolationAndVolumeCRUD(t *testing.T) {
 	config := rootTestConfig(t)

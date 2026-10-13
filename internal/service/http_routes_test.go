@@ -216,9 +216,8 @@ func TestManagementRoutesStrictMutationAndSynchronousCRUD(t *testing.T) {
 	if response.Code != http.StatusNoContent || response.Body.Len() != 0 {
 		t.Fatalf("delete: %d %s", response.Code, response.Body.String())
 	}
-	current, err := f.store.GetVolume(t.Context(), f.admin.ID, management.ID(volume.ID))
-	if err != nil || current.State != management.VolumeDeleted {
-		t.Fatalf("delete settlement: %+v %v", current, err)
+	if _, err := f.store.GetVolume(t.Context(), f.admin.ID, management.ID(volume.ID)); !errors.Is(err, management.ErrNotFound) {
+		t.Fatalf("completed deletion remains in catalog: %v", err)
 	}
 	for _, path := range []string{"/me?extra=true", "/volumes?limit=51", "/volumes?limit=01", "/volumes?limit=1&limit=2", "/volumes?after=invalid"} {
 		if response := routeRequest(handler, "GET", path, bearer, ""); response.Code != http.StatusBadRequest {

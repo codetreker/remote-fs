@@ -576,11 +576,9 @@ func TestAuthResourceScopeRequiresExplicitResources(t *testing.T) {
 	if err != nil {
 		t.Fatalf("summary-only credential requires no owned volume: %v", err)
 	}
-	if _, err := s.write.ExecContext(ctx, "UPDATE cli_credentials SET scopes='[\"files\"]' WHERE id=?", credential.ID); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := s.GetCredential(ctx, credential.ID); !errors.Is(err, ErrCorrupt) {
-		t.Fatalf("stored resource scope lacks selector: %v", err)
+	stored, err := s.GetCredential(ctx, credential.ID)
+	if err != nil || stored.AllOwnedVolumes || len(stored.VolumeIDs) != 0 {
+		t.Fatalf("summary-only credential gained volume authority: %+v %v", stored, err)
 	}
 }
 

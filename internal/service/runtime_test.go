@@ -142,3 +142,82 @@ func TestRuntimeSharedOpenAndDeleteWaitsForReferences(t *testing.T) {
 		t.Fatalf("deleted root retained: %v", err)
 	}
 }
+
+func TestRuntimeActiveEmptyRootIsNotInitialized(t *testing.T) {
+	runtime, volume := runtimeFixture(t)
+	if err := runtime.Close(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	root := runtime.volumeRoot(volume.ID)
+	if err := os.RemoveAll(root); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(root, 0700); err != nil {
+		t.Fatal(err)
+	}
+	reopened := newRuntimeManager(Config{}, runtime.root, nil, nil)
+	defer func() {
+		if err := reopened.Close(t.Context()); err != nil {
+			t.Error(err)
+		}
+	}()
+	summary, err := reopened.Summary(t.Context(), volume)
+	if !errors.Is(err, syscall.EIO) || summary != (VolumeSummary{}) {
+		t.Fatalf("active empty root summary: %+v, %v; want storage failure", summary, err)
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("active empty root was initialized: %v", entries)
+	}
+}
+
+func TestRuntimeActiveMissingStorageFailsForCachedAndReopenedVolumes(t *testing.T) {
+	for _, cached := range []bool{true, false} {
+		name := "reopened"
+		if cached {
+			name = "cached"
+		}
+		t.Run(name, func(t *testing.T) {
+			for _, component := range []string{"root", "LOCALSTORE", "FORMAT", "metastore.sqlite"} {
+				t.Run(component, func(t *testing.T) {
+					runtime, volume := runtimeFixture(t)
+					reader := runtime
+					if !cached {
+						if err := runtime.Close(t.Context()); err != nil {
+							t.Fatal(err)
+						}
+						reader = newRuntimeManager(Config{}, runtime.root, nil, nil)
+						t.Cleanup(func() {
+							if err := reader.Close(t.Context()); err != nil {
+								t.Error(err)
+							}
+						})
+					}
+					path := runtime.volumeRoot(volume.ID)
+					if component != "root" {
+						path = filepath.Join(path, component)
+					}
+					moved := path + ".missing"
+					if err := os.Rename(path, moved); err != nil {
+						t.Fatal(err)
+					}
+					t.Cleanup(func() {
+						if err := os.Rename(moved, path); err != nil {
+							t.Error(err)
+						}
+					})
+					summary, err := reader.Summary(t.Context(), volume)
+					if !errors.Is(err, syscall.EIO) || summary != (VolumeSummary{}) {
+						t.Fatalf("missing active %s summary: %+v, %v; want storage failure", component, summary, err)
+					}
+					if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+						t.Fatalf("missing active %s was recreated: %v", component, err)
+					}
+				})
+			}
+		})
+	}
+}

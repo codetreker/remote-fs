@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -227,16 +228,21 @@ func runServiceCommand(args []string, in io.Reader, out, errOut io.Writer) error
 			return err
 		}
 		defer unlock()
-		if err = client.RevokeCredential(ctx, id); err != nil {
-			return err
+		revokeErr := client.RevokeCredential(ctx, id)
+		if revokeErr != nil {
+			var problem *serviceapi.APIError
+			if !errors.As(revokeErr, &problem) || problem.Status != http.StatusUnauthorized || problem.Code != "authentication_required" {
+				return revokeErr
+			}
 		}
-		if id == record.ID {
-			if err = os.Remove(c.credentials); err != nil {
-				return err
-			}
-			if err = syncParent(c.credentials); err != nil {
-				return err
-			}
+		if err = os.Remove(c.credentials); err != nil {
+			return errors.Join(revokeErr, err)
+		}
+		if err = syncParent(c.credentials); err != nil {
+			return errors.Join(revokeErr, err)
+		}
+		if revokeErr != nil {
+			return fmt.Errorf("local credential removed; remote revocation was not confirmed: %w", revokeErr)
 		}
 		return printCLI(out, c.json, map[string]string{"credentialId": id, "state": "revoked"})
 	case "user list":
