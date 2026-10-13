@@ -23,23 +23,22 @@ func TestSMBNameOperationsDirectAndHTTP(t *testing.T) {
 		name string
 		run  func(*testing.T, realSMBFixture, string)
 	}{
-		{"TestSMBNameMutationBoundConflictsReobserveOriginalReference", testSMBNameMutationBoundConflictsReobserveOriginalReference},
-		{"TestSMBNameMutationUnknownRetainsFrozenEffect", testSMBNameMutationUnknownRetainsFrozenEffect},
-		{"TestSMBNameMutationCurrentIdentityAndReplacement", testSMBNameMutationCurrentIdentityAndReplacement},
+		{"guarded-replacement-recovery", testSMBGuardedReplacementRecovery},
 		{"TestSMBOrdinaryDispositionClearPreservesCloseIntent", testSMBOrdinaryDispositionClearPreservesCloseIntent},
 	}
+	seed := newRealSMBFixture(t)
 	for _, transport := range []string{"direct", "http"} {
 		t.Run(transport, func(t *testing.T) {
-			factory := newRealSMBFixture
+			parent := seed
 			if transport == "http" {
-				factory = newHTTPSMBFixture
+				backend := httpSMBBackendForTest(t, seed.volume)
+				parent = realSMBFixtureForSession(t, seed.volume, backend, seed.raw)
 			}
-			seed := factory(t)
 			for index, entry := range cases {
 				t.Run(entry.name, func(t *testing.T) {
-					f := newFileSessionFixture(t, seed)
+					f := newFileSessionFixture(t, parent)
 					f.tree.sessionID = f.session.id
-					entry.run(t, f, fmt.Sprintf("case%d-", index))
+					entry.run(t, f, fmt.Sprintf("%s-case%d-", transport, index))
 					status := f.server.Status()
 					if status.Handles != 0 || status.OpeningHandles != 0 || status.RetainedDirectoryBytes != 0 || status.UnknownWrites != 0 || status.RetainedWriteBytes != 0 || status.PendingFlushes != 0 {
 						t.Fatalf("name case retained live responsibility: %+v", status)
@@ -92,103 +91,153 @@ func nameMutationInterceptForTest(raw storage.FileSession) *nameMutationIntercep
 	return &nameMutationInterceptSession{FileSession: raw, FileSessionIdentity: raw.(storage.FileSessionIdentity), DirectoryMetadataObserver: raw.(storage.DirectoryMetadataObserver), NamespaceAccess: raw.(storage.NamespaceAccess), FileActions: raw.(storage.FileActions)}
 }
 
-func testSMBNameMutationBoundConflictsReobserveOriginalReference(t *testing.T, f realSMBFixture, prefix string) {
-	if err := f.volume.Write(t.Context(), prefix+"original", []byte("body")); err != nil {
+func testSMBGuardedReplacementRecovery(t *testing.T, f realSMBFixture, prefix string) {
+	for _, directory := range []string{"old", "new"} {
+		if err := f.volume.Mkdir(t.Context(), prefix+directory); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := f.volume.Write(t.Context(), prefix+"old/source", []byte("original")); err != nil {
 		t.Fatal(err)
 	}
-	id := openInfoFileForTest(t, f, prefix+"original", accessDelete)
+	if err := f.volume.Write(t.Context(), prefix+"new/target", []byte("replaced")); err != nil {
+		t.Fatal(err)
+	}
+	id := openInfoFileForTest(t, f, prefix+`old\source`, accessReadData|accessDelete)
 	h := f.tree.findFileHandle(id)
+	target := openInfoFileForTest(t, f, prefix+`new\target`, accessReadData)
+	targetNode := f.tree.findFileHandle(target).nodeID
+	if err := f.volume.Rename(t.Context(), prefix+"old/source", prefix+"old/current"); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.volume.Write(t.Context(), prefix+"old/source", []byte("new occupant")); err != nil {
+		t.Fatal(err)
+	}
+	if got := normalizedNameForTest(t, f, id); got != `\`+prefix+`old\current` {
+		t.Fatalf("current name=%q", got)
+	}
+	if status := nameSetStatusForTest(t, f, id, wire.FileRenameInformation, renameInformationForTest(prefix+`new\target`, false)); status != statusNameCollision {
+		t.Fatalf("collision=%#x", status)
+	}
 	raw := f.tree.authority.raw
 	intercept := nameMutationInterceptForTest(raw)
-	calls := 0
+	prior := f.server.config.Authorize
+	var denied atomic.Bool
+	f.server.config.Authorize = authz.AuthorizerFunc(func(ctx context.Context, request authz.AccessRequest) error {
+		if request.Operation == storage.OpVolumeRename && denied.Load() {
+			return authz.ErrDenied
+		}
+		return prior.Authorize(ctx, request)
+	})
+	calls, queries := 0, 0
 	actions := make(map[storage.FileActionID]bool)
+	var frozen *storage.NameCommand
+	loseQuery := false
 	intercept.mutate = func(ctx context.Context, command storage.NameCommand) (storage.NameResult, error) {
 		calls++
-		if command.Target.NodeID != h.nodeID || actions[command.Action] {
-			t.Fatalf("retry lost original identity/fresh action: %+v", command)
+		if command.Target.NodeID != h.nodeID {
+			t.Fatalf("source identity changed=%+v", command)
 		}
-		actions[command.Action] = true
+		if calls <= 3 {
+			if actions[command.Action] {
+				t.Fatal("bound refusal reused old action")
+			}
+			actions[command.Action] = true
+		} else if !reflect.DeepEqual(*frozen, command) {
+			t.Fatal("unknown replay changed frozen action/payload")
+		}
 		if calls <= 2 {
 			if err := f.volume.Mkdir(t.Context(), fmt.Sprintf("%sinterference-%d", prefix, calls)); err != nil {
 				t.Fatal(err)
 			}
 		}
-		return intercept.NamespaceAccess.MutateName(ctx, command)
-	}
-	f.tree.authority.raw = intercept
-	if status := nameSetStatusForTest(t, f, id, wire.FileRenameInformation, renameInformationForTest(prefix+"renamed", false)); status != statusOK || calls != 3 {
-		t.Fatalf("two guarded retries status=%#x calls=%d", status, calls)
-	}
-	f.tree.authority.raw = raw
-	if got := normalizedNameForTest(t, f, id); got != `\`+prefix+`renamed` {
-		t.Fatalf("result name=%q", got)
-	}
-	closeFixtureHandle(t, f, id)
-	if got := f.server.Status().RetainedDirectoryBytes; got != 0 {
-		t.Fatalf("retry captured=%d", got)
-	}
-}
-
-func testSMBNameMutationUnknownRetainsFrozenEffect(t *testing.T, f realSMBFixture, prefix string) {
-	if err := f.volume.Write(t.Context(), prefix+"original", []byte("body")); err != nil {
-		t.Fatal(err)
-	}
-	id := openInfoFileForTest(t, f, prefix+"original", accessDelete)
-	raw := f.tree.authority.raw
-	intercept := nameMutationInterceptForTest(raw)
-	calls, queries := 0, 0
-	var frozen *storage.NameCommand
-	intercept.mutate = func(ctx context.Context, command storage.NameCommand) (storage.NameResult, error) {
-		calls++
-		if calls == 1 {
+		if calls == 3 {
 			frozen = mutationCommand{name: &command}.clone().name
-		} else if !reflect.DeepEqual(*frozen, command) {
-			t.Fatal("unknown action changed frozen payload")
 		}
 		result, err := intercept.NamespaceAccess.MutateName(ctx, command)
-		if calls == 1 && err == nil {
+		if calls <= 2 && !errors.Is(err, storage.ErrConditionConflict) {
+			t.Fatalf("genuine stale guard was not refused: %v", err)
+		}
+		if calls == 3 && err == nil {
+			loseQuery = true
 			return storage.NameResult{}, syscall.EIO
 		}
 		return result, err
 	}
-	intercept.query = func(ctx context.Context, id storage.FileActionID) (storage.FileActionReceipt, error) {
+	intercept.query = func(ctx context.Context, action storage.FileActionID) (storage.FileActionReceipt, error) {
 		queries++
-		if queries == 1 {
+		if loseQuery {
+			loseQuery = false
 			return storage.FileActionReceipt{}, syscall.EIO
 		}
-		return intercept.FileActions.QueryFileAction(ctx, id)
+		receipt, err := intercept.FileActions.QueryFileAction(ctx, action)
+		if queries <= 2 && (err != nil || receipt.Outcome != storage.FileActionNotExecuted || receipt.Operation != storage.OpFileMutateName) {
+			t.Fatalf("refusal lacked bound receipt=%+v err=%v", receipt, err)
+		}
+		return receipt, err
 	}
 	f.tree.authority.raw = intercept
-	if status := nameSetStatusForTest(t, f, id, wire.FileRenameInformation, renameInformationForTest(prefix+"renamed", false)); status != statusIO {
-		t.Fatalf("lost result=%#x", status)
+	if status := nameSetStatusForTest(t, f, id, wire.FileRenameInformation, renameInformationForTest(prefix+`new\TARGET`, true)); status != statusIO || calls != 3 || queries != 3 {
+		t.Fatalf("lost committed replacement status=%#x calls=%d queries=%d", status, calls, queries)
 	}
-	if f.tree.findFileHandle(id).pendingWrite == nil || calls != 1 {
-		t.Fatalf("unknown discarded calls=%d", calls)
+	owner := h.pendingWrite
+	if owner == nil || !owner.pending() || frozen == nil {
+		t.Fatal("unknown replacement discarded original owner")
 	}
-	if err := f.volume.Rename(t.Context(), prefix+"renamed", prefix+"external"); err != nil {
+	attr, err := f.volume.Stat(t.Context(), prefix+"new/TARGET")
+	if err != nil || attr.ID != h.nodeID || attr.ID == targetNode {
+		t.Fatalf("replacement identity=%+v err=%v", attr, err)
+	}
+	if err := f.volume.Rename(t.Context(), prefix+"new/TARGET", prefix+"new/external"); err != nil {
 		t.Fatal(err)
 	}
-	if err := f.volume.Write(t.Context(), prefix+"original", []byte("replacement")); err != nil {
+	if err := f.volume.Write(t.Context(), prefix+"old/current", []byte("frozen source successor")); err != nil {
 		t.Fatal(err)
 	}
-	if got := normalizedNameForTest(t, f, id); got != `\`+prefix+`external` || calls != 2 {
-		t.Fatalf("recovered name=%q calls=%d", got, calls)
+	denied.Store(true)
+	if _, status := f.connection.queryFileInfo(t.Context(), f.session, f.tree, queryInfoRequestForTest(id, wire.FileNormalizedNameInformation, 4096)); status != statusIO || calls != 3 || queries != 3 {
+		t.Fatalf("revoked recovery status=%#x calls=%d queries=%d", status, calls, queries)
 	}
+	owner.mu.Lock()
+	retained := *owner.command.clone().name
+	lastErr := owner.lastErr
+	owner.mu.Unlock()
+	if !reflect.DeepEqual(*frozen, retained) || !errors.Is(lastErr, authz.ErrDenied) || !owner.pending() {
+		t.Fatalf("revoked recovery lost frozen responsibility/cause=%v", lastErr)
+	}
+	facts := f.server.Status().WriteFailures
+	if len(facts) != 1 || facts[0].Execution != WriteExecutionUnknown || facts[0].PayloadReleased || facts[0].ChainSettled {
+		t.Fatalf("unknown replacement facts=%+v", facts)
+	}
+	denied.Store(false)
+	if got := normalizedNameForTest(t, f, id); got != `\`+prefix+`new\external` || calls != 4 || queries != 4 {
+		t.Fatalf("recovered name=%q calls=%d queries=%d", got, calls, queries)
+	}
+	f.server.config.Authorize = prior
 	f.tree.authority.raw = raw
-	if data, err := f.volume.Read(t.Context(), prefix+"original"); err != nil || string(data) != "replacement" {
-		t.Fatalf("recovery rebound original: %q %v", data, err)
+	if data, err := f.volume.Read(t.Context(), prefix+"old/source"); err != nil || string(data) != "new occupant" {
+		t.Fatalf("recovery rebound source successor=%q err=%v", data, err)
 	}
-	body := make([]byte, 24)
-	binary.LittleEndian.PutUint16(body, 24)
-	copy(body[8:], id[:])
-	if _, status := f.connection.closeFile(t.Context(), f.session, f.tree, wire.Request{Header: wire.Header{Command: wire.Close}, Body: body}, wire.FileID{}); status != statusIO {
-		t.Fatalf("recovered error CLOSE=%#x", status)
+	if data, err := f.volume.Read(t.Context(), prefix+"old/current"); err != nil || string(data) != "frozen source successor" {
+		t.Fatalf("recovery rebound frozen source successor=%q err=%v", data, err)
 	}
-	if f.server.Status().Handles != 0 {
-		t.Fatal("CLOSE did not release recovered reference")
+	attr, err = f.volume.Stat(t.Context(), prefix+"new/external")
+	if err != nil || attr.ID != h.nodeID || attr.ID == targetNode {
+		t.Fatalf("recovery changed original identity=%+v err=%v", attr, err)
 	}
-	if got := f.server.Status().RetainedDirectoryBytes; got != 0 {
-		t.Fatalf("unknown captured=%d", got)
+	body, status := f.connection.readFile(t.Context(), f.session, f.tree, readRequestForTest(target, 0, 20, 0))
+	if status != statusOK || !bytes.Equal(body[16:], []byte("replaced")) {
+		t.Fatalf("old target reference status=%#x body=%x", status, body)
+	}
+	if _, status := f.connection.queryFileInfo(t.Context(), f.session, f.tree, queryInfoRequestForTest(target, wire.FileNormalizedNameInformation, 4096)); status != statusInvalid {
+		t.Fatalf("detached target normalized name=%#x", status)
+	}
+	closeFixtureHandle(t, f, target)
+	if err := f.tree.closeFileHandle(t.Context(), h); !errors.Is(err, syscall.EIO) {
+		t.Fatalf("CLOSE hid original confirmation failure: %v", err)
+	}
+	if f.tree.findFileHandle(id) != nil || f.server.Status().Handles != 0 || f.server.Status().RetainedDirectoryBytes != 0 {
+		t.Fatal("recovered replacement retained handles/capture")
 	}
 }
 
@@ -215,61 +264,6 @@ func normalizedNameForTest(t *testing.T, f realSMBFixture, id wire.FileID) strin
 		t.Fatal(err)
 	}
 	return name
-}
-
-func testSMBNameMutationCurrentIdentityAndReplacement(t *testing.T, f realSMBFixture, prefix string) {
-	for _, directory := range []string{"old", "new"} {
-		if err := f.volume.Mkdir(t.Context(), prefix+directory); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := f.volume.Write(t.Context(), prefix+"old/source", []byte("original")); err != nil {
-		t.Fatal(err)
-	}
-	if err := f.volume.Write(t.Context(), prefix+"new/target", []byte("replaced")); err != nil {
-		t.Fatal(err)
-	}
-	id := openInfoFileForTest(t, f, prefix+`old\source`, accessReadData|accessDelete)
-	h := f.tree.findFileHandle(id)
-	target := openInfoFileForTest(t, f, prefix+`new\target`, accessReadData)
-	oldTargetID := f.tree.findFileHandle(target).nodeID
-	if err := f.volume.Rename(t.Context(), prefix+"old/source", prefix+"old/current"); err != nil {
-		t.Fatal(err)
-	}
-	if err := f.volume.Write(t.Context(), prefix+"old/source", []byte("new occupant")); err != nil {
-		t.Fatal(err)
-	}
-	if got := normalizedNameForTest(t, f, id); got != `\`+prefix+`old\current` {
-		t.Fatalf("current name=%q", got)
-	}
-	if status := nameSetStatusForTest(t, f, id, wire.FileRenameInformation, renameInformationForTest(prefix+`new\target`, false)); status != statusNameCollision {
-		t.Fatalf("collision=%#x", status)
-	}
-	if status := nameSetStatusForTest(t, f, id, wire.FileRenameInformation, renameInformationForTest(prefix+`new\TARGET`, true)); status != statusOK {
-		t.Fatalf("rename=%#x", status)
-	}
-	if got := normalizedNameForTest(t, f, id); got != `\`+prefix+`new\TARGET` {
-		t.Fatalf("renamed name=%q", got)
-	}
-	attr, err := f.volume.Stat(t.Context(), prefix+"new/TARGET")
-	if err != nil || attr.ID != h.nodeID || attr.ID == oldTargetID {
-		t.Fatalf("source identity changed attr=%+v err=%v", attr, err)
-	}
-	if data, err := f.volume.Read(t.Context(), prefix+"old/source"); err != nil || string(data) != "new occupant" {
-		t.Fatalf("replacement source=%q %v", data, err)
-	}
-	body, status := f.connection.readFile(t.Context(), f.session, f.tree, readRequestForTest(target, 0, 20, 0))
-	if status != statusOK || !bytes.Equal(body[16:], []byte("replaced")) {
-		t.Fatalf("old target reference status=%#x body=%x", status, body)
-	}
-	if _, status := f.connection.queryFileInfo(t.Context(), f.session, f.tree, queryInfoRequestForTest(target, wire.FileNormalizedNameInformation, 4096)); status != statusInvalid {
-		t.Fatalf("detached normalized name=%#x", status)
-	}
-	closeFixtureHandle(t, f, target)
-	closeFixtureHandle(t, f, id)
-	if got := f.server.Status().RetainedDirectoryBytes; got != 0 {
-		t.Fatalf("retained name bytes=%d", got)
-	}
 }
 
 func testSMBOrdinaryDispositionClearPreservesCloseIntent(t *testing.T, f realSMBFixture, prefix string) {

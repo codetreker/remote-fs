@@ -19,27 +19,26 @@ import (
 )
 
 func TestCreateSupersedeDirectAndHTTP(t *testing.T) {
-	fixtures := []struct {
-		name string
-		seed realSMBFixture
+	seed := newRealSMBFixture(t)
+	for _, transport := range []struct {
+		name    string
+		backend storage.FileStorage
 	}{
-		{"direct", newRealSMBFixture(t)},
-		{"http", newHTTPSMBFixture(t)},
-	}
-	for _, family := range []struct {
-		name string
-		run  func(*testing.T, realSMBFixture)
-	}{
-		{"TestCreateSupersedeImplicitRightsPreserveObjectAndMetadataDirectAndHTTP", testCreateSupersedeImplicitRightsPreserveObjectAndMetadataDirectAndHTTP},
-		{"TestCreateSupersedeMissingUsesOnlyIncomingRightsDirectAndHTTP", testCreateSupersedeMissingUsesOnlyIncomingRightsDirectAndHTTP},
-		{"TestCreateSupersedeSelectionRaceKeepsFrozenBranchDirectAndHTTP", testCreateSupersedeSelectionRaceKeepsFrozenBranchDirectAndHTTP},
-		{"TestCreateSupersedeLostResultReplaysOriginalEffectDirectAndHTTP", testCreateSupersedeLostResultReplaysOriginalEffectDirectAndHTTP},
-		{"mixed-data-grant", testCreateSupersedeMixedDataGrant},
+		{"direct", seed.volume},
+		{"http", httpSMBBackendForTest(t, seed.volume)},
 	} {
-		t.Run(family.name, func(t *testing.T) {
-			for _, fixture := range fixtures {
-				t.Run(fixture.name, func(t *testing.T) {
-					family.run(t, newFileSessionFixture(t, fixture.seed))
+		t.Run(transport.name, func(t *testing.T) {
+			base := realSMBFixtureForSession(t, seed.volume, transport.backend, seed.raw)
+			for _, family := range []struct {
+				name string
+				run  func(*testing.T, realSMBFixture, string)
+			}{
+				{"reset-and-lost-result", testCreateSupersedeResetAndLostResult},
+				{"missing-node-ref", testCreateSupersedeMissingUsesOnlyIncomingRightsDirectAndHTTP},
+				{"mixed-data-grant", testCreateSupersedeMixedDataGrant},
+			} {
+				t.Run(family.name, func(t *testing.T) {
+					family.run(t, newFileSessionFixture(t, base), transport.name+"-")
 				})
 			}
 		})
@@ -76,6 +75,7 @@ func TestCreateSupersedeAdapterMapping(t *testing.T) {
 	t.Run("existing-rights", testCreateSupersedeExistingRightsMapping)
 	t.Run("missing-rights", testCreateSupersedeMissingRightsMapping)
 	t.Run("sharing-and-attributes", testCreateSupersedeSharingAndAttributesMapping)
+	t.Run("existing-selection-race", testCreateSupersedeExistingSelectionRaceMapping)
 	t.Run("missing-selection-races", testCreateSupersedeMissingSelectionRaceMapping)
 	t.Run("allocation-and-authorization", testCreateSupersedeAllocationAndRemoveAuthorizationBeforeEffect)
 }
@@ -203,9 +203,40 @@ func testCreateSupersedeMissingSelectionRaceMapping(t *testing.T) {
 	}
 }
 
-func testCreateSupersedeImplicitRightsPreserveObjectAndMetadataDirectAndHTTP(t *testing.T, f realSMBFixture) {
+func testCreateSupersedeExistingSelectionRaceMapping(t *testing.T) {
+	f, backend, probe := newSupersedeMappingFixture(t)
+	before := backend.attr(8).Clone()
+	wrapped := probe.createSessionContract.(*supersedeSelectionRaceProbe)
+	calls := 0
+	winner := before.Clone()
+	winner.ID, winner.Size = 999, 11
+	wrapped.before = func() {
+		calls++
+		backend.mu.Lock()
+		for index := range backend.views[1] {
+			if backend.views[1][index].Attr.ID == before.ID {
+				backend.views[1][index].Name = "original"
+			}
+		}
+		backend.views[1] = append(backend.views[1], storage.Entry{Name: "supersede.txt", Attr: winner})
+		backend.revision++
+		backend.mu.Unlock()
+	}
+	_, status, id := f.connection.createFile(t.Context(), f.session, f.tree, createRequestForTest("supersede.txt", 0, 0))
+	if status != statusRetry || id != (wire.FileID{}) || calls != 1 || len(probe.calls) != 1 || probe.calls[0].Target.State != storage.SameNode || probe.calls[0].Target.NodeID != before.ID || probe.calls[0].Create || probe.calls[0].ResetUse != storage.DeleteName {
+		t.Fatalf("existing frozen selection = %#x, %x, calls=%+v", status, id, probe.calls)
+	}
+	if !reflect.DeepEqual(backend.attr(before.ID), before) || !reflect.DeepEqual(backend.attr(winner.ID), winner) {
+		t.Fatal("stale existing selection changed a fixture object")
+	}
+	if owners := f.server.HandleOwners(); len(owners) != 0 {
+		t.Fatalf("known existing refusal retained cleanup = %+v", owners)
+	}
+}
+
+func testCreateSupersedeResetAndLostResult(t *testing.T, f realSMBFixture, prefix string) {
 	incoming := uint32(0)
-	name := fmt.Sprintf("supersede-%x", incoming)
+	name := prefix + "supersede"
 	if err := f.volume.Write(t.Context(), name, []byte("body")); err != nil {
 		t.Fatal(err)
 	}
@@ -236,43 +267,77 @@ func testCreateSupersedeImplicitRightsPreserveObjectAndMetadataDirectAndHTTP(t *
 	if err != nil {
 		t.Fatal(err)
 	}
-	probe := &createResultProbe{createSessionContract: f.raw.(createSessionContract)}
+	probe := &createResultProbe{createSessionContract: f.raw.(createSessionContract), loseFirst: true}
+	authorize := f.server.config.Authorize
+	var captured storage.Attr
+	var outcome storage.OpenOutcome
+	probe.change = func(result *storage.OpenResult) {
+		captured, outcome = result.Attr.Clone(), result.Outcome
+	}
+	probe.afterOpen = func() {
+		probe.afterOpen = nil
+		options := probe.calls[0]
+		if outcome != storage.Reset || captured.ID != before.ID || options.Read || options.Write || options.Create || options.Existing != storage.ResetContent || options.ResetUse != storage.DeleteName || options.Target.State != storage.SameNode || options.Target.NodeID != before.ID || options.Use.Uses != storage.DeleteName || options.MetadataAccess != storage.WriteMetadata {
+			t.Fatalf("live zero-data reset options=%+v attr=%+v outcome=%d", options, captured, outcome)
+		}
+		attributes, projectErr := projectWindowsAttributes(captured)
+		if projectErr != nil || captured.Size != 0 || attributes != dosHidden|dosSystem|dosArchive || !reflect.DeepEqual(captured.BirthTime, before.BirthTime) || !captured.AccessTime.Equal(before.AccessTime) || !captured.ModTime.After(before.ModTime) || captured.ChangeTime == nil || !captured.ChangeTime.After(*before.ChangeTime) || !reflect.DeepEqual(captured.Metadata["other"], before.Metadata["other"]) {
+			t.Fatalf("live reset metadata before=%+v after=%+v attrs=%x err=%v", before, captured, attributes, projectErr)
+		}
+		state, err := probe.last.(storage.ReferenceStateAccess).State(t.Context(), storage.StateScalars)
+		if err != nil || state.Attr.ID != before.ID || state.Attr.Size != 0 {
+			t.Fatalf("reset reference not live before response loss: %+v, %v", state, err)
+		}
+		oldRead, err := f.tree.findFileHandle(oldID).file.ReadAt(t.Context(), 0, 4)
+		if err != nil || oldRead.Attr.ID != before.ID || oldRead.Attr.Size != 0 || len(oldRead.Data) != 0 {
+			t.Fatalf("old handle changed object or missed live reset = %+v, %v", oldRead, err)
+		}
+		if _, err := probe.last.ReadAt(t.Context(), 0, 1); !errors.Is(err, syscall.EBADF) {
+			t.Fatalf("live supersede granted data read: %v", err)
+		}
+		if _, err := probe.last.WriteAt(t.Context(), 0, []byte("x")); !errors.Is(err, syscall.EBADF) {
+			t.Fatalf("live supersede granted data write: %v", err)
+		}
+		newID := wire.FileID{}
+		for _, owner := range f.server.HandleOwners() {
+			if owner.OpenAction == options.Action {
+				newID = owner.FileID
+			}
+		}
+		if newID == (wire.FileID{}) || newID == oldID {
+			t.Fatalf("supersede did not reserve a separate FileId: %x/%x", oldID, newID)
+		}
+		if err := f.volume.Rename(t.Context(), name, prefix+"reset-original"); err != nil {
+			t.Fatal(err)
+		}
+		if err := f.volume.Write(t.Context(), name, []byte("replacement")); err != nil {
+			t.Fatal(err)
+		}
+		f.server.config.Authorize = authz.AuthorizerFunc(func(context.Context, authz.AccessRequest) error { return authz.ErrDenied })
+	}
 	f.tree.authority.raw = probe
 	request := createRequestForTest(name, 0, incoming)
 	binary.LittleEndian.PutUint32(request.Body[28:], dosHidden|dosSystem)
-	body, status, newID := f.connection.createFile(t.Context(), f.session, f.tree, request)
-	if status != statusOK || newID == oldID || newID == (wire.FileID{}) || binary.LittleEndian.Uint32(body[4:]) != 0 {
-		t.Fatalf("supersede = status %#x action/body %x ids %x/%x", status, body, oldID, newID)
+	_, status, id := f.connection.createFile(t.Context(), f.session, f.tree, request)
+	if status != statusIO || id != (wire.FileID{}) || len(probe.calls) != 2 || !reflect.DeepEqual(probe.calls[0], probe.calls[1]) || !reflect.DeepEqual(probe.selections[0], probe.selections[1]) {
+		t.Fatalf("lost reset result = %#x, %x, calls=%+v", status, id, probe.calls)
 	}
-	h := f.tree.findFileHandle(newID)
-	if h.file == nil || h.node != nil || h.nodeID != before.ID || h.access != incoming|accessDelete|accessWriteEA|accessWriteAttr || len(probe.calls) != 1 {
-		t.Fatalf("supersede reference/access = %+v calls=%+v", h, probe.calls)
+	after, err := f.volume.Stat(t.Context(), prefix+"reset-original")
+	if err != nil || after.ID != before.ID || after.Size != 0 {
+		t.Fatalf("original reset effect = %+v, %v", after, err)
 	}
-	options := probe.calls[0]
-	if options.Read || options.Write || options.Create || options.Existing != storage.ResetContent || options.ResetUse != storage.DeleteName || options.Target.State != storage.SameNode || options.Target.NodeID != before.ID || options.Use.Uses != storage.DeleteName || options.MetadataAccess != storage.WriteMetadata {
-		t.Fatalf("actual atomic grant = %+v", options)
+	replacement, err := f.volume.Read(t.Context(), name)
+	if err != nil || !bytes.Equal(replacement, []byte("replacement")) {
+		t.Fatalf("reset replay touched replacement = %q, %v", replacement, err)
 	}
-	after, err := f.volume.Stat(t.Context(), name)
-	attributes, projectErr := projectWindowsAttributes(after)
-	if err != nil || projectErr != nil || after.ID != before.ID || after.Size != 0 || attributes != dosHidden|dosSystem|dosArchive || !reflect.DeepEqual(after.BirthTime, before.BirthTime) || !after.AccessTime.Equal(before.AccessTime) || !after.ModTime.After(before.ModTime) || after.ChangeTime == nil || !after.ChangeTime.After(*before.ChangeTime) || !reflect.DeepEqual(after.Metadata["other"], before.Metadata["other"]) {
-		t.Fatalf("atomic reset metadata before=%+v after=%+v attrs=%x err=%v/%v", before, after, attributes, err, projectErr)
-	}
-	oldRead, err := f.tree.findFileHandle(oldID).file.ReadAt(t.Context(), 0, 4)
-	if err != nil || oldRead.Attr.ID != before.ID || oldRead.Attr.Size != 0 || len(oldRead.Data) != 0 {
-		t.Fatalf("old handle changed object or missed reset = %+v, %v", oldRead, err)
-	}
-	if _, err := h.file.ReadAt(t.Context(), 0, 1); !errors.Is(err, syscall.EBADF) {
-		t.Fatalf("implicit rights granted data read: %v", err)
-	}
-	if _, err := h.file.WriteAt(t.Context(), 0, []byte("x")); !errors.Is(err, syscall.EBADF) {
-		t.Fatalf("implicit rights granted data write: %v", err)
-	}
-	closeFixtureHandle(t, f, newID)
+	f.server.config.Authorize = authorize
 	closeFixtureHandle(t, f, oldID)
-	f.tree.authority.raw = f.raw
+	if owners := f.server.HandleOwners(); len(owners) != 0 {
+		t.Fatalf("lost reset retained cleanup responsibility = %+v", owners)
+	}
 }
 
-func testCreateSupersedeMissingUsesOnlyIncomingRightsDirectAndHTTP(t *testing.T, f realSMBFixture) {
+func testCreateSupersedeMissingUsesOnlyIncomingRightsDirectAndHTTP(t *testing.T, f realSMBFixture, prefix string) {
 	f.server.config.Authorize = authz.AuthorizerFunc(func(_ context.Context, request authz.AccessRequest) error {
 		if request.Operation == storage.OpVolumeRemove {
 			return authz.ErrDenied
@@ -282,7 +347,7 @@ func testCreateSupersedeMissingUsesOnlyIncomingRightsDirectAndHTTP(t *testing.T,
 	probe := &createResultProbe{createSessionContract: f.raw.(createSessionContract)}
 	f.tree.authority.raw = probe
 	incoming := uint32(0)
-	name := fmt.Sprintf("missing-%x", incoming)
+	name := prefix + "missing"
 	body, status, id := f.connection.createFile(t.Context(), f.session, f.tree, createRequestForTest(name, 0, incoming))
 	if status != statusOK || binary.LittleEndian.Uint32(body[4:]) != uint32(storage.Created) {
 		t.Fatalf("incoming %x missing supersede = %#x, %x", incoming, status, body)
@@ -381,90 +446,18 @@ func (p *supersedeSelectionRaceProbe) OpenChildRef(ctx context.Context, selectio
 	return result, err
 }
 
-func testCreateSupersedeSelectionRaceKeepsFrozenBranchDirectAndHTTP(t *testing.T, f realSMBFixture) {
-	const name = "existing"
-	if err := f.volume.Write(t.Context(), name, []byte("original")); err != nil {
+func testCreateSupersedeMixedDataGrant(t *testing.T, f realSMBFixture, prefix string) {
+	if err := f.volume.Write(t.Context(), prefix+"mixed-data", []byte("body")); err != nil {
 		t.Fatal(err)
 	}
-	original, err := f.volume.Stat(t.Context(), name)
-	if err != nil {
-		t.Fatal(err)
-	}
-	calls := 0
-	probe := &supersedeSelectionRaceProbe{createSessionContract: f.raw.(createSessionContract)}
-	probe.before = func() {
-		calls++
-		if err := f.volume.Rename(t.Context(), name, name+"-original"); err != nil {
-			t.Fatal(err)
-		}
-		if err := f.volume.Write(t.Context(), name, []byte("replacement")); err != nil {
-			t.Fatal(err)
-		}
-	}
-	f.tree.authority.raw = probe
-	_, status, id := f.connection.createFile(t.Context(), f.session, f.tree, createRequestForTest(name, 0, 0))
-	if status != statusRetry || id != (wire.FileID{}) || calls != 1 {
-		t.Fatalf("existing selection race = %#x, %x, calls=%d", status, id, calls)
-	}
-	data, err := f.volume.Read(t.Context(), name)
-	if err != nil || !bytes.Equal(data, []byte("replacement")) {
-		t.Fatalf("selection race changed replacement = %q, %v", data, err)
-	}
-	retained, err := f.volume.Stat(t.Context(), name+"-original")
-	if err != nil || retained.ID != original.ID || retained.Size != original.Size {
-		t.Fatalf("selection race reset original = %+v, %v", retained, err)
-	}
-}
-
-func testCreateSupersedeLostResultReplaysOriginalEffectDirectAndHTTP(t *testing.T, f realSMBFixture) {
-	if err := f.volume.Write(t.Context(), "lost-file", []byte("original")); err != nil {
-		t.Fatal(err)
-	}
-	original, err := f.volume.Stat(t.Context(), "lost-file")
-	if err != nil {
-		t.Fatal(err)
-	}
-	probe := &createResultProbe{createSessionContract: f.raw.(createSessionContract), loseFirst: true}
-	probe.afterOpen = func() {
-		probe.afterOpen = nil
-		if err := f.volume.Rename(t.Context(), "lost-file", "lost-original"); err != nil {
-			t.Fatal(err)
-		}
-		if err := f.volume.Write(t.Context(), "lost-file", []byte("replacement")); err != nil {
-			t.Fatal(err)
-		}
-		f.server.config.Authorize = authz.AuthorizerFunc(func(context.Context, authz.AccessRequest) error { return authz.ErrDenied })
-	}
-	f.tree.authority.raw = probe
-	_, status, id := f.connection.createFile(t.Context(), f.session, f.tree, createRequestForTest("lost-file", 0, 0))
-	if status != statusIO || id != (wire.FileID{}) || len(probe.calls) != 2 || !reflect.DeepEqual(probe.calls[0], probe.calls[1]) || !reflect.DeepEqual(probe.selections[0], probe.selections[1]) {
-		t.Fatalf("lost supersede result = %#x, %x, calls=%+v", status, id, probe.calls)
-	}
-	after, err := f.volume.Stat(t.Context(), "lost-original")
-	if err != nil || after.ID != original.ID || after.Size != 0 {
-		t.Fatalf("original supersede effect = %+v, %v", after, err)
-	}
-	replacement, err := f.volume.Read(t.Context(), "lost-file")
-	if err != nil || !bytes.Equal(replacement, []byte("replacement")) {
-		t.Fatalf("replay touched replacement = %q, %v", replacement, err)
-	}
-	if owners := f.server.HandleOwners(); len(owners) != 0 {
-		t.Fatalf("recovered supersede retained cleanup responsibility = %+v", owners)
-	}
-}
-
-func testCreateSupersedeMixedDataGrant(t *testing.T, f realSMBFixture) {
-	if err := f.volume.Write(t.Context(), "mixed-data", []byte("body")); err != nil {
-		t.Fatal(err)
-	}
-	before, err := f.volume.Stat(t.Context(), "mixed-data")
+	before, err := f.volume.Stat(t.Context(), prefix+"mixed-data")
 	if err != nil {
 		t.Fatal(err)
 	}
 	probe := &createResultProbe{createSessionContract: f.raw.(createSessionContract)}
 	f.tree.authority.raw = probe
 	incoming := accessReadData | accessWriteData | accessDelete
-	body, status, id := f.connection.createFile(t.Context(), f.session, f.tree, createRequestForTest("mixed-data", 0, incoming))
+	body, status, id := f.connection.createFile(t.Context(), f.session, f.tree, createRequestForTest(prefix+"mixed-data", 0, incoming))
 	if status != statusOK || binary.LittleEndian.Uint32(body[4:]) != 0 || len(probe.calls) != 1 {
 		t.Fatalf("mixed supersede = %#x, %x, calls=%+v", status, body, probe.calls)
 	}

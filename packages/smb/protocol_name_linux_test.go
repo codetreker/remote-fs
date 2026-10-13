@@ -4,15 +4,42 @@ package smb
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"reflect"
+	"sync/atomic"
 	"testing"
 
 	"github.com/codetreker/remote-fs/packages/smb/internal/wire"
+	"github.com/codetreker/remote-fs/packages/storage"
 )
 
+type signedNameBackend struct {
+	*nativeDeleteBackend
+	mutations atomic.Int32
+}
+
+func (b *signedNameBackend) NewFileSession(ctx context.Context, options storage.FileSessionOptions) (storage.FileSession, error) {
+	raw, err := b.nativeDeleteBackend.NewFileSession(ctx, options)
+	if err != nil {
+		return nil, err
+	}
+	return &signedNameSession{nativeDeleteSession: raw.(*nativeDeleteSession), mutations: &b.mutations}, nil
+}
+
+type signedNameSession struct {
+	*nativeDeleteSession
+	mutations *atomic.Int32
+}
+
+func (s *signedNameSession) MutateName(ctx context.Context, command storage.NameCommand) (storage.NameResult, error) {
+	s.mutations.Add(1)
+	return s.nativeDeleteSession.MutateName(ctx, command)
+}
+
 func TestSignedRelatedNameMutationWarningPreservesClose(t *testing.T) {
-	f, client := startRealFileProtocolServer(t)
+	backend := &signedNameBackend{nativeDeleteBackend: NewNativeNameProbeBackend()}
+	server, client := startFileProtocolServerForBackend(t, backend)
 	sessionID, key := authenticateProtocol(t, client)
 	treeID := connectProtocolTree(t, client, key, sessionID, 3, "data")
 	create := createRequestForTest("original", 2, accessDelete)
@@ -51,30 +78,39 @@ func TestSignedRelatedNameMutationWarningPreservesClose(t *testing.T) {
 		}
 		offset = end
 	}
-	if _, err := f.volume.Stat(t.Context(), "renamed-long"); err != nil {
-		t.Fatal(err)
+	backend.mu.Lock()
+	var renamed storage.NameObservation
+	for _, entry := range backend.views[1] {
+		if entry.Name == "renamed-long" {
+			renamed = backend.binding(entry.Attr.ID)
+		}
 	}
-	if status := f.server.Status(); status.Handles != 0 || status.RetainedDirectoryBytes != 0 {
+	backend.mu.Unlock()
+	if renamed.State != storage.NameLinked || string(renamed.RawLeaf) != "renamed-long" || backend.mutations.Load() != 1 {
+		t.Fatalf("signed compound projected name=%+v mutation calls=%d", renamed, backend.mutations.Load())
+	}
+	if status := server.Status(); status.Handles != 0 || status.RetainedDirectoryBytes != 0 {
 		t.Fatalf("related name CLOSE retained=%+v", status)
 	}
 }
 
 func TestSignedNameReplacementRejectsReadOnlyTargetWithoutEffects(t *testing.T) {
-	f, client := startRealFileProtocolServer(t)
-	if err := f.volume.Write(t.Context(), "source", []byte("source bytes")); err != nil {
+	backend := &signedNameBackend{nativeDeleteBackend: NewNativeNameProbeBackend()}
+	data, err := encodeWindowsMetadata(windowsMetadata{Attributes: dosReadOnly | dosHidden})
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := f.volume.Write(t.Context(), "target", []byte("target bytes")); err != nil {
-		t.Fatal(err)
-	}
-	targetBefore := seedIOWindowsMetadata(t, f, "target", dosReadOnly|dosHidden)
-	sourceBefore, err := f.volume.Stat(t.Context(), "source")
-	if err != nil || sourceBefore.ID == targetBefore.ID {
-		t.Fatalf("source/target identities before replacement: source=%+v target=%+v err=%v", sourceBefore, targetBefore, err)
-	}
+	backend.mu.Lock()
+	targetBefore := backend.attr(4).Clone()
+	targetBefore.Metadata = map[string]storage.OpaquePayload{windowsMetadataKey: {Version: []byte("readonly"), Data: data}}
+	backend.updateAttr(targetBefore)
+	sourceBefore := backend.attr(3).Clone()
+	sourceName, targetName := backend.binding(3), backend.binding(4)
+	backend.mu.Unlock()
+	server, client := startFileProtocolServerForBackend(t, backend)
 	sessionID, key := authenticateProtocol(t, client)
 	treeID := connectProtocolTree(t, client, key, sessionID, 3, "data")
-	create := createRequestForTest("source", 1, accessDelete)
+	create := createRequestForTest("alpha.txt", 1, accessDelete)
 	sendFrame(t, client, signedRequest(t, key, wire.Header{Command: wire.Create, MessageID: 4, SessionID: sessionID, TreeID: treeID, Credits: 1}, create.Body))
 	response := readFrame(t, client)
 	header, err := wire.ParseHeader(response)
@@ -83,29 +119,19 @@ func TestSignedNameReplacementRejectsReadOnlyTargetWithoutEffects(t *testing.T) 
 	}
 	var id wire.FileID
 	copy(id[:], response[128:144])
-	rename := setInfoRequestForTest(id, wire.FileRenameInformation, renameInformationForTest("target", true))
+	rename := setInfoRequestForTest(id, wire.FileRenameInformation, renameInformationForTest("beta.bin", true))
 	sendFrame(t, client, signedRequest(t, key, wire.Header{Command: wire.SetInfo, MessageID: 5, SessionID: sessionID, TreeID: treeID, Credits: 1}, rename.Body))
 	response = readFrame(t, client)
 	header, err = wire.ParseHeader(response)
 	if err != nil || header.Command != wire.SetInfo || header.MessageID != 5 || header.SessionID != sessionID || header.TreeID != treeID || header.Status != statusDenied || header.Flags&wire.FlagSigned == 0 || header.NextCommand != 0 || key.Verify(response) != nil || !bytes.Equal(response[wire.HeaderSize:], wire.ErrorResponseBody()) {
 		t.Fatalf("signed READONLY target replacement header=%+v err=%v packet=%x", header, err, response)
 	}
-	for _, entry := range []struct {
-		name    string
-		content string
-	}{{"source", "source bytes"}, {"target", "target bytes"}} {
-		data, err := f.volume.Read(t.Context(), entry.name)
-		if err != nil || string(data) != entry.content {
-			t.Fatalf("rejected replacement changed %s content=%q err=%v", entry.name, data, err)
-		}
-	}
-	sourceAfter, err := f.volume.Stat(t.Context(), "source")
-	if err != nil || !reflect.DeepEqual(sourceAfter, sourceBefore) {
-		t.Fatalf("rejected replacement changed source identity/binding/attributes: before=%+v after=%+v err=%v", sourceBefore, sourceAfter, err)
-	}
-	targetAfter, err := f.volume.Stat(t.Context(), "target")
-	if err != nil || !reflect.DeepEqual(targetAfter, targetBefore) {
-		t.Fatalf("rejected replacement changed target identity/binding/attributes: before=%+v after=%+v err=%v", targetBefore, targetAfter, err)
+	backend.mu.Lock()
+	sourceAfter, targetAfter := backend.attr(3).Clone(), backend.attr(4).Clone()
+	sourceBinding, targetBinding := backend.binding(3), backend.binding(4)
+	backend.mu.Unlock()
+	if !reflect.DeepEqual(sourceAfter, sourceBefore) || !reflect.DeepEqual(targetAfter, targetBefore) || !reflect.DeepEqual(sourceBinding, sourceName) || !reflect.DeepEqual(targetBinding, targetName) || backend.mutations.Load() != 0 {
+		t.Fatalf("signed denied replacement changed projection: source=%+v target=%+v bindings=%+v/%+v mutations=%d", sourceAfter, targetAfter, sourceBinding, targetBinding, backend.mutations.Load())
 	}
 	closeBody := make([]byte, 24)
 	binary.LittleEndian.PutUint16(closeBody, 24)
@@ -116,7 +142,7 @@ func TestSignedNameReplacementRejectsReadOnlyTargetWithoutEffects(t *testing.T) 
 	if err != nil || header.Command != wire.Close || header.MessageID != 6 || header.Status != statusOK || key.Verify(response) != nil {
 		t.Fatalf("signed source CLOSE header=%+v err=%v packet=%x", header, err, response)
 	}
-	if status := f.server.Status(); status.Handles != 0 || status.OpeningHandles != 0 || status.RetainedDirectoryBytes != 0 || status.WriteOwners != 0 || status.UnknownWrites != 0 || status.RetainedWriteBytes != 0 || len(status.WriteFailures) != 0 {
+	if status := server.Status(); status.Handles != 0 || status.OpeningHandles != 0 || status.RetainedDirectoryBytes != 0 || status.WriteOwners != 0 || status.UnknownWrites != 0 || status.RetainedWriteBytes != 0 || len(status.WriteFailures) != 0 {
 		t.Fatalf("rejected signed replacement retained ownership=%+v", status)
 	}
 }
