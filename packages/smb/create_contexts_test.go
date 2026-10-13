@@ -74,10 +74,34 @@ func TestValidateCreateContexts(t *testing.T) {
 		{"unsupported before mixed durable", []wire.CreateContext{testCreateContext("unknown", 0), testCreateContext("DHnQ", 16), testCreateContext("DH2Q", 32)}, syscall.EINVAL},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			if err := validateCreateContexts(wire.CreateRequest{Contexts: test.contexts}); !errors.Is(err, test.want) {
+			if err := validateCreateContexts(wire.CreateRequest{Disposition: 1, Contexts: test.contexts}); !errors.Is(err, test.want) {
 				t.Fatalf("validate = %v, want %v", err, test.want)
 			}
 		})
+	}
+}
+
+func TestSupersedeAllocationContextRejectsOnlyNonzeroReservation(t *testing.T) {
+	for _, value := range []uint64{0, 1, 1 << 63, ^uint64(0)} {
+		allocation := testCreateContext("AlSi", 8)
+		binary.LittleEndian.PutUint64(allocation.Data, value)
+		want := error(nil)
+		if value != 0 {
+			want = syscall.EOPNOTSUPP
+		}
+		if err := validateCreateContexts(wire.CreateRequest{Disposition: 0, Contexts: []wire.CreateContext{allocation}}); !errors.Is(err, want) {
+			t.Fatalf("supersede allocation %d = %v, want %v", value, err, want)
+		}
+		for disposition := uint32(1); disposition <= 5; disposition++ {
+			if err := validateCreateContexts(wire.CreateRequest{Disposition: disposition, Contexts: []wire.CreateContext{allocation}}); err != nil {
+				t.Fatalf("ordinary disposition %d allocation %d = %v", disposition, value, err)
+			}
+		}
+	}
+	for _, size := range []int{0, 7, 9} {
+		if err := validateCreateContexts(wire.CreateRequest{Disposition: 0, Contexts: []wire.CreateContext{testCreateContext("AlSi", size)}}); !errors.Is(err, syscall.EINVAL) {
+			t.Fatalf("malformed allocation %d = %v", size, err)
+		}
 	}
 }
 

@@ -20,7 +20,28 @@ import (
 	"github.com/codetreker/remote-fs/packages/storage"
 )
 
-type retainedNode struct{ volume, id int64 }
+func (s *Store) pinNodeLocked(id int64) {
+	pins := s.coordinator.pins[s.volume]
+	if pins == nil {
+		pins = make(map[int64]int)
+		s.coordinator.pins[s.volume] = pins
+	}
+	pins[id]++
+}
+
+func (s *Store) nodePinCountLocked(id int64) int { return s.coordinator.pins[s.volume][id] }
+
+func (s *Store) unpinNodeLocked(id int64) {
+	pins := s.coordinator.pins[s.volume]
+	if pins[id] == 1 {
+		delete(pins, id)
+		if len(pins) == 0 {
+			delete(s.coordinator.pins, s.volume)
+		}
+	} else {
+		pins[id]--
+	}
+}
 
 // All fields are protected by the database commit gate. Physical retention is
 // distinct from active publication authority, which is revoked before I/O drains.
@@ -194,7 +215,7 @@ func (s *Store) openFile(ctx context.Context, path string, id int64, options sto
 	}
 	s.files[f] = struct{}{}
 	s.fileDomain.files++
-	s.coordinator.pins[retainedNode{s.volume, f.id}]++
+	s.pinNodeLocked(f.id)
 	return f, nil
 }
 
@@ -543,8 +564,7 @@ func (f *retainedFile) CloseWithResult(ctx context.Context) (storage.ReferenceCl
 	}
 	terminalResult = f.retireResult
 	s := f.store
-	key := retainedNode{s.volume, f.id}
-	count := s.coordinator.pins[key]
+	count := s.nodePinCountLocked(f.id)
 	if count < 1 || s.fileDomain.files < 1 {
 		return f.poisonCloseLocked(syscall.EIO)
 	}
@@ -571,11 +591,7 @@ func (f *retainedFile) CloseWithResult(ctx context.Context) (storage.ReferenceCl
 		}
 		return storage.ReferenceCloseResult{Determined: true}, errors.Join(sqlerr.Failure(terminalResult), err)
 	}
-	if count == 1 {
-		delete(s.coordinator.pins, key)
-	} else {
-		s.coordinator.pins[key] = count - 1
-	}
+	s.unpinNodeLocked(f.id)
 	delete(s.files, f)
 	s.fileDomain.files--
 	f.closed = true

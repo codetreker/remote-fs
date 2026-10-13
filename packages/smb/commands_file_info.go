@@ -90,11 +90,14 @@ func (c *connection) queryFileInfo(ctx context.Context, s *session, t *tree, req
 		return nil, statusUnsupported
 	}
 	size := fileInfoSize(parsed.FileInfoClass)
-	if size == 0 {
+	if size == 0 && parsed.FileInfoClass != wire.FileNormalizedNameInformation {
 		return nil, statusUnsupported
 	}
 	if parsed.OutputBufferLength > uint32(c.server.config.Limits.MaxFrameBytes-72) {
 		return nil, statusResources
+	}
+	if parsed.FileInfoClass == wire.FileNormalizedNameInformation {
+		return c.queryNormalizedName(ctx, s, t, request, parsed)
 	}
 	id, err := relatedIOFileID(ctx, request, parsed.FileID)
 	if err != nil {
@@ -376,6 +379,9 @@ func (c *connection) setFileInfo(ctx context.Context, s *session, t *tree, reque
 	}
 	if parsed.AdditionalInformation != 0 {
 		return nil, statusInvalid
+	}
+	if parsed.FileInfoClass == wire.FileRenameInformation || parsed.FileInfoClass == wire.FileDispositionInformation {
+		return c.setNameInformation(ctx, s, t, request, parsed)
 	}
 	if parsed.FileInfoClass != wire.FileBasicInformation && parsed.FileInfoClass != wire.FileEndOfFileInformation {
 		return nil, statusUnsupported

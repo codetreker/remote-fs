@@ -66,7 +66,7 @@ func TestInvalidAtomicOpenPermissionsHaveNoNativeEffects(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	files, pins := store.fileDomain.files, len(store.coordinator.pins)
+	files, pins := store.fileDomain.files, len(store.coordinator.pins[store.volume])
 	options := storage.OpenAtOptions{Write: true, Create: true, Exclusive: true, MetadataAccess: storage.ReadMetadata,
 		Action: fileAction(t), Target: storage.ChildCondition{State: storage.Absent}, Existing: storage.Keep,
 		Use: storage.UseClaim{Uses: storage.WriteData}, Initial: storage.InitialState{OnCreate: storage.InitialFields{Metadata: map[string][]byte{"test.initial": []byte("value")}}}}
@@ -87,7 +87,7 @@ func TestInvalidAtomicOpenPermissionsHaveNoNativeEffects(t *testing.T) {
 			t.Fatalf("invalid open created a name: %v", err)
 		}
 		after, err := store.DurableState(t.Context())
-		if err != nil || after != before || store.fileDomain.files != files || len(store.coordinator.pins) != pins {
+		if err != nil || after != before || store.fileDomain.files != files || len(store.coordinator.pins[store.volume]) != pins {
 			t.Fatalf("invalid open changed durable state or retention: %+v, %+v, %v", before, after, err)
 		}
 	}

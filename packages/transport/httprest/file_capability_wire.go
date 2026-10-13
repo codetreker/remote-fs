@@ -101,18 +101,22 @@ func childSelectionStorage(name *childName, guards *namespaceGuards) storage.Chi
 
 func canonicalChildSelection(value storage.ChildSelection) storage.ChildSelection {
 	value = value.Clone()
-	if value.Guards == nil {
-		return value
-	}
-	if value.Guards.RootID == 0 && len(value.Guards.Directories) == 0 && len(value.Guards.Edges) == 0 {
+	value.Guards = canonicalNamespaceGuards(value.Guards)
+	if value.Guards != nil && value.Guards.RootID == 0 && len(value.Guards.Directories) == 0 && len(value.Guards.Edges) == 0 {
 		value.Guards = nil
-		return value
 	}
-	sort.Slice(value.Guards.Directories, func(left, right int) bool {
-		return value.Guards.Directories[left].ParentID < value.Guards.Directories[right].ParentID
+	return value
+}
+
+func canonicalNamespaceGuards(value *storage.NamespaceGuards) *storage.NamespaceGuards {
+	if value == nil {
+		return nil
+	}
+	sort.Slice(value.Directories, func(left, right int) bool {
+		return value.Directories[left].ParentID < value.Directories[right].ParentID
 	})
-	sort.Slice(value.Guards.Edges, func(left, right int) bool {
-		leftEdge, rightEdge := value.Guards.Edges[left], value.Guards.Edges[right]
+	sort.Slice(value.Edges, func(left, right int) bool {
+		leftEdge, rightEdge := value.Edges[left], value.Edges[right]
 		if leftEdge.ParentID != rightEdge.ParentID {
 			return leftEdge.ParentID < rightEdge.ParentID
 		}
@@ -241,16 +245,17 @@ type openAtOptions struct {
 	Action                 storage.FileActionID        `json:"action"`
 	Use                    storage.UseClaim            `json:"use"`
 	Existing               storage.ExistingEffect      `json:"existing"`
+	ResetUse               storage.Uses                `json:"resetUse,omitempty"`
 	Initial                initialState                `json:"initial"`
 	CloseIntent            *closeIntent                `json:"closeIntent,omitempty"`
 }
 
 func openAtOptionsOf(value storage.OpenAtOptions) *openAtOptions {
-	return &openAtOptions{ContentMetadataEffects: contentMetadataEffectsOf(value.ContentMetadataEffects), MetadataAccess: value.MetadataAccess, Read: value.Read, Write: value.Write, Create: value.Create, Exclusive: value.Exclusive, Target: childConditionOf(value.Target), Action: value.Action, Use: value.Use, Existing: value.Existing, Initial: initialStateOf(value.Initial), CloseIntent: closeIntentOf(value.CloseIntent)}
+	return &openAtOptions{ContentMetadataEffects: contentMetadataEffectsOf(value.ContentMetadataEffects), MetadataAccess: value.MetadataAccess, Read: value.Read, Write: value.Write, Create: value.Create, Exclusive: value.Exclusive, Target: childConditionOf(value.Target), Action: value.Action, Use: value.Use, Existing: value.Existing, ResetUse: value.ResetUse, Initial: initialStateOf(value.Initial), CloseIntent: closeIntentOf(value.CloseIntent)}
 }
 
 func (value openAtOptions) storage() storage.OpenAtOptions {
-	result := storage.OpenAtOptions{ContentMetadataEffects: contentMetadataEffectsStorage(value.ContentMetadataEffects), MetadataAccess: value.MetadataAccess, Read: value.Read, Write: value.Write, Create: value.Create, Exclusive: value.Exclusive, Target: value.Target.storage(), Action: value.Action, Use: value.Use, Existing: value.Existing, Initial: value.Initial.storage()}
+	result := storage.OpenAtOptions{ContentMetadataEffects: contentMetadataEffectsStorage(value.ContentMetadataEffects), MetadataAccess: value.MetadataAccess, Read: value.Read, Write: value.Write, Create: value.Create, Exclusive: value.Exclusive, Target: value.Target.storage(), Action: value.Action, Use: value.Use, Existing: value.Existing, ResetUse: value.ResetUse, Initial: value.Initial.storage()}
 	if value.CloseIntent != nil {
 		intent := value.CloseIntent.storage()
 		result.CloseIntent = &intent
@@ -284,21 +289,23 @@ func (value nodeRefOptions) storage() storage.NodeRefOptions {
 }
 
 type nameCommand struct {
-	Kind        storage.NameOperation `json:"kind"`
-	Action      storage.FileActionID  `json:"action"`
-	Name        childName             `json:"name"`
-	Target      childCondition        `json:"target"`
-	Destination *renameTarget         `json:"destination,omitempty"`
-	Initial     initialFields         `json:"initial"`
-	Uses        []storage.TargetUse   `json:"uses,omitempty"`
+	Kind                     storage.NameOperation `json:"kind"`
+	Action                   storage.FileActionID  `json:"action"`
+	Name                     childName             `json:"name"`
+	Target                   childCondition        `json:"target"`
+	Destination              *renameTarget         `json:"destination,omitempty"`
+	Initial                  initialFields         `json:"initial"`
+	Uses                     []storage.TargetUse   `json:"uses,omitempty"`
+	Guards                   *namespaceGuards      `json:"guards,omitempty"`
+	RequireNoOpenDescendants bool                  `json:"requireNoOpenDescendants,omitempty"`
 }
 
 func nameCommandOf(value storage.NameCommand) *nameCommand {
-	return &nameCommand{Kind: value.Kind, Action: value.Action, Name: *childNameOf(value.Name), Target: childConditionOf(value.Target), Destination: renameTargetOf(value.Destination), Initial: initialFieldsOf(value.Initial), Uses: value.Uses}
+	return &nameCommand{Kind: value.Kind, Action: value.Action, Name: *childNameOf(value.Name), Target: childConditionOf(value.Target), Destination: renameTargetOf(value.Destination), Initial: initialFieldsOf(value.Initial), Uses: value.Uses, Guards: namespaceGuardsOf(canonicalNamespaceGuards(value.Guards.Clone())), RequireNoOpenDescendants: value.RequireNoOpenDescendants}
 }
 
 func (value nameCommand) storage() storage.NameCommand {
-	result := storage.NameCommand{Kind: value.Kind, Action: value.Action, Name: value.Name.storage(), Target: value.Target.storage(), Initial: value.Initial.storage(), Uses: value.Uses}
+	result := storage.NameCommand{Kind: value.Kind, Action: value.Action, Name: value.Name.storage(), Target: value.Target.storage(), Initial: value.Initial.storage(), Uses: value.Uses, Guards: canonicalNamespaceGuards(value.Guards.storage()), RequireNoOpenDescendants: value.RequireNoOpenDescendants}
 	if value.Destination != nil {
 		destination := value.Destination.storage()
 		result.Destination = &destination

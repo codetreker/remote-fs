@@ -14,11 +14,11 @@ Windows 的 `FILE_DELETE_ON_CLOSE` 在打开成功时接受删除责任，发起
 
 | 范围 | 需求与分类 | 交付或延期成本 |
 |---|---|---|
-| 文件及目录 CREATE 关闭删除 | R-WIN-7；能力 | 当前五种合法非 supersede disposition、字节及 metadata-only 引用接入原 `CloseIntent`。 |
+| 文件及目录 CREATE 关闭删除 | R-WIN-7；能力 | 本决定将五种非 supersede disposition、字节及 metadata-only 引用接入原 CloseIntent；[名字修改](2026-09-28-smb-guarded-name-mutation.md)的 supersede 复用该接纳链。 |
 | 对象身份、共享、原子接受、未知结果和跨重启责任 | R-FS-6、R-FS-8、R-WIN-6、R-WIN-7；保证 | 原打开与关闭责任保持不变；不能在事后另按路径补做。 |
 | 显式恢复、当前授权、停止和状态 | R-SEC-5、R-ERR-4、R-WIN-10；保证 | 有界有限扫描、恢复额度预留、原 ACK witness 和未结算 session 错误保留。 |
 | 原生旧 Armed trigger、物理 discard 与 pending 目录准入 | R-WS-7、R-WIN-7、R-INT-11；保证 | 复用 SQLite 现有启动、发布与名字 guard；接口、RPC 和 schema 保持原形。 |
-| 普通 disposition、SMB rename／replacement／unlink／supersede | R-WIN-2、R-WIN-7；能力 | 由[名字修改提案](../../proposed/feature/2026-09-28-smb-guarded-name-mutation.md)增加协议处理器；未支持请求返回不支持。 |
+| 普通 disposition、SMB rename／replacement／unlink／supersede | R-WIN-2、R-WIN-7；能力 | 由[名字修改决定](2026-09-28-smb-guarded-name-mutation.md)拥有协议与中立 mutation 接入，复用原 CloseIntent／pending 与 cleanup；其它未支持类明确失败。 |
 | LOCK／CANCEL、通知、缓存、WNet 与 Windows 11 资格 | 各自平台需求；能力或验收 | 按独立提案接入；本任务的 Windows Server 原生用例不证明 Windows 11 普通用户资格。 |
 
 删除责任不能绑定到原路径、SMB FileId、session epoch 或 authority incarnation；普通 disposition 的 CLEAR 不能撤销它。Linux／SDK 名字效果经过同一个 pending 检查，现有兼容引用继续访问原对象。后续能力复用这些身份和排序，不需要重建持久删除责任。

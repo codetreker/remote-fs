@@ -160,7 +160,7 @@ func TestClosePostqueryFailureStillReleasesReference(t *testing.T) {
 
 func TestCreateRejectsUnsupportedEffectsBeforeOpen(t *testing.T) {
 	for _, request := range []wire.CreateRequest{
-		{Disposition: 0},
+		{Disposition: 0, Options: createDirectory},
 		{Disposition: 1, Options: createDeleteOnClose},
 		{Disposition: 1, Options: createOpenByFileID},
 		{Disposition: 1, DesiredAccess: 0x00040000},
@@ -236,7 +236,7 @@ func TestCreateSynchronousOptionsRequireSynchronizedAccess(t *testing.T) {
 }
 
 func TestCreateOutcomeMatchesDisposition(t *testing.T) {
-	expected := map[uint32][]storage.OpenOutcome{1: {storage.Opened}, 2: {storage.Created}, 3: {storage.Opened, storage.Created}, 4: {storage.Reset}, 5: {storage.Created, storage.Reset}}
+	expected := map[uint32][]storage.OpenOutcome{0: {storage.Created, storage.Reset}, 1: {storage.Opened}, 2: {storage.Created}, 3: {storage.Opened, storage.Created}, 4: {storage.Reset}, 5: {storage.Created, storage.Reset}}
 	for disposition := uint32(0); disposition <= 6; disposition++ {
 		for outcome := storage.OpenOutcome(0); outcome <= storage.Replaced+1; outcome++ {
 			want := false
@@ -306,5 +306,35 @@ func TestOpenAuthorizationSeparatesInitialMetadataFromSealedEffects(t *testing.T
 				t.Fatalf("unrestricted initial metadata used sealed authorization: requests=%+v err=%v", checked, err)
 			}
 		})
+	}
+}
+
+func TestSupersedeIntentKeepsIncomingRightsBeforeSelection(t *testing.T) {
+	for _, access := range []uint32{0, accessReadAttr, accessDelete, accessReadData, accessWriteData | accessDelete} {
+		intent, err := classifyCreate(wire.CreateRequest{Disposition: 0, DesiredAccess: access, ShareAccess: 7})
+		if err != nil || !intent.create || intent.reset || intent.resetUse != 0 || intent.access != access {
+			t.Fatalf("incoming access %x = %+v, %v", access, intent, err)
+		}
+	}
+	if _, err := classifyCreate(wire.CreateRequest{Disposition: 0, Options: createDeleteOnClose, ShareAccess: 7}); !errors.Is(err, syscall.EACCES) {
+		t.Fatalf("implicit supersede DELETE satisfied incoming DOC requirement: %v", err)
+	}
+}
+
+func TestSupersedeAuthorizationDescribesDeleteEffectAndActualDataGrant(t *testing.T) {
+	for _, write := range []bool{false, true} {
+		var requests []authz.AccessRequest
+		c := &connection{server: &Server{config: Config{Authorize: authz.AuthorizerFunc(func(_ context.Context, request authz.AccessRequest) error {
+			requests = append(requests, request.Clone())
+			return nil
+		})}}}
+		intent := openIntent{reset: true, resetUse: storage.DeleteName, write: write, metadata: storage.WriteMetadata}
+		initial := storage.InitialState{OnReset: storage.InitialFields{Metadata: map[string][]byte{windowsMetadataKey: []byte("attrs")}}}
+		if err := c.authorizeOpen(t.Context(), &tree{export: &Export{share: Share{Volume: "v"}}}, storage.OpFileOpenAt, intent, initial); err != nil {
+			t.Fatal(err)
+		}
+		if len(requests) != 3 || requests[0].Operation != storage.OpFileOpenAt || requests[0].Open.Write != write || requests[0].Open.Read || !requests[0].Open.Truncate || requests[0].Open.Create || requests[1].Operation != storage.OpVolumeRemove || requests[2].Operation != storage.OpFileSetMetadata {
+			t.Fatalf("actual grant write=%v authorization=%+v", write, requests)
+		}
 	}
 }

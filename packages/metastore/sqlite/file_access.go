@@ -56,7 +56,10 @@ func (f *retainedFile) checkCaptureAccess(ctx context.Context, state metastore.F
 	return f.store.checkAccessIntent(ctx, state, f.scope, access)
 }
 
-func (s *Store) checkContentPublication(ctx context.Context, before metastore.FileState, nextSize int64, scope storage.UseScope) error {
+func (s *Store) checkContentPublication(ctx context.Context, before metastore.FileState, nextSize int64, scope storage.UseScope, resetUse storage.Uses) error {
+	if resetUse == storage.DeleteName {
+		return s.fileDomain.coordinator.CheckUse(ctx, uint64(before.ID), scope, storage.DeleteName)
+	}
 	access, present := metastore.FileAccessFrom(ctx)
 	if present {
 		if access.Uses != storage.WriteData {

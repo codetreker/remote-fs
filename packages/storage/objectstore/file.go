@@ -326,6 +326,9 @@ func (f *openFile) SetAttr(ctx context.Context, change storage.AttrChange) (stor
 }
 
 func (f *openFile) Sync(ctx context.Context) error {
+	if !f.options.Read && !f.options.Write {
+		return syscall.EBADF
+	}
 	ctx, done, err := f.begin(ctx)
 	if err != nil {
 		return err

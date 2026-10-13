@@ -285,7 +285,7 @@ func TestHTTPStateProjectionIsExplicitAndCurrentPolicyCanDenyFull(t *testing.T) 
 }
 
 func TestHTTPScalarStateRejectsProtectedFieldsEvenWhenEmpty(t *testing.T) {
-	state := storage.ReferenceState{Attr: storage.Attr{ID: 7, Kind: storage.NodeRegular, Size: 3, AllocationKnown: true, AllocationSize: 4096}, PendingUnlink: true}
+	state := storage.ReferenceState{Attr: storage.Attr{ID: 7, Kind: storage.NodeRegular, Size: 3, AllocationKnown: true, AllocationSize: 4096}, PendingUnlink: true, PendingGeneration: []byte{1}}
 	response := fileResponse{Epoch: 1, Data: []byte{}, State: referenceStateOfProjection(state, storage.StateScalars)}
 	encoded, err := json.Marshal(response)
 	if err != nil {
@@ -311,14 +311,12 @@ func TestHTTPScalarStateRejectsProtectedFieldsEvenWhenEmpty(t *testing.T) {
 		"change time":            `"change_time":{"unix_sec":-62135596800,"nanos":0}`,
 		"access time":            `"access_time":{"unix_sec":-62135596800,"nanos":0}`,
 		"modification time":      `"mod_time":{"unix_sec":-62135596800,"nanos":0}`,
-		"generation":             `"pendingGeneration":""`,
 		"link target":            `"linkTarget":""`,
 		"metadata null":          `"metadata":null`,
 		"birth time null":        `"birth_time":null`,
 		"change time null":       `"change_time":null`,
 		"access time null":       `"access_time":null`,
 		"modification time null": `"mod_time":null`,
-		"generation null":        `"pendingGeneration":null`,
 		"link target null":       `"linkTarget":null`,
 	} {
 		t.Run(name, func(t *testing.T) {

@@ -329,7 +329,7 @@ func TestNodeReferenceDelegatesMetadataMutationPendingDeleteAndLifecycle(t *test
 	}
 	pendingRename.Action = fileAction(t)
 	pendingRename.Uses = []storage.TargetUse{{NodeID: opened.State.Attr().ID, Scope: scope}}
-	if _, err := store.MutateName(t.Context(), pendingRename); err != nil {
+	if _, err := store.MutateName(t.Context(), pendingRename); !errors.Is(err, storage.ErrPendingDelete) {
 		t.Fatalf("pending name with its live use = %v", err)
 	}
 	if _, err := deletion.ClearPendingUnlink(t.Context(), storage.ClearPendingUnlinkCommand{

@@ -50,7 +50,7 @@ Volume 的请求最小输出长度为 24，实际 serialized prefix 为 18；不
 |---|---|---|
 | 泛用物理 sector／geometry 能力 | 按真实消费者增加 capability；allocation 字节与 Space 计量不变，逻辑 tuple 不冒充物理事实 | 本决定只报告已验证的逻辑容量单位 |
 | volume label setter、security／quota 和 FS control | 独立增加授权与修改语义；查询没有发布效果 | 相应请求明确未支持 |
-| [关闭删除](../../implemented/feature/2026-09-28-smb-close-delete-obligation.md)及[名字修改](../../proposed/feature/2026-09-28-smb-guarded-name-mutation.md) | 独立增加持久义务及 ancestry guards；原引用不转成旧路径 | 相应文件／目录命令按各自交付范围处理 |
+| [关闭删除](../../implemented/feature/2026-09-28-smb-close-delete-obligation.md)及[名字修改](2026-09-28-smb-guarded-name-mutation.md) | 独立增加持久义务及 ancestry guards；原引用不转成旧路径 | 相应文件／目录命令按各自交付范围处理 |
 | [范围锁](../../proposed/feature/2026-09-28-smb-range-lock-cancel.md)与[通知／缓存](../../proposed/feature/2026-09-28-smb-change-notify-cache-coherence.md) | 增加跨入口保护、失效协议及原生证明；本次查询不宣称私有缓存一致 | 相应能力独立交付 |
 
 ## 备选方案

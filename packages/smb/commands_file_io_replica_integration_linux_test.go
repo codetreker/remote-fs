@@ -241,7 +241,7 @@ func TestFileIOReplicaUnknownWriteRetainsPayloadUntilCloseBarrierSettles(t *test
 		t.Fatal("unknown WRITE lost its handle owner")
 	}
 	handle.pendingWrite.mu.Lock()
-	payload := bytes.Clone(handle.pendingWrite.command.Data)
+	payload := bytes.Clone(handle.pendingWrite.command.file.Data)
 	handle.pendingWrite.mu.Unlock()
 	if string(payload) != "after!" {
 		t.Fatalf("retained original payload=%q", payload)
@@ -265,7 +265,7 @@ func TestFileIOReplicaUnknownWriteRetainsPayloadUntilCloseBarrierSettles(t *test
 		t.Fatalf("local release retired outer owner before settlement: handle=%p state=%d released=%t pending=%p authorityClosed=%t", fixture.tree.findFileHandle(id), handle.state.Load(), handle.released, handle.pendingWrite, fixture.tree.authority.isClosed())
 	}
 	handle.pendingWrite.mu.Lock()
-	payloadAfterNativeRelease := bytes.Clone(handle.pendingWrite.command.Data)
+	payloadAfterNativeRelease := bytes.Clone(handle.pendingWrite.command.file.Data)
 	retiredBeforeBarrier := handle.pendingWrite.retired
 	handle.pendingWrite.mu.Unlock()
 	if string(payloadAfterNativeRelease) != "after!" || retiredBeforeBarrier {
@@ -287,7 +287,7 @@ func TestFileIOReplicaUnknownWriteRetainsPayloadUntilCloseBarrierSettles(t *test
 		t.Fatalf("confirmed close did not retire FileId: position=%d barrier=%d handle=%p", local.Position(), barrier.Position, fixture.tree.findFileHandle(id))
 	}
 	handle.pendingWrite.mu.Lock()
-	retired, remainingPayload := handle.pendingWrite.retired, len(handle.pendingWrite.command.Data)
+	retired, remainingPayload := handle.pendingWrite.retired, len(handle.pendingWrite.command.file.Data)
 	handle.pendingWrite.mu.Unlock()
 	if !retired || remainingPayload != 0 {
 		t.Fatalf("confirmed close did not retire original payload owner: retired=%t bytes=%d", retired, remainingPayload)

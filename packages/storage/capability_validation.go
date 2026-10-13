@@ -178,13 +178,21 @@ func (s InitialState) Check() error {
 }
 
 func (o OpenAtOptions) Check() error {
+	if o.ResetUse != 0 {
+		if o.ResetUse != DeleteName || o.Existing != ResetContent || o.Target.State != SameNode || o.Create {
+			return syscall.EINVAL
+		}
+		if o.Use.Uses&DeleteName == 0 {
+			return syscall.EACCES
+		}
+	}
 	if err := CheckContentMetadataEffects(o.ContentMetadataEffects); err != nil {
 		return err
 	}
 	if len(o.ContentMetadataEffects) != 0 && !o.Write {
 		return syscall.EINVAL
 	}
-	if !o.Read && !o.Write || o.Exclusive && !o.Create || o.Existing < Keep || o.Existing > ReplaceNode {
+	if !o.Read && !o.Write && o.ResetUse != DeleteName || o.Exclusive && !o.Create || o.Existing < Keep || o.Existing > ReplaceNode {
 		return syscall.EINVAL
 	}
 	if o.Read && o.Use.Uses&ReadData == 0 || o.Write && o.Use.Uses&WriteData == 0 || o.Use.Uses&ReadEntries != 0 ||
@@ -197,7 +205,7 @@ func (o OpenAtOptions) Check() error {
 	if o.Existing == ReplaceNode && (!o.Create || o.Use.Uses&DeleteName == 0) {
 		return syscall.EINVAL
 	}
-	if o.Existing == ResetContent && !o.Write {
+	if o.Existing == ResetContent && o.ResetUse == 0 && !o.Write {
 		return syscall.EINVAL
 	}
 	if err := o.Target.Check(); err != nil {
@@ -314,7 +322,7 @@ func (c PendingUnlinkCommand) Check() error {
 }
 
 func (c ClearPendingUnlinkCommand) Check() error {
-	if len(c.Generation) == 0 || len(c.Generation) > MaxObservationTokenBytes {
+	if len(c.Generation) > MaxObservationTokenBytes {
 		return syscall.EINVAL
 	}
 	if err := c.Action.Check(); err != nil {
@@ -359,8 +367,14 @@ func (c NameCommand) Check() error {
 		if err := c.Destination.Check(); err != nil {
 			return err
 		}
-	} else if c.Destination != nil {
+	} else if c.Destination != nil || c.RequireNoOpenDescendants {
 		return syscall.EINVAL
+	}
+	if err := c.Guards.Check(); err != nil {
+		return err
+	}
+	if err := checkNameCommandGuards(c); err != nil {
+		return err
 	}
 	if c.Kind == NameSymlink {
 		if len(c.Initial.LinkTarget) == 0 {
@@ -375,6 +389,70 @@ func (c NameCommand) Check() error {
 		return c.Initial.Check()
 	}
 	if !c.Initial.Empty() {
+		return syscall.EINVAL
+	}
+	return nil
+}
+
+func checkNameCommandGuards(c NameCommand) error {
+	g := c.Guards
+	if g == nil {
+		return nil
+	}
+	if g.RootID == 0 {
+		return syscall.EINVAL
+	}
+	directories := make(map[uint64]struct{}, len(g.Directories))
+	for _, directory := range g.Directories {
+		directories[directory.ParentID] = struct{}{}
+	}
+	edges := make(map[uint64]ObservedEdge, len(g.Edges))
+	for _, edge := range g.Edges {
+		edges[edge.ChildID] = edge
+	}
+	usedDirectories := make(map[uint64]struct{}, len(g.Directories))
+	usedEdges := make(map[uint64]struct{}, len(g.Edges))
+	cover := func(name ChildName, expected ChildCondition) error {
+		for directory := name.Parent.NodeID; ; {
+			if _, exists := directories[directory]; !exists {
+				return syscall.EINVAL
+			}
+			usedDirectories[directory] = struct{}{}
+			if directory == g.RootID {
+				break
+			}
+			edge, exists := edges[directory]
+			if !exists {
+				return syscall.EINVAL
+			}
+			usedEdges[directory] = struct{}{}
+			directory = edge.ParentID
+		}
+		if expected.State == SameNode {
+			edge, exists := edges[expected.NodeID]
+			if !exists || edge.ParentID != name.Parent.NodeID || !bytes.Equal(edge.RawLeaf, name.RawLeaf) {
+				return syscall.EINVAL
+			}
+			usedEdges[expected.NodeID] = struct{}{}
+		} else if expected.State == Absent {
+			for _, edge := range edges {
+				if edge.ParentID == name.Parent.NodeID && bytes.Equal(edge.RawLeaf, name.RawLeaf) {
+					return syscall.EINVAL
+				}
+			}
+		}
+		return nil
+	}
+	if err := cover(c.Name, c.Target); err != nil {
+		return err
+	}
+	if c.Destination != nil {
+		name := ChildName{Parent: c.Destination.Parent, RawLeaf: c.Destination.ObservedLeaf}
+		if err := cover(name, c.Destination.Expected); err != nil {
+			return err
+		}
+	}
+	if len(usedDirectories) != len(directories) || len(usedEdges) != len(edges) {
 		return syscall.EINVAL
 	}
 	return nil

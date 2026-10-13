@@ -29,7 +29,7 @@ func (s *Store) OpenAt(ctx context.Context, selection storage.ChildSelection, op
 	selection = selection.Clone()
 	file, state, outcome, err := s.openAtomicChild(ctx, selection, storage.NodeRegular, options.Read, options.Write,
 		options.MetadataAccess, options.Create, options.Exclusive, options.Target,
-		options.Use, options.Existing, options.Initial, options.CloseIntent, options.ContentMetadataEffects)
+		options.Use, options.Existing, options.ResetUse, options.Initial, options.CloseIntent, options.ContentMetadataEffects)
 	if file == nil {
 		return metastore.OpenResult{}, err
 	}
@@ -38,7 +38,7 @@ func (s *Store) OpenAt(ctx context.Context, selection storage.ChildSelection, op
 
 func (s *Store) openAtomicChild(ctx context.Context, selection storage.ChildSelection, kind storage.NodeKind, read, write bool,
 	metadata storage.MetadataPermissions, create, exclusive bool, target storage.ChildCondition,
-	use storage.UseClaim, existing storage.ExistingEffect,
+	use storage.UseClaim, existing storage.ExistingEffect, resetUse storage.Uses,
 	initial storage.InitialState, closeIntent *storage.CloseIntent, effects []storage.ContentMetadataEffect,
 ) (*retainedFile, metastore.FileState, storage.OpenOutcome, error) {
 	if err := storage.CheckContentMetadataEffects(effects); err != nil {
@@ -112,7 +112,7 @@ func (s *Store) openAtomicChild(ctx context.Context, selection storage.ChildSele
 			if pending {
 				return nil, false, storage.ErrPendingDelete
 			}
-			return atomicOpenVolumeIntent(before, false, existing, scope), true, nil
+			return atomicOpenVolumeIntent(before, false, existing, resetUse, scope), true, nil
 		}
 		if before.Kind != kind {
 			return nil, false, nodeKindMismatch(before.Kind, kind)
@@ -125,14 +125,14 @@ func (s *Store) openAtomicChild(ctx context.Context, selection storage.ChildSele
 			return nil, false, storage.ErrPendingDelete
 		}
 		mutation := existing != storage.Keep || closeIntent != nil
-		return atomicOpenVolumeIntent(before, true, existing, scope), mutation, nil
+		return atomicOpenVolumeIntent(before, true, existing, resetUse, scope), mutation, nil
 	}
 	var state metastore.FileState
 	var outcome storage.OpenOutcome
 	claimed := false
 	apply := func(tx *sql.Tx) error {
 		at := time.Now()
-		node, selected, err := s.applyAtomicOpen(ctx, tx, selection.Name, before, found, kind, existing, initial, at)
+		node, selected, err := s.applyAtomicOpen(ctx, tx, selection.Name, before, found, kind, existing, resetUse, initial, at)
 		if err != nil {
 			return err
 		}
@@ -173,7 +173,7 @@ func (s *Store) openAtomicChild(ctx context.Context, selection storage.ChildSele
 	return s.finishReferenceOpen(ctx, file, claimed, deleteIntent, state, outcome, err)
 }
 
-func atomicOpenVolumeIntent(before metastore.Node, found bool, existing storage.ExistingEffect, scope storage.UseScope) *volumeIntent {
+func atomicOpenVolumeIntent(before metastore.Node, found bool, existing storage.ExistingEffect, resetUse storage.Uses, scope storage.UseScope) *volumeIntent {
 	if !found {
 		return &volumeIntent{kind: locking.CreateMutation, nodes: []int64{}}
 	}
@@ -185,6 +185,7 @@ func atomicOpenVolumeIntent(before metastore.Node, found bool, existing storage.
 	case storage.ResetContent:
 		intent.kind = locking.WriteMutation
 		intent.scope = scope
+		intent.resetUse = resetUse
 	case storage.ReplaceNode:
 		intent.kind = locking.RemoveMutation
 	}
@@ -212,7 +213,7 @@ func (s *Store) finishReferenceOpen(ctx context.Context, file *retainedFile, cla
 func (s *Store) retainFileLocked(file *retainedFile) {
 	s.files[file] = struct{}{}
 	s.fileDomain.files++
-	s.coordinator.pins[retainedNode{s.volume, file.id}]++
+	s.pinNodeLocked(file.id)
 }
 
 func nodeKindMismatch(actual, requested storage.NodeKind) error {
@@ -229,14 +230,20 @@ func nodeKindMismatch(actual, requested storage.NodeKind) error {
 }
 
 func (s *Store) applyAtomicOpen(ctx context.Context, tx *sql.Tx, name storage.ChildName, before metastore.Node,
-	found bool, kind storage.NodeKind, existing storage.ExistingEffect, initial storage.InitialState, at time.Time,
+	found bool, kind storage.NodeKind, existing storage.ExistingEffect, resetUse storage.Uses, initial storage.InitialState, at time.Time,
 ) (metastore.Node, storage.OpenOutcome, error) {
 	if found && existing == storage.Keep {
 		return before, storage.Opened, nil
 	}
 	if found && existing == storage.ResetContent {
-		if err := s.checkByteExtent(ctx, uint64(before.ID), storage.UseScope{}, 0, before.Size, storage.WriteData); err != nil {
-			return metastore.Node{}, 0, err
+		var accessErr error
+		if resetUse == storage.DeleteName {
+			accessErr = s.fileDomain.coordinator.CheckUse(ctx, uint64(before.ID), storage.UseScope{}, storage.DeleteName)
+		} else {
+			accessErr = s.checkByteExtent(ctx, uint64(before.ID), storage.UseScope{}, 0, before.Size, storage.WriteData)
+		}
+		if accessErr != nil {
+			return metastore.Node{}, 0, accessErr
 		}
 		if err := s.replaceNodeContentFields(ctx, tx, before, metastore.Object{ModTime: at}, at); err != nil {
 			return metastore.Node{}, 0, err

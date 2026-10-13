@@ -150,7 +150,12 @@ func TestFileInformationRejectsContradictoryFacts(t *testing.T) {
 		{"scalar-leaks-metadata", wire.FileInternalInformation, func(f *infoFileProbe, _ *tree) { f.info.Attr.Metadata = map[string]storage.OpaquePayload{} }},
 		{"scalar-leaks-times", wire.FileInternalInformation, func(f *infoFileProbe, _ *tree) { f.info.Attr.ModTime = time.Now() }},
 		{"scalar-leaks-link", wire.FileInternalInformation, func(f *infoFileProbe, _ *tree) { f.info.LinkTarget = []byte("target") }},
-		{"scalar-leaks-generation", wire.FileInternalInformation, func(f *infoFileProbe, _ *tree) { f.info.PendingGeneration = []byte("private") }},
+		{"scalar-unexpected-generation", wire.FileInternalInformation, func(f *infoFileProbe, _ *tree) { f.info.PendingGeneration = []byte("pending-generation") }},
+		{"scalar-missing-pending-generation", wire.FileStandardInformation, func(f *infoFileProbe, _ *tree) { f.info.PendingUnlink = true }},
+		{"scalar-oversized-pending-generation", wire.FileStandardInformation, func(f *infoFileProbe, _ *tree) {
+			f.info.PendingUnlink = true
+			f.info.PendingGeneration = make([]byte, storage.MaxObservationTokenBytes+1)
+		}},
 		{"scalar-wrong-kind", wire.FileInternalInformation, func(f *infoFileProbe, _ *tree) { f.info.Attr.Kind = storage.NodeDirectory }},
 		{"scalar-negative-eof", wire.FileStandardInformation, func(f *infoFileProbe, _ *tree) { f.info.Attr.Size = -1 }},
 		{"scalar-unknown-allocation", wire.FileStandardInformation, func(f *infoFileProbe, _ *tree) { f.info.Attr.AllocationKnown = false; f.info.Attr.AllocationSize = 0 }},

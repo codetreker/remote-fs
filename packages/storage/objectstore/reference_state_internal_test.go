@@ -201,7 +201,12 @@ func TestObjectScalarStateRejectsNativeProtectedFacts(t *testing.T) {
 		{"content", func(s *metastore.ReferenceState) { s.State.Content = metastore.Key("private-object") }},
 		{"revision", func(s *metastore.ReferenceState) { s.State.Revision = 1 }},
 		{"link", func(s *metastore.ReferenceState) { s.LinkTarget = []byte{} }},
-		{"pending_generation", func(s *metastore.ReferenceState) { s.PendingGeneration = []byte{} }},
+		{"missing_pending_generation", func(s *metastore.ReferenceState) { s.PendingUnlink = true }},
+		{"unexpected_pending_generation", func(s *metastore.ReferenceState) { s.PendingGeneration = []byte{1} }},
+		{"oversized_pending_generation", func(s *metastore.ReferenceState) {
+			s.PendingUnlink = true
+			s.PendingGeneration = make([]byte, storage.MaxObservationTokenBytes+1)
+		}},
 	}
 	for _, node := range []bool{false, true} {
 		for _, tc := range cases {
@@ -219,6 +224,34 @@ func TestObjectScalarStateRejectsNativeProtectedFacts(t *testing.T) {
 					t.Fatalf("protected state=%+v,%v", got, err)
 				}
 			})
+		}
+	}
+}
+
+func TestObjectScalarStateOwnsBoundedPendingGenerationWithoutMetadataGrant(t *testing.T) {
+	for _, node := range []bool{false, true} {
+		session := actionTestSession(t, 10)
+		probe := &referenceObservationNativeProbe{id: 19, state: metastore.ReferenceState{
+			State:         metastore.FileState{Node: metastore.Node{ID: 19, Kind: storage.NodeRegular, AllocationKnown: true}},
+			PendingUnlink: true, PendingGeneration: make([]byte, storage.MaxObservationTokenBytes),
+		}}
+		probe.state.PendingGeneration[0] = 7
+		var access storage.ReferenceStateAccess
+		if node {
+			access = &nodeReference{session: session, native: &referenceObservationNodeNative{referenceObservationNativeProbe: probe}, active: true}
+		} else {
+			access = &openFile{session: session, native: &referenceObservationFileNative{referenceObservationNativeProbe: probe}, active: true}
+		}
+		got, err := access.State(t.Context(), storage.StateScalars)
+		if err != nil || !reflect.DeepEqual(got, publicReferenceState(probe.state)) {
+			t.Fatalf("node=%t, scalar state=%+v,%v", node, got, err)
+		}
+		got.PendingGeneration[0] = 9
+		if probe.state.PendingGeneration[0] != 7 {
+			t.Fatal("scalar pending token aliases native state")
+		}
+		if got, err := access.State(t.Context(), storage.StateFull); !errors.Is(err, syscall.EBADF) || !reflect.DeepEqual(got, storage.ReferenceState{}) {
+			t.Fatalf("scalar observation granted full state: %+v,%v", got, err)
 		}
 	}
 }

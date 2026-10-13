@@ -12,11 +12,19 @@ import (
 
 	"github.com/codetreker/remote-fs/packages/authz"
 	"github.com/codetreker/remote-fs/packages/smb/internal/wire"
+	"github.com/codetreker/remote-fs/packages/storage"
 )
 
 func startRealFileProtocolServer(t *testing.T) (realSMBFixture, net.Conn) {
 	t.Helper()
 	fixture := newRealSMBFixture(t)
+	server, client := startFileProtocolServerForBackend(t, fixture.volume)
+	fixture.server = server
+	return fixture, client
+}
+
+func startFileProtocolServerForBackend(t *testing.T, backend storage.FileStorage) (*Server, net.Conn) {
+	t.Helper()
 	server, err := New(Config{
 		Authenticator:     &protocolAuthenticator{},
 		AuthorizeIdentity: IdentityAuthorizerFunc(func(context.Context, Principal) error { return nil }),
@@ -27,12 +35,11 @@ func startRealFileProtocolServer(t *testing.T) (realSMBFixture, net.Conn) {
 		t.Fatal(err)
 	}
 	server.nameComparer = testNameCompare
-	fixture.server = server
-	identity, err := fixture.volume.BackendIdentity(t.Context())
+	identity, err := backend.(storage.BackendIdentity).BackendIdentity(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := server.Publish(Share{Name: "data", Volume: "files", BackendVolume: identity.Volume, RootNodeID: identity.RootNodeID, Backend: fixture.volume}); err != nil {
+	if _, err := server.Publish(Share{Name: "data", Volume: "files", BackendVolume: identity.Volume, RootNodeID: identity.RootNodeID, Backend: backend}); err != nil {
 		t.Fatal(err)
 	}
 	listener, err := net.Listen("tcp4", "127.0.0.1:0")
@@ -61,7 +68,7 @@ func startRealFileProtocolServer(t *testing.T) (realSMBFixture, net.Conn) {
 			t.Error("Serve did not drain")
 		}
 	})
-	return fixture, client
+	return server, client
 }
 
 func TestSignedRelatedCreateCloseReportsAuthoritativeAllocation(t *testing.T) {

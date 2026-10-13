@@ -30,7 +30,7 @@ limited、locked、objectstore、localstore 与 replicated 包装层转发完整
 
 HTTP v4 的 `file.open-at` 与 `file.open-child-ref` 保留既有顶层 `child`，并增加可选的顶层 `guards`；server 在严格解码后把二者组装成 `ChildSelection`。canonical base64、每类 256 项、64 KiB guard retention、64-byte revision 与 4096-byte leaf 上限在授权和 native action 前检查。guards 不改变基础 Operation、`OpenAccess` 或补充效果的授权序列，也不成为业务身份。
 
-FUSE 把 Linux 的精确字节叶名包装成不带 guards 的 `ChildSelection`。它不从 replica 本地 revision 推导权威证据；当前路径遍历与 `MutateName` 的行为不变。
+FUSE 把 Linux 的精确字节叶名包装成不带 guards 的 ChildSelection，不从 replica 本地 revision 推导权威证据；其 raw MutateName 也不附加后代引用条件。[SMB 名字修改](../feature/2026-09-28-smb-guarded-name-mutation.md)独立把 rooted union 接入 NameCommand，原观察与原子 child selection 合同保持。
 
 ### 范围边界
 

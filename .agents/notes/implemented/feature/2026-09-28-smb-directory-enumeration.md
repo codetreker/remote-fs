@@ -63,7 +63,7 @@ CLOSE 先 fence／drain 原 FIFO，再于 pending Basic reconcile 和 native clo
 
 | 延后能力 | 代价与保持的结构 | 请求结果 |
 |---|---|---|
-| [名字修改](../../proposed/feature/2026-09-28-smb-guarded-name-mutation.md) | 独立增加 ancestry guards；snapshot 的 raw order、ID 与 revision 不充当 mutation guard | rename／move／当前名字类由独立工作拥有 |
+| [名字修改](2026-09-28-smb-guarded-name-mutation.md) | 独立增加 ancestry guards；snapshot 的 raw order、ID 与 revision 不充当 mutation guard | rename／move／当前名字类由独立工作拥有 |
 | [通知与缓存恢复](../../proposed/feature/2026-09-28-smb-change-notify-cache-coherence.md) | 增加通知、overflow 重取和原生缓存证明；冻结续页不冒充实时观察 | CHANGE_NOTIFY 与预热目录缓存资格仍独立交付 |
 | 增量流式捕获 | 增加完整性证明；不能边读边输出或只验证匹配项 | 超过 capture 上限明确失败 |
 | 持久或跨连接 cursor | 需要持久 handle／恢复状态；普通 FileId 与缓存不跨连接接管 | 断线后的旧 FileId 无效 |

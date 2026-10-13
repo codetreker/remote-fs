@@ -413,8 +413,10 @@ func TestNamespaceAndDeletionCommandsValidateTaggedEffects(t *testing.T) {
 	if err := (PendingUnlinkCommand{Action: action, Condition: UnlinkFile, ExpectedMetadata: map[string][]byte{"windows.attributes": nil}, Uses: uses}).Check(); err != nil {
 		t.Fatalf("valid pending unlink: %v", err)
 	}
-	if err := (ClearPendingUnlinkCommand{Action: action, Generation: []byte{1}, Uses: uses}).Check(); err != nil {
-		t.Fatalf("valid pending clear: %v", err)
+	for _, generation := range [][]byte{nil, {}, {1}, make([]byte, MaxObservationTokenBytes)} {
+		if err := (ClearPendingUnlinkCommand{Action: action, Generation: generation, Uses: uses}).Check(); err != nil {
+			t.Fatalf("valid pending clear with generation length %d: %v", len(generation), err)
+		}
 	}
 	for _, bad := range []CloseIntent{{}, {ID: validDeleteIntent, Trigger: Now, Condition: UnlinkFile}, {ID: validDeleteIntent, Trigger: OnReferenceClose, Condition: UnlinkFile, ExpectedMetadata: map[string][]byte{"bad key": nil}}} {
 		if bad.Check() == nil {

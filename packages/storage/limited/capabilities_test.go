@@ -22,6 +22,8 @@ type capabilityProbe struct {
 	action       storage.FileActionReceipt
 	deleteStatus storage.DeleteIntentStatus
 	selection    storage.ChildSelection
+	openOptions  storage.OpenAtOptions
+	nameCommand  storage.NameCommand
 }
 
 type directoryReaderOnlyProbe struct{ storage.FileSession }
@@ -71,8 +73,9 @@ func TestNamespaceCapabilityIsIndependentOfDirectoryRead(t *testing.T) {
 }
 
 func (p *capabilityProbe) CheckAtomicFileOpen() error { return p.checkErr }
-func (p *capabilityProbe) OpenAt(_ context.Context, selection storage.ChildSelection, _ storage.OpenAtOptions) (storage.OpenResult, error) {
+func (p *capabilityProbe) OpenAt(_ context.Context, selection storage.ChildSelection, options storage.OpenAtOptions) (storage.OpenResult, error) {
 	p.selection = selection
+	p.openOptions = options
 	return p.open, p.callErr
 }
 func (p *capabilityProbe) CheckNamespaceAccess() error { return p.checkErr }
@@ -89,7 +92,8 @@ func (p *capabilityProbe) ReadDirNodeBounded(_ context.Context, _ storage.Direct
 	}
 	return storage.DirectoryObservation{ParentID: 3, Revision: []byte{1}}, p.callErr
 }
-func (p *capabilityProbe) MutateName(context.Context, storage.NameCommand) (storage.NameResult, error) {
+func (p *capabilityProbe) MutateName(_ context.Context, command storage.NameCommand) (storage.NameResult, error) {
+	p.nameCommand = command
 	return p.name, p.callErr
 }
 func (p *capabilityProbe) CheckNodeReferences() error { return p.checkErr }
@@ -345,12 +349,16 @@ func TestIdentityCapabilityWrappersPreservePartialResultsAndReferences(t *testin
 		}
 	}
 	openSelection := storage.ChildSelection{Name: storage.ChildName{RawLeaf: []byte("open")}, Guards: &storage.NamespaceGuards{RootID: 7}}
-	opened, err := wrapper.OpenAt(t.Context(), openSelection, storage.OpenAtOptions{})
+	openOptions := storage.OpenAtOptions{Existing: storage.ResetContent, ResetUse: storage.DeleteName, Use: storage.UseClaim{Uses: storage.DeleteName}, Initial: storage.InitialState{OnReset: storage.InitialFields{Metadata: map[string][]byte{"app.flags": {1}}}}}
+	opened, err := wrapper.OpenAt(t.Context(), openSelection, openOptions)
 	if !errors.Is(err, failure) || opened.File == nil || opened.Attr.ID != attr.ID || opened.Outcome != storage.Created {
 		t.Fatalf("atomic open=%+v error=%v", opened, err)
 	}
 	if !reflect.DeepEqual(probe.selection, openSelection) {
 		t.Fatalf("atomic open selection=%+v, want %+v", probe.selection, openSelection)
+	}
+	if !reflect.DeepEqual(probe.openOptions, openOptions) {
+		t.Fatalf("atomic reset options=%+v, want %+v", probe.openOptions, openOptions)
 	}
 	reference, err := wrapper.OpenNodeRef(t.Context(), attr.ID, storage.NodeRefOptions{})
 	if !errors.Is(err, failure) || reference.Reference == nil || reference.Attr.ID != attr.ID {
@@ -385,9 +393,13 @@ func TestIdentityCapabilityWrappersPreservePartialResultsAndReferences(t *testin
 	if entries, err := bounded.Entries(); entries != nil || !errors.Is(err, failure) {
 		t.Fatalf("failed bounded directory exposed %+v, %v", entries, err)
 	}
-	result, err := wrapper.MutateName(t.Context(), storage.NameCommand{})
+	nameCommand := storage.NameCommand{Kind: storage.NameRename, Action: action, Guards: openSelection.Guards, RequireNoOpenDescendants: true, Target: storage.ChildCondition{State: storage.SameNode, NodeID: attr.ID, ExpectedMetadata: map[string][]byte{"app.flags": {2}}}}
+	result, err := wrapper.MutateName(t.Context(), nameCommand)
 	if !errors.Is(err, failure) || result.Attr == nil || result.Attr.ID != attr.ID {
 		t.Fatalf("name result=%+v error=%v", result, err)
+	}
+	if !reflect.DeepEqual(probe.nameCommand, nameCommand) {
+		t.Fatalf("name mutation=%+v, want %+v", probe.nameCommand, nameCommand)
 	}
 	if receipt, err := wrapper.QueryFileAction(t.Context(), action); !errors.Is(err, failure) || receipt.Action != action {
 		t.Fatalf("action receipt=%+v error=%v", receipt, err)

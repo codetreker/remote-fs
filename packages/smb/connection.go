@@ -596,6 +596,9 @@ func responseBudget(request wire.Request) int {
 	case wire.Write:
 		return 80
 	case wire.QueryInfo:
+		if parsed, err := request.QueryInfo(); err == nil && parsed.InfoType == wire.InfoFile && parsed.FileInfoClass == wire.FileNormalizedNameInformation {
+			return max(80, (72+int(parsed.OutputBufferLength)+7)&^7)
+		}
 		if parsed, err := request.QueryInfo(); err == nil && parsed.InfoType == wire.InfoFilesystem {
 			if _, maximum := volumeInfoLengths(parsed.FileInfoClass); maximum != 0 {
 				return max(80, (72+min(int(parsed.OutputBufferLength), maximum)+7)&^7)
@@ -618,7 +621,7 @@ func responseBudget(request wire.Request) int {
 
 func relatedOperationFailed(request wire.Request, status uint32, body []byte) bool {
 	queryWarning := request.Header.Command == wire.QueryDirectory || request.Header.Command == wire.QueryInfo &&
-		len(request.Body) >= 3 && request.Body[2] == wire.InfoFilesystem
+		len(request.Body) >= 4 && (request.Body[2] == wire.InfoFilesystem || request.Body[2] == wire.InfoFile && request.Body[3] == wire.FileNormalizedNameInformation)
 	return status != statusOK && !(status == statusBufferOverflow && queryWarning && len(body) >= 8 &&
 		binary.LittleEndian.Uint16(body) == 9 && binary.LittleEndian.Uint16(body[2:]) == wire.HeaderSize+8 &&
 		binary.LittleEndian.Uint32(body[4:]) == uint32(len(body)-8))

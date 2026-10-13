@@ -70,7 +70,7 @@ func (h *Handler) attrResultBudget(req fileRequest) storage.AttrResultBudget {
 				if metadataBytes != 0 {
 					return syscall.EIO
 				}
-				response.State = referenceStateOfProjection(storage.ReferenceState{Attr: attr}, storage.StateScalars)
+				response.State = referenceStateOfProjection(storage.ReferenceState{Attr: attr, PendingUnlink: true, PendingGeneration: make([]byte, storage.MaxObservationTokenBytes)}, storage.StateScalars)
 			} else {
 				response.State = referenceStateOf(storage.ReferenceState{Attr: attr, PendingGeneration: make([]byte, storage.MaxObservationTokenBytes)})
 			}

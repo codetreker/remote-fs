@@ -52,7 +52,7 @@ func TestFileInfoReplicaUnknownMutationRetainsIntentUntilCloseBarrierSettles(t *
 				t.Fatal("unknown SET lost its intent owner")
 			}
 			h.pendingWrite.mu.Lock()
-			original := cloneMutationCommand(h.pendingWrite.command)
+			original := cloneMutationCommand(*h.pendingWrite.command.file)
 			h.pendingWrite.mu.Unlock()
 			before := f.server.Status()
 			if before.RetainedWriteBytes == 0 || len(before.WriteFailures) != 1 || before.WriteFailures[0].PayloadReleased {
@@ -74,7 +74,7 @@ func TestFileInfoReplicaUnknownMutationRetainsIntentUntilCloseBarrierSettles(t *
 				t.Fatalf("release prematurely settled reference: position=%d barrier=%d handle=%p", local.Position(), barrier.Position, f.tree.findFileHandle(id))
 			}
 			h.pendingWrite.mu.Lock()
-			retained := cloneMutationCommand(h.pendingWrite.command)
+			retained := cloneMutationCommand(*h.pendingWrite.command.file)
 			retired := h.pendingWrite.retired
 			h.pendingWrite.mu.Unlock()
 			if retired || original.Action != retained.Action || original.Kind != retained.Kind || original.Size != retained.Size || !bytes.Equal(original.ExpectedMetadata[windowsMetadataKey], retained.ExpectedMetadata[windowsMetadataKey]) || !bytes.Equal(original.Metadata[windowsMetadataKey].Data, retained.Metadata[windowsMetadataKey].Data) {

@@ -396,9 +396,16 @@ func TestDirectoryRealFailedRestartAndBudgetRelease(t *testing.T) {
 			t.Fatal(err)
 		}
 		queryDirectoryForTest(t, f, id, 12, 1, "*", 512, statusOK)
-		f.server.config.Limits.MaxRetainedDirectoryBytes = f.server.Status().RetainedDirectoryBytes
 		second := openDirectoryForTest(t, f, "d")
+		saturated := f.server.Status()
+		f.server.config.Limits.MaxRetainedDirectoryBytes = saturated.RetainedDirectoryBytes
 		queryDirectoryForTest(t, f, second, 12, 0, "*", 512, statusResources)
+		if _, status, _ := f.connection.createFile(t.Context(), f.session, f.tree, createRequestForTest("d", 1, accessReadData)); status != statusResources {
+			t.Fatalf("named open under global capture saturation=%#x", status)
+		}
+		if current := f.server.Status(); current.Handles != saturated.Handles || current.OpeningHandles != saturated.OpeningHandles || current.RetainedDirectoryBytes != saturated.RetainedDirectoryBytes {
+			t.Fatalf("failed captures leaked ownership: before=%+v after=%+v", saturated, current)
+		}
 		closeFixtureHandle(t, f, second)
 		closeFixtureHandle(t, f, id)
 		if got := f.server.Status().RetainedDirectoryBytes; got != 0 {

@@ -84,6 +84,26 @@ func newRealSMBFixture(t *testing.T) realSMBFixture {
 			t.Error(err)
 		}
 	})
+	return realSMBFixtureForSession(t, volume, volume, raw)
+}
+
+func newFileSessionFixture(t *testing.T, seed realSMBFixture) realSMBFixture {
+	t.Helper()
+	backend := seed.tree.export.share.Backend
+	raw, err := backend.NewFileSession(t.Context(), fixtureFileSessionOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := raw.Close(context.Background()); err != nil {
+			t.Error(err)
+		}
+	})
+	return realSMBFixtureForSession(t, seed.volume, backend, raw)
+}
+
+func realSMBFixtureForSession(t *testing.T, volume *objectstore.Storage, backend storage.FileStorage, raw storage.FileSession) realSMBFixture {
+	t.Helper()
 	state, err := raw.Status(t.Context())
 	if err != nil {
 		t.Fatal(err)
@@ -93,7 +113,7 @@ func newRealSMBFixture(t *testing.T) realSMBFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	export := &Export{server: server, share: Share{Volume: "files", Backend: volume, BackendVolume: identity.Backend.Volume, RootNodeID: identity.Backend.RootNodeID}}
+	export := &Export{server: server, share: Share{Volume: "files", Backend: backend, BackendVolume: identity.Backend.Volume, RootNodeID: identity.Backend.RootNodeID}}
 	authority := &authoritySession{raw: raw, identity: identity, export: export, actionEpoch: state.ActionEpoch, deadline: time.Now().Add(state.Remaining)}
 	tree := &tree{kind: volumeTree, export: export, authority: authority}
 	s := &session{id: 21}
@@ -339,10 +359,25 @@ func TestCreateWithoutAllocationCapabilityHasNoEffect(t *testing.T) {
 func newHTTPSMBFixture(t *testing.T) realSMBFixture {
 	t.Helper()
 	fixture := newRealSMBFixture(t)
+	client := httpSMBBackendForTest(t, fixture.volume)
+	raw, err := client.NewFileSession(t.Context(), fixtureFileSessionOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := raw.Close(context.Background()); err != nil {
+			t.Error(err)
+		}
+	})
+	return realSMBFixtureForSession(t, fixture.volume, client, raw)
+}
+
+func httpSMBBackendForTest(t *testing.T, backend storage.FileStorage) storage.FileStorage {
+	t.Helper()
 	handlerOptions := httprest.DefaultHandlerOptions()
 	handlerOptions.Files = httprest.DefaultFileLimits()
 	handlerOptions.Files.Session = fixtureFileSessionOptions()
-	handler, err := httprest.NewHandlerWithOptions(fixture.volume, nil, handlerOptions)
+	handler, err := httprest.NewHandlerWithOptions(backend, nil, handlerOptions)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -359,27 +394,7 @@ func newHTTPSMBFixture(t *testing.T) realSMBFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	raw, err := client.NewFileSession(t.Context(), fixtureFileSessionOptions())
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		if err := raw.Close(context.Background()); err != nil {
-			t.Error(err)
-		}
-	})
-	state, err := raw.Status(t.Context())
-	if err != nil {
-		t.Fatal(err)
-	}
-	identity, err := raw.(storage.FileSessionIdentity).FileSessionIdentity(t.Context())
-	if err != nil {
-		t.Fatal(err)
-	}
-	fixture.raw, fixture.state = raw, state
-	fixture.tree.export.share.Backend = client
-	fixture.tree.authority = &authoritySession{raw: raw, identity: identity, export: fixture.tree.export, actionEpoch: state.ActionEpoch, deadline: time.Now().Add(state.Remaining)}
-	return fixture
+	return client
 }
 
 func closeFixtureHandle(t *testing.T, fixture realSMBFixture, id wire.FileID) {

@@ -12,7 +12,7 @@ volume 的使用者。持有一份 remote storage，把 volume 呈现为 Linux �
 | **显式锁控制** | HTTP client 实现锁 Service，调用方保留 Session / Owner 与原动作身份，以 `WithScope` 构造独立、不可变的修改 proof 集合。控制请求具有独立预算。 | R-CC-3、R-CC-6 至 R-CC-11、R-INT-3 |
 | **本地副本** `packages/storage/replicated` | 一个 storage 装饰器：按路径 `Stat` 走本地 SQLite，公开 `List` / `ListBounded` 与身份目录／名字观察在确认副本健康后回源 authority，其余操作也走远端。副本由 v5 变更流喂着，保留来源节点的已知或未知分配量，并为自己的目录树维护不可作为 authority 证据的本地 revision。 | R-CON-1~4、R-ERR-1、R-ERR-2、R-INT-3、R-SEC-3 |
 | **挂载呈现层** `packages/fuse` | 把一份 storage 呈现为本地目录。持有 FileSession、已打开目录的 NodeReference、普通 File、UseOwner 与内核 owner 的映射；以父 NodeID 执行子项操作，目录 handle 以 Scope 捕获一次完整 Readdir，文件以 direct I/O 逐次读写。仅 Linux。 | R-FS-1、R-FS-5、R-FS-6、R-FS-8、R-CON-1~3、R-ERR-1、R-ERR-2、R-CC-12、R-CC-13、R-WS-5、R-INT-3、R-INT-8 |
-| **本机 SMB 端点** `packages/smb`、`packages/smb/windows` | 接受 loopback 上的 Windows SMB client，执行 SMB 3.1.1、SSPI 身份、强制签名、guarded CREATE/CLOSE 与 typed FileId 清理；每个 authenticated session/export 共享一份经 backend pins 核对的 FileSession，tree 独立拥有其引用。其它文件／目录命令明确不支持。 | R-FS-5~9、R-CC-14、R-INT-1~3、R-SEC-1、R-SEC-4、R-SEC-5、R-WIN-1、R-WIN-6、R-WIN-9、R-WIN-10 |
+| **本机 SMB 端点** `packages/smb`、`packages/smb/windows` | 接受 loopback 上的 Windows SMB client，执行 SMB 3.1.1、SSPI 身份、强制签名、guarded 文件／名字命令与 typed FileId 清理；每个 authenticated session/export 共享一份经 backend pins 核对的 FileSession，tree 独立拥有其引用。实际支持类与错误、范围和资格边界见[端点设计](smb-endpoint.md)。 | R-FS-5~9、R-CC-14、R-INT-1~3、R-SEC-1、R-SEC-4、R-SEC-5、R-WIN-1、R-WIN-6、R-WIN-9、R-WIN-10 |
 | **生命周期** | Linux mount 与 SMB Server／Export 的建立、停止和清理重试。 | R-WS-2、R-WIN-10 |
 
 Linux mount 的数据路径如下；Windows endpoint 的内部层次见[本机 SMB 端点](smb-endpoint.md)。
@@ -237,9 +237,9 @@ FUSE 在挂载 admission 时检查 FileSession 的 `AllocationReporting`，缺�
 
 同步写入不在离线时返回成功，不把未知失败重试为新写入。原生补丁实现可在已知未提交的 revision 竞争后有界重试；这与应用重做一个结果未知的修改不同。普通 fd 没有隐含的内容版本前置条件，显式版本工作流仍独立。
 
-目录子项 Lookup、mutation 与 Readdir 使用 NodeID 和可选 NodeReference Scope；reference current-name、完整有界 directory metadata observation 与持久 authority directory revision/guard 由[有界权威名字观察](../../../.agents/notes/implemented/architecture/2026-09-20-bounded-authoritative-name-observations.md)提供。[权威子项选择](../../../.agents/notes/implemented/architecture/2026-09-22-guard-authoritative-child-selection.md)允许 OpenAt 与 OpenChildRef 把这些 guards 带回最终 authority transaction。guards 不与 SQLite replica 的本地 revision 比较；FUSE 不从副本合成它们，名字 mutation 与当前路径遍历也仍不接受它们。目录 revision 不是通知游标，挂载层不据此实现缓存失效或恢复。
+目录子项 Lookup、mutation 与 Readdir 使用 NodeID 和可选 NodeReference Scope；reference current-name、完整有界 directory metadata observation 与持久 authority directory revision/guard 由[有界权威名字观察](../../../.agents/notes/implemented/architecture/2026-09-20-bounded-authoritative-name-observations.md)提供。[权威子项选择](../../../.agents/notes/implemented/architecture/2026-09-22-guard-authoritative-child-selection.md)允许 OpenAt 与 OpenChildRef 把这些 guards 带回最终 authority transaction。guards 不与 SQLite replica 的本地 revision 比较；FUSE 不从副本合成它们，NameCommand 的完整 union 和后代打开条件逐字送 authority；FUSE raw mutation 不携带 union／后代条件，当前路径遍历不从副本合成这些证据。目录 revision 不是通知游标，挂载层不据此实现缓存失效或恢复。
 
-标准 advisory 通过中立 range 表达 flock 与传统 POSIX 范围锁，完整 `F_OFD_*` 和 mmap 行为不由此推出。enforced range 为其它平台保留，当前 Linux 不把它冒充 advisory。显式 S/X 仍单独取得，挂载不自动选择 Strong 策略。SMB endpoint 提供协议、安全会话与 share 生命周期；Windows create/share/disposition 映射、文件与目录命令、通知、WNet 发布和 cache 验收不在其支持面，不能据此宣称 Windows 支持完成。
+标准 advisory 通过中立 range 表达 flock 与传统 POSIX 范围锁，完整 `F_OFD_*` 和 mmap 行为不由此推出。enforced range 为其它平台保留，当前 Linux 不把它冒充 advisory。显式 S/X 仍单独取得，挂载不自动选择 Strong 策略。SMB endpoint 提供协议、安全会话与 share 生命周期；Windows create/share/disposition、文件／目录／名字命令的支持面见[SMB 端点](smb-endpoint.md)；范围锁、通知／缓存、WNet 发布与原生资格按独立任务交付，不能据此宣称 Windows 支持完成。
 
 ## 十一、部署形态
 

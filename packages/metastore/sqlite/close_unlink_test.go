@@ -97,7 +97,7 @@ func TestDeleteOnCloseExemptsItsRetainedClaimThroughFinalization(t *testing.T) {
 			if err := store.fileDomain.coordinator.CheckCloseUnlink(t.Context(), uint64(file.id), file.scope, claim); !errors.Is(err, storage.ErrInvalidScope) {
 				t.Fatalf("released reference retained use claim: %v", err)
 			}
-			if count := store.coordinator.pins[retainedNode{store.volume, file.id}]; count != 0 || store.fileDomain.files != 0 {
+			if count := store.nodePinCountLocked(file.id); count != 0 || store.fileDomain.files != 0 {
 				t.Fatalf("released reference retained resources: pins %d, files %d", count, store.fileDomain.files)
 			}
 		})
@@ -160,7 +160,7 @@ func TestDeleteOnCloseSettlesOnReadOnlyLastReferenceAndHonorsOtherClaims(t *test
 			if err := store.fileDomain.coordinator.CheckUse(t.Context(), uint64(last.id), last.scope, storage.ReadData); err != nil {
 				t.Fatalf("failed close lost original claim = %v", err)
 			}
-			if count := store.coordinator.pins[retainedNode{store.volume, last.id}]; count != 1 {
+			if count := store.nodePinCountLocked(last.id); count != 1 {
 				t.Fatalf("failed close lost pin = %d", count)
 			}
 			if _, err := store.Stat(t.Context(), "victim"); err != nil {
@@ -199,7 +199,7 @@ func TestCloseUnlinkUnverifiableClaimFencesBeforeDeletingName(t *testing.T) {
 						t.Errorf("cleanup poisoned reference: %v", err)
 					} else {
 						delete(store.files, file)
-						delete(store.coordinator.pins, retainedNode{store.volume, file.id})
+						store.unpinNodeLocked(file.id)
 						store.fileDomain.files--
 						store.coordinator.commit.release()
 					}
@@ -230,7 +230,7 @@ func TestCloseUnlinkUnverifiableClaimFencesBeforeDeletingName(t *testing.T) {
 			if err := store.read.QueryRowContext(t.Context(), `SELECT count(*) FROM entries WHERE volume=? AND node=?`, store.volume, file.id).Scan(&named); err != nil || named != 1 {
 				t.Fatalf("unverifiable claim removed name: count %d, error %v", named, err)
 			}
-			if count := store.coordinator.pins[retainedNode{store.volume, file.id}]; count != 1 {
+			if count := store.nodePinCountLocked(file.id); count != 1 {
 				t.Fatalf("unverifiable claim released pin = %d", count)
 			}
 			if opened, err := store.OpenFile(t.Context(), "victim", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true}}); opened != nil || storage.ErrnoOf(err) != syscall.EIO {

@@ -10,8 +10,8 @@ import (
 const reservedCreateContext = "\x93\xad\x25\x50\x9c\xb4\x11\xe7\xb4\x23\x83\xde\x96\x8b\xcd\x7c"
 
 // Optional durable, lease and allocation requests do not grant those features.
-// Their valid payloads are ignored. QFid requests the opened object's stable
-// identity; other intents are rejected before the basic open.
+// Supersede rejects nonzero allocation reservations; other valid optional
+// payloads are ignored. QFid requests the opened object's stable identity.
 // https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-smb2/9adbc354-5fad-40e7-9a62-4a4b6c1ff8a0
 // https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-smb2/24cfce29-5d80-4651-ba5f-a2661c666b41
 // https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-smb2/3f343618-01b0-4aaf-b8a3-b270f9a6d334
@@ -46,6 +46,9 @@ func validateCreateContexts(request wire.CreateRequest) error {
 		case "AlSi":
 			if len(context.Data) != 8 {
 				return syscall.EINVAL
+			}
+			if request.Disposition == 0 && binary.LittleEndian.Uint64(context.Data) != 0 {
+				unsupported = true
 			}
 		case "DHnC":
 			if len(context.Data) != 16 {

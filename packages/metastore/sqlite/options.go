@@ -23,8 +23,9 @@ const (
 	// reference HTTP server can produce concurrently.
 	DefaultMaxSnapshotReaderConnections = 16
 
-	// DefaultMaxIntegrityRecords bounds the volume, node, object, entry, log, and change rows
-	// examined by one integrity pass when the caller supplies no limit of its own.
+	// DefaultMaxIntegrityRecords bounds the volume, node, object, entry, log, and
+	// change rows examined by one integrity pass, or the retained candidates and
+	// ancestry headers examined by one namespace descendant-reference check.
 	DefaultMaxIntegrityRecords int64 = 1_000_000
 
 	// DefaultMaxIntegrityBytes bounds variable-length volume and log fields examined by
@@ -74,8 +75,11 @@ type Options struct {
 	MaxSnapshotReaderConnections int
 
 	// MaxIntegrityRecords bounds the volume, node, object, entry, log, and change rows
-	// accepted by an integrity pass. A larger retained volume returns syscall.EFBIG before
-	// recursive traversal or row validation. Zero selects DefaultMaxIntegrityRecords.
+	// accepted by an integrity pass. A larger retained volume returns syscall.EFBIG
+	// before recursive traversal or row validation. It also bounds the combined
+	// retained-candidate and ancestry-header work of one namespace descendant-reference
+	// check, which returns syscall.EFBIG when that work exceeds the bound.
+	// Zero selects DefaultMaxIntegrityRecords.
 	MaxIntegrityRecords int64
 
 	// MaxIntegrityBytes bounds the combined entry and retained-change name bytes examined by

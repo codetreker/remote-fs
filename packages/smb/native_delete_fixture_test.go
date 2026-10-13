@@ -48,7 +48,8 @@ func NewNativeDeleteProbeBackend() *nativeDeleteBackend {
 	b.views[1][4].Attr.ID = 7
 	b.views[7] = nil
 	return &nativeDeleteBackend{nativeDirectoryBackend: b, refs: make(map[*nativeDeleteReference]struct{}),
-		intents: make(map[storage.DeleteIntentID]*nativeDeleteIntent), actions: make(map[storage.FileActionID]storage.FileActionReceipt), nextNode: 100}
+		intents: make(map[storage.DeleteIntentID]*nativeDeleteIntent), actions: make(map[storage.FileActionID]nativeDeleteAction), nextNode: 100,
+		ordinary: make(map[uint64]bool), generations: make(map[uint64]uint64), revision: 1}
 }
 
 type nativeDeleteIntent struct {
@@ -57,15 +58,23 @@ type nativeDeleteIntent struct {
 	cursor storage.DeleteIntentCursor
 }
 
+type nativeDeleteAction struct {
+	storage.FileActionReceipt
+	failure error
+}
+
 type nativeDeleteBackend struct {
 	*nativeDirectoryBackend
 	mu           sync.Mutex
 	refs         map[*nativeDeleteReference]struct{}
 	intents      map[storage.DeleteIntentID]*nativeDeleteIntent
-	actions      map[storage.FileActionID]storage.FileActionReceipt
+	actions      map[storage.FileActionID]nativeDeleteAction
 	sequence     storage.DeleteIntentCursor
 	nextNode     uint64
 	acknowledged []storage.DeleteIntentStatus
+	ordinary     map[uint64]bool
+	generations  map[uint64]uint64
+	revision     uint64
 }
 
 func (b *nativeDeleteBackend) NewFileSession(ctx context.Context, options storage.FileSessionOptions) (storage.FileSession, error) {
@@ -88,16 +97,21 @@ func (s *nativeDeleteSession) ObserveDirectoryMetadata(ctx context.Context, targ
 		result.Fail(err)
 		return storage.DirectoryMetadataObservation{}, err
 	}
-	if options.IncludeName {
-		result.Fail(syscall.EOPNOTSUPP)
-		return storage.DirectoryMetadataObservation{}, syscall.EOPNOTSUPP
-	}
 	if err := s.checkGuards(options.Guards); err != nil {
 		result.Fail(err)
 		return storage.DirectoryMetadataObservation{}, err
 	}
 	observation, err := s.directory(ctx, target, result)
-	return storage.DirectoryMetadataObservation{Observation: observation}, err
+	out := storage.DirectoryMetadataObservation{Observation: observation}
+	if err == nil && options.IncludeName {
+		name, nameErr := s.mutable.name(ctx, target.NodeID)
+		if nameErr != nil {
+			result.Fail(nameErr)
+			return storage.DirectoryMetadataObservation{}, nameErr
+		}
+		out.Name = &name
+	}
+	return out, err
 }
 
 func (s *nativeDeleteSession) ReadDirNodeBounded(ctx context.Context, target storage.DirectoryTarget, result *storage.ListResult) (storage.DirectoryObservation, error) {
@@ -140,14 +154,23 @@ func (s *nativeDeleteSession) directory(ctx context.Context, target storage.Dire
 			return out, err
 		}
 	}
-	return storage.DirectoryObservation{ParentID: target.NodeID, Revision: []byte("native-probe-one")}, nil
+	return storage.DirectoryObservation{ParentID: target.NodeID, Revision: s.mutable.revisionToken()}, nil
 }
 
 func (s *nativeDeleteSession) OpenNodeRef(ctx context.Context, id uint64, options storage.NodeRefOptions) (storage.NodeOpenResult, error) {
 	if id != 1 || options.CloseIntent != nil {
 		return storage.NodeOpenResult{}, syscall.EINVAL
 	}
-	return s.nativeDirectorySession.OpenNodeRef(ctx, id, options)
+	s.mutable.mu.Lock()
+	defer s.mutable.mu.Unlock()
+	opened, err := s.nativeDirectorySession.OpenNodeRef(ctx, id, options)
+	if err != nil {
+		return opened, err
+	}
+	ref := &nativeDeleteReference{nativeDirectoryReference: opened.Reference.(*nativeDirectoryReference), owner: s}
+	s.mutable.refs[ref] = struct{}{}
+	opened.Reference = ref
+	return opened, nil
 }
 
 func (s *nativeDeleteSession) OpenChildRef(ctx context.Context, selection storage.ChildSelection, options storage.NodeRefOptions) (storage.NodeOpenResult, error) {
@@ -166,7 +189,7 @@ func (s *nativeDeleteSession) OpenAt(ctx context.Context, selection storage.Chil
 	}
 	s.mutable.mu.Lock()
 	defer s.mutable.mu.Unlock()
-	if options.Existing != storage.Keep {
+	if options.Existing != storage.Keep && options.Existing != storage.ResetContent {
 		return storage.OpenResult{}, syscall.EOPNOTSUPP
 	}
 	ref, attr, outcome, err := s.open(ctx, selection, storage.NodeRefOptions{Kind: storage.NodeRegular,
@@ -175,8 +198,15 @@ func (s *nativeDeleteSession) OpenAt(ctx context.Context, selection storage.Chil
 	if err != nil {
 		return storage.OpenResult{}, err
 	}
-	s.mutable.actions[options.Action] = storage.FileActionReceipt{Action: options.Action, Operation: storage.OpFileOpenAt, Outcome: storage.FileActionCompleted}
-	return storage.OpenResult{File: &nativeDeleteFile{nativeDeleteReference: ref, readable: options.Read}, Attr: attr, Outcome: outcome}, nil
+	if options.Existing == storage.ResetContent && outcome == storage.Opened {
+		attr.Size = 0
+		attr.AllocationSize = 0
+		attr.Metadata = cloneNativeInitialMetadata(options.Initial.OnReset.Metadata)
+		s.mutable.updateAttr(attr)
+		outcome = storage.Reset
+	}
+	s.mutable.actions[options.Action] = nativeDeleteAction{FileActionReceipt: storage.FileActionReceipt{Action: options.Action, Operation: storage.OpFileOpenAt, Outcome: storage.FileActionCompleted}}
+	return storage.OpenResult{File: &nativeDeleteFile{nativeDeleteReference: ref, readable: options.Read, writable: options.Write}, Attr: attr, Outcome: outcome}, nil
 }
 
 func (s *nativeDeleteSession) open(ctx context.Context, selection storage.ChildSelection, options storage.NodeRefOptions) (*nativeDeleteReference, storage.Attr, storage.OpenOutcome, error) {
@@ -218,6 +248,9 @@ func (s *nativeDeleteSession) open(ctx context.Context, selection storage.ChildS
 		if intent.NodeID == attr.ID && intent.Outcome == storage.DeleteIntentPending {
 			return nil, storage.Attr{}, 0, storage.ErrPendingDelete
 		}
+	}
+	if b.ordinary[attr.ID] {
+		return nil, storage.Attr{}, 0, storage.ErrPendingDelete
 	}
 	for ref := range b.refs {
 		if ref.id == attr.ID && (ref.use.Deny&options.Use.Uses != 0 || options.Use.Deny&ref.use.Uses != 0) {
@@ -262,6 +295,7 @@ func (s *nativeDeleteSession) open(ctx context.Context, selection storage.ChildS
 		if options.Kind == storage.NodeDirectory {
 			b.views[attr.ID] = nil
 		}
+		b.revision++
 	}
 	s.refMu.Lock()
 	s.sequence++
@@ -276,7 +310,7 @@ func (s *nativeDeleteSession) open(ctx context.Context, selection storage.ChildS
 		ref.intent = intent.ID
 		b.intents[intent.ID] = &nativeDeleteIntent{DeleteIntentStatus: storage.DeleteIntentStatus{ID: intent.ID, NodeID: attr.ID, Outcome: storage.DeleteIntentArmed}, owner: intent.Owner, cursor: b.sequence}
 	}
-	b.actions[options.Action] = storage.FileActionReceipt{Action: options.Action, Operation: storage.OpFileOpenChildRef, Outcome: storage.FileActionCompleted}
+	b.actions[options.Action] = nativeDeleteAction{FileActionReceipt: storage.FileActionReceipt{Action: options.Action, Operation: storage.OpFileOpenChildRef, Outcome: storage.FileActionCompleted}}
 	return ref, attr.Clone(), outcome, nil
 }
 
@@ -287,7 +321,7 @@ func (s *nativeDeleteSession) QueryFileAction(ctx context.Context, id storage.Fi
 		return storage.FileActionReceipt{}, err
 	}
 	if result, found := s.mutable.actions[id]; found {
-		return result, nil
+		return result.FileActionReceipt, nil
 	}
 	return storage.FileActionReceipt{Action: id, Outcome: storage.FileActionUnknown}, nil
 }
@@ -347,7 +381,7 @@ func (s *nativeDeleteSession) AcknowledgeDeleteIntent(ctx context.Context, comma
 		s.mutable.acknowledged = append(s.mutable.acknowledged, intent.DeleteIntentStatus)
 		delete(s.mutable.intents, command.Intent)
 	}
-	s.mutable.actions[command.Action] = storage.FileActionReceipt{Action: command.Action, Operation: storage.OpFileAcknowledgeDeleteIntent, Outcome: storage.FileActionCompleted}
+	s.mutable.actions[command.Action] = nativeDeleteAction{FileActionReceipt: storage.FileActionReceipt{Action: command.Action, Operation: storage.OpFileAcknowledgeDeleteIntent, Outcome: storage.FileActionCompleted}}
 	return nil
 }
 
@@ -407,11 +441,14 @@ func (r *nativeDeleteReference) State(ctx context.Context, projection storage.St
 	for _, intent := range b.intents {
 		if intent.NodeID == r.id && intent.Outcome == storage.DeleteIntentPending {
 			state.PendingUnlink = true
-			if projection == storage.StateFull {
-				state.PendingGeneration = []byte("native-pending")
-			}
+			state.PendingGeneration = b.pendingToken(r.id)
 		}
 	}
+	state.PendingUnlink = state.PendingUnlink || b.ordinary[r.id]
+	if state.PendingUnlink {
+		state.PendingGeneration = b.pendingToken(r.id)
+	}
+	state.Detached = b.binding(r.id).State == storage.NameDetached
 	return state, nil
 }
 func (r *nativeDeleteReference) Stat(ctx context.Context) (storage.Attr, error) {
@@ -442,6 +479,9 @@ func (r *nativeDeleteReference) CloseWithResult(ctx context.Context) (storage.Re
 			intent.Outcome = storage.DeleteIntentNotExecuted
 			r.closeErr = syscall.ENOTEMPTY
 		} else {
+			if !b.pending(r.id) {
+				b.generations[r.id]++
+			}
 			intent.Outcome = storage.DeleteIntentPending
 		}
 	}
@@ -464,8 +504,13 @@ func (r *nativeDeleteReference) CloseWithResult(ctx context.Context) (storage.Re
 				}
 			}
 			delete(b.views, r.id)
+			b.revision++
 			intent.Outcome = storage.DeleteIntentCompleted
 		}
+	}
+	if b.ordinary[r.id] && !b.hasReference(r.id) {
+		b.unlink(r.id)
+		delete(b.ordinary, r.id)
 	}
 	return result, r.closeErr
 }
@@ -487,6 +532,7 @@ func (r *nativeDeleteReference) CloseWithAction(ctx context.Context, attempt sto
 type nativeDeleteFile struct {
 	*nativeDeleteReference
 	readable bool
+	writable bool
 }
 
 func (*nativeDeleteFile) CheckConditionalFileMutation() error { return nil }
@@ -517,6 +563,9 @@ func (*nativeDeleteFile) Truncate(context.Context, int64) (storage.Attr, error) 
 	return storage.Attr{}, syscall.EOPNOTSUPP
 }
 func (f *nativeDeleteFile) Sync(ctx context.Context) error {
+	if !f.readable && !f.writable {
+		return syscall.EBADF
+	}
 	_, err := f.State(ctx, storage.StateScalars)
 	return err
 }
