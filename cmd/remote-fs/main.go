@@ -53,7 +53,7 @@ func main() {
 // errUsage marks a command line that was rejected and already explained.
 var errUsage = errors.New("the command line was rejected")
 
-func run(args []string, errOut io.Writer) error {
+func runLegacy(args []string, errOut io.Writer) error {
 	flags := flag.NewFlagSet("remote-fs", flag.ContinueOnError)
 	flags.SetOutput(errOut)
 	serverURL := flags.String("server", "", "base URL of the server holding the volume, as http://host:port")

@@ -1,0 +1,2 @@
+g remote-fs 10001
+u remote-fs 10001:10001 "Remote volume service" /nonexistent /usr/sbin/nologin

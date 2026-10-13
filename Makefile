@@ -4,11 +4,23 @@
 
 BIN := bin
 CMDS := remote-fs remote-fs-server
+PNPM ?= pnpm
 
-.PHONY: build test azurite azurite-down clean
+.PHONY: build console console-check test azurite azurite-down clean
 
-## build: compile both binaries into bin/
-build:
+## console: install the locked frontend dependencies and build the embedded assets
+console:
+	$(PNPM) --dir internal/console install --frozen-lockfile
+	$(PNPM) --dir internal/console build
+	$(PNPM) --dir internal/console check:dist
+
+## console-check: verify frontend behavior and the committed release assets
+console-check: console
+	$(PNPM) --dir internal/console test
+	git diff --exit-code -- internal/console/dist
+
+## build: build the Console before compiling both binaries into bin/
+build: console
 	@mkdir -p $(BIN)
 	go build -o $(BIN)/ $(addprefix ./cmd/,$(CMDS))
 

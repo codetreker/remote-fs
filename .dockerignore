@@ -1,0 +1,14 @@
+.git
+.tmp
+.worktrees
+**/node_modules
+bin
+vendor
+**/*.out
+**/*.test
+.env
+.remote-fs
+**/.remote-fs
+**/credential.json
+**/credentials.json
+**/management.sqlite*

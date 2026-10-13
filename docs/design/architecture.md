@@ -195,20 +195,21 @@ remote-fs ──▶ 建立 remote storage，先访问一次根，确认 server �
 
 | 角色 | 作为库嵌入 | 作为独立二进制 |
 |---|---|---|
-| server | `packages/transport/httprest` 提供一个 `http.Handler`，链接进集成方既有的 server | `cmd/remote-fs-server`：服务 Azure Blob + SQLite，或同一私有目录中的本地对象 + SQLite |
-| client | `packages/transport/httprest`、`packages/fuse` 或 `packages/smb` 链接进集成方既有的 daemon／Windows 进程 | `cmd/remote-fs`：把一个 server 的 volume 挂到 Linux 本地目录；不提供 Windows WNet 二进制 |
+| server | `packages/transport/httprest` 提供一个 `http.Handler`，链接进集成方既有的 server | `cmd/remote-fs-server serve`：多用户 volume 管理与只读元数据 Console；`reference` 保留单 volume local/Azure 文件入口 |
+| client | `packages/transport/httprest`、`packages/fuse` 或 `packages/smb` 链接进集成方既有的 daemon／Windows 进程 | `cmd/remote-fs`：管理服务 CLI；原 reference 入口继续支持 Linux foreground mount，不提供 Windows WNet 二进制 |
 
 client 侧还有第三种用法：只使用 remote storage，不挂载（R-INT-5）。这条路径不依赖 FUSE，因此不受 Linux 限制。
 
 独立二进制的进程与挂载生命周期通过本机信号管理。一个 `remote-fs` 进程就是一个挂载点，卸载靠向它发信号；独立 server 用信号停止或查询存储与锁状态，见 [`server/architecture.md`](server/architecture.md)。文件占有另有跨角色的网络控制接口，不承担进程管理。作为 package 使用时，调用方直接使用所组合 storage 的状态 API。
 
-身份认证、凭据签发与轮换、角色和 TLS 由业务方管理。嵌入式 handler 可配置可信 volume 与 Authorizer；不配置时保留外层访问控制，独立二进制没有认证配置入口。锁能力校验约束修改的原生占有顺序，业务授权控制哪些语义请求能够进入，两者不能互相替代。同一 mount／replica 固定属于同一访问身份；凭据轮换可保持身份与连接，切换身份则建立新的客户端状态。
+嵌入式文件 handler 的认证、credential、角色和 TLS 仍由业务方管理，它配置可信 volume 和 Authorizer。管理服务提供本地管理员登录、immutable owner、自己的只读文件元数据和普通用户摘要，不挂载文件 handler；详见[管理服务架构](server/service.md)。既有 reference 文件入口的访问边界由其部署方保护。
 
 ## 七、第二层
 
 各角色内部的设计各占一个目录，一个角色一份：
 
 - `server/architecture.md` —— HTTP 服务端、请求与响应的形状、错误如何离开 server
+- `server/service.md` —— 独立服务的身份、volume owner、Console/CLI 和管理生命周期
 - `server/local-disk-object-store.md` —— 本地持久 storage 的格式、打开与恢复、容量和维护
 - `server/file-locks.md` —— 显式占有、有限授予、最终发布顺序、重启保护与 HTTP 控制协议
 - `server/file-handles.md` —— 保留对象、同步修改、中立 metadata、Uses/range 与文件会话协议

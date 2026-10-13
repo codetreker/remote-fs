@@ -15,6 +15,7 @@ server 是 volume、保留节点、身份 namespace、durable 删除义务与显
 | 文件 | 内容 |
 |---|---|
 | [`architecture.md`](architecture.md) | server 的内部构成、组件职责、内部数据流 |
+| [`service.md`](service.md) | 独立服务的账号、owner、Console/CLI 管理与 volume 生命周期 |
 | [`authorization.md`](authorization.md) | 嵌入方策略接口、操作映射、请求／流授权和安全错误 |
 | [`file-handles.md`](file-handles.md) | 保留对象、原子子项操作、action/delete-intent、条件修改、中立 metadata、Uses/range 与文件会话协议 |
 | [`file-locks.md`](file-locks.md) | 显式 S/X 占有、有限授权与动作历史、原生发布排序、重启恢复和 backend 绑定 |

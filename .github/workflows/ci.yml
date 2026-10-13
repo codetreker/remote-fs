@@ -33,7 +33,24 @@ jobs:
           persist-credentials: false
       - uses: ./.github/actions/setup-go
 
-      - run: go build ./...
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24.19.0'
+
+      - name: Install the pinned Console package manager
+        run: |
+          npm install --prefix .tmp/build-tools --cache .tmp/npm-cache --no-audit --no-fund pnpm@10.34.5
+          echo "$PWD/.tmp/build-tools/node_modules/.bin" >> "$GITHUB_PATH"
+
+      - name: Build the release assets and binaries
+        run: make build
+
+      - name: Console tests and committed asset verification
+        run: |
+          pnpm --dir internal/console test
+          pnpm --dir internal/console check:dist
+          git diff --exit-code -- internal/console/dist
+
       - run: go vet ./...
 
       - name: gofmt
@@ -51,11 +68,11 @@ jobs:
           set -uo pipefail
           # grep finds nothing in a file whose links are all absolute, and that is not a
           # failure, so the assignment must not inherit its status.
-          broken="$(while IFS= read -r f; do
+          broken="$(while IFS= read -r -d '' f; do
             d=$(dirname "$f")
             grep -oP '\]\(\K[^)#]+(?=[)#])' "$f" | grep -v '^https\?://' |
-              while read -r l; do [ -e "$d/$l" ] || echo "$f -> $l"; done
-          done < <(find . -name '*.md' -not -path './.git/*'))" || true
+              while IFS= read -r l; do [ -e "$d/$l" ] || echo "$f -> $l"; done
+          done < <(git ls-files -z -- '*.md'))" || true
           if [ -n "$broken" ]; then
             echo "::error::these relative links point at nothing:"
             echo "$broken"
