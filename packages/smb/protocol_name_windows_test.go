@@ -327,16 +327,78 @@ type nativeRenameInformation struct {
 }
 
 func nativeRenameFile(handle win.Handle, destination string, replace bool) error {
+	buffer := nativeRenameBuffer(destination, replace)
+	return win.SetFileInformationByHandle(handle, win.FileRenameInfo, &buffer[0], uint32(len(buffer)))
+}
+
+func nativeRenameBuffer(destination string, replace bool) []byte {
 	name := wire.EncodeUTF16(destination)
 	var header nativeRenameInformation
 	offset := int(unsafe.Offsetof(header.FileName))
-	buffer := make([]byte, offset+len(name))
+	// The Win32 wrapper converts FileName as a NUL-terminated DOS path before
+	// constructing native counted input. FileNameLength excludes the terminator.
+	// https://github.com/wine-mirror/wine/blob/081042ede6a165a36bf9988350dd584b440d7a3d/dlls/kernelbase/file.c#L3846
+	buffer := make([]byte, offset+len(name)+2)
 	if replace {
 		buffer[0] = 1
 	}
 	binary.LittleEndian.PutUint32(buffer[unsafe.Offsetof(header.FileNameLength):], uint32(len(name)))
 	copy(buffer[offset:], name)
-	return win.SetFileInformationByHandle(handle, win.FileRenameInfo, &buffer[0], uint32(len(buffer)))
+	return buffer
+}
+
+func TestNativeRenameBufferContract(t *testing.T) {
+	var header nativeRenameInformation
+	if unsafe.Sizeof(header) != 24 || unsafe.Offsetof(header.RootDirectory) != 8 || unsafe.Offsetof(header.FileNameLength) != 16 || unsafe.Offsetof(header.FileName) != 20 {
+		t.Fatal("invalid 64-bit FILE_RENAME_INFO native layout")
+	}
+	for _, name := range []string{`Z:\RENAMED.txt`, `Z:\folder\moved-😀.txt`} {
+		encoded := wire.EncodeUTF16(name)
+		buffer := nativeRenameBuffer(name, true)
+		if len(buffer) != 20+len(encoded)+2 || buffer[0] != 1 || binary.LittleEndian.Uint64(buffer[8:16]) != 0 || binary.LittleEndian.Uint32(buffer[16:20]) != uint32(len(encoded)) || !bytes.Equal(buffer[20:20+len(encoded)], encoded) || binary.LittleEndian.Uint16(buffer[len(buffer)-2:]) != 0 {
+			t.Fatal("native rename input does not own its counted name and trailing NUL WCHAR")
+		}
+	}
+}
+
+func TestNativeNameReceiptsCorrelateSemanticRejection(t *testing.T) {
+	receipts := &nativeNameReceipts{}
+	for index, test := range []struct {
+		name   string
+		root   uint64
+		status uint32
+	}{{"RENAMED.txt", 1, 0xc000000d}, {`\RENAMED.txt`, 0, 0xc000000d}, {"healthy.txt", 0, 0}} {
+		defer receipts.begin(t, wire.SetInfo, wire.FileRenameInformation)()
+		receipts.expectRename(test.name, false)
+		name := wire.EncodeUTF16(test.name)
+		input := make([]byte, 20+len(name))
+		binary.LittleEndian.PutUint64(input[8:16], test.root)
+		binary.LittleEndian.PutUint32(input[16:20], uint32(len(name)))
+		copy(input[20:], name)
+		body := make([]byte, 32+len(input))
+		binary.LittleEndian.PutUint16(body, 33)
+		body[2], body[3], body[16] = wire.InfoFile, wire.FileRenameInformation, 1
+		binary.LittleEndian.PutUint32(body[4:8], uint32(len(input)))
+		binary.LittleEndian.PutUint16(body[8:10], wire.HeaderSize+32)
+		copy(body[32:], input)
+		header := wire.Header{Command: wire.SetInfo, SessionID: 12, MessageID: uint64(index + 1), Flags: wire.FlagSigned}
+		packet := make([]byte, wire.HeaderSize+len(body))
+		if err := header.Encode(packet); err != nil {
+			t.Fatal(err)
+		}
+		copy(packet[wire.HeaderSize:], body)
+		receipts.request(packet)
+		header.Status = test.status
+		response := wire.SetInfoResponseBody()
+		if test.status != 0 {
+			response = wire.ErrorResponseBody()
+		}
+		receipts.response(wire.EncodeResponse(header, response))
+		facts := receipts.finish(t, test.status, true)
+		if len(facts) != 1 || !facts[0].renameDecoded || !facts[0].renameAdmissionChecked || facts[0].renameRoot != test.root || facts[0].renameCount != uint32(len(name)) || facts[0].renameName != test.name || facts[0].renameAdmitted != (test.status == 0) || facts[0].renameDigest != sha256.Sum256(input) {
+			t.Fatalf("semantic rejection or later healthy window lost its correlated receipt: %+v", facts)
+		}
+	}
 }
 
 func nativeDisposition(handle win.Handle, deleting bool) error {
@@ -418,19 +480,28 @@ func nativeNameClose(t *testing.T, handle *nativeDeleteHandle, receipts *nativeN
 }
 
 type nativeNameFact struct {
-	command        uint16
-	class          byte
-	status         uint32
-	desiredAccess  uint32
-	outputCapacity uint32
-	outputBytes    uint32
-	outputDigest   [32]byte
-	fileID         wire.FileID
-	createAction   uint32
-	renameName     string
-	renameExpected string
-	renameReplace  bool
-	renameMatches  bool
+	command                uint16
+	class                  byte
+	status                 uint32
+	desiredAccess          uint32
+	outputCapacity         uint32
+	outputBytes            uint32
+	outputDigest           [32]byte
+	fileID                 wire.FileID
+	createAction           uint32
+	renameName             string
+	renameExpected         string
+	renameReplace          bool
+	renameMatches          bool
+	renameBytes            uint32
+	renameDigest           [32]byte
+	renameHeader           bool
+	renameRoot             uint64
+	renameCount            uint32
+	renameFirst            uint16
+	renameDecoded          bool
+	renameAdmitted         bool
+	renameAdmissionChecked bool
 }
 
 type nativeNameReceipts struct {
@@ -510,13 +581,30 @@ func (r *nativeNameReceipts) request(packet []byte) {
 				continue
 			}
 			if fact.class == wire.FileRenameInformation {
-				rename, err := wire.ParseFileRenameInformation(value.Buffer)
-				if err != nil || len(rename.Name) > 256 || len(r.expectedName) > 256 {
-					r.err = fmt.Errorf("native rename receipt exceeds fixture name bound or has invalid input: %v", err)
+				if len(r.expectedName) > 256 {
+					r.err = fmt.Errorf("native rename expectation exceeds fixture name bound")
 					return
 				}
-				fact.renameName, fact.renameExpected, fact.renameReplace = rename.Name, r.expectedName, rename.ReplaceIfExists
-				fact.renameMatches = rename.Name == r.expectedName && rename.ReplaceIfExists == r.expectedReplace
+				fact.renameExpected = r.expectedName
+				fact.renameBytes, fact.renameDigest = uint32(len(value.Buffer)), sha256.Sum256(value.Buffer)
+				if len(value.Buffer) > 0 {
+					fact.renameReplace = value.Buffer[0] != 0
+				}
+				if len(value.Buffer) >= 20 {
+					fact.renameHeader = true
+					fact.renameRoot = binary.LittleEndian.Uint64(value.Buffer[8:16])
+					fact.renameCount = binary.LittleEndian.Uint32(value.Buffer[16:20])
+					if len(value.Buffer) >= 22 {
+						fact.renameFirst = binary.LittleEndian.Uint16(value.Buffer[20:22])
+					}
+					if fact.renameCount <= 256 && fact.renameCount&1 == 0 && uint64(fact.renameCount) <= uint64(len(value.Buffer)-20) {
+						name, decodeErr := wire.DecodeUTF16(value.Buffer[20 : 20+int(fact.renameCount)])
+						fact.renameName, fact.renameDecoded = name, decodeErr == nil
+						_, admissionErr := wire.ParseFileRenameInformation(value.Buffer)
+						fact.renameAdmissionChecked, fact.renameAdmitted = true, admissionErr == nil
+					}
+				}
+				fact.renameMatches = fact.renameDecoded && fact.renameName == r.expectedName && fact.renameReplace == r.expectedReplace
 			}
 		case wire.QueryInfo:
 			value, err := request.QueryInfo()
@@ -638,7 +726,7 @@ func (r *nativeNameReceipts) finish(t *testing.T, expected uint32, require bool)
 			for _, fact := range facts {
 				t.Logf("native name signed exchange: command=%d class=%d status=%#x capacity=%d bytes=%d", fact.command, fact.class, fact.status, fact.outputCapacity, fact.outputBytes)
 				if fact.command == wire.SetInfo && fact.class == wire.FileRenameInformation {
-					t.Logf("native rename input: requested=%q wire=%q replace=%t exactMatch=%t", fact.renameExpected, fact.renameName, fact.renameReplace, fact.renameMatches)
+					t.Logf("native rename input: requested=%q wire=%q replace=%t exactMatch=%t bytes=%d fixedHeader=%t root=%#x count=%d first=%#x decoded=%t admissionChecked=%t admitted=%t digest=%x", fact.renameExpected, fact.renameName, fact.renameReplace, fact.renameMatches, fact.renameBytes, fact.renameHeader, fact.renameRoot, fact.renameCount, fact.renameFirst, fact.renameDecoded, fact.renameAdmissionChecked, fact.renameAdmitted, fact.renameDigest)
 				}
 				if require && fact.status != expected {
 					t.Fatalf("native name wire status=%#x want %#x", fact.status, expected)
