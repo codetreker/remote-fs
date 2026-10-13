@@ -10,7 +10,7 @@ Status: proposed
 
 ## 提案
 
-本任务只交付 Windows 原生资格矩阵、测量与不可变证据；不在资格 PR 中实现遗漏的生产功能。以[完整 Windows 入口提案](2026-09-16-windows-network-drive-support.md)的 WN-01 至 WN-17 和 [`docs/spec/requirements.md`](../../../../docs/spec/requirements.md) 为可观察契约，以[原生映射与夹具提案](2026-09-28-smb-native-wnet-fixture.md)的真实 server、persistent volume、故障代理与映射控制器为执行基础。资格结果只能是 `pass`、`fail`、`not-executed` 或 `invalid-setup`；任一非 pass 不构成 Windows 支持声明。需求新增或验收语义变化必须先更新 spec，再改 corpus 与矩阵。
+本任务只交付 Windows 原生资格矩阵、测量与不可变证据；不在资格 PR 中实现遗漏的生产功能。以[完整 Windows 入口提案](2026-09-16-windows-network-drive-support.md)的 WN-01 至 WN-17 和 [`docs/spec/requirements.md`](../../../../docs/spec/requirements.md) 为可观察契约；实施前按顺序完成[8.2a 中立有序范围动作](2026-09-28-ordered-range-actions.md)、[8.2b SMB LOCK/CANCEL 生命周期](2026-09-28-smb-lock-cancel-lifecycle.md)、[9 原生映射与夹具](2026-09-28-smb-native-wnet-fixture.md)及[8.3 通知／缓存](2026-09-28-smb-change-notify-cache-coherence.md)。执行基础复用 9 的真实 server、persistent volume、故障代理与映射控制器。资格结果只能是 `pass`、`fail`、`not-executed` 或 `invalid-setup`；任一非 pass 不构成 Windows 支持声明。需求新增或验收语义变化必须先更新 spec，再改 corpus 与矩阵。
 
 资格运行在 Windows 11 24H2+ 的四个独立 OS cell：Home x64、Home ARM64、Pro x64、Pro ARM64。每个 cell 使用普通用户、原生 WNet／文件 API 和真实本机 445 SMB 端点，连接到真实 `cmd/remote-fs-server` 的持久 volume；Linux／SDK 入口与 Windows B 按 case 参与。每 cell 独立执行 WN-01–17，不能拿另一个 cell 的通过补足缺口。WN-09 的 Windows A 与 B 必须位于**两台不同 host**，各有可核验 host identity、独立端点／映射和可单独切断的普通 HTTP／变更通道；同机 VM 的 host 关系在证据中明确记录，不能把两个进程算为两台主机。
 

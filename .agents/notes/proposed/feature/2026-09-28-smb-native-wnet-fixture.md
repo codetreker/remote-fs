@@ -12,7 +12,7 @@ SMB 端点能接受合成请求，并不意味着普通 Windows 程序能通过�
 
 本任务交付可嵌入的 Windows 映射控制器，以及共用真实 [`cmd/remote-fs-server`](../../../../cmd/remote-fs-server/main.go) 和持久 volume 的原生故障夹具。一个映射控制器只拥有宿主显式请求的一份 WNet 映射及其 SMB export owner；`packages/smb` 保持协议、FileId 与远端清理 owner。宿主启动并拥有唯一 loopback listener 和可承载多个 export 的共享 `Server`，为每个映射控制器提供可信 share、backend、认证和授权策略；控制器不能关闭共享 listener、整个 `Server` 或其它 export。包初始化、构造 controller 与导入 Windows 包都没有 WNet 或系统设置副作用。本提案细化[完整 Windows 入口提案](2026-09-16-windows-network-drive-support.md)中的原生发布与 WN-01／WN-11／WN-12，现有[安全有界端点决定](../../implemented/architecture/2026-09-21-secure-bounded-smb-endpoint.md)继续拥有 SMB 会话与身份规则。
 
-任务内含普通用户 445 探测、WNet 映射和非强制移除、同会话身份验证、真实 HTTP backing 的故障注入、Windows Home／Pro × x64／ARM64 夹具可执行性。任务不实现 SMB 文件命令、变更缓存策略或最终 WN-01–17 全矩阵判定；后者由[原生资格提案](2026-09-28-smb-native-qualification.md)拥有。控制器必须保留后续资格测试能使用的精确事实和失败状态，不把一个未证明的平台行为编码为成功假设。
+任务内含普通用户 445 探测、WNet 映射和非强制移除、同会话身份验证、真实 HTTP backing 的故障注入、Windows Home／Pro × x64／ARM64 夹具可执行性。执行基础包含已交付文件／名字能力，以及按顺序独立交付的[8.2a 中立有序范围动作](2026-09-28-ordered-range-actions.md)和[8.2b SMB LOCK/CANCEL 生命周期](2026-09-28-smb-lock-cancel-lifecycle.md)；本任务随后提供[8.3 通知／缓存提案](2026-09-28-smb-change-notify-cache-coherence.md)所需的原生夹具。任务不实现 SMB 文件命令、变更缓存策略或最终 WN-01–17 全矩阵判定；后者由[原生资格提案](2026-09-28-smb-native-qualification.md)拥有。控制器必须保留后续资格测试能使用的精确事实和失败状态，不把一个未证明的平台行为编码为成功假设。
 
 ### 目录与依赖
 
