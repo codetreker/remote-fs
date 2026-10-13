@@ -69,7 +69,7 @@ R-SVC-9 由手动触发的 [release workflow](../../../.github/workflows/release
 
 build 只构建一次服务镜像，向私有 `ghcr.io/codetreker/remote-fs` 推送分配的 tag，将完整 tag 引用与 build 输出 digest 传给 staging 和 prod 作业。staging 部署成功并通过 Compose 就绪等待后，prod 才部署同一产物。tag 分配、构建、拉取、digest 校验、启动或就绪等待失败均使发布失败。
 
-staging 和 prod 两个 GitHub Environments 使用已有 `OC_VM_HOST`、`OC_VM_USER` 和 `OC_VM_SSH_KEY` 连接部署机，`OC_VM_KNOWN_HOSTS` 提供经核验的 SSH host 公钥记录。各自的 `DEPLOY_PATH` 指向独立环境目录，持有本环境的 `.env`、YAML 配置和私有 state；镜像不包含这些内容。两套环境使用 `remote-fs-staging` 和 `remote-fs-prod` Compose project name，同机部署的 HTTP 端口也必须不同。
+staging 和 prod 两个 GitHub Environments 使用已有 `OC_VM_HOST`、`OC_VM_USER` 和 `OC_VM_SSH_KEY` 连接部署机。脚本在连接前用 `ssh-keyscan` 自动取得 host key，写入私有临时 `known_hosts` 文件供 SCP/SSH 使用。各自的 `DEPLOY_PATH` 指向独立环境目录，持有本环境的 `.env`、YAML 配置和私有 state；镜像不包含这些内容。两套环境使用 `remote-fs-staging` 和 `remote-fs-prod` Compose project name，同机部署的 HTTP 端口也必须不同。
 
 [部署脚本](../../../.github/scripts/deploy-service.sh) 用 SSH/SCP 更新 `DEPLOY_PATH/compose.yml`，拉取本次 tag，并从本地 image 的 `RepoDigests` 核对本仓库的 digest 等于 build 输出的 `EXPECTED_DIGEST`；不匹配时在启动前失败。脚本将完整 tag 引用作为 `RFS_IMAGE` 传给 Compose，读取已有 `.env` 与临时镜像选择文件，执行 `up --pull never --no-build --wait --wait-timeout 180 app`；健康检查成功后才将选择文件写为 `release.env`。后续维护同时读取 `.env` 和 `release.env`。发布保留目录中的数据与配置，不执行初始化或管理员维护命令。
 

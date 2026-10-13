@@ -4,7 +4,6 @@ set -euo pipefail
 : "${OC_VM_HOST:?set OC_VM_HOST to the deployment SSH host}"
 : "${OC_VM_USER:?set OC_VM_USER to the deployment SSH user}"
 : "${OC_VM_SSH_KEY:?set OC_VM_SSH_KEY to the deployment private key}"
-: "${OC_VM_KNOWN_HOSTS:?set OC_VM_KNOWN_HOSTS to the trusted SSH host keys}"
 : "${DEPLOY_PATH:?set DEPLOY_PATH to the prepared environment directory}"
 : "${ENVIRONMENT:?set ENVIRONMENT to staging or prod}"
 : "${IMAGE:?set IMAGE to the service release tag}"
@@ -29,7 +28,8 @@ mkdir -p -- "$repository_root/.tmp"
 ssh_tmp=$(mktemp -d "$repository_root/.tmp/service-release.XXXXXX")
 trap 'rm -rf -- "$ssh_tmp"' EXIT
 printf '%s\n' "$OC_VM_SSH_KEY" > "$ssh_tmp/key"
-printf '%s\n' "$OC_VM_KNOWN_HOSTS" > "$ssh_tmp/known_hosts"
+ssh-keyscan -T 10 "$OC_VM_HOST" > "$ssh_tmp/known_hosts"
+[[ -s "$ssh_tmp/known_hosts" ]] || { printf '%s\n' 'SSH host key scan returned no keys' >&2; exit 1; }
 ssh_options=(
   -F /dev/null
   -i "$ssh_tmp/key"

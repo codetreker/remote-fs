@@ -14,7 +14,7 @@ staging 和 prod 作业接收同一完整 tag 引用与 build 输出的 `EXPECTE
 
 两个 GitHub Environments 分别提供自己的 `DEPLOY_PATH`。环境目录内的 `.env`、配置、state 和端口设置由部署方准备，workflow 更新 `compose.yml`，健康检查通过后将完整 tag 引用写入 `release.env` 的 `RFS_IMAGE`。发布不初始化、复制或删除既有服务数据。两套部署采用独立的 Compose project name，容器仍使用 `/var/lib/remote-fs` 作为 state root。
 
-GHCR 发布与拉取使用各作业自己的 `GITHUB_TOKEN`，SSH 使用已有部署机配置和经核验的 `OC_VM_KNOWN_HOSTS` 公钥记录。SSH 材料与 registry 登录状态在任务私有临时目录内使用并清理。包保持 private，部署方必须允许本仓库 workflow 访问该 package。服务的账号、owner、文件权限和存储行为仍由[独立管理服务](../feature/2026-10-12-standalone-volume-service.md)拥有；发布机制见[服务部署设计](../../../../docs/design/server/service.md)。
+GHCR 发布与拉取使用各作业自己的 `GITHUB_TOKEN`，SSH 使用已有部署机配置。脚本在连接前用 `ssh-keyscan` 自动取得 host key 并写入私有临时 `known_hosts`。SSH 材料与 registry 登录状态在任务私有临时目录内使用并清理。包保持 private，部署方必须允许本仓库 workflow 访问该 package。服务的账号、owner、文件权限和存储行为仍由[独立管理服务](../feature/2026-10-12-standalone-volume-service.md)拥有；发布机制见[服务部署设计](../../../../docs/design/server/service.md)。
 
 ## 范围
 

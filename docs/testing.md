@@ -509,7 +509,7 @@ SMB Basic 设置共享时间与 HIDDEN／SYSTEM 后，Linux 原 fd 的 fstat 必
 
 ## 服务发布
 
-R-SVC-9 的发布验证分为流程与运行两层。流程检查使用 actionlint 验证 [release workflow](../.github/workflows/release.yml)，核对 prod 依赖 build 与 staging，两个部署都取得同一 build 输出 tag 与 `EXPECTED_DIGEST`。shell 语法检查和 ShellCheck 验证[部署脚本](../.github/scripts/deploy-service.sh)与[聚焦用例](../.github/scripts/test-deploy-service.sh)。用例执行远端 Bash 命令，核对拉取 tag 后从 `RepoDigests` 匹配预期 digest，再以 `--pull never` 启动 Compose；拉取、inspect、digest 不匹配和健康等待失败时不推进 `release.env`。成功后记录本次完整 tag，私有 registry 登录目录随成功或失败清理。环境配置、state 和端口设置在部署前准备，用例核对部署不会修改这些内容。
+R-SVC-9 的发布验证分为流程与运行两层。流程检查使用 actionlint 验证 [release workflow](../.github/workflows/release.yml)，核对 prod 依赖 build 与 staging，两个部署都取得同一 build 输出 tag 与 `EXPECTED_DIGEST`。shell 语法检查和 ShellCheck 验证[部署脚本](../.github/scripts/deploy-service.sh)与[聚焦用例](../.github/scripts/test-deploy-service.sh)。用例核对 `ssh-keyscan` 先取得 host key，再执行 SCP/SSH；扫描失败或没有取得 key 时不连接，私有临时文件随结束清理。远端 Bash 用例核对拉取 tag 后从 `RepoDigests` 匹配预期 digest，再以 `--pull never` 启动 Compose；拉取、inspect、digest 不匹配和健康等待失败时不推进 `release.env`。成功后记录本次完整 tag，私有 registry 登录目录随成功或失败清理。环境配置、state 和端口设置在部署前准备，用例核对部署不会修改这些内容。
 
 [tag 分配用例](../.github/scripts/test-service-image-tag.py) 使用标准库 HTTP 替身验证 [tag 脚本](../.github/scripts/service-image-tag.py)：分页取得全部 tag 后按当天序号的数值取最大值，忽略旧日期和格式错误的 tag，首次编号为 1，已发布构建的重试取下一编号，hash 取源码 SHA 前 8 位。只有首次枚举明确返回 `NAME_UNKNOWN` 的 404 才表示尚无 tag；认证、网络、解析、类型和分页错误必须失败。用例还核对 UTC 日期、GHCR HTTPS 目标限制和输出不泄漏 token。
 

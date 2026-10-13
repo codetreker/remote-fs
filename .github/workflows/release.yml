@@ -60,7 +60,6 @@ jobs:
           OC_VM_HOST: ${{ vars.OC_VM_HOST }}
           OC_VM_USER: ${{ vars.OC_VM_USER }}
           OC_VM_SSH_KEY: ${{ secrets.OC_VM_SSH_KEY }}
-          OC_VM_KNOWN_HOSTS: ${{ vars.OC_VM_KNOWN_HOSTS }}
           DEPLOY_PATH: ${{ vars.DEPLOY_PATH }}
           ENVIRONMENT: staging
           IMAGE: ${{ needs.build.outputs.image }}
@@ -85,7 +84,6 @@ jobs:
           OC_VM_HOST: ${{ vars.OC_VM_HOST }}
           OC_VM_USER: ${{ vars.OC_VM_USER }}
           OC_VM_SSH_KEY: ${{ secrets.OC_VM_SSH_KEY }}
-          OC_VM_KNOWN_HOSTS: ${{ vars.OC_VM_KNOWN_HOSTS }}
           DEPLOY_PATH: ${{ vars.DEPLOY_PATH }}
           ENVIRONMENT: prod
           IMAGE: ${{ needs.build.outputs.image }}

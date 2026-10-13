@@ -32,14 +32,13 @@ staging 先拉取本次 tag，并校验它的 digest 与 build 输出一致。Co
 |---|---|---|
 | 组织或仓库 variable | `OC_VM_HOST` | 部署机 SSH host。 |
 | 组织或仓库 variable | `OC_VM_USER` | 可以运行 Docker Compose 的 SSH 用户。 |
-| 组织或仓库 variable | `OC_VM_KNOWN_HOSTS` | 与 SSH host 匹配、已核验的标准 known_hosts 公钥记录。 |
 | 组织或仓库 secret | `OC_VM_SSH_KEY` | 该用户的 SSH 私钥。 |
 | `staging` Environment variable | `DEPLOY_PATH` | staging 部署目录的绝对路径。 |
 | `prod` Environment variable | `DEPLOY_PATH` | production 部署目录的绝对路径。 |
 
 部署机安装 Docker Engine 和 Docker Compose plugin。每个 `DEPLOY_PATH` 都由 SSH 用户持有，各自准备 `.env`、YAML 配置和已初始化的私有 state。`.env` 提供 `RFS_CONFIG`、`RFS_STATE_ROOT` 的宿主绝对路径和 `RFS_HTTP_PORT`。staging 与 production 使用不同的目录、配置、state 和 HTTPS origin；同机运行时还须使用不同的 HTTP 端口。
 
-[部署脚本](.github/scripts/deploy-service.sh) 使用 `OC_VM_KNOWN_HOSTS` 校验部署机的 SSH 服务器身份，通过 SSH/SCP 更新 `<DEPLOY_PATH>/compose.yml`，采用 `remote-fs-staging` 和 `remote-fs-prod` Compose project name，保留 `.env`、YAML 配置与 state。只有容器通过就绪等待后才写入 `release.env`，其中 `RFS_IMAGE` 保存完整 tag 引用，例如 `ghcr.io/codetreker/remote-fs:261013-1-a1b2c3d4`。手动维护已发布环境时，同时传入 `--env-file .env --env-file release.env`。
+[部署脚本](.github/scripts/deploy-service.sh) 在连接前用 `ssh-keyscan` 自动取得 host key，写入私有临时 `known_hosts` 文件供 SCP/SSH 使用，并在结束时清理。脚本通过 SSH/SCP 更新 `<DEPLOY_PATH>/compose.yml`，采用 `remote-fs-staging` 和 `remote-fs-prod` Compose project name，保留 `.env`、YAML 配置与 state。只有容器通过就绪等待后才写入 `release.env`，其中 `RFS_IMAGE` 保存完整 tag 引用，例如 `ghcr.io/codetreker/remote-fs:261013-1-a1b2c3d4`。手动维护已发布环境时，同时传入 `--env-file .env --env-file release.env`。
 
 构建作业使用自己的 `GITHUB_TOKEN` 发布 package，每个部署作业使用自己的 token 拉取私有镜像，无需另配 registry PAT。部署脚本将 registry 登录状态放在部署目录内的私有临时目录并在结束时清理。[GitHub 新 package 默认 private](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry)；保留该 visibility，并允许本仓库的 Actions 访问它。组织禁用 package 权限继承时，需在 package 的 Manage Actions access 中授予本仓库访问权。部署顺序与范围见[发布决定](.agents/notes/implemented/process/2026-10-13-stage-service-image-release.md)。
 

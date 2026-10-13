@@ -11,7 +11,19 @@ cat > "$test_tmp/bin/mock" <<'MOCK'
 #!/usr/bin/env bash
 set -euo pipefail
 command_name=${0##*/}
+if [[ "$command_name" = ssh-keyscan ]]; then
+  [[ "$*" = '-T 10 vm.invalid' ]]
+  known_hosts=$(readlink "/proc/$$/fd/1")
+  [[ "$known_hosts" = */service-release.*/known_hosts ]]
+  printf '%s\n' "${known_hosts%/known_hosts}" >> "$MOCK_CASE/ssh-directories"
+  printf '%s\n' scan >> "$MOCK_CASE/transport-events"
+  [[ "$MOCK_FAIL" != scan ]] || exit 47
+  [[ "$MOCK_FAIL" != scan-empty ]] || exit 0
+  printf '%s\n' 'vm.invalid ssh-ed25519 test-host-key'
+  exit
+fi
 if [[ "$command_name" = ssh || "$command_name" = scp ]]; then
+  strict_host_key=false
   while [[ $# -gt 0 ]]; do
     case "$1" in
       -F|-i|-o)
@@ -20,12 +32,16 @@ if [[ "$command_name" = ssh || "$command_name" = scp ]]; then
           printf '%s\n' "${2%/key}" >> "$MOCK_CASE/ssh-directories"
         elif [[ "$1" = -o && "$2" = UserKnownHostsFile=* ]]; then
           [[ -f "${2#*=}" && $(stat -c '%a' "${2#*=}") = 600 ]]
+          [[ $(cat -- "${2#*=}") = 'vm.invalid ssh-ed25519 test-host-key' ]]
+        elif [[ "$1" = -o && "$2" = StrictHostKeyChecking=yes ]]; then
+          strict_host_key=true
         fi
         shift 2 ;;
       --) shift; break ;;
       *) break ;;
     esac
   done
+  [[ "$strict_host_key" = true ]]
   printf '%s\n' "$command_name" >> "$MOCK_CASE/transport-events"
   [[ "$MOCK_FAIL" != "$command_name" ]] || exit 45
   if [[ "$command_name" = scp ]]; then
@@ -97,7 +113,7 @@ case "$1" in
 esac
 MOCK
 chmod +x "$test_tmp/bin/mock"
-for command_name in ssh scp docker; do
+for command_name in ssh-keyscan ssh scp docker; do
   ln -s mock "$test_tmp/bin/$command_name"
 done
 
@@ -135,7 +151,6 @@ run_case() {
     PATH="$test_tmp/bin:$PATH" MOCK_CASE="$case_dir" MOCK_DEPLOY="$deployment" \
       MOCK_FAIL="$injected_failure" MOCK_IMAGE="$image" MOCK_DIGEST="$expected_digest" \
       OC_VM_HOST=vm.invalid OC_VM_USER=operator OC_VM_SSH_KEY=test-ssh-private-key \
-      OC_VM_KNOWN_HOSTS='vm.invalid ssh-ed25519 test-host-key' \
       DEPLOY_PATH="$deployment" ENVIRONMENT="$environment" IMAGE="$image" EXPECTED_DIGEST="$expected_digest" \
       GHCR_USERNAME=test-actor GHCR_TOKEN=test-package-token \
       bash "$repository_root/.github/scripts/deploy-service.sh"
@@ -162,6 +177,7 @@ run_case() {
   if [[ "$expected_status" = 0 ]]; then
     assert_equal "$(cat -- "$deployment/release.env")" "RFS_IMAGE=$image" 'successful selector does not select the build tag'
     assert_equal "$(cat -- "$case_dir/docker-events")" $'login\npull\ninspect\nwait' 'success did not check the pulled digest before waiting'
+    assert_equal "$(cat -- "$case_dir/transport-events")" $'scan\nscp\nssh' 'success did not use the automatic host key scan before transport'
     assert_equal "$(cat -- "$case_dir/project")" "remote-fs-$environment" 'environment project mismatch'
     cmp -- "$deployment/compose.yml" "$repository_root/deployments/service/compose.yml" || fail 'wrong Compose file deployed'
   else
@@ -172,6 +188,11 @@ run_case() {
       inspect|mismatch|image-id) assert_equal "$(cat -- "$case_dir/docker-events")" $'login\npull\ninspect' 'digest failure reached Compose' ;;
       wait) assert_equal "$(cat -- "$case_dir/docker-events")" $'login\npull\ninspect\nwait' 'health failure bypassed digest verification' ;;
       ssh|scp) [[ ! -s "$case_dir/docker-events" ]] || fail 'transport failure reached Docker' ;;
+      scan|scan-empty)
+        assert_equal "$(cat -- "$case_dir/transport-events")" scan 'host key scan failure reached SSH or SCP'
+        [[ ! -s "$case_dir/docker-events" ]] || fail 'host key scan failure reached Docker'
+        [[ ! -e "$deployment/compose.yml" ]] || fail 'host key scan failure updated Compose'
+        ;;
     esac
   fi
   printf 'PASS: %s/%s\n' "$environment" "${injected_failure:-success}"
@@ -191,4 +212,6 @@ run_case staging image-id 1 'image ID is not a repository digest'
 run_case staging wait 44 'health failure'
 run_case staging ssh 45 'SSH failure'
 run_case staging scp 45 'SCP failure'
+run_case staging scan 47 'host key scan failure'
+run_case staging scan-empty 1 'empty host key scan'
 printf '%s\n' 'PASS: deployment status, selectors, environment isolation and credential cleanup'
