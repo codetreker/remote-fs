@@ -8,6 +8,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"sync/atomic"
 	"syscall"
@@ -107,36 +108,50 @@ func decodeDirectoryEntriesForTest(t *testing.T, class byte, data []byte) []deco
 }
 
 func TestDirectoryRealCaptureValidatesUnmatchedLateNames(t *testing.T) {
-	for _, bad := range []string{"z-invalid.", "z-invalid ", "CON", string([]byte{'z', '-', 0xff}), "ZZ"} {
+	seed := newRealSMBFixture(t)
+	transports := []struct {
+		name    string
+		backend storage.FileStorage
+	}{
+		{"direct", seed.volume},
+		{"http", httpSMBBackendForTest(t, seed.volume)},
+	}
+	for index, bad := range []string{"z-invalid.", "z-invalid ", "CON", string([]byte{'z', '-', 0xff}), "ZZ"} {
 		t.Run(string([]byte(bad)), func(t *testing.T) {
-			fileInfoFixturesForTest(t, func(t *testing.T, f realSMBFixture) {
-				if err := f.volume.Mkdir(t.Context(), "d"); err != nil {
-					t.Fatal(err)
-				}
-				if err := f.volume.Write(t.Context(), "d/good", []byte("original")); err != nil {
-					t.Fatal(err)
-				}
-				id := openDirectoryForTest(t, f, "d")
-				if bad == "ZZ" {
-					if err := f.volume.Create(t.Context(), "d/zz"); err != nil {
+			for _, transport := range transports {
+				t.Run(transport.name, func(t *testing.T) {
+					parent := realSMBFixtureForSession(t, seed.volume, transport.backend, seed.raw)
+					f := newFileSessionFixture(t, parent)
+					f.tree.sessionID = f.session.id
+					directory := fmt.Sprintf("case%d-%s", index, transport.name)
+					if err := f.volume.Mkdir(t.Context(), directory); err != nil {
 						t.Fatal(err)
 					}
-				}
-				if err := f.volume.Create(t.Context(), "d/"+bad); err != nil {
-					t.Fatal(err)
-				}
-				_, status := f.connection.queryDirectory(t.Context(), f.session, f.tree, directoryRequestForTest(id, 12, 0, "good", 1024))
-				if status == statusOK || status == statusBufferOverflow || status == 0x80000006 || status == 0xc000000f {
-					t.Fatalf("unmatched invalid name %q allowed a successful/invented absence result=%#x", bad, status)
-				}
-				if data, err := f.volume.Read(t.Context(), "d/good"); err != nil || string(data) != "original" {
-					t.Fatalf("failed observation changed valid object=%q error=%v", data, err)
-				}
-				if _, err := f.volume.Stat(t.Context(), "d/"+bad); err != nil {
-					t.Fatalf("failed observation removed raw bad name: %v", err)
-				}
-				closeFixtureHandle(t, f, id)
-			})
+					if err := f.volume.Write(t.Context(), directory+"/good", []byte("original")); err != nil {
+						t.Fatal(err)
+					}
+					id := openDirectoryForTest(t, f, directory)
+					if bad == "ZZ" {
+						if err := f.volume.Create(t.Context(), directory+"/zz"); err != nil {
+							t.Fatal(err)
+						}
+					}
+					if err := f.volume.Create(t.Context(), directory+"/"+bad); err != nil {
+						t.Fatal(err)
+					}
+					_, status := f.connection.queryDirectory(t.Context(), f.session, f.tree, directoryRequestForTest(id, 12, 0, "good", 1024))
+					if status == statusOK || status == statusBufferOverflow || status == 0x80000006 || status == 0xc000000f {
+						t.Fatalf("unmatched invalid name %q allowed a successful/invented absence result=%#x", bad, status)
+					}
+					if data, err := f.volume.Read(t.Context(), directory+"/good"); err != nil || string(data) != "original" {
+						t.Fatalf("failed observation changed valid object=%q error=%v", data, err)
+					}
+					if _, err := f.volume.Stat(t.Context(), directory+"/"+bad); err != nil {
+						t.Fatalf("failed observation removed raw bad name: %v", err)
+					}
+					closeFixtureHandle(t, f, id)
+				})
+			}
 		})
 	}
 }

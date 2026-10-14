@@ -61,6 +61,14 @@ SQLite 的纯只读取消保留 context 原因并归为 `EINTR`。[database/sql 
 
 修复继续拥有错误的阶段判定与跨层传播。[首次副本订阅的构建取消](../../proposed/bug-fix/2026-09-07-cancel-initial-replica-subscription.md)仍需要初始化与长期订阅的生命周期交接；[容量上限](../architecture/2026-08-21-space-limit.md)与其计费决定分别拥有权威用量、实际发布结算及通用包装的剩余限制。
 
+### 普通比较观察与首次中断判据分开
+
+普通对拍的判据是最终状态与身份；[retryComparisonInterruption](../../../../packages/fuse/fuse_test.go)只在 storage.ErrnoOf 把原错误单独分类为 EINTR 时重做相同调用，总尝试至多八次。它用于固定参数的 Chtimes、Unlink／Rmdir 及 raw 目录观察；hard error、含 EIO 的 joined error 和最后一次 EINTR 都保留，成功必须来自实际调用的无错误结果。确定性用例分别验证成功、纯／包裹 EINTR、hard／joined failure 与上限。
+
+listedInodes 仍读取真实 raw Dirent.Ino。unix.Open 的重试保持路径、O_RDONLY|O_DIRECTORY 与 mode，成功后才持有返回 fd；该 fd 只 Close 一次，不对 close 使用重试策略。每次 unix.Getdents 在同一 fd／buffer 和当前 cursor 上重试，不重开目录或重置 offset，失败结果不进入 Dirent 解析。inode 与 symlink 的身份比较保持；该辅助观察的 errno 本身不能证明一次历史失败发生在 Open 还是 Getdents，也不能证明其信号来源。
+
+首次 EINTR、请求取消、未执行证明和关闭阶段是另一组判据。原始信号探针继续观察第一次 syscall，不使用普通比较的 helper；生产请求的效果分类与未确认责任仍按原阶段处理。完整调用范围见[测试策略](../../../../docs/testing.md#分层)。
+
 ### 原请求必须得到回复
 
 [go-fuse 的 Context 约定](https://github.com/hanwen/go-fuse/blob/423b377e1452ab7b3522229185a3047f72e3f966/fuse/context.go#L12-L18)规定，文件系统接受请求取消时回复 `EINTR`；[其 API 说明](https://github.com/hanwen/go-fuse/blob/423b377e1452ab7b3522229185a3047f72e3f966/fuse/api.go#L413-L419)说明非忽略信号与 Go 抢占均可产生中断。[Linux FUSE 文档](https://github.com/torvalds/linux/blob/e8f897f4afef0031fe618a8e94127a0934896aba/Documentation/filesystems/fuse.rst#L136-L173)允许忽略 `INTERRUPT` 继续原请求，或向原请求回复 `EINTR`。[go-fuse 的协议发送逻辑](https://github.com/hanwen/go-fuse/blob/423b377e1452ab7b3522229185a3047f72e3f966/fuse/protocol-server.go#L63-L94)区分 `INTERRUPT` 消息自身与原请求：连接仍存活时，原请求的 `EINTR` 会正常序列化并回复。
@@ -73,7 +81,7 @@ SQLite 的纯只读取消保留 context 原因并归为 `EINTR`。[database/sql 
 
 **不回复被中断的原 FUSE 请求。** `FUSE_INTERRUPT` 不免除原请求的回复义务；忽略原回复会让调用线程继续等待。请求被接受取消时仍回复 `EINTR`。
 
-**在测试里重试、预热或关闭异步抢占。** 这些做法改变信号或首次操作条件，掩盖实际程序仍会遇到的错误。保留原用例的断言和执行条件，另加确定性的信号与阶段测试。
+**在验证首次中断结果的测试里重试、预热或关闭异步抢占。** 这些做法改变信号或首次操作条件，掩盖实际程序仍会遇到的错误。原首次 syscall 的断言与执行条件保留；普通最终状态比较的有界纯 EINTR helper 不用于这些探针。
 
 **让 `Flush` 像普通查询一样接受取消并返回 `EINTR`。** `close(2)` 已经消耗描述符，普通 Go `File.Close` 不会以同一描述符重试；未提交内容可能随 `Release` 消失。只给 `Flush` 一次受预算约束的完成机会，保留其它可取消操作的行为。
 

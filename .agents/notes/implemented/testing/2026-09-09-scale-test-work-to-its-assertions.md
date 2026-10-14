@@ -4,19 +4,25 @@ Status: implemented
 
 ## 问题
 
-部分拒绝矩阵在每个子用例重新建立同一套真实后端，但被检查的结果正是“调用失败且状态不变”。副本确认用例则在建立挂载时就延迟事件流，使尚未进入被测确认阶段的初始化也承担等待。它们重复支付了准备成本，却没有增加对应拒绝或确认断言的覆盖。
+部分矩阵在每个子用例重新建立同一套真实后端。拒绝项检查“调用失败且状态不变”；SMB 的打开、关闭删除、目录捕获和退休项检查各自真实对象与引用的效果。相同 schema 的重复形成并不是这些场景的判据，操作、授权、动作历史和清理寿命却必须隔离。副本确认用例则在建立挂载时就延迟事件流，使尚未进入被测确认阶段的初始化也承担等待。它们重复支付了准备成本，却没有增加对应拒绝或确认断言的覆盖。
 
 另一些错误路径取决于两个真实故障谁先返回。响应失败和 follower 失败同时发生时，端到端用例可以正确拒绝修改，却不能稳定覆盖“服务器已成功、随后无法确认”的特定分支。测试需要分别证明具体错误语义与真实双故障交错。公共 storage 原子替换契约的重复写入次数还决定统计暴露与耗时，需要在保留检测证据的前提下单独作取舍。
 
 ## 决定
 
-### 拒绝矩阵在不变性检查下复用后端
+### 矩阵复用准备，子用例独立拥有操作状态
 
 [SQLite 匿名发布矩阵](../../../../packages/metastore/sqlite/publication_test.go)为 S、X 各建立一份真实 fixture，共两份。每种权限仍按原顺序执行九种操作，共 18 个 leaf；每次调用前后的 List、Space 与 Conflict 分类断言保留。调用前还与该权限 fixture 的初始列表、配额比较，上一项拒绝若污染状态，下一项会明确失败，不能把污染当作新的基线。
 
 [HTTP 构造选项的两个矩阵](../../../../packages/transport/httprest/server_test.go)分别复用各自原有的 failingStorage 包装器。每个子用例从完整 options 值复制后只破坏原定字段，继续调用原来的 Check／constructor。可用配置与零值默认配置仍成功；构造测试验证配置和所需接口形状，错误路径保留原注入错误。纯拒绝fixture的storage与lockservice全部方法返回该错误和零结果，不使用能意外成功的健康backing；健康publication与lock能力由真实nativefixture的独立用例验证。
 
 HTTP文件信息、metadata观察与恢复矩阵复用顶层真实authority的schema准备，各项保持独立对象、HTTPpair、session、journal与faultwriter；不共享已接受动作或恢复状态。持久状态形成、初始化失败清理与真实锁／publication验证继续使用各自必要的nativefixture；没有加入新的detached完整性种子复制。文件信息的fixture归属见[文件信息决定](../feature/2026-09-28-smb-file-information.md)。
+
+SMB 七个现有父矩阵由父测试各拥有一份真实 SQLite／memory authority，direct 与原 HTTP overlay 访问同一后端。关闭删除的 disposition、原关联的 SDK 修改和效果前拒绝矩阵位于[关闭删除用例](../../../../packages/smb/delete_intent_integration_linux_test.go)；非法原子打开结果及迟到结果的取消／退休矩阵位于[CREATE 用例](../../../../packages/smb/commands_file_integration_linux_test.go)；不匹配坏名字的完整捕获和签名目录退休分别位于[目录捕获](../../../../packages/smb/commands_directory_integration_linux_test.go)与[签名目录用例](../../../../packages/smb/protocol_directory_linux_test.go)。65 个语义子用例的父／子名称、原断言、故障时点与生命周期拓扑保持，物理 authority 准备为 7 份。
+
+每个子用例以原 backend 新建 raw FileSession，取得自身 Status／action epoch，再构造新的 Server／Tree／config／policy／owner ledger；不同场景使用独立路径或父目录。非法叶名及 ordinal 冲突只隔离其父目录，不改写待拒绝的原始 leaf。签名场景还各自创建 TCP connection、认证会话和 signer。复用只属于 native/schema 准备，不能让一个 child 的授权、未知动作、引用或捕获状态进入下一个 child。
+
+newFileSessionFixture 的 cleanup 检查 tree handles、opening/live handles、directory bytes、unknown/write payload、flush 与 delete-recovery 本地责任已经结束，并调用原 raw CloseWithResult；error、Determined=false 或 Released=false 都使测试失败。协议 server 在所属 child 的原 Shutdown／Serve join 路径中关闭。原 lease／history rotation、restart、quota、恢复与跨进程用例继续各自形成所需状态；共享矩阵不改变它们的时间、容量、owner 或错误判据。
 
 ### 确认用例在初始化完成后控制事件交付
 
@@ -38,7 +44,7 @@ HTTP文件信息、metadata观察与恢复矩阵复用顶层真实authority的sc
 
 ## 备选方案
 
-**每个拒绝项重新构造后端。** 自然隔离，但重复准备相同 authority、内容与元数据。按权限或矩阵复用可以减少准备，前提是保留逐项前后断言，并拒绝跨项状态污染。
+**每个矩阵子项重新构造后端。** 物理隔离直接，但重复准备相同 authority／schema，未增加所检查的操作效果。按权限或父矩阵复用减少准备，前提是每个 child 保留独立引用、授权、动作、路径和原状态／清理断言；验证初始化或持久形成的用例仍需独立准备。
 
 **从 bootstrap 开始延迟整条事件流。** 它能制造未确认结果，但把初始化也放入无关等待。初始化后控制交付点可以保留确认阶段的真实停顿；专门断言慢 snapshot 或 stream 时序的用例仍使用延迟。
 
@@ -48,7 +54,7 @@ HTTP文件信息、metadata观察与恢复矩阵复用顶层真实authority的sc
 
 ## 后果
 
-SQLite 拒绝矩阵的真实准备从 18 份减为 2 份，18 个 leaf、操作次序与每次调用的状态断言不减少；HTTP 两个矩阵分别只准备一次原有包装器。共享后端增加了测试对不变性和正确 cleanup 归属的依赖，不能通过重置或吞掉错误来隐藏污染。事件门减少初始化阶段的等待，不缩短被测 grace 或 Close 上限。
+SQLite 拒绝矩阵的真实准备从 18 份减为 2 份，18 个 leaf、操作次序与每次调用的状态断言不减少；HTTP 两个矩阵分别只准备一次原有包装器。共享后端增加了测试对不变性和正确 cleanup 归属的依赖，不能通过重置或吞掉错误来隐藏污染。SMB 七个父矩阵的 65 个子场景继续执行，减少的是相同 schema／authority 的重复初始化；每个 raw session 的确定释放、case-local owner 归零与独立命名是接受共享的条件。事件门减少初始化阶段的等待，不缩短被测 grace 或 Close 上限。
 
 相同 Go 1.26.8、环境与 flags 的各一次普通整包运行中，SQLite 拒绝矩阵从 0.36 秒变为 0.06 秒，HTTP 两个矩阵合计从 0.57 秒变为 0.04 秒，五个副本用例合计从 35.03 秒变为 2.53 秒。这些是单次用例耗时观察，不是隔离的 benchmark，也不能据此推算 CI 作业耗时。
 
@@ -58,4 +64,4 @@ Go 1.26.8、GOMAXPROCS=2 的三组 race 正向配对测量中，带 API 区间�
 
 覆盖块未减少、有限负向对照通过和 API 区间重叠，都不能证明内部竞争窗口具有相同检出概率。100 次写入减少遇到长尾时序的机会；更窄窗口或新缺陷若不能被稳定检出，应增加定向交错或恢复所需负载。不能以包覆盖率相同掩盖这个统计代价。
 
-这些调整沿用[先前测试工作决定](2026-09-09-reduce-test-work.md)的真实后端与隔离约束；该记录中的历史数据和取舍保留。包划分、两个 CI 作业、race、`-count=1`、错误判定、[包内覆盖门禁](2026-09-09-sqlite-package-local-coverage.md)与执行预算均不放宽。局部准备成本和整条 CI 耗时分别验证，不能把覆盖到同一代码块等同于覆盖所有竞争窗口。
+这些调整沿用[先前测试工作决定](2026-09-09-reduce-test-work.md)的真实后端与隔离约束；该记录中的历史数据和取舍保留。CI 包划分与作业配置、race、`-count=1`、错误判定、[包内覆盖门禁](2026-09-09-sqlite-package-local-coverage.md)与执行预算均不放宽。局部准备成本和整条 CI 耗时分别验证，不能把覆盖到同一代码块等同于覆盖所有竞争窗口。

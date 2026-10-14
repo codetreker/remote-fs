@@ -59,7 +59,8 @@ QUERY_INFO／SET_INFO 的原签名字节不改写，related FileId 只在 frame-
 | 延后能力 | 延后代价与保持的结构 | 未交付请求的结果 |
 |---|---|---|
 | [7.6 关闭删除](../../implemented/feature/2026-09-28-smb-close-delete-obligation.md)与[8.1 名字修改](2026-09-28-smb-guarded-name-mutation.md) | 增加持久义务与 ancestryguards；旧 CREATE 名字不当作当前事实 | ordinary disposition、rename 与 normalized current name 由各自独立决定拥有；link 保持 unsupported |
-| [8.2 范围锁](../../proposed/feature/2026-09-28-smb-range-lock-cancel.md) | 增加跨入口范围保护；EOF／Basic 继续走受控 reference 和 authority 最终检查 | LOCK／asyncCANCEL 按未交付协议结果处理 |
+| [8.2a 中立有序范围动作](../../proposed/feature/2026-09-28-ordered-range-actions.md) | 补足跨入口范围排序与结果核对；EOF／Basic 继续走受控 reference 和 authority 最终检查 | 中立能力按独立提案交付 |
+| [8.2b SMB LOCK/CANCEL 生命周期](../../proposed/feature/2026-09-28-smb-lock-cancel-lifecycle.md) | 依赖 8.2a 增加范围命令与异步请求生命周期；原引用 owner 继续拥有清理 | LOCK／async CANCEL 按未交付协议结果处理 |
 | [8.3 通知与缓存](../../proposed/feature/2026-09-28-smb-change-notify-cache-coherence.md) | 增加失效协议与原生证明；不能将 Go／wire 查询成功当作 Windows 私有缓存资格 | CHANGE_NOTIFY 明确 unsupported |
 
 allocation setter、EA／streams／compression／reparse、position／mode setter、security／quota 信息和 FScontrol 不在类表。未支持的信息类返回 NOT_SUPPORTED；支持类的畸形 length／flag 按规范返回 INVALID_PARAMETER 或指定长度错误，不用占位字段凑成功。

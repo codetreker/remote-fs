@@ -996,7 +996,14 @@ func TestListingADirectoryNothingHasLookedInsideYet(t *testing.T) {
 // two stats and never observe the numbers the listing itself carries.
 func listedInodes(t *testing.T, dir string) map[string]uint64 {
 	t.Helper()
-	fd, err := unix.Open(dir, unix.O_RDONLY|unix.O_DIRECTORY, 0)
+	var fd int
+	err := retryComparisonInterruption(func() error {
+		opened, err := unix.Open(dir, unix.O_RDONLY|unix.O_DIRECTORY, 0)
+		if err == nil {
+			fd = opened
+		}
+		return err
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1005,7 +1012,12 @@ func listedInodes(t *testing.T, dir string) map[string]uint64 {
 	listed := map[string]uint64{}
 	buf := make([]byte, 8192)
 	for {
-		n, err := unix.Getdents(fd, buf)
+		var n int
+		err := retryComparisonInterruption(func() error {
+			var err error
+			n, err = unix.Getdents(fd, buf)
+			return err
+		})
 		if err != nil {
 			t.Fatal(err)
 		}
