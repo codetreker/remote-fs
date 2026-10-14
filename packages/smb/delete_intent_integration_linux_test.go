@@ -79,6 +79,8 @@ func requireDeleteOutcomeForTest(t *testing.T, f realSMBFixture, intent storage.
 }
 
 func TestDeleteOnCloseAtomicDispositions(t *testing.T) {
+	seed := newRealSMBFixture(t)
+	httpBackend := httpSMBBackendForTest(t, seed.volume)
 	for _, transport := range []string{"direct", "http"} {
 		for _, test := range []struct {
 			name                         string
@@ -97,19 +99,21 @@ func TestDeleteOnCloseAtomicDispositions(t *testing.T) {
 			{"directory-create", 2, accessReadAttr | accessDelete, createDirectory, false, storage.Created},
 		} {
 			t.Run(transport+"/"+test.name, func(t *testing.T) {
-				factory := newRealSMBFixture
+				backend := storage.FileStorage(seed.volume)
 				if transport == "http" {
-					factory = newHTTPSMBFixture
+					backend = httpBackend
 				}
-				f := enableDeleteIntentsForTest(t, factory(t))
+				parent := realSMBFixtureForSession(t, seed.volume, backend, seed.raw)
+				f := enableDeleteIntentsForTest(t, newFileSessionFixture(t, parent))
+				name := transport + "-" + test.name
 				var previous storage.Attr
 				if test.exists {
-					if err := f.volume.Write(t.Context(), "victim", []byte("original")); err != nil {
+					if err := f.volume.Write(t.Context(), name, []byte("original")); err != nil {
 						t.Fatal(err)
 					}
-					previous = seedIOWindowsMetadata(t, f, "victim", dosHidden|dosSystem)
+					previous = seedIOWindowsMetadata(t, f, name, dosHidden|dosSystem)
 				}
-				request := deleteCreateRequestForTest("victim", test.disposition, test.access, test.options)
+				request := deleteCreateRequestForTest(name, test.disposition, test.access, test.options)
 				if test.exists && test.disposition >= 4 {
 					binary.LittleEndian.PutUint32(request.Body[28:], dosHidden|dosSystem)
 				}
@@ -117,7 +121,7 @@ func TestDeleteOnCloseAtomicDispositions(t *testing.T) {
 				if status != statusOK || id == (wire.FileID{}) || len(body) != 88 || binary.LittleEndian.Uint32(body[4:]) != uint32(test.outcome) {
 					t.Fatalf("atomic create status=%#x id=%x body=%x", status, id, body)
 				}
-				attr, err := f.volume.Stat(t.Context(), "victim")
+				attr, err := f.volume.Stat(t.Context(), name)
 				if err != nil || test.exists && attr.ID != previous.ID {
 					t.Fatalf("atomic identity=%+v previous=%+v err=%v", attr, previous, err)
 				}
@@ -133,7 +137,7 @@ func TestDeleteOnCloseAtomicDispositions(t *testing.T) {
 					t.Fatalf("armed standard=%x", standard)
 				}
 				closeDeleteFixtureHandle(t, f, id)
-				if _, err := f.volume.Stat(t.Context(), "victim"); !errors.Is(err, syscall.ENOENT) {
+				if _, err := f.volume.Stat(t.Context(), name); !errors.Is(err, syscall.ENOENT) {
 					t.Fatalf("close left name: %v", err)
 				}
 			})
@@ -217,48 +221,52 @@ func TestDeleteOnCloseWaitsForCompatibleSMBAndSDKReferences(t *testing.T) {
 }
 
 func TestDeleteOnCloseTracksOriginalAssociationThroughSDKMutations(t *testing.T) {
+	seed := newRealSMBFixture(t)
+	httpBackend := httpSMBBackendForTest(t, seed.volume)
 	for _, transport := range []string{"direct", "http"} {
 		for _, mutation := range []string{"rename", "unlink", "replacement"} {
 			t.Run(transport+"/"+mutation, func(t *testing.T) {
-				factory := newRealSMBFixture
+				backend := storage.FileStorage(seed.volume)
 				if transport == "http" {
-					factory = newHTTPSMBFixture
+					backend = httpBackend
 				}
-				f := enableDeleteIntentsForTest(t, factory(t))
-				if err := f.volume.Write(t.Context(), "victim", []byte("original")); err != nil {
+				parent := realSMBFixtureForSession(t, seed.volume, backend, seed.raw)
+				f := enableDeleteIntentsForTest(t, newFileSessionFixture(t, parent))
+				name, moved, source := transport+"-"+mutation+"-victim", transport+"-"+mutation+"-moved", transport+"-"+mutation+"-source"
+				if err := f.volume.Write(t.Context(), name, []byte("original")); err != nil {
 					t.Fatal(err)
 				}
-				original, err := f.volume.Stat(t.Context(), "victim")
+				original, err := f.volume.Stat(t.Context(), name)
 				if err != nil {
 					t.Fatal(err)
 				}
-				_, status, id := f.connection.createFile(WithPrincipal(t.Context(), f.session.principal), f.session, f.tree, deleteCreateRequestForTest("victim", 1, accessReadData|accessDelete, 0))
+				_, status, id := f.connection.createFile(WithPrincipal(t.Context(), f.session.principal), f.session, f.tree, deleteCreateRequestForTest(name, 1, accessReadData|accessDelete, 0))
 				if status != statusOK {
 					t.Fatalf("arm status=%#x", status)
 				}
 				intent := acceptedDeleteIntentForTest(t, f, original.ID)
 				if mutation == "rename" {
-					if err := f.volume.Rename(t.Context(), "victim", "moved"); err != nil {
+					if err := f.volume.Rename(t.Context(), name, moved); err != nil {
 						t.Fatal(err)
 					}
 				} else if mutation == "unlink" {
-					if err := f.volume.Remove(t.Context(), "victim"); err != nil {
+					if err := f.volume.Remove(t.Context(), name); err != nil {
 						t.Fatal(err)
 					}
 				} else {
-					if err := f.volume.Write(t.Context(), "source", []byte("replacement")); err != nil {
+					if err := f.volume.Write(t.Context(), source, []byte("replacement")); err != nil {
 						t.Fatal(err)
 					}
-					if err := f.volume.Rename(t.Context(), "source", "victim"); err != nil {
+					if err := f.volume.Rename(t.Context(), source, name); err != nil {
 						t.Fatal(err)
 					}
 				}
 				if mutation != "replacement" {
-					if err := f.volume.Write(t.Context(), "victim", []byte("replacement")); err != nil {
+					if err := f.volume.Write(t.Context(), name, []byte("replacement")); err != nil {
 						t.Fatal(err)
 					}
 				}
-				replacement := requireIOContents(t, f, "victim", "replacement")
+				replacement := requireIOContents(t, f, name, "replacement")
 				if replacement.ID == original.ID {
 					t.Fatal("SDK replacement reused identity")
 				}
@@ -268,9 +276,9 @@ func TestDeleteOnCloseTracksOriginalAssociationThroughSDKMutations(t *testing.T)
 					t.Fatalf("old reference rebound=%q %v", body.Data, err)
 				}
 				closeDeleteFixtureHandle(t, f, id)
-				requireIOContents(t, f, "victim", "replacement")
+				requireIOContents(t, f, name, "replacement")
 				if mutation == "rename" {
-					if _, err := f.volume.Stat(t.Context(), "moved"); !errors.Is(err, syscall.ENOENT) {
+					if _, err := f.volume.Stat(t.Context(), moved); !errors.Is(err, syscall.ENOENT) {
 						t.Fatalf("renamed association left: %v", err)
 					}
 				} else {
@@ -295,6 +303,8 @@ func closeDeleteFixtureHandle(t *testing.T, f realSMBFixture, id wire.FileID) {
 }
 
 func TestDeleteOnCloseRejectsBeforeAtomicEffects(t *testing.T) {
+	seed := newRealSMBFixture(t)
+	httpBackend := httpSMBBackendForTest(t, seed.volume)
 	for _, transport := range []string{"direct", "http"} {
 		for _, test := range []struct {
 			name                                              string
@@ -309,12 +319,13 @@ func TestDeleteOnCloseRejectsBeforeAtomicEffects(t *testing.T) {
 			{"delete-denied", 5, accessWriteData | accessDelete, 0, 0, 7, true, true},
 		} {
 			t.Run(transport+"/"+test.name, func(t *testing.T) {
-				factory := newRealSMBFixture
+				backend := storage.FileStorage(seed.volume)
 				if transport == "http" {
-					factory = newHTTPSMBFixture
+					backend = httpBackend
 				}
-				f := enableDeleteIntentsForTest(t, factory(t))
-				name := "victim"
+				parent := realSMBFixtureForSession(t, seed.volume, backend, seed.raw)
+				f := enableDeleteIntentsForTest(t, newFileSessionFixture(t, parent))
+				name := transport + "-" + test.name
 				if test.name == "root" {
 					name = ""
 				}

@@ -108,7 +108,7 @@ Status: implemented
 
 原子替换读循环以 Go 1.26.7、相同 race 配置作三组配对测量。limited 的 native publication 分支中位数从 10.858 秒降至 8.238 秒（24.1%），unmanaged bounded 分支从 11.672 秒降至 9.384 秒（19.6%）；这张测量不混入后续 Go 1.26.8 的执行结果。总读取次数的中位数也分别从 4933 降为 3277、从 4980 降为 3359，因此不能只用耗时更短证明选择成立。每个读者的 API 区间都与全部 200 次写入重叠，且各自看到了两种值；按每个读者统计，至少含一次完整 Read 调用的 Write 调用区间数从 193～199 次变为 197～200 次。两种实现、调度前后各十次无额外等待的非原子负向对照，合计 40 次均检出损坏。正确后端样本没有遇到 EAGAIN，因此没有动态覆盖该让出分支；它仍沿用原错误接受规则。读取样本减少的代价由这些区间分布和负向对照约束，但它们不能证明更窄内部损坏窗口的检出率等价，也不能推出净 CI 收益。
 
-SMB share matrix、live scalar corruption 和 frontier 超限用例使用 Go 1.26.8、`GOMAXPROCS=2`，前后各执行三次 `go test -json -race -p=1 -count=1 -timeout 10m`，每次用 `-run` 精确选择对应顶层测试。编译预热独立记录，以下为顶层测试 Elapsed 的中位数，包含准备、子项和清理，不包含编译与进程启动耗时：
+SMB share matrix、live scalar corruption 和 frontier 超限用例的匹配测量比较 [0d49a6a](https://github.com/codetreker/remote-fs/tree/0d49a6a833bcb01f90d8ee5c56c2c93431ddb771) 与 [732a92b](https://github.com/codetreker/remote-fs/tree/732a92b007f710be6c987b4c71965b3db21d49fc) 的测试源码。两者使用 Go 1.26.8、`GOMAXPROCS=2`，前后各执行三次 `go test -json -race -p=1 -count=1 -timeout 10m`，每次用 `-run` 精确选择对应顶层测试。编译预热独立记录，以下为顶层测试 Elapsed 的中位数，包含准备、子项和清理，不包含编译与进程启动耗时：
 
 | 用例 | 原执行方式（分钟） | 优化后（分钟） | 减少 |
 |---|---:|---:|---:|
@@ -118,7 +118,7 @@ SMB share matrix、live scalar corruption 和 frontier 超限用例使用 Go 1.2
 
 每次的原 verdict 名称集合分别为 3、15 和 1 个，前后完全相同，全部通过且没有 skip 或 fail；144 个 SMB 逻辑向量仍在两个 transport 子项内逐项执行。这个比较只衡量三项用例的准备改动，不能推算并发调度后的完整 CI 耗时。
 
-SQLite、SMB 与 limited 前后各一次完整普通构建使用带 `-json -p=1 -count=1 -timeout 10m` 的 `go test`，通过 `-coverprofile` 保存默认 package-local instrumentation 的执行结果。2181 项 Package／Test／Action verdict 完全相同，全部通过且没有 skip 或 fail。生产覆盖块清单相同，没有丢失任何已覆盖块；SQLite 为 2913→2913、limited 为 493→493，SMB 为 3299→3300，增加的是既有 cleanup 路径的一块运行观察。三包覆盖率分别为 81.5524%、88.2022%→88.2363% 和 91.2258%。这些是局部测试与 profile 比较，完整 module-wide coverage gate 仍由 CI 执行。三包的定向 `go vet -p=1` 与三个修改文件的 `gofmt -l` 均退出零且无输出。
+相同两份源码的 SQLite、SMB 与 limited 前后各一次完整普通构建使用带 `-json -p=1 -count=1 -timeout 10m` 的 `go test`，通过 `-coverprofile` 保存默认 package-local instrumentation 的执行结果。2181 项 Package／Test／Action verdict 完全相同，全部通过且没有 skip 或 fail。生产覆盖块清单相同，没有丢失任何已覆盖块；SQLite 为 2913→2913、limited 为 493→493，SMB 为 3299→3300，增加的是既有 cleanup 路径的一块运行观察。三包覆盖率分别为 81.5524%、88.2022%→88.2363% 和 91.2258%。这些是局部测试与 profile 比较，完整 module-wide coverage gate 仍由 CI 执行。三包的定向 `go vet -p=1` 与三个修改文件的 `gofmt -l` 均退出零且无输出。
 
 共享契约数据库让前面子用例的 volume 留到顶层结束，增加后续 Open 面对的已存状态；工厂的唯一命名和跨例不变性检查不能省略。完整性矩阵另须保存一份种子字节，并为每个子用例复制文件、重新打开真实 SQLite。种子必须完整、不可变且只在所属顶层用例内存活；损坏或隔离检查失败就结束测试，不能回退成一份看似有效的新数据库。live scalar 矩阵则保留同一份活 owner，对前置状态和逐项恢复的验证不能省略；SMB 分组减少重复取得 incumbent，对每个 applicant 的独立关闭和最终清理检查保持。
 
