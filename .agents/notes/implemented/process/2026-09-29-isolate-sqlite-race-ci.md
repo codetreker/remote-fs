@@ -10,9 +10,9 @@ Status: implemented
 
 ## 决定
 
-[CI workflow](../../../../.github/workflows/ci.yml)使用三个 Linux 作业。`checks` 执行 build、vet、格式、链接、串行全负载验收和其它非挂载包的 race suite；它用 `go list` 从并行 suite 中精确排除挂载包、**根** `./packages/metastore/sqlite` 与根 HTTP 包。HTTP 由同一 checks 作业的后续步骤完整执行，其理由由[HTTP race 调度决定](2026-10-12-isolate-http-race-ci.md)持有。`sqlite-race` 在独立 Ubuntu runner 上只对根 SQLite 包执行 `assert-every-test-ran.sh -race -count=1 -timeout 10m ./packages/metastore/sqlite`。SQLite 的内部子包仍由 `checks` 运行，不能在这些包集合之间丢包。`mounted` 保持 FUSE／端到端 race、卸载检查及整个模块的 package-local 覆盖率门禁；覆盖率调用仍包含根 SQLite 包。Windows 作业独立。
+[CI workflow](../../../../.github/workflows/ci.yml)的 `sqlite-race` 在独立 Ubuntu runner 上只对根 SQLite 包执行 `assert-every-test-ran.sh -race -count=1 -timeout 10m ./packages/metastore/sqlite`。SQLite 的内部子包仍由 `checks-work` 的其它非挂载 race suite 运行，不能在包集合之间丢包。`mounted` 保持 FUSE／端到端 race、卸载检查及整个模块的 package-local 覆盖率门禁；覆盖率调用仍包含根 SQLite 包。Windows 作业独立。其它非挂载工作、HTTP 根包与最终门禁的现行分工由[并发 CI 决定](2026-10-14-parallel-ci-execution.md)持有；HTTP 完整独立执行的依据见[HTTP race 调度决定](2026-10-12-isolate-http-race-ci.md)。
 
-SQLite race 作业上限为二十分钟，但 Go 的十分钟 watchdog 仍约束该包二进制的累计执行。strict script 继续拒绝 skip、无测试、缺失 verdict 与测试进程失败；`-count=1` 禁止缓存结果替代执行。独立 runner 去掉同作业其它 Go 包与 SQLite race 的并行资源竞争，不降低测试断言，也不放宽测试本身的完成期限。受保护分支的现有必需状态是 `checks`，不是新增 `sqlite-race`：workflow 令 `checks` 依赖它，并以 `always()` 使 checks 在依赖失败或跳过后仍运行；最后一步显式核对 `needs.sqlite-race.result == success`，其它结果使原必需检查失败。该作业没有 Blob 依赖；`checks` 与 `mounted` 继续各自启动 Azurite 供它们的 Blob 用例使用。
+SQLite race 作业上限为二十分钟，但 Go 的十分钟 watchdog 仍约束该包二进制的累计执行。strict script 继续拒绝 skip、无测试、缺失 verdict 与测试进程失败；`-count=1` 禁止缓存结果替代执行。独立 runner 去掉同作业其它 Go 包与 SQLite race 的并行资源竞争，不降低测试断言，也不放宽测试本身的完成期限。受保护分支的现有必需状态仍为 `checks`；最终门禁以 `always()` 执行并明确核对 SQLite 与另外两项依赖均为 success，其它结果使原必需检查失败。SQLite 作业没有 Blob 依赖；`checks-work` 与 `mounted` 各自启动 Azurite 供它们的 Blob 用例使用。
 
 ## 备选方案
 
@@ -24,6 +24,6 @@ SQLite race 作业上限为二十分钟，但 Go 的十分钟 watchdog 仍约束
 
 ## 后果
 
-根 SQLite race 与其它包在不同 runner 上执行，整包仍受十分钟累计 watchdog 约束；checks 作业的并行资源压力下降。代价是一份额外 Ubuntu runner、独立的 Go 编译缓存快照与串行依赖造成的关键路径延长。`sqlite-race` 的失败、跳过或超时都经 `checks` 的末步进入现有必需状态；工作流取消也不能形成成功的 `checks`。SQLite 内部子包和 module-wide coverage 继续运行，不把这个独立作业误当作覆盖率替代。
+根 SQLite race 与其它包在不同 runner 上执行，整包仍受十分钟累计 watchdog 约束，其它非挂载作业的并行资源压力下降。当时付出的代价是一份额外 Ubuntu runner、独立的 Go 编译缓存快照与串行依赖造成的关键路径延长；[并发 CI 决定](2026-10-14-parallel-ci-execution.md)取代了这项串行依赖。`sqlite-race` 的失败、跳过或超时都经最终 `checks` 门禁进入现有必需状态；取消结果不能形成成功的 `checks`。SQLite 内部子包和 module-wide coverage 继续运行，不把这个独立作业误当作覆盖率替代。
 
 若独立 runner 上的 SQLite race 仍反复触及十分钟，或具体测试出现可重复的局部退化，应重新检查包内执行进展、锁等待和用例成本；本决定不授权再次提高 watchdog。全负载验收与整作业预算仍由[全负载执行预算决定](2026-09-23-budget-ci-full-load-execution.md)持有；测试层和 skip 判据见[测试策略](../../../../docs/testing.md#ci-执行预算)。

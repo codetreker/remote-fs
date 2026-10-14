@@ -12,15 +12,15 @@ Go 1.26.8 下的一次独立 HTTP 调度实验使用原 strict script、`-race -
 
 ## 决定
 
-[CI workflow](../../../../.github/workflows/ci.yml)在现有 `checks` 作业中，先运行其它非挂载包的并行 race suite，再用独立步骤执行完整根 HTTP 包。前一步的 `go list` 排除集合包括挂载包、根 `./packages/metastore/sqlite` 和根 `./packages/transport/httprest`；后一项只改变根包的调度，不排除其它 transport 包。HTTP 步骤使用：
+本决定落地时，[CI workflow](../../../../.github/workflows/ci.yml)在同一 `checks` 作业中，先运行其它非挂载包的并行 race suite，再用独立步骤执行完整根 HTTP 包。当前[并发 CI 决定](2026-10-14-parallel-ci-execution.md)将 HTTP 移入独立作业；它部分取代这里的顺序执行和 runner 复用，完整包调用及完成判据保持。`checks-work` 的 `go list` 排除集合仍包括挂载包、根 `./packages/metastore/sqlite` 和根 `./packages/transport/httprest`，不排除其它 transport 包。HTTP 调用使用：
 
 ```sh
 .github/scripts/assert-every-test-ran.sh -race -count=1 -timeout 10m ./packages/transport/httprest
 ```
 
-HTTP 步骤在前序 suite 成功后执行。它与其余 checks 步骤、[独立 SQLite 作业](2026-09-29-isolate-sqlite-race-ci.md)的成功结论共同决定现有 `checks` 状态；没有新的作业或 required status。挂载包、SQLite 根包、HTTP 根包与其余包的集合不重叠且覆盖整个模块，后续新增包继续由 `go list ./...` 进入相应集合。
+完整 HTTP suite、其它非挂载工作与[独立 SQLite 作业](2026-09-29-isolate-sqlite-race-ci.md)的成功结论共同决定现有 `checks` 必需状态。挂载包、SQLite 根包、HTTP 根包与其余包的集合不重叠且覆盖整个模块，后续新增包继续由 `go list ./...` 进入相应集合；当前独立作业和最终门禁的依赖由并发 CI 决定持有。
 
-strict script、race、`-count=1`、十分钟 per-binary watchdog、checks 三十五分钟作业预算与 module-wide package-local coverage 保持原契约。调度和预算分别由本决定、[原有 race 预算](2026-09-08-budget-ci-race-test-execution.md)与[全负载作业预算](2026-09-23-budget-ci-full-load-execution.md)持有。
+strict script、race、`-count=1`、十分钟 per-binary watchdog 与 module-wide package-local coverage 保持原契约。非挂载 checks-work 的三十五分钟预算仍由[全负载作业预算](2026-09-23-budget-ci-full-load-execution.md)持有；整包 watchdog 由[原有 race 预算](2026-09-08-budget-ci-race-test-execution.md)持有。
 
 ## 备选方案
 
@@ -32,6 +32,6 @@ strict script、race、`-count=1`、十分钟 per-binary watchdog、checks 三�
 
 ## 后果
 
-HTTP 获得没有同作业其它 Go suite 竞争的执行时段；其它非挂载包继续并行。代价是 HTTP 完整调用进入 checks 的顺序关键路径，必须由真实 CI 验证作业仍在三十五分钟预算内。这个步骤的失败或未执行不能形成成功的 `checks`，也不能用独立调度实验替代新提交的 CI 结果。
+HTTP 获得没有同作业其它 Go suite 竞争的执行时段；其它非挂载包继续并行。当时的代价是 HTTP 完整调用进入 checks 的顺序关键路径，须由真实 CI 验证作业仍在三十五分钟预算内；[并发 CI 决定](2026-10-14-parallel-ci-execution.md)以另一份 runner 取代这项顺序成本。完整 HTTP 调用的失败或未执行不能形成成功的 `checks`，也不能用独立调度实验替代新提交的 CI 结果。
 
 若单独调度后仍触及十分钟，应重新定位测试进展、fixture 成本或具体等待；本决定不授权提高 watchdog、缩小测试集合或用重跑替代原因修复。挂载作业的覆盖率门禁继续执行 HTTP 和 SQLite，不能把 race 调度当作覆盖率替代。执行判据见[测试策略](../../../../docs/testing.md#ci-执行预算)。

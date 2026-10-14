@@ -10,9 +10,9 @@ Status: implemented
 
 ## 决定
 
-两个既有作业共同使用[仓库内的 Go setup action](../../../../.github/actions/setup-go/action.yml)，把执行工具链固定为 Go 1.26.8，关闭 setup-go 内建缓存。每个作业使用一次 actions/cache，把实际 `go env GOMODCACHE GOCACHE` 返回的两个目录按该顺序存入同一快照。
+执行 Go 的五个测试作业共同使用[仓库内的 Go setup action](../../../../.github/actions/setup-go/action.yml)，把执行工具链固定为 Go 1.26.8，关闭 setup-go 内建缓存。每个测试作业使用一次 actions/cache，把实际 `go env GOMODCACHE GOCACHE` 返回的两个目录按该顺序存入同一快照；最终 checks 结果门禁不安装 Go 或缓存。
 
-主键包含缓存格式前缀、操作系统、架构、runner 镜像、实际 Go 版本、作业、go.sum 摘要及源码 SHA。相同源码可以精确命中；新源码先查同作业、工具链与依赖的前缀，成功执行后保存自己的快照。不同作业保留各自实际使用的编译变体，测试仍以 `-count=1` 执行。
+主键包含缓存格式前缀、操作系统、架构、runner 镜像、实际 Go 版本、缓存作业身份、go.sum 摘要及源码 SHA。相同源码可以精确命中；新源码先查同身份、工具链与依赖的前缀，成功执行后保存自己的快照。缓存身份默认等于调用方作业；`checks-work` 显式沿用 `checks`，新 `http-race` 还在自身前缀之后尝试相容的 `checks` 前缀，以自身身份保存。这个额外恢复来源由[并发 CI 决定](2026-10-14-parallel-ci-execution.md)选择。不同作业保留各自实际使用的编译变体，测试仍以 `-count=1` 执行。
 
 最后一个 restore key 精确构造旧 setup-go 的同平台、工具链与依赖键，让现有 Go 1.26.8 快照可以为迁移提供种子。两个目录的字符串、顺序、压缩方式与版本盐均按固定 action 核对一致；键中的架构沿用其小写命名。依据分别是 [setup-go 的键](https://github.com/actions/setup-go/blob/b7ad1dad31e06c5925ef5d2fc7ad053ef454303e/src/cache-restore.ts#L17-L40)、[目录顺序](https://github.com/actions/setup-go/blob/b7ad1dad31e06c5925ef5d2fc7ad053ef454303e/src/package-managers.ts#L10-L14)及[缓存版本算法](https://github.com/actions/cache/blob/55cc8345863c7cc4c66a329aec7e433d2d1c52a9/dist/restore/index.js#L43408-L43422)。升级任一 action 时须重查这个耦合；不相容时允许正常 miss，不能修改缓存内部格式或删除远端缓存来伪造命中。
 
@@ -24,8 +24,8 @@ Status: implemented
 
 ## 后果
 
-源码变化可以产生可更新的编译快照，两个作业不再争夺一个永久不变的主键。Go 自身仍校验源码、工具链与编译选项的兼容性；缓存命中不能代替测试成功。
+源码变化可以产生可更新的编译快照，各测试作业不争夺一个永久不变的主键。Go 自身仍校验源码、工具链与编译选项的兼容性；缓存命中不能代替测试成功。
 
 每源码、每作业保存组合快照会增加压缩、上传和仓库缓存空间消耗。缓存检索还受 ref 范围影响，PR 范围内的旧精确项可能先于默认分支的新前缀被选中；这影响速度，不改变 Go 的有效性校验。需要同时观察恢复、测试和 post-save 的整作业耗时，不能只报告测试步骤减少了几秒。当前确认了旧快照无法刷新与迁移兼容性，净 CI 耗时收益仍由实际运行判定。
 
-两个 CI 作业、包分配、权限、事件范围、测试命令、race、`-count=1`、严格 verdict 和[包内覆盖](../testing/2026-09-09-sqlite-package-local-coverage.md)门禁保持不变。[执行预算](2026-09-08-budget-ci-race-test-execution.md)也不因缓存调整而放宽；这项决定只拥有工具链选择与构建缓存，测试本身的精简由[测试工作决定](../testing/2026-09-09-reduce-test-work.md)拥有。
+当时的两个 CI 作业、包分配、权限、事件范围、测试命令、race、`-count=1`、严格 verdict 和[包内覆盖](../testing/2026-09-09-sqlite-package-local-coverage.md)门禁均未改变。当前作业调度由[并发 CI 决定](2026-10-14-parallel-ci-execution.md)持有；[执行预算](2026-09-08-budget-ci-race-test-execution.md)不因缓存调整而放宽。这项决定只拥有工具链选择与构建缓存，测试本身的精简由[测试工作决定](../testing/2026-09-09-reduce-test-work.md)拥有。

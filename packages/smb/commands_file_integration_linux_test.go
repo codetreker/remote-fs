@@ -959,17 +959,25 @@ func TestCreateShareMatrixAcrossTwoSMBSessionsAndNonSMBDirectAndHTTP(t *testing.
 				}
 			})
 			root := first.tree.authority.identity.Backend.RootNodeID
+			checkObject := func(label string) {
+				t.Helper()
+				current, err := first.volume.Stat(t.Context(), "matrix")
+				if err != nil || current.ID != attr.ID || current.Size != 4 {
+					t.Fatalf("%s changed object: %+v %v", label, current, err)
+				}
+			}
 			for _, incumbent := range classes {
 				for share := uint32(0); share < 8; share++ {
+					label := fmt.Sprintf("%s/share%d", incumbent.name, share)
+					request := createRequestForTest("matrix", 1, incumbent.access)
+					binary.LittleEndian.PutUint32(request.Body[32:], share)
+					renewSMBCommandFixture(t, first)
+					_, status, firstID := first.connection.createFile(t.Context(), first.session, first.tree, request)
+					if status != statusOK {
+						t.Fatalf("%s incumbent status=%#x", label, status)
+					}
 					for _, applicant := range classes {
 						label := fmt.Sprintf("%s/share%d/%s", incumbent.name, share, applicant.name)
-						request := createRequestForTest("matrix", 1, incumbent.access)
-						binary.LittleEndian.PutUint32(request.Body[32:], share)
-						renewSMBCommandFixture(t, first)
-						_, status, firstID := first.connection.createFile(t.Context(), first.session, first.tree, request)
-						if status != statusOK {
-							t.Fatalf("%s incumbent status=%#x", label, status)
-						}
 						expected := statusOK
 						if share&applicant.shareBit == 0 {
 							expected = statusSharingViolation
@@ -989,10 +997,18 @@ func TestCreateShareMatrixAcrossTwoSMBSessionsAndNonSMBDirectAndHTTP(t *testing.
 						if externalClose != nil {
 							externalClose()
 						}
-						closeFixtureHandle(t, first, firstID)
-						externalClose, err = nonSMBMatrixOpen(t, external, root, attr.ID, incumbent.access, share)
-						if err != nil {
-							t.Fatalf("%s external incumbent err=%v", label, err)
+						checkObject(label)
+					}
+					closeFixtureHandle(t, first, firstID)
+					externalClose, err := nonSMBMatrixOpen(t, external, root, attr.ID, incumbent.access, share)
+					if err != nil {
+						t.Fatalf("%s external incumbent err=%v", label, err)
+					}
+					for _, applicant := range classes {
+						label := fmt.Sprintf("%s/share%d/%s", incumbent.name, share, applicant.name)
+						expected := statusOK
+						if share&applicant.shareBit == 0 {
+							expected = statusSharingViolation
 						}
 						for _, endpoint := range []realSMBFixture{first, second} {
 							renewSMBCommandFixture(t, endpoint)
@@ -1004,12 +1020,10 @@ func TestCreateShareMatrixAcrossTwoSMBSessionsAndNonSMBDirectAndHTTP(t *testing.
 								closeFixtureHandle(t, endpoint, id)
 							}
 						}
-						externalClose()
-						current, err := first.volume.Stat(t.Context(), "matrix")
-						if err != nil || current.ID != attr.ID || current.Size != 4 {
-							t.Fatalf("%s changed object: %+v %v", label, current, err)
-						}
+						checkObject(label)
 					}
+					externalClose()
+					checkObject(label)
 				}
 			}
 		})

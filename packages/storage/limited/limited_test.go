@@ -418,7 +418,14 @@ func TestAFrontierThatExceedsItsAggregateBoundInvalidatesTheRecount(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	for i := range 100 {
+	frontierRecordBytes := int64(unsafe.Sizeof(struct {
+		path string
+		next unsafe.Pointer
+	}{}))
+	childBytes := frontierRecordBytes + int64(len("directory-000"))
+	// The active root stays charged while its children enter the frontier.
+	directories := (limits.MaxFrontierBytes-frontierRecordBytes)/childBytes + 1
+	for i := range directories {
 		if err := backing.Mkdir(t.Context(), fmt.Sprintf("directory-%03d", i)); err != nil {
 			t.Fatal(err)
 		}

@@ -8,6 +8,8 @@ Status: implemented
 
 [基线 CI](https://github.com/codetreker/remote-fs/actions/runs/34327807431)的 checks 作业耗时 457 秒，mounted 作业 246 秒。它们包含并发执行的包、测试与清理，不能把用例耗时直接相加，也不能单凭作业时长断言某类 CPU 或 I/O 成本。需要在同一配置下区分准备、被测操作和结果返回后的清理，同时保持原来的测试命题。
 
+双 SMB sessions 的 share matrix 在每种 incumbent／share 条件下为三个 applicant 重复取得相同 incumbent；十四项 live scalar corruption 各自建立同一健康 Store；256-byte frontier 超限用例准备一百个目录。这三处的判据分别是共享准入、损坏读取拒绝、固定 byte bound 与 recount 原计数保持，重复的准备不构成额外行为证据。
+
 ## 决定
 
 ### 契约共享物理数据库，子用例拥有独立 volume
@@ -36,7 +38,7 @@ Status: implemented
 
 种子同时接受健康与隔离检查：第一份副本通过公开 Create 写入并能 Stat；第二份副本能通过 Open/ObjectStatus，且看不到第一份副本的探针。顶层 cleanup 再核对种子字节未变。没有全局缓存、共享活句柄或共享可变数据库，也不能在 WAL 尚未完整归并时只复制主文件。
 
-复用仅限这两个当前 schema 的损坏矩阵。迁移、WAL、恢复、lease、原生文件身份及跨进程用例继续使用各自原有的准备路径；这些用例的状态形成过程本身属于被验证的行为。
+这项种子复制仅限两个当前 schema 的完整性损坏矩阵。迁移、WAL、恢复、lease、原生文件身份及跨进程用例继续使用各自原有的准备路径；这些用例的状态形成过程本身属于被验证的行为。
 
 ### 写者结果返回后结束读者负载
 
@@ -52,6 +54,24 @@ Status: implemented
 
 这是测试负载的调度选择，不是 storage 的性能保证。正确后端的每次成功读取仍只能是两个完整值之一，汇总观察必须包含两种值；其它错误仍失败。选择时另外记录读写 API 调用区间，并用先发布空内容、再发布目标内容的真实后端包装器作负向对照，包装器不插入额外等待。API 区间重叠不等于命中了发布内部的短暂窗口，有限次负向对照也不能证明所有更短窗口都有相同检出率。
 
+### SMB share matrix 按 incumbent 分组
+
+[双 SMB sessions 与非 SMB share matrix](../../../../packages/smb/commands_file_integration_linux_test.go)保留 direct／HTTP、三类 incumbent access、八种 ShareAccess、三类 applicant access，共 144 个原向量。每个 incumbent／share 组合分别只建立一份 SMB incumbent 和一份非 SMB incumbent，在各自拥有的循环内测试三类 applicant；每个 applicant 仍独立打开和关闭。两个 SMB sessions、非 SMB applicant 和反向两个 SMB applicants 的冲突或成功判据保持，真实 Renew 继续执行。每类正向和反向 applicant 之后，以及最后一份 incumbent 关闭后，都核对原对象身份和四字节长度。每种 transport 的 incumbent 建立／释放从 144 组降为 48 组，总打开尝试从 432 次降为 336 次。
+
+复用只跨同一 incumbent／share 组合内不修改对象的申请。incumbent 在另一方向开始前关闭，各成功 applicant 在下一项之前关闭；不能把新 grant、未结清 close 或残留共享限制带到下一组合。
+
+### Live scalar corruption 每项恢复健康基线
+
+[十四项 scalar corruption](../../../../packages/metastore/sqlite/reference_state_projection_test.go)在所属顶层测试中建立一份真实健康 Store 和 retained file reference。每个子项先确认完整 FileState、scalar projection、DurableState 和持久 used／allocated_used 与原基线完全相同，再注入原存储类型或非法值，调用真实 StateScalars 并要求 `EIO` 与全零 ReferenceState。
+
+每项独立拥有注入用 writer connection 和清理；清理恢复节点的原 scalar 值、check constraints，并检查连接关闭。前置与清理后的检查还须确认 coordinator healthy、native file ownership 有效及 reader connection InUse 为零；拒绝返回后也立即核对 reader 已归还。清理后的读取使用顶层 context，因为子项的 context 在 cleanup 之前取消。共享活 fixture 仅限这一纯读取拒绝矩阵，不跨顶层测试，也不进入关闭、迁移或恢复用例；清理或恢复失败必须使测试失败并停止后续损坏。retained file 和 Store 按原 owner 清理，先关闭引用，再关闭 Store。
+
+### Frontier 超限只准备足以越界的目录
+
+[256-byte frontier recount 用例](../../../../packages/storage/limited/limited_test.go)以 active root 的 record charge 和每个 `directory-000` 格式路径的 record／name charge 计算最少目录数：`(MaxFrontierBytes - recordBytes) / childBytes + 1`。record size 沿用精确边界用例的同一结构，经 `unsafe.Sizeof` 适配平台字长；amd64 为七个目录，32-bit 为十个。最后一项加入后才超过原 256-byte 上限，单目录上限保持 1 MiB，不用它替代 frontier 拒绝。
+
+真实 bounded backend、七字节原计数、后加的一百字节内容、`EIO` 与 traversal-frontier 原因、失败后保留计数及写入恢复 operation gate 的断言保持。这个用例检验越界和回滚；精确边界的独立用例继续覆盖 active／pending 路径计费。
+
 ## 备选方案
 
 **每个契约子用例使用新数据库文件。** 物理隔离直接，但反复建立相同 schema。独立 volume 保留接口状态隔离，子用例保留 Open／Close；增加顺序隔离回归，是接受共享物理数据库的必要约束。专门验证数据库形成与恢复的其它用例不使用这个工厂。
@@ -66,6 +86,10 @@ Status: implemented
 
 **读循环成功后立即抢占下一次读取。** 它取得更多大块内容样本，但在相同的 200 次写入期间反复消耗 CPU。每次完整观察后主动让出调度，保留无固定上限的读取循环；是否仍保留有效交错，由匹配测量、实际观察与负向对照约束，不能仅凭耗时更短选择。
 
+**每个 share applicant 或 scalar corruption 都重建 incumbent／健康 fixture。** 自然隔离，却重复准备没有被修改的相同前置事实。按 incumbent 分组、逐项核对健康 scalar state 和恢复原值，保留每个申请的独立 owner 与错误判据；恢复失败不能被新的 fixture 隐藏。
+
+**Frontier 超限用例保留一百个目录。** 它制造更大的真实树，但对固定 256-byte 上限，越界后的目录不会增加当前拒绝和原计数保持的证据。按实际 byte charge 跨过精确上限即可保留该命题，独立边界用例继续检验计费公式。
+
 ## 后果
 
 下列准备与退出优化使用 Go 1.26.7，在同一环境以 `GOMAXPROCS=2`、`-race -count=1 -p=1` 串行运行，预热编译独立记录。每项优化前后各测三次，以下为顶层测试耗时中位数，包含各自准备与子用例，优化后的矩阵也包含新增健康／隔离对照：
@@ -78,13 +102,25 @@ Status: implemented
 | detached 状态拒绝矩阵 | 16.97 秒 | 4.29 秒 | 74.7% |
 | 128 读者下的写者推进与清理 | 19.82 秒 | 7.83 秒 | 60.5% |
 
-每次比较保留原 verdict 名称集合：公共契约为 97 个，准入用例为 1 个，两个损坏矩阵合计为 80 个；全部通过，没有失败或跳过。新增邻居回归另以 race 构建验证，旧夹具的负向对照在预期断言失败。读者负载用例的写者阶段仍约 1.5 秒；结果后的 join 从约 12.2 秒降为 0.0006～0.0713 秒，节省来自观察窗口之后。编译、进程及包的耗时不混入这张表。这些是局部匹配结果，不能直接推算新的流水线耗时；整条 CI 的效果仍须由实际运行观察。两个 CI 作业与测试门禁保持不变；工具链和构建缓存由[缓存决定](../process/2026-09-09-refresh-ci-go-build-caches.md)单独拥有。
+每次比较保留原 verdict 名称集合：公共契约为 97 个，准入用例为 1 个，两个损坏矩阵合计为 80 个；全部通过，没有失败或跳过。新增邻居回归另以 race 构建验证，旧夹具的负向对照在预期断言失败。读者负载用例的写者阶段仍约 1.5 秒；结果后的 join 从约 12.2 秒降为 0.0006～0.0713 秒，节省来自观察窗口之后。编译、进程及包的耗时不混入这张表。这些是局部匹配结果，不能直接推算新的流水线耗时；整条 CI 的效果仍须由实际运行观察。当时的两个 CI 作业与测试门禁均未改变；当前调度由[并发 CI 决定](../process/2026-10-14-parallel-ci-execution.md)持有，工具链和构建缓存由[缓存决定](../process/2026-09-09-refresh-ci-go-build-caches.md)单独拥有。
 
 共享物理数据库另在 Go 1.26.8 下作三组匹配测量：公共 metastore 契约由 39.64／39.63／39.66 秒变为 34.30／34.15／34.08 秒，中位数减少 5.49 秒（13.85%）。每次保留原 97 个 verdict，新增顺序隔离与既有邻居回归另通过 race。它不与上表 Go 1.26.7 的计时相减；全包与 CI 的结果各自验证。
 
 原子替换读循环以 Go 1.26.7、相同 race 配置作三组配对测量。limited 的 native publication 分支中位数从 10.858 秒降至 8.238 秒（24.1%），unmanaged bounded 分支从 11.672 秒降至 9.384 秒（19.6%）；这张测量不混入后续 Go 1.26.8 的执行结果。总读取次数的中位数也分别从 4933 降为 3277、从 4980 降为 3359，因此不能只用耗时更短证明选择成立。每个读者的 API 区间都与全部 200 次写入重叠，且各自看到了两种值；按每个读者统计，至少含一次完整 Read 调用的 Write 调用区间数从 193～199 次变为 197～200 次。两种实现、调度前后各十次无额外等待的非原子负向对照，合计 40 次均检出损坏。正确后端样本没有遇到 EAGAIN，因此没有动态覆盖该让出分支；它仍沿用原错误接受规则。读取样本减少的代价由这些区间分布和负向对照约束，但它们不能证明更窄内部损坏窗口的检出率等价，也不能推出净 CI 收益。
 
-共享契约数据库让前面子用例的 volume 留到顶层结束，增加后续 Open 面对的已存状态；工厂的唯一命名和跨例不变性检查不能省略。矩阵另须保存一份种子字节，并为每个子用例复制文件、重新打开真实 SQLite。种子必须完整、不可变且只在所属顶层用例内存活；损坏或隔离检查失败就结束测试，不能回退成一份看似有效的新数据库。
+SMB share matrix、live scalar corruption 和 frontier 超限用例使用 Go 1.26.8、`GOMAXPROCS=2`，前后各执行三次 `go test -json -race -p=1 -count=1 -timeout 10m`，每次用 `-run` 精确选择对应顶层测试。编译预热独立记录，以下为顶层测试 Elapsed 的中位数，包含准备、子项和清理，不包含编译与进程启动耗时：
+
+| 用例 | 原执行方式（分钟） | 优化后（分钟） | 减少 |
+|---|---:|---:|---:|
+| 双会话 SMB share matrix | 1.0930 | 0.8862 | 18.92% |
+| 十四项 live scalar corruption | 0.2580 | 0.0302 | 88.31% |
+| 256-byte frontier 超限 | 0.1115 | 0.0252 | 77.43% |
+
+每次的原 verdict 名称集合分别为 3、15 和 1 个，前后完全相同，全部通过且没有 skip 或 fail；144 个 SMB 逻辑向量仍在两个 transport 子项内逐项执行。这个比较只衡量三项用例的准备改动，不能推算并发调度后的完整 CI 耗时。
+
+SQLite、SMB 与 limited 前后各一次完整普通构建使用带 `-json -p=1 -count=1 -timeout 10m` 的 `go test`，通过 `-coverprofile` 保存默认 package-local instrumentation 的执行结果。2181 项 Package／Test／Action verdict 完全相同，全部通过且没有 skip 或 fail。生产覆盖块清单相同，没有丢失任何已覆盖块；SQLite 为 2913→2913、limited 为 493→493，SMB 为 3299→3300，增加的是既有 cleanup 路径的一块运行观察。三包覆盖率分别为 81.5524%、88.2022%→88.2363% 和 91.2258%。这些是局部测试与 profile 比较，完整 module-wide coverage gate 仍由 CI 执行。三包的定向 `go vet -p=1` 与三个修改文件的 `gofmt -l` 均退出零且无输出。
+
+共享契约数据库让前面子用例的 volume 留到顶层结束，增加后续 Open 面对的已存状态；工厂的唯一命名和跨例不变性检查不能省略。完整性矩阵另须保存一份种子字节，并为每个子用例复制文件、重新打开真实 SQLite。种子必须完整、不可变且只在所属顶层用例内存活；损坏或隔离检查失败就结束测试，不能回退成一份看似有效的新数据库。live scalar 矩阵则保留同一份活 owner，对前置状态和逐项恢复的验证不能省略；SMB 分组减少重复取得 incumbent，对每个 applicant 的独立关闭和最终清理检查保持。
 
 拒绝矩阵复用、确认阶段事件门及写入重复次数的后续选择见[测试工作量决定](2026-09-09-scale-test-work-to-its-assertions.md)，这里的历史测量与原取舍保持。
 
