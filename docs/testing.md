@@ -14,7 +14,7 @@
 
 公共边界各有包内直接用例：[metastore 页结果](../packages/metastore/bounded_test.go)核对预留、提交、整页失效和 payload 所有权，[发布 guard](../packages/metastore/files_test.go)核对组合顺序、首个失败及父 context 不变；[storage 值类型](../packages/storage/storage_test.go)核对路径边界、NodeKind、可选时间与容量一致性。[limited 句柄](../packages/storage/limited/files_test.go)通过 OpenNode 在改名后截断同一对象，核对内容、Used 和超额拒绝后的原状态。[HTTP range cancel](../packages/transport/httprest/file_client_test.go)取消真实 Pending 请求并重复核对同一 Request，原持有者释放后仍为 Cancelled，不能留下迟到授予。
 
-普通对拍中可能直接返回 `EINTR` 的调用使用 [`retryComparisonInterruption`](../packages/fuse/fuse_test.go)：六处 `os.Chtimes` 以及 `Unlink`／`Rmdir` 步骤的总尝试次数至多八次，仅在上一次错误只分类为 `EINTR` 时重做完全相同的调用参数。挂载点和普通目录使用同一规则；包含 `EIO` 的组合错误及其它错误立即返回，八次仍中断则保留最后的 `EINTR` 并使对拍失败。时间步骤重复相同的路径、绝对 atime 与 mtime，包括明确省略某个时间的参数；这里比较最终的 atime / mtime，ctime 不在对拍结果中。专门验证中断的真实信号用例继续断言第一次系统调用的结果，不使用这个辅助函数。
+普通对拍中可能直接返回 EINTR 的调用使用 [`retryComparisonInterruption`](../packages/fuse/fuse_test.go)：六处 os.Chtimes、Unlink／Rmdir 步骤及 listedInodes 的 raw unix.Open／每次 unix.Getdents，各次调用总尝试至多八次，仅在上一次错误只分类为 EINTR 时重做相同参数。挂载点和普通目录使用同一规则；含 EIO 的组合错误及其它错误立即保留，八次仍中断则保留最后 EINTR 并使比较失败。时间步骤保持相同路径、绝对 atime／mtime 和明确省略参数，比较最终 atime／mtime，不比较 ctime。目录 Open 保持相同 path／flags／mode，只有成功才保存 fd，Close 仅执行一次且不重试；Getdents 始终使用同一 fd、buffer 和当前 cursor，不重新打开或回到起点，错误结果不解析。返回项仍使用原 raw d_ino，inode／symlink 身份断言不变；普通目录观察的 EINTR 不构成具体信号或效果阶段的归因。确定性 helper 用例核对纯／包裹 EINTR、hard／joined error 和八次上限；专门验证中断的真实信号用例继续断言首次系统调用结果，不使用该 helper。归属与区别见[请求中断决定](../.agents/notes/implemented/bug-fix/2026-08-22-eio-from-a-freshly-mounted-mountpoint.md)。
 
 对拍失败保留双方原错误的类型与文本。模式修改复合步骤先 WriteFile 再 Chmod，失败后才用独立五秒 context 查询 backing 属性及至多 32 字节内容；这些是失败后的额外观察，不重试原操作、不改变原来的失败判定。仍未解释的 EIO 由[独立调查](../.agents/notes/proposed/testing/2026-09-09-trace-unexplained-fuse-eio.md)记录，不能从步骤名称或未复现的批次推断原因。
 
