@@ -94,12 +94,21 @@ func newFileSessionFixture(t *testing.T, seed realSMBFixture) realSMBFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
+	fixture := realSMBFixtureForSession(t, seed.volume, backend, raw)
 	t.Cleanup(func() {
-		if err := raw.Close(context.Background()); err != nil {
-			t.Error(err)
+		fixture.tree.fileMu.Lock()
+		handles := len(fixture.tree.handles)
+		fixture.tree.fileMu.Unlock()
+		status := fixture.tree.export.server.Status()
+		if handles != 0 || status.Handles != 0 || status.OpeningHandles != 0 || status.RetainedDirectoryBytes != 0 || status.UnknownWrites != 0 || status.RetainedWriteBytes != 0 || status.PendingFlushes != 0 || status.LocalDeleteOwners != 0 || status.DeleteRecoveryCleanupOwners != 0 {
+			t.Errorf("session fixture retained responsibility: handles=%d status=%+v", handles, status)
+		}
+		result, err := raw.CloseWithResult(context.Background())
+		if err != nil || !result.Determined || !result.Released {
+			t.Errorf("session fixture close=%+v error=%v", result, err)
 		}
 	})
-	return realSMBFixtureForSession(t, seed.volume, backend, raw)
+	return fixture
 }
 
 func realSMBFixtureForSession(t *testing.T, volume *objectstore.Storage, backend storage.FileStorage, raw storage.FileSession) realSMBFixture {
@@ -618,6 +627,7 @@ func (p *createResultProbe) OpenAt(ctx context.Context, selection storage.ChildS
 }
 
 func TestCreateInvalidAtomicResultsRetainCleanupOwnership(t *testing.T) {
+	seed := newRealSMBFixture(t)
 	for _, test := range []struct {
 		name   string
 		change func(*storage.OpenResult)
@@ -634,17 +644,18 @@ func TestCreateInvalidAtomicResultsRetainCleanupOwnership(t *testing.T) {
 		}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			fixture := newRealSMBFixture(t)
+			fixture := newFileSessionFixture(t, seed)
+			name := "bad-result-" + test.name
 			probe := &createResultProbe{createSessionContract: fixture.raw.(createSessionContract), change: test.change}
 			fixture.tree.authority.raw = probe
 			disposition, access := uint32(2), accessReadData
 			if test.name == "reset-missing-change" {
-				if err := fixture.volume.Write(t.Context(), "bad-result", []byte("body")); err != nil {
+				if err := fixture.volume.Write(t.Context(), name, []byte("body")); err != nil {
 					t.Fatal(err)
 				}
 				disposition, access = 4, accessWriteData
 			}
-			_, status, id := fixture.connection.createFile(t.Context(), fixture.session, fixture.tree, createRequestForTest("bad-result", disposition, access))
+			_, status, id := fixture.connection.createFile(t.Context(), fixture.session, fixture.tree, createRequestForTest(name, disposition, access))
 			if status != statusIO || id != (wire.FileID{}) {
 				t.Fatalf("invalid result status=%#x id=%x", status, id)
 			}
@@ -1136,14 +1147,18 @@ func TestSharedAuthorityTreeRetirementDrainsOwnHandlesDirectAndHTTP(t *testing.T
 }
 
 func TestCreateDelayedResultCannotPublishAfterCancellationOrRetirement(t *testing.T) {
+	seed := newRealSMBFixture(t)
+	httpBackend := httpSMBBackendForTest(t, seed.volume)
 	for _, transport := range []string{"direct", "http"} {
 		for _, reason := range []string{"cancel", "tree", "session", "deadline"} {
 			t.Run(transport+"/"+reason, func(t *testing.T) {
-				factory := newRealSMBFixture
+				backend := storage.FileStorage(seed.volume)
 				if transport == "http" {
-					factory = newHTTPSMBFixture
+					backend = httpBackend
 				}
-				fixture := factory(t)
+				parent := realSMBFixtureForSession(t, seed.volume, backend, seed.raw)
+				fixture := newFileSessionFixture(t, parent)
+				name := "delayed-" + transport + "-" + reason
 				ctx, cancel := context.WithCancel(t.Context())
 				defer cancel()
 				probe := &createResultProbe{createSessionContract: fixture.raw.(createSessionContract)}
@@ -1164,13 +1179,13 @@ func TestCreateDelayedResultCannotPublishAfterCancellationOrRetirement(t *testin
 					}
 				}
 				fixture.tree.authority.raw = probe
-				request := createRequestForTest("delayed", 2, accessReadData)
+				request := createRequestForTest(name, 2, accessReadData)
 				binary.LittleEndian.PutUint32(request.Body[32:], 0)
 				_, status, id := fixture.connection.createFile(ctx, fixture.session, fixture.tree, request)
 				if status == statusOK || id != (wire.FileID{}) {
 					t.Fatalf("published after %s: status=%#x id=%x", reason, status, id)
 				}
-				if err := fixture.volume.Write(t.Context(), "delayed", []byte("cleanup released")); err != nil {
+				if err := fixture.volume.Write(t.Context(), name, []byte("cleanup released")); err != nil {
 					t.Fatalf("delayed result cleanup leaked share: %v", err)
 				}
 			})

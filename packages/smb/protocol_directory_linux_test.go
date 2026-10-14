@@ -108,12 +108,13 @@ func TestSignedDirectoryWarningsCloseAndExhaustionRetainsSuppressedClose(t *test
 }
 
 func TestSignedDirectorySnapshotsReleaseThroughProtocolRetirement(t *testing.T) {
+	seed := newRealSMBFixture(t)
+	if err := seed.volume.Create(t.Context(), "child"); err != nil {
+		t.Fatal(err)
+	}
 	for _, retirement := range []string{"tree", "logoff", "disconnect", "shutdown"} {
 		t.Run(retirement, func(t *testing.T) {
-			f, client := startRealFileProtocolServer(t)
-			if err := f.volume.Create(t.Context(), "child"); err != nil {
-				t.Fatal(err)
-			}
+			f, client := startRealFileProtocolServerForFixture(t, newFileSessionFixture(t, seed))
 			sessionID, key := authenticateProtocol(t, client)
 			treeID := connectProtocolTree(t, client, key, sessionID, 3, "data")
 			create := createRequestForTest("", 1, accessReadData)

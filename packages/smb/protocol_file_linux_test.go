@@ -17,7 +17,11 @@ import (
 
 func startRealFileProtocolServer(t *testing.T) (realSMBFixture, net.Conn) {
 	t.Helper()
-	fixture := newRealSMBFixture(t)
+	return startRealFileProtocolServerForFixture(t, newRealSMBFixture(t))
+}
+
+func startRealFileProtocolServerForFixture(t *testing.T, fixture realSMBFixture) (realSMBFixture, net.Conn) {
+	t.Helper()
 	server, client := startFileProtocolServerForBackend(t, fixture.volume)
 	fixture.server = server
 	return fixture, client
