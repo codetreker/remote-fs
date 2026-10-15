@@ -2,81 +2,12 @@ package dbstate
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"math"
-	"os"
 	"strings"
 	"syscall"
 	"testing"
-
-	"github.com/codetreker/remote-fs/packages/sqliteschema"
 )
-
-func stateFixture(t *testing.T) (*sql.DB, State) {
-	t.Helper()
-	db, err := sql.Open("sqlite", t.TempDir()+"/state.db")
-	if err != nil {
-		t.Fatal(err)
-	}
-	db.SetMaxOpenConns(1)
-	t.Cleanup(func() {
-		if err := db.Close(); err != nil {
-			t.Error(err)
-		}
-	})
-	tx := stateTransaction(t, db)
-	if err := sqliteschema.MustLoad(os.DirFS("../schema"), "migrations").Reach(t.Context(), tx); err != nil {
-		t.Fatal(err)
-	}
-	if err := tx.Commit(); err != nil {
-		t.Fatal(err)
-	}
-	execState(t, db, `INSERT INTO volumes (id, name, root, used) VALUES (1, 'workspace', 1, 0)`)
-	execState(t, db, `INSERT INTO nodes
-		(id,volume,kind,size,atime_sec,atime_nsec,mtime_sec,mtime_nsec)
-		VALUES (1,1,2,0,0,0,0,0),(2,1,1,0,0,0,0,0)`)
-	execState(t, db, `INSERT INTO entries (volume, parent, name, node) VALUES (1, 1, x'66', 2)`)
-	execState(t, db, `INSERT INTO logs VALUES (1, '0123456789abcdef0123456789abcdef', 2, 0, 0)`)
-	execState(t, db, `INSERT INTO changes
-		(position, previous_position, volume, kind, parent, name, node,
-		 node_kind, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec, recorded_sec, recorded_nsec, metadata)
-		VALUES (2,0,1,0,1,x'66',2,1,0,0,0,0,0,0,0,x'52464d010000')`)
-	state := State{DatabaseID: "0123456789abcdef0123456789abcdef", Generation: 7, NodeHighWater: 4, ChangeHighWater: 6}
-	setFixtureState(t, db, state)
-	return db, state
-}
-
-func stateTransaction(t *testing.T, db *sql.DB) *sql.Tx {
-	t.Helper()
-	tx, err := db.BeginTx(t.Context(), nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		if err := tx.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
-			t.Error(err)
-		}
-	})
-	return tx
-}
-
-func execState(t *testing.T, db interface {
-	ExecContext(context.Context, string, ...any) (sql.Result, error)
-}, statement string, arguments ...any) {
-	t.Helper()
-	if _, err := db.ExecContext(t.Context(), statement, arguments...); err != nil {
-		t.Fatalf("fixture statement %q: %v", statement, err)
-	}
-}
-
-func setFixtureState(t *testing.T, db *sql.DB, state State) {
-	t.Helper()
-	execState(t, db, `UPDATE database_state SET database_id=?, generation=?, node_high_water=?, change_high_water=?`,
-		state.DatabaseID, state.Generation, state.NodeHighWater, state.ChangeHighWater)
-	execState(t, db, `UPDATE sqlite_sequence SET seq=? WHERE name='nodes'`, state.NodeHighWater)
-	execState(t, db, `UPDATE sqlite_sequence SET seq=? WHERE name='changes'`, state.ChangeHighWater)
-}
 
 func TestCheckStateRejectsInvalidIdentityAndNegativeCounters(t *testing.T) {
 	valid := State{DatabaseID: "0123456789abcdef0123456789abcdef"}
@@ -110,6 +41,7 @@ func TestCheckStateRejectsInvalidIdentityAndNegativeCounters(t *testing.T) {
 }
 
 func TestReadPreservesStateAndRefusesCorruptRows(t *testing.T) {
+	f := preparedState(t)
 	for _, test := range []struct{ name, mutation string }{
 		{"intact", ""},
 		{"missing singleton", `DELETE FROM database_state`},
@@ -120,13 +52,14 @@ func TestReadPreservesStateAndRefusesCorruptRows(t *testing.T) {
 		{"invalid identity alphabet", `UPDATE database_state SET database_id='zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz'`},
 		{"negative counter", `UPDATE database_state SET change_high_water=-1`},
 	} {
-		t.Run(test.name, func(t *testing.T) {
-			db, want := stateFixture(t)
-			execState(t, db, `PRAGMA ignore_check_constraints=ON`)
+		if !t.Run(test.name, func(t *testing.T) {
+			tx := f.transaction(t)
+			want := f.before
+			execState(t, tx, `PRAGMA ignore_check_constraints=ON`)
 			if test.mutation != "" {
-				execState(t, db, test.mutation)
+				execState(t, tx, test.mutation)
 			}
-			got, err := Read(t.Context(), db)
+			got, err := Read(t.Context(), tx)
 			if test.mutation == "" {
 				if err != nil || got != want {
 					t.Fatalf("read state=%+v, %v; want %+v", got, err, want)
@@ -134,17 +67,19 @@ func TestReadPreservesStateAndRefusesCorruptRows(t *testing.T) {
 			} else if !errors.Is(err, syscall.EIO) || got != (State{}) {
 				t.Fatalf("corrupt row produced %+v, %v", got, err)
 			}
-		})
+		}) {
+			return
+		}
 	}
-	db, _ := stateFixture(t)
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
-	if got, err := Read(ctx, db); !errors.Is(err, context.Canceled) || got != (State{}) {
+	if got, err := Read(ctx, f.db); !errors.Is(err, context.Canceled) || got != (State{}) {
 		t.Fatalf("canceled read returned %+v, %v", got, err)
 	}
 }
 
 func TestValidateRejectsSequenceAndSurvivingIdentityCorruption(t *testing.T) {
+	f := preparedState(t)
 	for _, test := range []struct{ name, mutation string }{
 		{"coherent", ""},
 		{"node sequence mismatch", `UPDATE sqlite_sequence SET seq=3 WHERE name='nodes'`},
@@ -163,12 +98,13 @@ func TestValidateRejectsSequenceAndSurvivingIdentityCorruption(t *testing.T) {
 		{"corrupt node sequence", `UPDATE sqlite_sequence SET seq='bad' WHERE name='nodes'`},
 		{"corrupt change sequence", `UPDATE sqlite_sequence SET seq='bad' WHERE name='changes'`},
 	} {
-		t.Run(test.name, func(t *testing.T) {
-			db, want := stateFixture(t)
+		if !t.Run(test.name, func(t *testing.T) {
+			tx := f.transaction(t)
+			want := f.before
 			if test.mutation != "" {
-				execState(t, db, test.mutation)
+				execState(t, tx, test.mutation)
 			}
-			got, err := Validate(t.Context(), db)
+			got, err := Validate(t.Context(), tx)
 			if test.mutation == "" {
 				if err != nil || got != want {
 					t.Fatalf("valid state=%+v, %v; want %+v", got, err, want)
@@ -176,7 +112,9 @@ func TestValidateRejectsSequenceAndSurvivingIdentityCorruption(t *testing.T) {
 			} else if !errors.Is(err, syscall.EIO) || got != (State{}) {
 				t.Fatalf("corruption produced %+v, %v", got, err)
 			}
-		})
+		}) {
+			return
+		}
 	}
 }
 

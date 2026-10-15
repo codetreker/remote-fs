@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"testing"
+	"time"
 
 	sdk "github.com/Azure/azure-sdk-for-go/sdk/storage/azblob"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/bloberror"
@@ -73,15 +74,19 @@ func newStorageWithAllowance(t *testing.T, allowance int64) storage.Storage {
 
 func newParts(t *testing.T, allowance int64) parts {
 	t.Helper()
+	return newPartsAt(t, filepath.Join(t.TempDir(), "meta.db"), "workspace", allowance)
+}
+
+func newPartsAt(t *testing.T, database, volumeName string, allowance int64) parts {
+	t.Helper()
 	name := containerFor(t)
 	prefix := fmt.Sprintf("n%d/", volumes.Add(1))
-	database := filepath.Join(t.TempDir(), "meta.db")
 
 	objects, err := azblob.NewWithSharedKey(serviceURL()+"/"+name, accountName, accountKey, prefix)
 	if err != nil {
 		t.Fatalf("reaching the blob container: %v", err)
 	}
-	meta, err := sqlite.Open(t.Context(), database, "workspace", allowance, sqlite.DefaultWindow())
+	meta, err := sqlite.Open(t.Context(), database, volumeName, allowance, sqlite.DefaultWindow())
 	if err != nil {
 		t.Fatalf("opening the metastore: %v", err)
 	}
@@ -146,7 +151,120 @@ func makeContainer(ctx context.Context, name string) error {
 // TestContract is the whole obligation: a volume in a blob container behaves the way
 // every other volume does.
 func TestContract(t *testing.T) {
-	storagetest.Run(t, newStorage)
+	factory := contractPartsFactory(filepath.Join(t.TempDir(), "meta.db"))
+	storagetest.Run(t, func(t *testing.T) storage.Storage { return factory(t) })
+}
+
+// Each child owns its connections, object prefix and maintenance worker; only
+// the physical schema is retained between contract cases.
+func contractPartsFactory(database string) func(*testing.T) parts {
+	var sequence atomic.Uint64
+	return func(t *testing.T) parts {
+		return newPartsAt(t, database, fmt.Sprintf("volume-%d", sequence.Add(1)), 0)
+	}
+}
+
+func TestContractPartsFactoryKeepsVolumesAndPrefixesIsolated(t *testing.T) {
+	database := filepath.Join(t.TempDir(), "meta.db")
+	factory := contractPartsFactory(database)
+	var first parts
+	var firstRoot storage.Attr
+	var firstNode metastore.Node
+	var firstBarrier metastore.LogBarrier
+	t.Run("populated volume", func(t *testing.T) {
+		first = factory(t)
+		if err := first.Write(t.Context(), "same", []byte("first content")); err != nil {
+			t.Fatal(err)
+		}
+		modified := time.Unix(123, 456).UTC()
+		if err := first.SetAttr(t.Context(), "", storage.AttrChange{AccessTime: &modified, ModTime: &modified}); err != nil {
+			t.Fatal(err)
+		}
+		if err := first.SetAttr(t.Context(), "same", storage.AttrChange{AccessTime: &modified, ModTime: &modified}); err != nil {
+			t.Fatal(err)
+		}
+		var err error
+		firstRoot, err = first.Stat(t.Context(), "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		firstNode, err = first.meta.Stat(t.Context(), "same")
+		if err != nil || firstNode.Content == "" {
+			t.Fatalf("first object node=%+v, error=%v", firstNode, err)
+		}
+		if _, err := first.meta.Reserve(t.Context(), "reserved", 3); err != nil {
+			t.Fatal(err)
+		}
+		firstBarrier, err = first.meta.(*sqlite.Store).Barrier(t.Context(), 1024)
+		if err != nil || firstBarrier.Position == 0 {
+			t.Fatalf("first change barrier=%+v, error=%v", firstBarrier, err)
+		}
+	})
+	if t.Failed() {
+		return
+	}
+	if !first.meta.(*sqlite.Store).Terminal() {
+		t.Fatal("the first contract child retained its Store after cleanup")
+	}
+	before, err := sqlite.InspectDurableState(t.Context(), database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var second parts
+	t.Run("fresh volume", func(t *testing.T) {
+		second = factory(t)
+		if entries, err := second.List(t.Context(), ""); err != nil || len(entries) != 0 {
+			t.Fatalf("fresh volume listing=%+v, error=%v", entries, err)
+		}
+		if _, err := second.Stat(t.Context(), "same"); !errors.Is(err, syscall.ENOENT) {
+			t.Fatalf("fresh volume inherited a name: %v", err)
+		}
+		if content, err := second.Read(t.Context(), "same"); !errors.Is(err, syscall.ENOENT) || content != nil {
+			t.Fatalf("fresh volume inherited contents=%q, error=%v", content, err)
+		}
+		root, err := second.Stat(t.Context(), "")
+		if err != nil || root.ID == firstRoot.ID || root.AccessTime.Equal(firstRoot.AccessTime) || root.ModTime.Equal(firstRoot.ModTime) || len(root.Metadata) != 0 {
+			t.Fatalf("fresh root=%+v, first root=%+v, error=%v", root, firstRoot, err)
+		}
+		meta := second.meta.(*sqlite.Store)
+		if used, err := meta.Usage(t.Context()); err != nil || used != 0 {
+			t.Fatalf("fresh logical usage=%d, error=%v", used, err)
+		}
+		if status, err := meta.ObjectStatus(t.Context()); err != nil || status != (sqlite.ObjectStatus{}) {
+			t.Fatalf("fresh object maintenance state=%+v, error=%v", status, err)
+		}
+		if barrier, err := meta.Barrier(t.Context(), 1024); err != nil || barrier.Position != 0 || barrier.Incarnation == "" || barrier.Incarnation == firstBarrier.Incarnation {
+			t.Fatalf("fresh barrier=%+v, first barrier=%+v, error=%v", barrier, firstBarrier, err)
+		}
+		if content, err := second.objects.Get(t.Context(), string(firstNode.Content)); !errors.Is(err, syscall.ENOENT) || content != nil {
+			t.Fatalf("fresh object prefix exposed the first volume's object=%q, error=%v", content, err)
+		}
+		if err := second.Write(t.Context(), "same", []byte("second content")); err != nil {
+			t.Fatal(err)
+		}
+		t.Run("independent closure", func(t *testing.T) {
+			third := factory(t)
+			if err := third.Create(t.Context(), "third"); err != nil {
+				t.Fatal(err)
+			}
+		})
+		if content, err := second.Read(t.Context(), "same"); err != nil || string(content) != "second content" {
+			t.Fatalf("sibling closure changed the live volume=%q, error=%v", content, err)
+		}
+		if content, err := first.objects.Get(t.Context(), string(firstNode.Content)); err != nil || string(content) != "first content" {
+			t.Fatalf("later children changed the first object=%q, error=%v", content, err)
+		}
+	})
+	if t.Failed() {
+		return
+	}
+	if !second.meta.(*sqlite.Store).Terminal() {
+		t.Fatal("the second contract child retained its Store after cleanup")
+	}
+	after, err := sqlite.InspectDurableState(t.Context(), database)
+	if err != nil || after.DatabaseID != before.DatabaseID || after.Generation <= before.Generation {
+		t.Fatalf("shared database before=%+v, after=%+v, error=%v", before, after, err)
+	}
 }
 
 func TestBoundedContract(t *testing.T) {

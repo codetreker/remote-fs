@@ -3,7 +3,6 @@ package changes
 import (
 	"database/sql"
 	"errors"
-	"os"
 	"reflect"
 	"strings"
 	"syscall"
@@ -11,58 +10,8 @@ import (
 	"time"
 
 	"github.com/codetreker/remote-fs/packages/metastore"
-	"github.com/codetreker/remote-fs/packages/sqliteschema"
 	"github.com/codetreker/remote-fs/packages/storage"
 )
-
-func logFixture(t *testing.T) (*sql.DB, *sql.Tx) {
-	t.Helper()
-	db, err := sql.Open("sqlite", t.TempDir()+"/log.db")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		if err := db.Close(); err != nil {
-			t.Error(err)
-		}
-	})
-	tx, err := db.BeginTx(t.Context(), nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	setup := tx
-	t.Cleanup(func() {
-		if err := setup.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
-			t.Error(err)
-		}
-	})
-	if err := sqliteschema.MustLoad(os.DirFS("../schema"), "migrations").Reach(t.Context(), tx); err != nil {
-		t.Fatal(err)
-	}
-	execLogSQL(t, tx, `INSERT INTO volumes(id,name,root,used) VALUES(1,'one',1,0),(2,'two',3,0)`)
-	execLogSQL(t, tx, `INSERT INTO nodes(id,volume,kind,size,atime_sec,atime_nsec,mtime_sec,mtime_nsec,directory_revision)
-		VALUES(1,1,2,0,0,0,0,0,X'0000000000000001'),(2,1,1,0,0,0,0,0,X''),(3,2,2,0,0,0,0,0,X'0000000000000001'),(4,2,1,0,0,0,0,0,X'')`)
-	execLogSQL(t, tx, `INSERT INTO entries(volume,parent,name,node) VALUES(1,1,x'66696c65',2),(2,3,x'66696c65',4)`)
-	execLogSQL(t, tx, `UPDATE database_state SET node_high_water=4`)
-	for _, volume := range []int64{1, 2} {
-		if err := CreateLog(t.Context(), tx, volume); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := tx.Commit(); err != nil {
-		t.Fatal(err)
-	}
-	tx, err = db.BeginTx(t.Context(), nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		if err := tx.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
-			t.Error(err)
-		}
-	})
-	return db, tx
-}
 
 func execLogSQL(t *testing.T, tx *sql.Tx, query string, args ...any) {
 	t.Helper()
@@ -146,6 +95,7 @@ func TestRecordStoresChangesAndTailInTheCallerTransaction(t *testing.T) {
 }
 
 func TestRecordRefusesInvalidTailAndPreservesSQLFailures(t *testing.T) {
+	fixture := newLogMatrixFixture(t, 0)
 	for _, test := range []struct{ name, setup, want string }{
 		{"missing log", `DELETE FROM logs WHERE volume=1`, "no rows"},
 		{"text tail", `UPDATE logs SET committed_position='bad' WHERE volume=1`, "invalid committed position"},
@@ -155,15 +105,17 @@ func TestRecordRefusesInvalidTailAndPreservesSQLFailures(t *testing.T) {
 		{"insert failure", `CREATE TRIGGER fail_insert BEFORE INSERT ON changes BEGIN SELECT RAISE(ABORT,'record insert failed'); END`, "record insert failed"},
 		{"tail failure", `CREATE TRIGGER fail_tail BEFORE UPDATE ON logs BEGIN SELECT RAISE(ABORT,'record tail failed'); END`, "record tail failed"},
 	} {
-		t.Run(test.name, func(t *testing.T) {
-			_, tx := logFixture(t)
+		if !t.Run(test.name, func(t *testing.T) {
+			tx := fixture.transaction(t)
 			execLogSQL(t, tx, test.setup)
 			if err := Record(t.Context(), tx, 1, fileChange(metastore.Created)); err == nil || !strings.Contains(err.Error(), test.want) {
 				t.Fatalf("Record error = %v, want %q", err, test.want)
 			}
-		})
+		}) {
+			return
+		}
 	}
-	_, tx := logFixture(t)
+	tx := fixture.transaction(t)
 	if err := Record(t.Context(), tx, 1, fileChange(metastore.ChangeKind(99))); !errors.Is(err, syscall.EIO) {
 		t.Fatalf("unknown kind = %v", err)
 	}

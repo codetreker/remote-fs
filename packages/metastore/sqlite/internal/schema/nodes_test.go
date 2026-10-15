@@ -10,6 +10,10 @@ import (
 )
 
 func TestNodeRelationshipsRejectBrokenRootsAndCycles(t *testing.T) {
+	db := testDatabase(t, 0)
+	id, root := testVolume(t, db, "workspace")
+	testFile(t, db, id, root, "file", 3, false)
+	fixture := newValidationFixture(t, db)
 	for _, test := range []struct{ name, mutation, diagnostic string }{
 		{"missing root", `UPDATE volumes SET root=900`, "invalid volume roots"},
 		{"two names", `INSERT INTO entries VALUES(1,1,X'616c696173',2)`, "entry cardinality"},
@@ -18,18 +22,18 @@ func TestNodeRelationshipsRejectBrokenRootsAndCycles(t *testing.T) {
 		{"cross volume", `UPDATE entries SET volume=20`, "invalid relationship"},
 		{"unreachable cycle", `UPDATE nodes SET kind=2,size=0,content=NULL WHERE id=2; UPDATE entries SET parent=2`, "outside their volume root"},
 	} {
-		t.Run(test.name, func(t *testing.T) {
-			db := testDatabase(t, 0)
-			id, root := testVolume(t, db, "workspace")
-			testFile(t, db, id, root, "file", 3, false)
-			execute(t, db, test.mutation)
+		if !t.Run(test.name, func(t *testing.T) {
+			tx := fixture.transaction(t)
+			execute(t, tx, test.mutation)
 			for _, scope := range []*int64{nil, &id} {
-				err := validateNodeRelationships(t.Context(), db, scope)
+				err := validateNodeRelationships(t.Context(), tx, scope)
 				if !errors.Is(err, syscall.EIO) || !strings.Contains(err.Error(), test.diagnostic) {
 					t.Fatalf("got %v, want EIO describing %q", err, test.diagnostic)
 				}
 			}
-		})
+		}) {
+			return
+		}
 	}
 }
 
@@ -58,6 +62,11 @@ func TestVersionOneGraphRejectsDamageBeforeEntryRebuild(t *testing.T) {
 }
 
 func TestUsedAccountingRejectsOverflowAndInvalidScalars(t *testing.T) {
+	db := testDatabase(t, 0)
+	id, root := testVolume(t, db, "workspace")
+	testFile(t, db, id, root, "first", 3, false)
+	testFile(t, db, id, root, "second", 5, false)
+	fixture := newValidationFixture(t, db)
 	for _, test := range []struct{ name, mutation, diagnostic string }{
 		{"counter text", `UPDATE volumes SET used='bad'`, "1 volumes with an invalid used counter"},
 		{"negative counter", `UPDATE volumes SET used=-1`, "1 volumes with an invalid used counter"},
@@ -65,19 +74,18 @@ func TestUsedAccountingRejectsOverflowAndInvalidScalars(t *testing.T) {
 		{"kind text", `UPDATE nodes SET kind='bad' WHERE id=2`, "1 nodes with invalid accounting values"},
 		{"mismatched total", `UPDATE volumes SET used=0`, "1 volumes whose used counter disagrees"},
 	} {
-		t.Run(test.name, func(t *testing.T) {
-			db := testDatabase(t, 0)
-			id, root := testVolume(t, db, "workspace")
-			testFile(t, db, id, root, "first", 3, false)
-			testFile(t, db, id, root, "second", 5, false)
-			if err := validateUsedAccounting(t.Context(), db, &id); err != nil {
+		if !t.Run(test.name, func(t *testing.T) {
+			tx := fixture.transaction(t)
+			if err := validateUsedAccounting(t.Context(), tx, &id); err != nil {
 				t.Fatal(err)
 			}
-			execute(t, db, test.mutation)
-			err := validateUsedAccounting(t.Context(), db, &id)
+			execute(t, tx, test.mutation)
+			err := validateUsedAccounting(t.Context(), tx, &id)
 			if !errors.Is(err, syscall.EIO) || !strings.Contains(err.Error(), test.diagnostic) {
 				t.Fatalf("got %v, want EIO describing %q", err, test.diagnostic)
 			}
-		})
+		}) {
+			return
+		}
 	}
 }

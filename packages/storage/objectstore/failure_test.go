@@ -4,12 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
 
 	"github.com/codetreker/remote-fs/packages/metastore"
+	"github.com/codetreker/remote-fs/packages/metastore/sqlite"
 	"github.com/codetreker/remote-fs/packages/storage"
 	"github.com/codetreker/remote-fs/packages/storage/objectstore"
 )
@@ -36,6 +38,7 @@ type failingObjects struct {
 	onGet, onPut error
 	deleteMu     sync.RWMutex
 	onDelete     error
+	refusedGets  atomic.Int64
 	// refusedDeletes counts the deletes onDelete turned away. Most cases here reach the
 	// object store through a call that reports its own failure, which is proof enough that
 	// the injected error was reached; a sweep that a mutation triggers reports nothing, so
@@ -45,6 +48,7 @@ type failingObjects struct {
 
 func (f *failingObjects) Get(ctx context.Context, key string) ([]byte, error) {
 	if f.onGet != nil {
+		f.refusedGets.Add(1)
 		return nil, f.onGet
 	}
 	return f.Objects.Get(ctx, key)
@@ -144,18 +148,73 @@ func requireReported(t *testing.T, err, injected error) {
 	}
 }
 
+func readonlyFailureParts(t *testing.T) (parts, func(*testing.T)) {
+	t.Helper()
+	p := newParts(t, 0)
+	ctx := t.Context()
+	content := []byte("content")
+	if err := p.Write(ctx, "f", content); err != nil {
+		t.Fatalf("writing the healthy read fixture: %v", err)
+	}
+	attr, err := p.Stat(ctx, "f")
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries, err := p.List(ctx, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	space, spaceErr := p.Space(ctx)
+	if spaceErr != nil && !errors.Is(spaceErr, syscall.ENOSYS) {
+		t.Fatal(spaceErr)
+	}
+	meta := p.meta.(*sqlite.Store)
+	used, err := meta.Usage(ctx)
+	if err != nil || used != int64(len(content)) {
+		t.Fatalf("healthy read fixture usage=%d, error=%v", used, err)
+	}
+	status, err := meta.ObjectStatus(ctx)
+	if err != nil || status != (sqlite.ObjectStatus{}) {
+		t.Fatalf("healthy read fixture object state=%+v, error=%v", status, err)
+	}
+	// The parent context remains live while child cleanup closes each borrowed
+	// worker and then verifies that the owning fixture is unchanged.
+	return p, func(t *testing.T) {
+		t.Helper()
+		if current, err := p.Stat(ctx, "f"); err != nil || !reflect.DeepEqual(current, attr) {
+			t.Fatalf("read failure changed the original attributes: got=%+v, want=%+v, error=%v", current, attr, err)
+		}
+		if current, err := p.List(ctx, ""); err != nil || !reflect.DeepEqual(current, entries) {
+			t.Fatalf("read failure changed the original listing: got=%+v, want=%+v, error=%v", current, entries, err)
+		}
+		currentSpace, currentSpaceErr := p.Space(ctx)
+		sameSpaceError := spaceErr == nil && currentSpaceErr == nil || spaceErr != nil && currentSpaceErr != nil && spaceErr.Error() == currentSpaceErr.Error()
+		if currentSpace != space || !sameSpaceError {
+			t.Fatalf("read failure changed space: got=%+v/%v, want=%+v/%v", currentSpace, currentSpaceErr, space, spaceErr)
+		}
+		if current, err := meta.Usage(ctx); err != nil || current != used {
+			t.Fatalf("read failure changed logical usage: got=%d, want=%d, error=%v", current, used, err)
+		}
+		if current, err := meta.ObjectStatus(ctx); err != nil || current != status {
+			t.Fatalf("read failure changed object maintenance state: got=%+v, want=%+v, error=%v", current, status, err)
+		}
+		if current, err := p.Read(ctx, "f"); err != nil || string(current) != string(content) {
+			t.Fatalf("read failure changed the healthy contents=%q, error=%v", current, err)
+		}
+	}
+}
+
 // A tree that answers and an object store that does not is the split R-ERR-6 names. The file
 // is there — the tree says so, and still says so afterwards — and its bytes are what could
 // not be fetched.
 func TestReadingThroughAFailingObjectStoreReportsTheFailure(t *testing.T) {
+	p, unchanged := readonlyFailureParts(t)
 	for _, failure := range objectFailures {
 		t.Run(failure.name, func(t *testing.T) {
-			p := newParts(t, 0)
+			unchanged(t)
+			t.Cleanup(func() { unchanged(t) })
 			volume, objects := p.failing(t)
 			ctx := t.Context()
-			if err := volume.Write(ctx, "f", []byte("content")); err != nil {
-				t.Fatalf("write: %v", err)
-			}
 
 			objects.onGet = failure.err
 			content, err := volume.Read(ctx, "f")
@@ -163,6 +222,9 @@ func TestReadingThroughAFailingObjectStoreReportsTheFailure(t *testing.T) {
 				t.Fatalf("read answered %q through an object store that refused it", content)
 			}
 			requireReported(t, err, failure.err)
+			if got := objects.refusedGets.Load(); got != 1 {
+				t.Fatalf("injected Get failure was reached %d times, want 1", got)
+			}
 
 			// The tree is the half that still answers, and nothing about the failure has been
 			// written back into it: the file is there and still says how long it is.
@@ -174,6 +236,7 @@ func TestReadingThroughAFailingObjectStoreReportsTheFailure(t *testing.T) {
 }
 
 func TestReadingDoesNotTurnObjectKeyFailuresIntoVolumeFacts(t *testing.T) {
+	p, unchanged := readonlyFailureParts(t)
 	independent := errors.New("the object service also failed independently")
 	for _, test := range []struct {
 		name     string
@@ -192,11 +255,9 @@ func TestReadingDoesNotTurnObjectKeyFailuresIntoVolumeFacts(t *testing.T) {
 		{name: "EINVAL", failure: syscall.EINVAL},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			p := newParts(t, 0)
+			unchanged(t)
+			t.Cleanup(func() { unchanged(t) })
 			volume, objects := p.failing(t)
-			if err := volume.Write(t.Context(), "f", []byte("content")); err != nil {
-				t.Fatalf("writing the fixture: %v", err)
-			}
 			objects.onGet = test.failure
 
 			_, err := volume.Read(t.Context(), "f")
@@ -213,6 +274,9 @@ func TestReadingDoesNotTurnObjectKeyFailuresIntoVolumeFacts(t *testing.T) {
 			}
 			if got := storage.ErrnoNameOf(err); got != "EIO" {
 				t.Fatalf("Read travels over the transport as %s, want EIO", got)
+			}
+			if got := objects.refusedGets.Load(); got != 1 {
+				t.Fatalf("injected object-key failure was reached %d times, want 1", got)
 			}
 		})
 	}

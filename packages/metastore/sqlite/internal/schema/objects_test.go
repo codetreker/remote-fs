@@ -8,6 +8,10 @@ import (
 )
 
 func TestObjectRelationshipsRequireUniqueSameVolumeOwnership(t *testing.T) {
+	db := testDatabase(t, 0)
+	id, root := testVolume(t, db, "workspace")
+	testFile(t, db, id, root, "file", 3, false)
+	fixture := newValidationFixture(t, db)
 	for _, mutation := range []string{
 		`DELETE FROM objects`,
 		`UPDATE objects SET volume=99`,
@@ -16,18 +20,18 @@ func TestObjectRelationshipsRequireUniqueSameVolumeOwnership(t *testing.T) {
 		`UPDATE nodes SET content=NULL WHERE id=2`,
 		`UPDATE nodes SET content='absent' WHERE id=2`,
 	} {
-		t.Run(mutation, func(t *testing.T) {
-			db := testDatabase(t, 0)
-			id, root := testVolume(t, db, "workspace")
-			testFile(t, db, id, root, "file", 3, false)
-			execute(t, db, mutation)
+		if !t.Run(mutation, func(t *testing.T) {
+			tx := fixture.transaction(t)
+			execute(t, tx, mutation)
 			for _, scope := range []*int64{nil, &id} {
-				err := validateObjectRelationships(t.Context(), db, scope)
+				err := validateObjectRelationships(t.Context(), tx, scope)
 				if !errors.Is(err, syscall.EIO) || !strings.Contains(err.Error(), "object relationships") {
 					t.Fatalf("unsafe object ownership accepted: %v", err)
 				}
 			}
-		})
+		}) {
+			return
+		}
 	}
 }
 
