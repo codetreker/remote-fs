@@ -78,6 +78,7 @@ func TestGlobalIdentityBoundsUseExpressionIndexSearches(t *testing.T) {
 }
 
 func TestSequenceValueAcceptsAbsentAndBoundedCounters(t *testing.T) {
+	f := preparedState(t)
 	for _, test := range []struct {
 		name, preparation string
 		want              int64
@@ -92,10 +93,10 @@ func TestSequenceValueAcceptsAbsentAndBoundedCounters(t *testing.T) {
 		{"fractional", `UPDATE sqlite_sequence SET seq=4.5 WHERE name='nodes'`, 0, true},
 		{"null", `UPDATE sqlite_sequence SET seq=NULL WHERE name='nodes'`, 0, true},
 	} {
-		t.Run(test.name, func(t *testing.T) {
-			db, _ := stateFixture(t)
-			execState(t, db, test.preparation)
-			got, err := SequenceValue(t.Context(), db, "nodes")
+		if !t.Run(test.name, func(t *testing.T) {
+			tx := f.transaction(t)
+			execState(t, tx, test.preparation)
+			got, err := SequenceValue(t.Context(), tx, "nodes")
 			if test.invalid {
 				if got != 0 || !errors.Is(err, syscall.EIO) {
 					t.Fatalf("corrupt sequence returned %d, %v", got, err)
@@ -103,12 +104,13 @@ func TestSequenceValueAcceptsAbsentAndBoundedCounters(t *testing.T) {
 			} else if err != nil || got != test.want {
 				t.Fatalf("sequence=%d, %v; want %d", got, err, test.want)
 			}
-		})
+		}) {
+			return
+		}
 	}
-	db, _ := stateFixture(t)
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
-	if _, err := SequenceValue(ctx, db, "nodes"); !errors.Is(err, context.Canceled) {
+	if _, err := SequenceValue(ctx, f.db, "nodes"); !errors.Is(err, context.Canceled) {
 		t.Fatalf("canceled sequence read: %v", err)
 	}
 }
@@ -169,10 +171,12 @@ func TestAllocatorsPublishOnlyThroughTheCallingTransaction(t *testing.T) {
 }
 
 func TestIdentityAllocationRejectsCorruptionAndExhaustion(t *testing.T) {
+	f := preparedState(t)
 	for _, kind := range []string{"node", "change", "observed node"} {
 		for _, fault := range []string{"missing state", "sequence scalar", "sequence mismatch", "write failure", "exhausted"} {
-			t.Run(kind+" "+fault, func(t *testing.T) {
-				db, before := stateFixture(t)
+			if !t.Run(kind+" "+fault, func(t *testing.T) {
+				tx := f.transaction(t)
+				before := f.before
 				sequence := "nodes"
 				if kind == "change" {
 					sequence = "changes"
@@ -180,13 +184,13 @@ func TestIdentityAllocationRejectsCorruptionAndExhaustion(t *testing.T) {
 				want := error(syscall.EIO)
 				switch fault {
 				case "missing state":
-					execState(t, db, `DELETE FROM database_state`)
+					execState(t, tx, `DELETE FROM database_state`)
 				case "sequence scalar":
-					execState(t, db, `UPDATE sqlite_sequence SET seq='broken' WHERE name=?`, sequence)
+					execState(t, tx, `UPDATE sqlite_sequence SET seq='broken' WHERE name=?`, sequence)
 				case "sequence mismatch":
-					execState(t, db, `UPDATE sqlite_sequence SET seq=0 WHERE name=?`, sequence)
+					execState(t, tx, `UPDATE sqlite_sequence SET seq=0 WHERE name=?`, sequence)
 				case "write failure":
-					execState(t, db, `CREATE TRIGGER reject_identity BEFORE UPDATE ON database_state BEGIN SELECT RAISE(ABORT, 'identity write refused'); END`)
+					execState(t, tx, `CREATE TRIGGER reject_identity BEFORE UPDATE ON database_state BEGIN SELECT RAISE(ABORT, 'identity write refused'); END`)
 					want = nil
 				case "exhausted":
 					if kind == "change" {
@@ -194,12 +198,11 @@ func TestIdentityAllocationRejectsCorruptionAndExhaustion(t *testing.T) {
 					} else {
 						before.NodeHighWater = math.MaxInt64
 					}
-					setFixtureState(t, db, before)
+					setFixtureState(t, tx, before)
 					if kind != "observed node" {
 						want = syscall.ENOSPC
 					}
 				}
-				tx := stateTransaction(t, db)
 				var err error
 				var id int64
 				switch kind {
@@ -220,7 +223,9 @@ func TestIdentityAllocationRejectsCorruptionAndExhaustion(t *testing.T) {
 						t.Fatalf("rejected allocation changed %+v to %+v: %v", before, got, readErr)
 					}
 				}
-			})
+			}) {
+				return
+			}
 		}
 	}
 }

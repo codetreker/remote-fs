@@ -69,6 +69,11 @@ func TestIntegrityWorkAndNameBytesHaveExactBounds(t *testing.T) {
 }
 
 func TestIntegrityRejectsInvalidStoredClassesAndMetadata(t *testing.T) {
+	db := testDatabase(t, 0)
+	id, root := testVolume(t, db, "workspace")
+	testFile(t, db, id, root, "file", 3, false)
+	testChange(t, db, id, root, "old")
+	fixture := newValidationFixture(t, db)
 	for _, test := range []struct {
 		name, mutation, diagnostic string
 		check                      func(context.Context, sqlvalue.Queryer, *int64) error
@@ -88,19 +93,18 @@ func TestIntegrityRejectsInvalidStoredClassesAndMetadata(t *testing.T) {
 			return validateIntegrity(ctx, q, ns, 1000, 1<<20, schema.Version())
 		}},
 	} {
-		t.Run(test.name, func(t *testing.T) {
-			db := testDatabase(t, 0)
-			id, root := testVolume(t, db, "workspace")
-			testFile(t, db, id, root, "file", 3, false)
-			testChange(t, db, id, root, "old")
-			execute(t, db, test.mutation)
+		if !t.Run(test.name, func(t *testing.T) {
+			tx := fixture.transaction(t)
+			execute(t, tx, test.mutation)
 			for _, scope := range []*int64{nil, &id} {
-				err := test.check(t.Context(), db, scope)
+				err := test.check(t.Context(), tx, scope)
 				if !errors.Is(err, syscall.EIO) || !strings.Contains(err.Error(), test.diagnostic) {
 					t.Fatalf("got %v, want EIO describing %q", err, test.diagnostic)
 				}
 			}
-		})
+		}) {
+			return
+		}
 	}
 }
 
