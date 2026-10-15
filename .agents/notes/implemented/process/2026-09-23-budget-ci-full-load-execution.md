@@ -10,7 +10,7 @@ Status: implemented
 
 ## 决定
 
-[CI workflow](../../../../.github/workflows/ci.yml)给 checks 作业三十五分钟上限，给串行 `rfs_acceptance` 整包测试五分钟进程上限。十分钟 contract / unit 整包 watchdog、一秒可见性断言、race、`-count=1`、严格 verdict、覆盖率与包划分保持不变。
+[CI workflow](../../../../.github/workflows/ci.yml)给非挂载检查工作 `checks-work` 三十五分钟上限，给其中串行 `rfs_acceptance` 整包测试五分钟进程上限。十分钟 contract / unit 整包 watchdog、一秒可见性断言、race、`-count=1`、严格 verdict、覆盖率与包划分保持不变。checks-work 沿用当时 checks 工作的预算；当前独立根包和最终结果门禁的调度及预算由[并发 CI 决定](2026-10-14-parallel-ci-execution.md)持有。
 
 ## 备选方案
 

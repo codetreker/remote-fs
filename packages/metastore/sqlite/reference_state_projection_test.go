@@ -176,39 +176,84 @@ func TestReferenceScalarStateZeroesLifetimeAndAuthorityFailures(t *testing.T) {
 }
 
 func TestReferenceScalarStateRejectsMalformedStoredScalars(t *testing.T) {
+	store, file := openContentEffectFile(t, nil)
+	ctx := t.Context()
+	before, err := file.Node(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scalars, err := file.State(ctx, storage.StateScalars)
+	if err != nil {
+		t.Fatal(err)
+	}
+	durable, err := store.DurableState(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var quota [2]int64
+	if err := store.read.QueryRowContext(ctx, `SELECT used,allocated_used FROM volumes WHERE id=?`, store.volume).
+		Scan(&quota[0], &quota[1]); err != nil {
+		t.Fatal(err)
+	}
+	assertFixture := func(t *testing.T) {
+		t.Helper()
+		if err := errors.Join(store.coordinator.healthy(), store.checkFileOwnership()); err != nil {
+			t.Fatalf("shared scalar fixture lost its authority: %v", err)
+		}
+		if got, err := file.Node(ctx); err != nil || !reflect.DeepEqual(got, before) {
+			t.Fatalf("shared scalar fixture node = %+v, %v; want %+v", got, err, before)
+		}
+		if got, err := file.State(ctx, storage.StateScalars); err != nil || !reflect.DeepEqual(got, scalars) {
+			t.Fatalf("shared scalar fixture projection = %+v, %v; want %+v", got, err, scalars)
+		}
+		if got, err := store.DurableState(ctx); err != nil || got != durable {
+			t.Fatalf("shared scalar fixture durable state = %+v, %v; want %+v", got, err, durable)
+		}
+		var gotQuota [2]int64
+		if err := store.read.QueryRowContext(ctx, `SELECT used,allocated_used FROM volumes WHERE id=?`, store.volume).
+			Scan(&gotQuota[0], &gotQuota[1]); err != nil || gotQuota != quota {
+			t.Fatalf("shared scalar fixture quota = %v, %v; want %v", gotQuota, err, quota)
+		}
+		if count := store.read.Stats().InUse; count != 0 {
+			t.Fatalf("shared scalar fixture retains %d reader connections", count)
+		}
+	}
 	for _, update := range []string{
 		`kind=0`, `kind=X'31'`, `size=-1`, `size=X'31'`, `allocation_size=NULL`, `allocation_size=8192`,
 		`detached=1`, `detached=2`, `detached=X'30'`, `pending_unlink=2`, `pending_unlink=X'30'`,
 		`pending_generation=-1`, `pending_generation=X'30'`, `pending_unlink=1,pending_generation=0`,
 	} {
-		t.Run(update, func(t *testing.T) {
-			store, file := openContentEffectFile(t, nil)
-			before, err := file.Node(t.Context())
-			if err != nil {
-				t.Fatal(err)
-			}
-			t.Cleanup(func() {
-				if _, err := store.write.ExecContext(context.Background(), `UPDATE nodes SET kind=?,size=?,allocation_size=?,detached=0,pending_unlink=0,pending_generation=0 WHERE volume=? AND id=?`,
-					before.Kind, before.Size, before.AllocationSize, store.volume, file.id); err != nil {
-					t.Error(err)
-				}
-			})
+		if !t.Run(update, func(t *testing.T) {
+			assertFixture(t)
 			connection, err := store.write.Conn(t.Context())
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer connection.Close()
+			t.Cleanup(func() {
+				_, restoreErr := connection.ExecContext(context.Background(), `UPDATE nodes SET kind=?,size=?,allocation_size=?,detached=0,pending_unlink=0,pending_generation=0 WHERE volume=? AND id=?`,
+					before.Kind, before.Size, before.AllocationSize, store.volume, file.id)
+				_, pragmaErr := connection.ExecContext(context.Background(), `PRAGMA ignore_check_constraints=OFF`)
+				if err := errors.Join(restoreErr, pragmaErr, connection.Close()); err != nil {
+					t.Errorf("restoring the shared scalar fixture: %v", err)
+					return
+				}
+				assertFixture(t)
+			})
 			if _, err := connection.ExecContext(t.Context(), `PRAGMA ignore_check_constraints=ON`); err != nil {
 				t.Fatal(err)
 			}
-			defer connection.ExecContext(context.Background(), `PRAGMA ignore_check_constraints=OFF`)
 			if _, err := connection.ExecContext(t.Context(), `UPDATE nodes SET `+update+` WHERE volume=? AND id=?`, store.volume, file.id); err != nil {
 				t.Fatal(err)
 			}
 			if got, err := file.State(t.Context(), storage.StateScalars); !errors.Is(err, syscall.EIO) || !reflect.DeepEqual(got, metastore.ReferenceState{}) {
 				t.Fatalf("malformed scalar state = %+v, %v", got, err)
 			}
-		})
+			if count := store.read.Stats().InUse; count != 0 {
+				t.Fatalf("rejected scalar read retains %d reader connections", count)
+			}
+		}) {
+			return
+		}
 	}
 }
 

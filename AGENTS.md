@@ -81,38 +81,43 @@ Azurite release moves the highest `x-ms-version` its blob service will accept, a
 pinned SDK sits exactly on that ceiling.
 
 [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs the CI checks on every
-pull request and on every commit that reaches `main`. Three Linux jobs divide the work:
-`checks` builds, vets, checks formatting and links, runs the serial full-load acceptance,
-then runs the nonmounting race suite excluding the root SQLite and HTTP packages. A
-following step runs the complete root `packages/transport/httprest` race suite on its
-own, after the parallel suite succeeds. `sqlite-race` runs the root SQLite package
-alone with the race detector; `mounted` runs the FUSE and end-to-end race suite,
+pull request and on every commit that reaches `main`. Four Linux test jobs divide the work:
+`checks-work` builds, vets, checks formatting and links, runs the serial full-load
+acceptance, then runs the nonmounting race suite excluding the root SQLite and HTTP
+packages. `sqlite-race` and `http-race` each run their complete root package alone
+with the race detector; these three jobs have no dependency on one another.
+`mounted` runs the FUSE and end-to-end race suite,
 checks that mounts are gone, and executes the module-wide coverage gate. A wedged mount
 cannot hide the nonmounting results. The root SQLite race binary has its own runner because
 parallel package contention can exhaust its ten-minute cumulative watchdog while its
-tests are still advancing. The HTTP step removes same-job Go package contention without
-adding another runner. Every race invocation retains `-count=1`, the same per-binary
+tests are still advancing. The HTTP runner also removes same-job Go package contention.
+Every race invocation retains `-count=1`, the same per-binary
 `-timeout 10m`, and the strict no-skip verdict check. The protected branch requires the
-existing `checks` status, so `checks` depends on `sqlite-race`, still runs when that job
-fails or is skipped, and has a final step that fails unless `sqlite-race` succeeded.
+existing `checks` status. That job is a final gate depending on `checks-work`,
+`sqlite-race` and `http-race`; it uses `always()` and succeeds only when all three
+results are explicitly `success`. Failure, cancellation or a skipped dependency
+cannot produce a successful required status.
 [The SQLite isolation decision](.agents/notes/implemented/process/2026-09-29-isolate-sqlite-race-ci.md)
-records its scheduling and required-check link; [the HTTP scheduling decision](.agents/notes/implemented/process/2026-10-12-isolate-http-race-ci.md)
-records the sequential step and its cost. A focused Windows Server 2025 job runs
+records the reason for a separate runner; [the HTTP scheduling decision](.agents/notes/implemented/process/2026-10-12-isolate-http-race-ci.md)
+records the original isolated step. [The concurrent CI decision](.agents/notes/implemented/process/2026-10-14-parallel-ci-execution.md)
+owns the current dependency graph and gate. A focused Windows Server 2025 job runs
 the native SSPI package tests and vet, plus the root SMB and wire race suites through
 the strict verdict runner. The root suite compares every UTF-16 code unit and the
 resulting order with the native Windows ordinal name API. Windows 11 redirector and
 WNet behavior require their separate acceptance environment.
 
-`checks` and `mounted` each start the emulator in
+`checks-work` and `mounted` each start the emulator in
 [`deployments/ci/docker-compose.yml`](deployments/ci/docker-compose.yml) before their
 Blob-dependent tests, waiting for it to answer requests. The mounted job needs it for
 the real Azure binary lock and restart tests; its later coverage gate uses the same
-running emulator. The SQLite race job has no Blob dependency.
+running emulator. Neither root SQLite nor root HTTP race job has a Blob dependency.
 
-All four jobs use [the shared Go setup action](.github/actions/setup-go/action.yml), which
+All five test jobs use [the shared Go setup action](.github/actions/setup-go/action.yml), which
 pins Go 1.26.8 and owns a combined module/build cache for each job, toolchain,
-dependency hash and source SHA. A same-job prefix and a verified legacy archive
-can seed new snapshots. This cache reuses compilation work; every test still runs
+dependency hash and source SHA. `checks-work` retains the existing `checks` cache
+identity. A same-job prefix and a verified legacy archive can seed new snapshots;
+`http-race` also tries the compatible `checks` prefix before the legacy archive,
+then saves under its own identity. This cache reuses compilation work; every test still runs
 with `-count=1`. [The cache decision](.agents/notes/implemented/process/2026-09-09-refresh-ci-go-build-caches.md)
 records the restore compatibility and upload/storage costs.
 
@@ -130,7 +135,7 @@ that matches no test, and on any test that reaches no verdict. It takes `go test
 flags and packages, so it substitutes for any line above.
 
 **Full-load visibility acceptance.** Before the parallel package and race suites, the
-checks job runs the entire `packages/storage/replicated` package serially in a normal
+`checks-work` job runs the entire `packages/storage/replicated` package serially in a normal
 build with `-tags=rfs_acceptance`, through `assert-every-test-ran.sh` without a `-run`
 filter. This test-only tag includes the 4096-file, 128-reader HTTP/SSE workload and its
 one-second visibility assertion; it does not select different production code. The

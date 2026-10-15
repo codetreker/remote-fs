@@ -12,9 +12,9 @@ SQLite、metastore 契约测试及 Go 依赖未变的两次先前运行，包耗
 
 ## 决定
 
-[CI workflow](../../../../.github/workflows/ci.yml)中，checks 作业总上限为二十分钟，contract / unit 步骤的 `go test -timeout` 为十分钟。后者约束每个包测试二进制的累计执行，不是单个操作的允许延迟。
+[CI workflow](../../../../.github/workflows/ci.yml)的 contract / unit 调用使用十分钟 `go test -timeout`，约束每个包测试二进制的累计执行，不是单个操作的允许延迟。本决定落地时 checks 作业总上限为二十分钟；当前的作业与验收预算由[全负载执行预算](2026-09-23-budget-ci-full-load-execution.md)持有。
 
-race、`-count=1`、严格 verdict 检查与包划分保持原义。单项 deadline、副本可见性验收的一秒可见性断言、覆盖率门禁及受保护的交付检查均不放宽。当时的验收进程预算为三分钟；当前的作业与验收预算见[全负载执行预算](2026-09-23-budget-ci-full-load-execution.md)。根 SQLite race 包的现行独立调度由[SQLite race 调度决定](2026-09-29-isolate-sqlite-race-ci.md)说明，根 HTTP 包的现行独立步骤由[HTTP race 调度决定](2026-10-12-isolate-http-race-ci.md)说明；十分钟 per-binary watchdog 仍是本决定的边界。预算与判据的分工见[测试策略](../../../../docs/testing.md#ci-执行预算)。
+race、`-count=1`、严格 verdict 检查与包划分保持原义。单项 deadline、副本可见性验收的一秒可见性断言、覆盖率门禁及受保护的交付检查均不放宽。当时的验收进程预算为三分钟。根 SQLite 与 HTTP race 包独立完整执行的依据分别由[SQLite race 调度决定](2026-09-29-isolate-sqlite-race-ci.md)和[HTTP race 调度决定](2026-10-12-isolate-http-race-ci.md)说明；现行作业依赖由[并发 CI 决定](2026-10-14-parallel-ci-execution.md)持有，十分钟 per-binary watchdog 仍是本决定的边界。预算与判据的分工见[测试策略](../../../../docs/testing.md#ci-执行预算)。
 
 ## 备选方案
 

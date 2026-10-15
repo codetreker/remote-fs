@@ -21,17 +21,17 @@ env:
   MOUNTING_PACKAGES: ./packages/fuse/... ./cmd/...
 
 jobs:
-  checks:
-    name: build, format, links, contract and unit tests
+  checks-work:
+    name: build, format, links and nonmounting tests
     runs-on: ubuntu-24.04
     timeout-minutes: 35
-    needs: sqlite-race
-    if: ${{ always() && !cancelled() }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: ./.github/actions/setup-go
+        with:
+          cache-job: checks
 
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
@@ -101,19 +101,6 @@ jobs:
           .github/scripts/assert-every-test-ran.sh -race -count=1 -timeout 10m \
             $(go list ./... | grep -vxF -f "$RUNNER_TEMP/separate-packages")
 
-      - name: HTTP contract and race tests
-        run: .github/scripts/assert-every-test-ran.sh -race -count=1 -timeout 10m ./packages/transport/httprest
-
-      - name: Require SQLite contract and race tests
-        if: ${{ always() && !cancelled() }}
-        env:
-          SQLITE_RACE_RESULT: ${{ needs.sqlite-race.result }}
-        run: |
-          if [ "$SQLITE_RACE_RESULT" != success ]; then
-            echo "::error::SQLite contract and race tests concluded $SQLITE_RACE_RESULT"
-            exit 1
-          fi
-
   sqlite-race:
     name: SQLite contract and race tests
     runs-on: ubuntu-24.04
@@ -126,6 +113,49 @@ jobs:
 
       - name: SQLite contract and race tests
         run: .github/scripts/assert-every-test-ran.sh -race -count=1 -timeout 10m ./packages/metastore/sqlite
+
+  http-race:
+    name: HTTP contract and race tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-go
+        with:
+          restore-job: checks
+
+      - name: HTTP contract and race tests
+        run: .github/scripts/assert-every-test-ran.sh -race -count=1 -timeout 10m ./packages/transport/httprest
+
+  checks:
+    name: build, format, links, contract and unit tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    needs: [checks-work, sqlite-race, http-race]
+    if: ${{ always() }}
+    steps:
+      - name: Require all contract and race suites
+        env:
+          CHECKS_WORK_RESULT: ${{ needs.checks-work.result }}
+          SQLITE_RACE_RESULT: ${{ needs.sqlite-race.result }}
+          HTTP_RACE_RESULT: ${{ needs.http-race.result }}
+        run: |
+          failed=0
+          if [ "$CHECKS_WORK_RESULT" != success ]; then
+            echo "::error::Build and nonmounting tests concluded $CHECKS_WORK_RESULT"
+            failed=1
+          fi
+          if [ "$SQLITE_RACE_RESULT" != success ]; then
+            echo "::error::SQLite contract and race tests concluded $SQLITE_RACE_RESULT"
+            failed=1
+          fi
+          if [ "$HTTP_RACE_RESULT" != success ]; then
+            echo "::error::HTTP contract and race tests concluded $HTTP_RACE_RESULT"
+            failed=1
+          fi
+          exit "$failed"
 
   mounted:
     name: differential and end-to-end tests

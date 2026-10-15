@@ -20,15 +20,15 @@
 
 ## CI 工具链与缓存
 
-四个作业使用[共享 setup action](../.github/actions/setup-go/action.yml)固定 Go 1.26.8，并按作业、工具链、依赖和源码 SHA 保存 module／编译缓存；同作业前缀及经校验的旧快照可作为种子。三个 Linux 作业分别运行非挂载包、根 SQLite 包、挂载与端到端包；非挂载作业先运行其它包的并行 race suite，再单独运行完整根 HTTP 包。Windows 作业运行 native SSPI 的 race／vet，以及 SMB／wire 的严格 race suite，包含 native 名字比较、目录 API 和关闭删除用例。缓存复用编译工作，`-count=1` 仍使每次调用实际执行测试。SQLite 与 HTTP 的单独调度不缩小 race、严格 verdict 或 module-wide 覆盖率门禁。缓存上传也消耗时间与空间，净收益须看完整作业；原因与兼容边界见[缓存决定](../.agents/notes/implemented/process/2026-09-09-refresh-ci-go-build-caches.md)。
+五个测试作业使用[共享 setup action](../.github/actions/setup-go/action.yml)固定 Go 1.26.8，并按作业、工具链、依赖和源码 SHA 保存 module／编译缓存。同作业前缀及经校验的旧快照可作为种子；`checks-work` 保留原 `checks` 缓存身份，`http-race` 在自身前缀之后、旧快照之前尝试相容的 `checks` 前缀，保存时仍使用自己的身份。四个 Linux 测试作业分别运行其它非挂载包、根 SQLite 包、根 HTTP 包、挂载与端到端包。Windows 作业运行 native SSPI 的 race／vet，以及 SMB／wire 的严格 race suite，包含 native 名字比较、目录 API 和关闭删除用例。最终 `checks` 门禁只汇总结果，不安装工具链或恢复缓存。缓存复用编译工作，`-count=1` 仍使每次调用实际执行测试；race、严格 verdict 和 module-wide 覆盖率门禁均保持原判据。缓存上传也消耗时间与空间，净收益须看完整作业；原因与兼容边界见[缓存决定](../.agents/notes/implemented/process/2026-09-09-refresh-ci-go-build-caches.md)。
 
 ## CI 执行预算
 
-checks 作业总上限为三十五分钟，`sqlite-race` 与 `mounted` 各有二十分钟作业上限。`checks` 的并行非挂载 race suite 精确排除根 `./packages/metastore/sqlite` 和 `./packages/transport/httprest`。SQLite 根包由独立 `sqlite-race` 作业执行；HTTP 根包在同一 `checks` 作业的后续步骤单独执行。两者都使用 `assert-every-test-ran.sh -race -count=1 -timeout 10m`，不带测试过滤。SQLite 的内部子包仍随普通包运行，挂载包仍在 `mounted`；这四份包集合不重叠，也不遗漏整个模块的包。
+`checks-work` 作业总上限为三十五分钟，`sqlite-race`、`http-race` 与 `mounted` 各有二十分钟作业上限，最终 `checks` 门禁有五分钟作业上限。`checks-work` 的并行非挂载 race suite 精确排除根 `./packages/metastore/sqlite` 和 `./packages/transport/httprest`。这两个根包分别由独立作业完整执行，都使用 `assert-every-test-ran.sh -race -count=1 -timeout 10m`，不带测试过滤。SQLite 的内部子包仍随普通包运行，挂载包仍在 `mounted`；这四份包集合不重叠，也不遗漏整个模块的包。
 
-三个非挂载 race 调用与挂载 race 调用的每个测试二进制各有十分钟累计预算；调度隔离不提高该 watchdog，也不允许 skip、无测试或缺失 verdict。HTTP 步骤在前序并行 suite 成功后执行；`checks` 成功还要求该完整 HTTP 步骤成功。workflow 让 `checks` 依赖 `sqlite-race`，在依赖失败或跳过时仍执行，并在最后明确核对依赖结果为 success，否则 `checks` 失败。SQLite 与 HTTP 的结论都进入现有必需状态，不增加作业或 required status。
+三个非挂载 race 调用与挂载 race 调用的每个测试二进制各有十分钟累计预算；调度隔离不提高该 watchdog，也不允许 skip、无测试或缺失 verdict。`checks-work`、`sqlite-race` 与 `http-race` 没有相互依赖。最终 `checks` 依赖三者，以 `always()` 执行，并要求每一项结果明确为 `success`；失败、取消或跳过均使它失败。必需状态继续使用原有显示名称，新增 HTTP 作业的结论经同一门禁进入交付检查。
 
-`mounted` 的 module-wide coverage gate 继续测试整个模块，包含 SQLite 和 HTTP。串行副本可见性验收在 `checks` 以 `-timeout 5m` 执行整个包；这一进程预算与单项的一秒可见性判据分别成立。调度及成本见[SQLite race 调度决定](../.agents/notes/implemented/process/2026-09-29-isolate-sqlite-race-ci.md)与[HTTP race 调度决定](../.agents/notes/implemented/process/2026-10-12-isolate-http-race-ci.md)；预算依据见[执行预算决定](../.agents/notes/implemented/process/2026-09-23-budget-ci-full-load-execution.md)与[原有整包 race 预算](../.agents/notes/implemented/process/2026-09-08-budget-ci-race-test-execution.md)。
+`mounted` 的 module-wide coverage gate 继续测试整个模块，包含 SQLite 和 HTTP。串行副本可见性验收在 `checks-work` 以 `-timeout 5m` 执行整个包；这一进程预算与单项的一秒可见性判据分别成立。当前作业依赖及成本由[并发 CI 决定](../.agents/notes/implemented/process/2026-10-14-parallel-ci-execution.md)持有；独立执行的依据见[SQLite race 调度决定](../.agents/notes/implemented/process/2026-09-29-isolate-sqlite-race-ci.md)与[HTTP race 调度决定](../.agents/notes/implemented/process/2026-10-12-isolate-http-race-ci.md)，预算依据见[执行预算决定](../.agents/notes/implemented/process/2026-09-23-budget-ci-full-load-execution.md)与[原有整包 race 预算](../.agents/notes/implemented/process/2026-09-08-budget-ci-race-test-execution.md)。
 
 ## 覆盖率是必要的，从来不是充分的
 
@@ -282,7 +282,7 @@ authority 的[发布交错用例](../packages/locking/contract_concurrency_test.
 
 失败用例区分准备拒绝、已知效果和结果未知。SQLite 准备失败保留 reservation 与 Grant，删除与目标覆盖退役真实受影响身份；[记账收尾失败](../packages/metastore/sqlite/publication_test.go)与[持久确认失败](../packages/metastore/sqlite/publication_test.go)使 volume 和 authority 停止发布，错误原因仍可核对。复合修改的部分效果由 FUSE 阶段用例验证，已有副作用时不返回暗示整个操作未执行的 `EINTR`。Close 排空在途发布与持久水位准备，关闭失败保留原因和必要所有权，不能对可能已经复用的描述符重试 Close。
 
-[limited 构造与通用契约用例](../packages/storage/limited/limited_test.go)分别使用原生组合、委托原生计费但不暴露 retained 文件的 wrapper；两者都执行完整 storage 契约。缺少 native 计费能力在任何用量测量前以 `ENOSYS` 拒绝；[能力检查失败](../packages/storage/limited/publication_test.go)逐一保留原始错误，不因是否提供锁服务而改变。非 retained wrapper 继续验证有界初始化与 Recount：目录和 frontier 预算、取消、listing 失败均不发布部分计数，等待中的操作可在测量结束后推进。
+[limited 构造与通用契约用例](../packages/storage/limited/limited_test.go)分别使用原生组合、委托原生计费但不暴露 retained 文件的 wrapper；两者都执行完整 storage 契约。缺少 native 计费能力在任何用量测量前以 `ENOSYS` 拒绝；[能力检查失败](../packages/storage/limited/publication_test.go)逐一保留原始错误，不因是否提供锁服务而改变。非 retained wrapper 继续验证有界初始化与 Recount：目录和 frontier 预算、取消、listing 失败均不发布部分计数，等待中的操作可在测量结束后推进。256-byte frontier 超限用例按 active root、record 与完整路径的实际 byte charge 准备最少越界目录，保留原错误原因、七字节计数和失败后 operation gate 恢复；独立精确边界用例继续检验 active／pending 计费。准备成本的选择见[测试工作决定](../.agents/notes/implemented/testing/2026-09-09-reduce-test-work.md)。
 
 [native quota hook 用例](../packages/storage/limited/publication_test.go)以真实 SQLite 与内存对象保留 3072／1024 字节的目录改名交错：外层额度为 4096，内层分别不设额度或设为 8192；暂停 Put 时无关文件的等长覆盖须完成，再依次把 d 改名为 old、e 改名为 d。恢复后，针对较小新目标的增长以 `EDQUOT` 拒绝，反向大小组合的缩短按最终目标结算；两份内容、元数据权威 Usage、即时 Used 与 Recount 必须一致。最终效果注入另外验证增长先预留、Applied 后才返还缩减或删除的字节、NotApplied 退回增长；已应用但回复失败仍按实际效果结算。[未知结果或 unwind／settlement 失败](../packages/storage/limited/publication_uncertainty_test.go)保守保留预留，并使后续修改、Space 与 Recount 失败，已在 staging 的调用也不能越过该状态。嵌套 quota 验证准备被拒绝后各层预留归还；scope、锁服务与 Close 继续配对透传。
 
@@ -359,7 +359,7 @@ SMB CREATE 直接核对五种 disposition 的缺席／已有结果、目录与 m
 
 名字验证同时覆盖 UTF-16、设备名、非法 sibling、大小写歧义、合法无关 symlink、选中 symlink 拒绝、取消、root substitution 和祖先 ID 重用。每级观察单独使用 OpFileObserveDirectoryMetadata、可信 volume 与请求 principal 授权；策略拒绝时 observer 调用和 CREATE 效果均为零，允许观察而拒绝 replication.snapshot 的策略仍可完成按名打开。每一级必须消费完整权威 listing，再用固定 revision/edge guards 执行最终打开；坏条目不能被精确命中或 pattern 过滤遮蔽。portable comparer 核对规范表与边界向量，Windows native 比较用例遍历全部 65,536 个 UTF-16 unit 并核对排序／等价，另覆盖多 unit、surrogate、composed/decomposed 和非等价 Unicode 向量。
 
-访问矩阵区分 byte rights、Use/share 与 MetadataAccess：execute-only、DELETE-only、attribute-only 是 NodeReference；execute+write 声明 read/write Use 却没有字节读；字节读+metadata 写与字节写+metadata 读分别保持授予。参与 sharing 的 data/execute/write/append/DELETE access 与三种 share 位在两个 SMB sessions 及非 SMB 入口上双向核对，目录也参与 ReadEntries 声明。metadata/control-only Use=0 的 Windows 打开忽略 ShareAccess、Deny=0；在参与者之前／之后打开均不能产生 sharing conflict。授权拒绝不得留下引用、Use、创建、内容、metadata 或 allocation 效果。
+访问矩阵区分 byte rights、Use/share 与 MetadataAccess：execute-only、DELETE-only、attribute-only 是 NodeReference；execute+write 声明 read/write Use 却没有字节读；字节读+metadata 写与字节写+metadata 读分别保持授予。参与 sharing 的 data/execute/write/append/DELETE access 与三种 share 位在两个 SMB sessions 及非 SMB 入口上双向核对，目录也参与 ReadEntries 声明。[双会话 share matrix](../packages/smb/commands_file_integration_linux_test.go)保留 direct／HTTP 的 144 个 access／share／applicant 向量，每个 incumbent／share 组合分别拥有 SMB 与非 SMB incumbent，三类 applicant 仍独立打开和关闭。两个方向之间先关闭原 incumbent，每个新 SMB 打开仍执行真实 Renew；成功 applicant 立即关闭，每类正向／反向 applicant 后及最终 incumbent 关闭后均核对原对象身份与长度。metadata/control-only Use=0 的 Windows 打开忽略 ShareAccess、Deny=0；在参与者之前／之后打开均不能产生 sharing conflict。授权拒绝不得留下引用、Use、创建、内容、metadata 或 allocation 效果。
 
 普通 direct／HTTP 命令矩阵共用 command-only fixture，不启动后台 renew worker；FileSession 的 Lease 和 History 都显式设为有限的 5 分钟，使普通场景在该窗口内核对自身行为。七个原有 CREATE、关闭删除、目录完整捕获及签名目录退休父矩阵，各自在父测试初始化一份真实 authority，direct／HTTP 复用该 backend；65 个语义 children 保留原名称、断言和故障／退休拓扑。每个 child 新建 raw FileSession／epoch、server／tree／config／policy／owner ledger，使用独立名字或目录；坏 leaf 原值保持，签名 child 另有 fresh TCP／认证／signer。newFileSessionFixture 的清理检查引用／目录／write／flush／delete 本地责任并核对 raw CloseWithResult 的无错误、Determined 与 Released；共享的是准备，不能跨 child 共享未结清状态。特殊 lease／history、restart、quota 与恢复矩阵保持原 fixture 和时间／容量判据。准备归属及代价见[测试工作量决定](../.agents/notes/implemented/testing/2026-09-09-scale-test-work-to-its-assertions.md)。跨两个 SMB sessions 与非 SMB 入口的 share 矩阵还在每个新 SMB 打开前调用真实 FileSession.Renew，并经 authority.acceptStatus 安装返回的 admission epoch。续租不延长 action history；过期 epoch 的 action 仍拒绝，测试夹具不改变产品默认值或原动作规则。显式 semanticAction 以 native history 判定；回归先观察真实 native epoch 轮换，再改变 served session 的 HTTP started 起算点制造两层 clock 偏差，验证仍有效的 OpenAt／MutateTruncate 可执行、typed replay 保留原 Attr／barrier、未来／陈旧 native ID 拒绝且无效果。同 ID 意图变化、implicit transport epoch／Retry 和 explicit close cursor 继续由各自原有测试验证。[专用短 history 回归](../packages/smb/fixture_history_integration_linux_test.go)显式使用 2 秒 History，经真实 Status 确认同一 native incarnation 的 ActionEpoch 前进，再验证旧 admission epoch 的新动作被拒绝，真实续期后 CREATE 成功；退休及 history-rotation 用例各自选择其受测期限，sharing 结果仍由独立矩阵逐项验证。
 
@@ -564,7 +564,7 @@ SMB Basic 设置共享时间与 HIDDEN／SYSTEM 后，Linux 原 fd 的 fstat 必
 
 ### Azure Blob
 
-`packages/storage/objectstore/azblob` 对一个真的 Blob 端点跑，那个端点是 Azurite。它定义在 [`deployments/azurite.yml`](../deployments/azurite.yml)：本地 `make azurite` 起、`make azurite-down` 停；CI 的 `checks` 与 `mounted` 两个 Linux job 各自在依赖 Blob 的测试之前启动同一模拟器，并等待它能够回答请求。挂载 job 的真实 Azure 二进制锁与重启用例依赖该端点，因此启动步骤位于对拍和端到端测试之前；后面的全 module 覆盖率闸门继续使用这份模拟器。
+`packages/storage/objectstore/azblob` 对一个真的 Blob 端点跑，那个端点是 Azurite。它定义在 [`deployments/azurite.yml`](../deployments/azurite.yml)：本地 `make azurite` 起、`make azurite-down` 停；CI 的 `checks-work` 与 `mounted` 两个 Linux job 各自在依赖 Blob 的测试之前启动同一模拟器，并等待它能够回答请求。挂载 job 的真实 Azure 二进制锁与重启用例依赖该端点，因此启动步骤位于对拍和端到端测试之前；后面的全 module 覆盖率闸门继续使用这份模拟器。
 
 **够不到模拟器时这一层失败，不跳过。** 依赖缺席是一个必须报出来的事实，不是一个可以让用例自己消失的条件。
 
@@ -598,7 +598,9 @@ SQLite 的包内直接用例按各模块持有的边界核对结果：
 
 当前 schema 的 volume 与 detached 完整性拒绝矩阵各自建立一次健康种子，种子仍由真实 Open 和公开 mutation 产生。全部 Store 和 raw handle 成功关闭、WAL TRUNCATE checkpoint 的 busy/frames/checkpointed 均为零之后，才保存完整主库字节和 fixture 元数据。每例写入新的私有 `0600` 文件，持有独立 inode、连接与可变状态，再执行原来的 detach、损坏及 Open/ObjectStatus 顺序。
 
-复制机制同时验证健康与隔离：一份副本的公开写入可读，另一份副本通过 Open/ObjectStatus 且看不到该写入；顶层 cleanup 核对种子字节未变。种子不跨顶层测试共享，也不保留共享活句柄。迁移、WAL、恢复、lease、文件身份和跨进程用例保持原有准备路径；不能复制掉它们要验证的状态形成过程。选择与局部匹配测量见[减少无用 SQLite 测试工作](../.agents/notes/implemented/testing/2026-09-09-reduce-test-work.md)。
+复制机制同时验证健康与隔离：一份副本的公开写入可读，另一份副本通过 Open/ObjectStatus 且看不到该写入；顶层 cleanup 核对种子字节未变。种子不跨顶层测试共享，也不保留共享活句柄。迁移、WAL、恢复、lease、文件身份和跨进程用例保持原有准备路径；不能复制掉它们要验证的状态形成过程。
+
+[十四项 live scalar corruption](../packages/metastore/sqlite/reference_state_projection_test.go)只在所属顶层读取拒绝矩阵内复用一份健康 Store 和 retained file reference。每项先核对原完整 FileState、scalar projection、DurableState 与持久 used／allocated_used，再独立取得 writer connection 注入原损坏；`StateScalars` 必须返回 `EIO` 与全零结果，并归还 reader connection。每项清理恢复节点 scalar 值、check constraints 并检查连接关闭，再以顶层 context 核对全部基线、coordinator health、native file ownership 和 reader InUse 为零；恢复或关闭失败使测试失败并停止后续损坏。retained file 与 Store 仍由原 owner 按顺序关闭。它不共享损坏状态，不扩展到迁移、关闭或恢复矩阵。准备规则与局部匹配测量见[减少无用测试工作](../.agents/notes/implemented/testing/2026-09-09-reduce-test-work.md)。
 
 #### 迁移与完整性断言
 
