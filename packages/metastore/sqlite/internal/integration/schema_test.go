@@ -2,6 +2,7 @@ package integration_test
 
 import (
 	"bytes"
+	"database/sql"
 	"errors"
 	"flag"
 	"fmt"
@@ -84,14 +85,25 @@ func TestOpenRejectsLargeBlobSchemaVersionBeforeMigration(t *testing.T) {
 func writePreRetainedDatabase(t *testing.T, version int) string {
 	t.Helper()
 	path := writeHistoricalLeaseDatabase(t, true)
+	db := raw(t, path)
+	defer closeHistoricalFixture(t, db)
+	tx := historicalFixtureTransaction(t, db)
+	defer rollbackHistoricalFixture(t, tx)
 	for current := 4; current <= version; current++ {
 		name := fmt.Sprintf("../schema/migrations/%04d_%s.sql", current, map[int]string{4: "lease_recovery", 5: "retained_files"}[current])
 		migration, err := os.ReadFile(name)
 		if err != nil {
 			t.Fatal(err)
 		}
-		damageDatabase(t, path, string(migration))
-		damageDatabase(t, path, fmt.Sprintf(`UPDATE schema_version SET version = %d`, current))
+		if _, err := tx.ExecContext(t.Context(), string(migration)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tx.ExecContext(t.Context(), `UPDATE schema_version SET version = ?`, current); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
 	}
 	return path
 }
@@ -460,8 +472,10 @@ func writeVersionTwo(t *testing.T, path string) {
 		t.Fatal(err)
 	}
 	db := raw(t, path)
-	if _, err := db.Exec(string(statements)); err != nil {
-		db.Close()
+	defer closeHistoricalFixture(t, db)
+	tx := historicalFixtureTransaction(t, db)
+	defer rollbackHistoricalFixture(t, tx)
+	if _, err := tx.ExecContext(t.Context(), string(statements)); err != nil {
 		t.Fatalf("building the version 2 witness: %v", err)
 	}
 	const (
@@ -487,12 +501,11 @@ func writeVersionTwo(t *testing.T, path string) {
 		{`INSERT INTO logs (volume, incarnation, committed_position, trimmed_through, trimmed_by_age)
 		  VALUES (1, 'version-two-incarnation', 0, 0, 0)`, nil},
 	} {
-		if _, err := db.Exec(statement.sql, statement.args...); err != nil {
-			db.Close()
+		if _, err := tx.ExecContext(t.Context(), statement.sql, statement.args...); err != nil {
 			t.Fatalf("filling the version 2 database: %v", err)
 		}
 	}
-	if err := db.Close(); err != nil {
+	if err := tx.Commit(); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -1410,11 +1423,9 @@ func TestAVersionOneDatabaseIsCarriedForwardIntact(t *testing.T) {
 func writeVersionOne(t *testing.T, path string) {
 	t.Helper()
 	db := raw(t, path)
-	defer func() {
-		if err := db.Close(); err != nil {
-			t.Fatalf("closing the version 1 database: %v", err)
-		}
-	}()
+	defer closeHistoricalFixture(t, db)
+	tx := historicalFixtureTransaction(t, db)
+	defer rollbackHistoricalFixture(t, tx)
 
 	for _, statement := range []string{
 		`CREATE TABLE schema_version (version INTEGER NOT NULL)`,
@@ -1455,7 +1466,7 @@ func writeVersionOne(t *testing.T, path string) {
 		`CREATE INDEX nodes_by_content ON nodes (content)`,
 		`INSERT INTO schema_version (version) VALUES (1)`,
 	} {
-		if _, err := db.Exec(statement); err != nil {
+		if _, err := tx.ExecContext(t.Context(), statement); err != nil {
 			t.Fatalf("building the version 1 layout: %v", err)
 		}
 	}
@@ -1485,8 +1496,34 @@ func writeVersionOne(t *testing.T, path string) {
 		{`INSERT INTO entries (parent, name, node) VALUES (1, ?, 2)`, []any{[]byte("d")}},
 		{`INSERT INTO entries (parent, name, node) VALUES (2, ?, 3)`, []any{[]byte("f")}},
 	} {
-		if _, err := db.Exec(statement.sql, statement.args...); err != nil {
+		if _, err := tx.ExecContext(t.Context(), statement.sql, statement.args...); err != nil {
 			t.Fatalf("filling the version 1 database: %v", err)
 		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func historicalFixtureTransaction(t *testing.T, db *sql.DB) *sql.Tx {
+	t.Helper()
+	tx, err := db.BeginTx(t.Context(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return tx
+}
+
+func rollbackHistoricalFixture(t *testing.T, tx *sql.Tx) {
+	t.Helper()
+	if err := tx.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
+		t.Errorf("release historical fixture transaction: %v", err)
+	}
+}
+
+func closeHistoricalFixture(t *testing.T, db *sql.DB) {
+	t.Helper()
+	if err := db.Close(); err != nil {
+		t.Fatalf("close historical fixture database: %v", err)
 	}
 }

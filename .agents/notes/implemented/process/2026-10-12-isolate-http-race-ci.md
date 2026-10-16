@@ -12,13 +12,13 @@ Go 1.26.8 下的一次独立 HTTP 调度实验使用原 strict script、`-race -
 
 ## 决定
 
-本决定落地时，[CI workflow](../../../../.github/workflows/ci.yml)在同一 `checks` 作业中，先运行其它非挂载包的并行 race suite，再用独立步骤执行完整根 HTTP 包。当前[并发 CI 决定](2026-10-14-parallel-ci-execution.md)将 HTTP 移入独立作业；它部分取代这里的顺序执行和 runner 复用，完整包调用及完成判据保持。`checks-work` 的 `go list` 排除集合仍包括挂载包、根 `./packages/metastore/sqlite` 和根 `./packages/transport/httprest`，不排除其它 transport 包。HTTP 调用使用：
+本决定落地时，[CI workflow](../../../../.github/workflows/ci.yml)在同一 `checks` 作业中，先运行其它非挂载包的并行 race suite，再用独立步骤执行完整根 HTTP 包。当前[并发 CI 决定](2026-10-14-parallel-ci-execution.md)将 HTTP 移入独立作业；它部分取代这里的顺序执行和 runner 复用，完整包调用及完成判据保持。`checks-work` 的 `go list` 排除挂载包、根 SQLite、根 HTTP 及[contract CI 平衡决定](2026-10-16-balance-contract-ci.md)的 canonical storage 列表，不排除其它 transport 包。HTTP 调用使用：
 
 ```sh
 .github/scripts/assert-every-test-ran.sh -race -count=1 -timeout 10m ./packages/transport/httprest
 ```
 
-完整 HTTP suite、其它非挂载工作与[独立 SQLite 作业](2026-09-29-isolate-sqlite-race-ci.md)的成功结论共同决定现有 `checks` 必需状态。挂载包、SQLite 根包、HTTP 根包与其余包的集合不重叠且覆盖整个模块，后续新增包继续由 `go list ./...` 进入相应集合；当前独立作业和最终门禁的依赖由并发 CI 决定持有。
+完整 HTTP suite、其它非挂载工作、storage 与[独立 SQLite 作业](2026-09-29-isolate-sqlite-race-ci.md)的成功结论共同决定现有 `checks` 必需状态。挂载包、SQLite 根包、HTTP 根包、三个 storage 根包与其余包的集合不重叠且覆盖整个模块，后续新增包继续由 `go list ./...` 进入相应集合；当前独立作业和最终门禁的依赖由 contract CI 平衡决定持有。
 
 strict script、race、`-count=1`、十分钟 per-binary watchdog 与 module-wide package-local coverage 保持原契约。非挂载 checks-work 的三十五分钟预算仍由[全负载作业预算](2026-09-23-budget-ci-full-load-execution.md)持有；整包 watchdog 由[原有 race 预算](2026-09-08-budget-ci-race-test-execution.md)持有。
 

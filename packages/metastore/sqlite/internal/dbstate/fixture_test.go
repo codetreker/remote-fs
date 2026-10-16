@@ -35,21 +35,21 @@ func stateFixture(t *testing.T) (*sql.DB, State) {
 	if err := sqliteschema.MustLoad(os.DirFS("../schema"), "migrations").Reach(t.Context(), tx); err != nil {
 		t.Fatal(err)
 	}
-	if err := tx.Commit(); err != nil {
-		t.Fatal(err)
-	}
-	execState(t, db, `INSERT INTO volumes (id, name, root, used) VALUES (1, 'workspace', 1, 0)`)
-	execState(t, db, `INSERT INTO nodes
+	execState(t, tx, `INSERT INTO volumes (id, name, root, used) VALUES (1, 'workspace', 1, 0)`)
+	execState(t, tx, `INSERT INTO nodes
 		(id,volume,kind,size,atime_sec,atime_nsec,mtime_sec,mtime_nsec)
 		VALUES (1,1,2,0,0,0,0,0),(2,1,1,0,0,0,0,0)`)
-	execState(t, db, `INSERT INTO entries (volume, parent, name, node) VALUES (1, 1, x'66', 2)`)
-	execState(t, db, `INSERT INTO logs VALUES (1, '0123456789abcdef0123456789abcdef', 2, 0, 0)`)
-	execState(t, db, `INSERT INTO changes
+	execState(t, tx, `INSERT INTO entries (volume, parent, name, node) VALUES (1, 1, x'66', 2)`)
+	execState(t, tx, `INSERT INTO logs VALUES (1, '0123456789abcdef0123456789abcdef', 2, 0, 0)`)
+	execState(t, tx, `INSERT INTO changes
 		(position, previous_position, volume, kind, parent, name, node,
 		 node_kind, size, atime_sec, atime_nsec, mtime_sec, mtime_nsec, recorded_sec, recorded_nsec, metadata)
 		VALUES (2,0,1,0,1,x'66',2,1,0,0,0,0,0,0,0,x'52464d010000')`)
 	state := State{DatabaseID: "0123456789abcdef0123456789abcdef", Generation: 7, NodeHighWater: 4, ChangeHighWater: 6}
-	setFixtureState(t, db, state)
+	setFixtureState(t, tx, state)
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
 	return db, state
 }
 

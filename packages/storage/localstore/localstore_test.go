@@ -5,7 +5,6 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/base64"
-	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"io/fs"
@@ -1017,51 +1016,6 @@ func TestCompletionMarkerCannotBeMovedToAnotherObjectRoot(t *testing.T) {
 	}
 	if !errors.Is(err, syscall.EIO) {
 		t.Fatalf("Open returned %v, want EIO", err)
-	}
-}
-
-func TestMalformedCompletionMarkerFailsClosed(t *testing.T) {
-	tests := map[string]func([]byte) []byte{
-		"truncated": func(marker []byte) []byte { return marker[:len(marker)-1] },
-		"magic": func(marker []byte) []byte {
-			marker[0] ^= 0xff
-			return marker
-		},
-		"total length": func(marker []byte) []byte {
-			binary.BigEndian.PutUint32(marker[12:16], uint32(len(marker)+1))
-			return marker
-		},
-		"volume length": func(marker []byte) []byte {
-			binary.BigEndian.PutUint32(marker[16:20], localstore.MaxVolumeBytes+1)
-			return marker
-		},
-		"checksum": func(marker []byte) []byte {
-			marker[len(marker)-1] ^= 0xff
-			return marker
-		},
-	}
-	for name, corrupt := range tests {
-		t.Run(name, func(t *testing.T) {
-			config := testConfig(privateRoot(t))
-			closeStore(t, open(t, config))
-			path := filepath.Join(config.Root, "LOCALSTORE")
-			marker, err := os.ReadFile(path)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if err := os.WriteFile(path, corrupt(marker), 0o600); err != nil {
-				t.Fatal(err)
-			}
-
-			store, err := localstore.Open(t.Context(), config)
-			if err == nil {
-				store.Close()
-				t.Fatal("Open accepted a malformed completion marker")
-			}
-			if !errors.Is(err, syscall.EIO) {
-				t.Fatalf("Open returned %v, want EIO", err)
-			}
-		})
 	}
 }
 

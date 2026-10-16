@@ -50,7 +50,12 @@ func nodeOpenProofVolume(t *testing.T) (*objectstore.Storage, *nodeOpenProofAuth
 	return volume, authority
 }
 
+type borrowedNodeOpenProofAuthority struct{ *nodeOpenProofAuthority }
+
+func (*borrowedNodeOpenProofAuthority) Close() error { return nil }
+
 func TestNodeOpenRefusalProofPreservesJournalAndReferenceOwnership(t *testing.T) {
+	fixture := newReadOnlyNativeFixture(t, nil)
 	for _, test := range []struct {
 		name       string
 		proof      bool
@@ -75,8 +80,10 @@ func TestNodeOpenRefusalProofPreservesJournalAndReferenceOwnership(t *testing.T)
 		{name: "proof with outcome", proof: true, cause: context.Canceled, outcome: storage.Opened, wantErrno: syscall.EIO, wantRecord: storage.FileActionUnknown},
 		{name: "proof with retained reference", proof: true, cause: context.Canceled, reference: true, wantErrno: syscall.EIO, wantRecord: storage.FileActionUnknown},
 	} {
+		fixture.requireHealthy(t)
 		t.Run(test.name, func(t *testing.T) {
-			volume, authority := nodeOpenProofVolume(t)
+			authority := &nodeOpenProofAuthority{LockingStore: fixture.native}
+			volume := fixture.volume(t, &borrowedNodeOpenProofAuthority{authority})
 			meta := authority.LockingStore
 			root, err := volume.Stat(t.Context(), "")
 			if err != nil {

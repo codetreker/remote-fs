@@ -12,6 +12,7 @@ import (
 )
 
 func TestTrimHonorsVolumeAgeFloorAndVolume(t *testing.T) {
+	fixture := newLogMatrixFixture(t, 5)
 	for _, test := range []struct {
 		name   string
 		window Window
@@ -27,9 +28,8 @@ func TestTrimHonorsVolumeAgeFloorAndVolume(t *testing.T) {
 		{"age boundary", Window{1, 10, time.Hour}, 3, []int64{4, 5}, 3, true},
 		{"floor keeps all", Window{5, 10, time.Hour}, 5, []int64{1, 2, 3, 4, 5}, 0, false},
 	} {
-		t.Run(test.name, func(t *testing.T) {
-			_, tx := logFixture(t)
-			appendLog(t, tx, 5)
+		if !t.Run(test.name, func(t *testing.T) {
+			tx := fixture.transaction(t)
 			foreignChange := fileChange(metastore.Created)
 			foreignChange.Parent = 3
 			foreignChange.Node.ID = 4
@@ -66,7 +66,9 @@ func TestTrimHonorsVolumeAgeFloorAndVolume(t *testing.T) {
 			if !reflect.DeepEqual(got, test.want) || cut != test.cut || age != test.age || tail != 5 || foreign != 1 {
 				t.Fatalf("retained=%v cut=%d age=%v tail=%d foreign=%d", got, cut, age, tail, foreign)
 			}
-		})
+		}) {
+			return
+		}
 	}
 }
 

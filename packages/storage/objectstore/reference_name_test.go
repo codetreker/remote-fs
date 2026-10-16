@@ -371,7 +371,16 @@ func (*nameWithoutIdentity) ObserveName(context.Context, *storage.NamespaceGuard
 	return storage.NameObservation{}, syscall.EIO
 }
 
+type borrowedNameProbeStore struct{ *nameProbeStore }
+
+func (*borrowedNameProbeStore) Close() error { return nil }
+
 func TestObjectReferenceNameObservationRejectsUnsupportedAndMalformedBackends(t *testing.T) {
+	fixture := newReadOnlyNativeFixture(t, func(volume *objectstore.Storage) {
+		if err := volume.Create(t.Context(), "f"); err != nil {
+			t.Fatal(err)
+		}
+	})
 	failure := errors.New("name authority failure")
 	for _, test := range []struct {
 		name      string
@@ -390,9 +399,10 @@ func TestObjectReferenceNameObservationRejectsUnsupportedAndMalformedBackends(t 
 		{name: "contradictory binding", configure: func(f *nameProbeFile) { f.result.State = storage.NameDetached }, want: syscall.EIO},
 		{name: "owned result"},
 	} {
+		fixture.requireHealthy(t)
 		t.Run(test.name, func(t *testing.T) {
 			var probe *nameProbeFile
-			volume := newNameProbeVolume(t, func(file metastore.File) metastore.File {
+			backend := &nameProbeStore{LockingStore: fixture.native, wrap: func(file metastore.File) metastore.File {
 				id, err := storage.ReferenceNodeID(file)
 				if err != nil {
 					t.Fatal(err)
@@ -409,12 +419,10 @@ func TestObjectReferenceNameObservationRejectsUnsupportedAndMalformedBackends(t 
 				default:
 					return probe
 				}
-			})
-			if err := volume.Create(t.Context(), "f"); err != nil {
-				t.Fatal(err)
-			}
+			}}
+			volume := fixture.volume(t, &borrowedNameProbeStore{backend})
 			session := fileSessionFor(t, volume, storage.DefaultFileSessionOptions())
-			file := openFileFor(t, session, "f", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true}})
+			file := openFileFor(t, session, "f", storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true}, Use: storage.UseClaim{Uses: storage.ReadData}})
 			observer := objectCapability[storage.ReferenceNameObserver](t, file)
 			if err := observer.CheckReferenceNameObservation(); !errors.Is(err, test.checkWant) {
 				t.Fatalf("name capability = %v; want %v", err, test.checkWant)

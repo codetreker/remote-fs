@@ -12,17 +12,27 @@ Status: implemented
 
 objectstore 的 storage 契约为七十个子项重复形成相同 SQLite schema，两个只读 Get 错误矩阵重复写入同一健康内容。SQLite 内部组件的十四个校验父矩阵，也为 127 个原有命名子项反复准备同一健康数据库。它们必须验证独立 volume、调用方事务、实际拒绝原因与清理，重复的健康准备本身并不是这些判据。
 
+[后续逐项调查](../../../../docs/research/2026-10-16-slow-ci-cases.md)在固定 head 的 CI 中找到 173 个超过五秒的 verdict，其中 18 个已包含在父项时间内。普通 schema、只读 native owner、历史 fixture 的健康提交以及不进入 wire 的大路径分配仍有重复成本；契约、崩溃与真实恢复的成本则包含必须保留的状态形成。目标需要同时观察各项准备和整份 CI 的调度，不能把局部时间相加当作 wall time 收益。
+
 ## 决定
 
 ### 契约共享物理数据库，子用例拥有独立 volume
 
 根 [metastore 契约](../../../../packages/metastore/sqlite/contract_test.go)与 [objectstore 的公共 storage 契约](../../../../packages/storage/objectstore/storage_test.go)各由自己的顶层测试拥有一个真实文件数据库。metastore 工厂为每个子项分配唯一的 `volume-N`／`neighbour-N`，分别按原有 allowance 和默认选项打开 Store；objectstore 的原有七十个子项各取得唯一 `volume-N`，以及原有计数器分配的独立 Blob prefix。
 
-子项拥有自己的 context、Store、连接和检查错误的 Close cleanup；objectstore 还为每项创建独立 Storage 与 maintenance worker。下一项不借用前项的活句柄。physical schema 可以复用，树、内容、配额、对象 key 空间、维护队列、volume 日志和 worker 都属于该项。objectstore 的默认 `newParts` 为其它调用建立新数据库与 `workspace` volume，bounded 契约及其它有状态用例保持原准备路径。
+子项拥有自己的 context、Store、连接和检查错误的 Close cleanup；objectstore 还为每项创建独立 Storage 与 maintenance worker。下一项不借用前项的活句柄。physical schema 可以复用，树、内容、配额、对象 key 空间、维护队列、volume 日志和 worker 都属于该项。objectstore 的 bounded 契约、关闭排空、容量、sweep 与失败 Put 指定矩阵也使用所属父测试的普通 physical schema，各例仍取得自己的 volume、原 allowance 和 Objects／Blob prefix。默认 `newParts` 为其它调用建立新数据库与 `workspace` volume。
 
 顺序子用例回归先保存一份已有内容、配额、reserved／unresolved／garbage 对象和日志，再确认它的 Store 已关闭。下一对 volume 须从空目录、仅含根的 snapshot、零 Used／pending／garbage 与自己的 allowance 开始；新日志 identity 独立，共享数据库 identity 和高水位仍合法。第二例写入后重新读取第一例，核对其元数据、配额、对象状态和双方日志未被改动。每例仍制造稀疏 position，不假定新 volume 的全局序号从零开始。
 
 objectstore 的隔离回归确认前一项 Store 已结束，新项没有继承名字、内容、root 属性、配额用量、对象维护队列或日志 incarnation／position；新 Blob prefix 不能读取前项的真实 object key。关闭第三个 sibling 后第二个 volume 仍可读，前项的 Blob 字节保持，物理 database identity 相同且 generation 推进。
+
+### native storage 契约先形成独立 volume，再逐项完整打开
+
+limited 的两种 storage capability 各用 [RunPrepared](../../../../packages/storage/storagetest/storagetest.go)把权威 case 表的实际数量交给父工厂，不维护第二份 case 计数。[memoryfixture.Prepared](../../../../packages/storage/lockcontract/memoryfixture/prepared.go)在第一次 native lease binding 前，通过普通 SQLite Open／Close 形成全部独立 volume。每个原子项仍执行完整 OpenLocking，拥有新的 authority、Objects、连接池和 worker，检查本项完整 Close 后才进入下一 volume；不复制数据库、native anchor 或对象内容。
+
+父工厂按序分配且每个 volume 只用一次，mutex 拒绝仍 active、已耗尽或已 poison 的调用。检查 lease watermark 前还检查 owner live；前后 MaxLease 必须为零，任何打开、能力健康、watermark 或关闭失败都阻止后继。命名空间、root 属性、配额、history、对象队列、native capability、前项字节与健康后继由独立回归约束。strong grant 会留下 database-wide recovery watermark，这类锁契约继续使用独立 New，不进入该工厂。
+
+预准备使一个父测试的普通 Open／Close 次数增加，却消除反复 migration 和首次 lease initialization；收益必须包含整份 upfront 工作再判断。`-run` 过滤仍准备完整 case 表对应的全部 volume，这是避免复制测试 matcher 与产生另一份清单的成本。原有两个能力分支、140 个 leaf、100 次原子替换、两个读者和 128／96 KiB 内容均保持；localstore 的 root 永久绑定不能使用该机制。
 
 ### 只读 Get 故障矩阵保留健康 owner
 
@@ -30,17 +40,41 @@ objectstore 的隔离回归确认前一项 Store 已结束，新项没有继承�
 
 每项开始前和 borrowed worker 成功 Close 后，以仍有效的父 context 核对完整 Attr（含 metadata 与时间）、根 List、Space 的值与错误文本、Usage、ObjectStatus，以及健康 owner 的原内容。cleanup 按 LIFO 顺序先关闭 borrower，再检查不变性；父 owner 只在所属测试结束时关闭。准备、mutation、Put、sweep、lease 与恢复用例继续取得自己的 fixture，不能借用这份只读 owner。
 
+### 只读 native 拒绝保留能力与健康后继
+
+objectstore 的 [node-open](../../../../packages/storage/objectstore/node_open_refusal_test.go)、[目录 metadata](../../../../packages/storage/objectstore/directory_observation_test.go)和[引用名字](../../../../packages/storage/objectstore/reference_name_test.go)三个矩阵各保留一份健康 native owner／tree，原有 13／7／9 项各自拥有 fault／capability wrapper、Objects、Storage worker、session、reference、counter 与结果字节。borrowed adapter 保留 native optional capabilities；child Close 只结束自己的资源。关闭 session、worker 后，以父 context 比较递归 Node／Child 属性、身份、metadata、revision、BackendIdentity、DurableState、零 MaxLease、barrier、Space 分类和值、Usage 与 ObjectStatus，并验证相冲突的健康后继打开及再次观察。清理失败使 owner 不可再借用。
+
+limited 的三个拒绝矩阵将十七份 native 准备变为三份父 backing，保留七项 settlement、六项 capability 与四项 accounting error；locked 的四项 capability 变体同样各有新 session／probe／allowance／facade，父 backing 不被 child 关闭。拒绝必须保留原错误身份与精确注入次数，父树、history、Usage、ObjectStatus 及健康后继必须不受 child fence 影响。limited 的有状态目录 rename／publication 则仅共享普通 physical schema，四项分别拥有独立 volume、连接、Objects 和 worker。
+
+replicated 的三项 checkpoint 拒绝借用一个健康 authority／seed，handler、server、gates、counter、replica、transport 仍逐项拥有，关闭且 active work 排空后再核对原状态。service 的八项 missing component 以 cached／reopened 各有一个 root，fresh reader 先结束，注入恢复后检查 root／DB identity、权限和 marker；末尾实际重开并验证 summary、Attr 和原内容。它们不跨顶层测试共享 owner，不把故障、journal 或未知关闭带到后继。
+
 ### 纯校验矩阵使用独立事务
 
-[dbstate](../../../../packages/metastore/sqlite/internal/dbstate/fixture_test.go)、[changes](../../../../packages/metastore/sqlite/internal/changes/fixture_test.go)和 [schema](../../../../packages/metastore/sqlite/internal/schema/fixture_test.go)分别由所属父测试拥有健康文件数据库。复用限定为五个 dbstate、三个 changes、六个 schema 父矩阵，原有命名子项分别为 60、22、45 个。每项使用自己的 transaction，损坏、临时 trigger 和分配操作均在该事务中发生，原 variant 名称、errno、SQL 原因和结果断言保持。
+[dbstate](../../../../packages/metastore/sqlite/internal/dbstate/fixture_test.go)、[changes](../../../../packages/metastore/sqlite/internal/changes/fixture_test.go)和 [schema](../../../../packages/metastore/sqlite/internal/schema/fixture_test.go)分别由所属父测试拥有健康文件数据库。复用限定为七个 dbstate、四个 changes、七个 schema 父矩阵，原有命名子项分别为 85、28、50 个。每项使用自己的 transaction，损坏、临时 trigger 和分配操作均在该事务中发生，原 variant 名称、errno、SQL 原因和结果断言保持。directory revision 的四项目录损坏保持仅含目录的健康前提，文件类型分支另有独立文件树，不为共享准备增加原来不存在的节点。
 
 父 fixture 捕获完整 `sqlite_schema` 与所有表的 typed rows。纯校验子项结束时必须成功 Rollback；连接级 PRAGMA 另行恢复并读取确认，已提交 schema、数据与原基线比较，连接归还后 InUse 必须归零。dbstate 与 schema 恢复 `ignore_check_constraints`，changes 还恢复 `query_only`、`foreign_keys` 与 `recursive_triggers`。事务与清理使用不随子项取消的 owner context，被测操作仍使用原调用 context；不能让自动回滚与显式恢复争用一条连接。
 
-`ReconcileStartup` 的命名 variants 保留每项的真实 Commit 与提交后的 Read，以证明数据库状态不变；最终缺失 state 的场景仍使用独立数据库。公开 Prepare、迁移、创建事实、uncertain commit、持久恢复与原生所有权用例保持独立准备，不以内部纯校验事务替代其状态形成或发布。
+`ReconcileStartup` 的命名 variants 保留每项的真实 Commit 与提交后的 Read，以证明数据库状态不变；最终缺失 state 的场景仍使用独立数据库。公开 Prepare、迁移、创建事实、uncertain commit、持久恢复与原生所有权保留各自真实状态形成和发布，不以内部纯校验事务替代。
+
+### 健康 seed 批量提交，历史入口保持独立
+
+dbstate 把初始 migration 与八条 seed DML 通过同一 Tx 完成并检查 Commit，返回仍是已提交的健康数据库。schema 的 populated historical v1～v5 与 integration 的 v1／v2、pre-retained v4／v5 builders 用检查提交、回滚与关闭的事务构造健康 DDL／DML。每份历史数据库仍有独立文件，原损坏、实际 Prepare／migration 和拒绝后的 unchanged-state 断言保持；批量提交只发生在被测操作之前的健康准备。
+
+### 关闭的持久 root 仅供只读拒绝复用
+
+localstore 的 malformed marker、foreign witness、unsafe stage 三组各由父测试持有已关闭健康 root，原有十四个变体逐项注入并恢复。整棵树的路径、inode、mode、owner、link count、文件长度和 SHA-256 都必须与基线相同；目录时间和读取可更新的 atime 不属于这份不变性。每项确认 native ownership 已释放，末尾实际重开验证已确认文件的 Attr、身份和内容。污染回归覆盖同长度字节、权限、替换 inode 和额外文件；恢复失败停止后继。oversized SQL、初始化、真正恢复、SIGKILL、WAL 与契约继续独立准备。
+
+checkpoint-worker 用例用 held snapshot 和故障目录保持失败／恢复阶段，测试重试间隔为十毫秒，原 failure、Pending 和恢复状态均继续观察。serviceapi 的 25,000 项响应只为末条断言构造完整 child path，去除其它不进入 JSON 的路径分配；原 HTTP body、严格解析、大小边界和末条完整相等断言保持。
+
+### 关闭错误分别验证显式重试与 maintenance
+
+[确定 accounting refusal 用例](../../../../packages/storage/objectstore/files_test.go)保留两条独立 native lifecycle：volume close 验证原显式重试和 claim；maintenance 先等待失败 session.Close 完成，核对冲突打开仍被原 share claim 拒绝，恢复 accounting 后经公开空内容 Write 触发实际后台重试。`synctest.Wait` 确认 worker 完成，再在手动 volume Close 之前核对 native Usage 为零、旧 detached NodeID 返回零身份和 `ESTALE`、maintenance status 健康。阶段等待区分已完成失败和正在执行的 Close，避免把偶然进入的成功关闭分支当作错误重试覆盖；原回执容量、history 和关闭结果判据保持。
 
 ### 准备优化的范围
 
-physical schema、健康只读内容和纯校验事务的复用服务于 [R-FS-1／R-FS-5、R-CON-3、R-ERR-2／R-ERR-6／R-ERR-7](../../../../docs/spec/requirements.md)的既有验证。新的 logical volume、独立错误注入与 worker owner、逐项事务结算及恢复后的不变性是复用条件；生产路径、public contract 的数量与负载、workflow、race、`-count=1`、watchdog 和 package-local coverage 判据保持。
+physical schema、健康只读内容和纯校验事务的复用服务于 [R-FS-1／R-FS-5、R-CON-3、R-ERR-2／R-ERR-6／R-ERR-7](../../../../docs/spec/requirements.md)的既有验证。新的 logical volume、独立错误注入与 worker owner、逐项事务结算及恢复后的不变性是复用条件；生产路径、public contract 的数量与负载、race、`-count=1`、watchdog 和 package-local coverage 判据保持。package 分组和启动顺序由[contract CI 平衡决定](../process/2026-10-16-balance-contract-ci.md)拥有。
+
+延期的 native strong-lock 契约 pooling、HTTP／FUSE 只读矩阵和生产 SQL／JSON／publication 优化各自仍可局部实现与测量；保持跨顶层测试无可变共享状态、原生 inode binding、独立 authority／Store／worker 和工作负载，是使延期不变成架构重写的条件。localstore 的永久 root／volume 绑定、真实恢复、lease watermark 与原子读取并发窗口不由通用 fixture reset 代替。十分钟 CI 目标以完整 hosted step 实测裁定，局部候选上界不构成收益承诺。
 
 ### 邻居产生真实日志，目录保持固定
 
@@ -102,9 +136,15 @@ physical schema、健康只读内容和纯校验事务的复用服务于 [R-FS-1
 
 **只复用 objectstore 契约的 physical schema。** 范围集中于一个工厂，可以去除七十项契约的重复 schema 准备；两个纯读错误矩阵和内部纯校验矩阵仍重复构造相同健康前提。它们的状态不变性或事务 rollback 已有明确判据，分别由自己的 owner 复用可以减少这类准备，并保留原拒绝路径。
 
-**统一复用所有 native 契约。** 其它 native 契约依赖独立 authority、root、lease 与发布历史，通用 pooling 需要重新证明这些隔离。这项扩展保留独立比较的空间。默认工厂仍提供新数据库，新的 logical volume 不能退化为路径前缀 facade，不能在不同父测试之间共享可变 native owner；以后扩展复用只需在对应工厂增加局部证据。
+**统一复用所有 native 契约的活 authority。** 其它 native 契约依赖独立 authority、root、lease 与发布历史，通用 pooling 需要重新证明这些隔离。预准备 volume 仍逐项完整打开／关闭 authority，只用于无 strong watermark 的 storage 契约；默认工厂仍提供新数据库，新的 logical volume 不能退化为路径前缀 facade，不能在不同父测试之间共享可变 native owner。更多扩展仍需在对应工厂增加局部证据。
 
-**继续改变 CI 调度。** 调度改变同时运行的工作，不消除每项重复 schema 准备，并可能增加 runner 上的竞争。现行并发调度由[独立决定](../process/2026-10-14-parallel-ci-execution.md)拥有；更多调度改变须单独测量完整执行路径。
+**只改变 CI 调度。** 调度改变同时运行的工作，不消除每项重复 schema 准备，并可能增加 runner 上的竞争。当前分组由[独立决定](../process/2026-10-16-balance-contract-ci.md)拥有，局部准备优化仍分别测量，完整执行路径另行裁定。
+
+**只优化超过五秒的 leaf。** 慢父项多由若干一秒左右的准备累积，且原二进制的大量时间仍分散于阈值以下。只改显眼的慢 leaf 会漏掉可复用的健康前提；逐个父矩阵保留全部子项，才能同时证明减少的是重复准备。
+
+**SMB share matrix 按期限条件续期。** 该实验从真实 Status／Renew 保存 lease 和 history 的保守下界，只有不足以覆盖下一次 native operation 时才 Renew，保留 144 个向量及实际打开／关闭。匹配 race 调用的一次比较为 0.8385→0.8275 分钟，仅减少 0.0110 分钟（1.31%）；单对观察不能排除噪声，期限、取消、epoch 安装和错误处理的额外机制没有足够收益支撑。矩阵继续在每次新 SMB 打开之前真实 Renew；进一步改变需新的分段 profile 与重复测量。
+
+**把 native、恢复和有状态矩阵放进通用共享池。** 它能省更多构造，却使 root 属性、lease watermark、reference、journal、worker 或恢复 residue 进入后继，native anchor 还绑定原 inode。共享限定于各父测试可证明不变的前提；独立契约和真实 lifecycle 的延后优化需自己的测量与隔离证据。
 
 **每个损坏子用例重新构造完整健康数据库。** 它天然隔离，但为相同前置状态重复执行 schema 与公开 mutation。顶层只构造一次、每例复制独立数据库，保留真实来源和隔离，并通过健康对照检查复制本身。
 
@@ -122,7 +162,28 @@ physical schema、健康只读内容和纯校验事务的复用服务于 [R-FS-1
 
 ## 后果
 
-objectstore 的七十项契约只形成一份 physical schema，两个 Get 错误矩阵的健康 fixture 从十份减为两份。十四个内部父矩阵中，dbstate 的准备从 63 份减为六份（含独立的 missing-state 分支），changes 从 25 份减为三份，schema 从 45 份减为六份。每个新的 volume 和事务仍独立；代价是父测试持有更多既有 volume，复用还依赖完整基线、连接设置恢复与检查 cleanup，任一失败都必须暴露。更少的 schema 准备不构成持久发布或 CI 运行时间的保证。
+以 ef64c5a 为基线的准备优化中，objectstore 的七十项契约只形成一份 physical schema，两个 Get 错误矩阵的健康 fixture 从十份减为两份；十四个内部父矩阵中，dbstate 的准备从 63 份减为六份（含独立的 missing-state 分支），changes 从 25 份减为三份，schema 从 45 份减为六份。历史测量小节保留该次匹配结果。
+
+当前十八个内部父矩阵保留 163 个原有命名子项；native 只读复用、普通 volume 工厂、关闭的 root 恢复与批量健康 seed 各有所属 owner 和隔离检查。每个新的 volume 和事务仍独立；代价是父测试持有更多既有 volume，复用还依赖完整基线、连接设置恢复与检查 cleanup，任一失败都必须暴露。更少的 schema 准备不构成持久发布或 CI 运行时间的保证。
+
+### d394f24 基线的匹配测量
+
+以下比较固定 [d394f24](https://github.com/codetreker/remote-fs/tree/d394f2404c74c07245c3a80049518fdff8d31fb2) 的测试源码为基线，使用 Go 1.26.8、`GOMAXPROCS=2`、`go test -json -race -p=1 -count=1 -timeout 10m`，以 `-run` 选择对应父测试，objectstore 使用真实 pinned Azurite。每组前后各一次，编译预热独立记录。数字是每组共同父测试 inclusive Elapsed 的和，包含各自准备、子项及清理，不是进程或 CI wall time，也不是多轮中位数。
+
+| 测试组 | 基线（分钟） | 优化后（分钟） | 减少 | 共同父项／原 verdict |
+|---|---:|---:|---:|---:|
+| SQLite 内部校验矩阵 | 0.3685 | 0.0812 | 77.97% | 4／40 |
+| objectstore 指定矩阵 | 0.8408 | 0.3953 | 52.98% | 10／69 |
+| service／storage 只读与准备矩阵 | 1.0412 | 0.4960 | 52.36% | 12／56 |
+| limited 完整两能力契约 | 2.5722 | 1.8293 | 28.88% | 1／143 |
+
+SQLite 的四项是 IdentityBounds、LegacySequences、Trim 与 DirectoryRevision，原 36 个命名 children 和四个父 verdict 全部保留。objectstore 保留原 69 个 verdict，新增两个隔离根及四个 children 后共 75 PASS；将 borrower Close 改为结束父 owner、将新 volume 改为复用旧 volume 的两个负向对照分别在 owner／namespace 断言失败，源码随后恢复。service／storage 保留原 56 个 verdict，新增十个判定后共 66 PASS；共同父项耗时包括它们新增的恢复 child，另外两个新增回归根合计 0.0405 分钟，未计入共同父项比较。各组均无 skip、fail 或丢失的原 verdict。
+
+limited 完整契约的 143 个 verdict 和 140 个叶子完全相同；native publication 为 1.2808→0.9052 分钟，native accounting without retained files 为 1.2913→0.9242 分钟。父项测量包含全部 70＋70 份 upfront 普通 volume 准备；二进制为 2.5892→1.8464 分钟，不能把只测构造器的较大收益当作完整契约收益。Prepared helper 自身八个根项及四个 children 的 race 验证另有 12 PASS，无 skip／fail。
+
+这些单轮匹配结果证明选定源码与环境下的局部收益及原判定保留，不能量化 runner 变化或整条 CI 的净收益。完整包 race、各包自己的覆盖块、vet 与最终 hosted gate 分别裁定；十分钟目标只有完整交付 head 的实际测试步骤可证明。
+
+### ef64c5a 基线的历史测量
 
 以 [ef64c5a](https://github.com/codetreker/remote-fs/tree/ef64c5a73992e388065673a81cf96739c1179f9f) 为基线，四组分别选择 objectstore 的三个、dbstate 的五个、changes 的三个、schema 的六个原有父测试，在相同 Go 1.26.8、`GOMAXPROCS=2` 与真实 pinned Azurite 下前后各测三轮。调用使用 `go test -json -race -p=1 -count=1 -timeout 10m`，用 `-run` 选择对应测试；编译预热独立记录。下表按每轮各组父测试的 Elapsed 求和，再取三轮中位数，包含准备、子项和清理，不是进程或 CI 的 wall time：
 

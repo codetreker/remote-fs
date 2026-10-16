@@ -109,6 +109,7 @@ func TestReconcileStartupRequiresTheAcceptedLineageAndWAL(t *testing.T) {
 }
 
 func TestValidateLegacySequencesRejectsLostAndMalformedHistory(t *testing.T) {
+	f := preparedState(t)
 	for _, test := range []struct{ name, mutation, detail string }{
 		{"intact", "", ""},
 		{"malformed node sequence", `UPDATE sqlite_sequence SET seq='bad' WHERE name='nodes'`, "SQLite sequence"},
@@ -122,12 +123,12 @@ func TestValidateLegacySequencesRejectsLostAndMalformedHistory(t *testing.T) {
 		{"missing change sequence", `DELETE FROM sqlite_sequence WHERE name='changes'`, "below retained position"},
 		{"retained log tail above sequence", `UPDATE logs SET committed_position=7`, "below retained position"},
 	} {
-		t.Run(test.name, func(t *testing.T) {
-			db, _ := stateFixture(t)
+		if !t.Run(test.name, func(t *testing.T) {
+			tx := f.transaction(t)
 			if test.mutation != "" {
-				execState(t, db, test.mutation)
+				execState(t, tx, test.mutation)
 			}
-			err := ValidateLegacySequences(t.Context(), db, 2)
+			err := ValidateLegacySequences(t.Context(), tx, 2)
 			if test.detail == "" {
 				if err != nil {
 					t.Fatalf("valid legacy sequences: %v", err)
@@ -135,23 +136,29 @@ func TestValidateLegacySequencesRejectsLostAndMalformedHistory(t *testing.T) {
 			} else if !errors.Is(err, syscall.EIO) || !strings.Contains(err.Error(), test.detail) {
 				t.Fatalf("corrupt legacy sequence returned %v, want %q", err, test.detail)
 			}
-		})
+		}) {
+			return
+		}
 	}
-	t.Run("version one has no history", func(t *testing.T) {
-		db, _ := stateFixture(t)
-		execState(t, db, `DROP TABLE changes`)
-		execState(t, db, `DROP TABLE logs`)
-		if err := ValidateLegacySequences(t.Context(), db, 1); err != nil {
+	if !t.Run("version one has no history", func(t *testing.T) {
+		tx := f.transaction(t)
+		execState(t, tx, `DROP TABLE changes`)
+		execState(t, tx, `DROP TABLE logs`)
+		if err := ValidateLegacySequences(t.Context(), tx, 1); err != nil {
 			t.Fatalf("version one required log tables: %v", err)
 		}
-	})
+	}) {
+		return
+	}
 	for _, table := range []string{"entries", "changes", "logs"} {
-		t.Run("missing "+table, func(t *testing.T) {
-			db, _ := stateFixture(t)
-			execState(t, db, "DROP TABLE "+table)
-			if err := ValidateLegacySequences(t.Context(), db, 2); err == nil || !strings.Contains(err.Error(), "no such table: "+table) {
+		if !t.Run("missing "+table, func(t *testing.T) {
+			tx := f.transaction(t)
+			execState(t, tx, "DROP TABLE "+table)
+			if err := ValidateLegacySequences(t.Context(), tx, 2); err == nil || !strings.Contains(err.Error(), "no such table: "+table) {
 				t.Fatalf("missing legacy table %s returned %v", table, err)
 			}
-		})
+		}) {
+			return
+		}
 	}
 }

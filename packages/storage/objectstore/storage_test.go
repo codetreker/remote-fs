@@ -151,22 +151,22 @@ func makeContainer(ctx context.Context, name string) error {
 // TestContract is the whole obligation: a volume in a blob container behaves the way
 // every other volume does.
 func TestContract(t *testing.T) {
-	factory := contractPartsFactory(filepath.Join(t.TempDir(), "meta.db"))
+	factory := partsFactory(filepath.Join(t.TempDir(), "meta.db"), 0)
 	storagetest.Run(t, func(t *testing.T) storage.Storage { return factory(t) })
 }
 
 // Each child owns its connections, object prefix and maintenance worker; only
 // the physical schema is retained between contract cases.
-func contractPartsFactory(database string) func(*testing.T) parts {
+func partsFactory(database string, allowance int64) func(*testing.T) parts {
 	var sequence atomic.Uint64
 	return func(t *testing.T) parts {
-		return newPartsAt(t, database, fmt.Sprintf("volume-%d", sequence.Add(1)), 0)
+		return newPartsAt(t, database, fmt.Sprintf("volume-%d", sequence.Add(1)), allowance)
 	}
 }
 
 func TestContractPartsFactoryKeepsVolumesAndPrefixesIsolated(t *testing.T) {
 	database := filepath.Join(t.TempDir(), "meta.db")
-	factory := contractPartsFactory(database)
+	factory := partsFactory(database, 0)
 	var first parts
 	var firstRoot storage.Attr
 	var firstNode metastore.Node
@@ -268,8 +268,9 @@ func TestContractPartsFactoryKeepsVolumesAndPrefixesIsolated(t *testing.T) {
 }
 
 func TestBoundedContract(t *testing.T) {
+	factory := partsFactory(filepath.Join(t.TempDir(), "meta.db"), 0)
 	storagetest.RunBounded(t, func(t *testing.T) storage.BoundedStorage {
-		return newParts(t, 0).Storage
+		return factory(t).Storage
 	})
 }
 

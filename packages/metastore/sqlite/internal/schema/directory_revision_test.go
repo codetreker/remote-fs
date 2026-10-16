@@ -77,6 +77,9 @@ func TestDirectoryRevisionMigrationInitializesLiveDirectoriesAndForcesReplicaRes
 }
 
 func TestDirectoryRevisionIntegrityRejectsInvalidCurrentState(t *testing.T) {
+	db := testDatabase(t, 0)
+	volume, _ := testVolume(t, db, "workspace")
+	fixture := newValidationFixture(t, db)
 	for _, damage := range []string{
 		`UPDATE nodes SET directory_revision=X'' WHERE kind=2`,
 		`UPDATE nodes SET directory_revision=X'0000000000000000' WHERE kind=2`,
@@ -84,17 +87,22 @@ func TestDirectoryRevisionIntegrityRejectsInvalidCurrentState(t *testing.T) {
 		`UPDATE nodes SET directory_revision='revision' WHERE kind=2`,
 		`UPDATE nodes SET directory_revision=X'01' WHERE kind=1`,
 	} {
-		t.Run(damage, func(t *testing.T) {
-			db := testDatabase(t, 0)
-			volume, root := testVolume(t, db, "workspace")
+		if !t.Run(damage, func(t *testing.T) {
+			current, currentVolume := fixture, volume
 			if bytes.Contains([]byte(damage), []byte("kind=1")) {
-				testFile(t, db, volume, root, "file", 1, false)
+				fileDB := testDatabase(t, 0)
+				fileVolume, root := testVolume(t, fileDB, "workspace")
+				testFile(t, fileDB, fileVolume, root, "file", 1, false)
+				current, currentVolume = newValidationFixture(t, fileDB), fileVolume
 			}
-			execute(t, db, damage)
-			if err := validateIntegrityWithMetadataPolicy(t.Context(), db, &volume, 1000, 1<<20, schema.Version(), 1<<20, false); !errors.Is(err, syscall.EIO) {
+			tx := current.transaction(t)
+			execute(t, tx, damage)
+			if err := validateIntegrityWithMetadataPolicy(t.Context(), tx, &currentVolume, 1000, 1<<20, schema.Version(), 1<<20, false); !errors.Is(err, syscall.EIO) {
 				t.Fatalf("invalid directory revision accepted: %v", err)
 			}
-		})
+		}) {
+			return
+		}
 	}
 }
 
