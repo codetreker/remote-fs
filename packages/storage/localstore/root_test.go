@@ -503,7 +503,7 @@ func TestStatusSurfacesCheckpointWorkerFailure(t *testing.T) {
 		return record.CheckpointedGeneration == record.State.Generation
 	})
 	store.durable.mu.Lock()
-	store.durable.retryInterval = 2 * time.Second
+	store.durable.retryInterval = 10 * time.Millisecond
 	store.durable.mu.Unlock()
 	snapshot, _, err := store.Log().Snapshot(t.Context())
 	if err != nil {

@@ -135,19 +135,23 @@ func TestPrepareMigratesPopulatedHistoricalVolumes(t *testing.T) {
 	for _, version := range []int{1, 2, 3, 4, 5} {
 		t.Run(fmt.Sprint(version), func(t *testing.T) {
 			db := testDatabase(t, version)
-			execute(t, db, `INSERT INTO volumes (id,name,root,used) VALUES (1,'legacy',1,3)`)
-			execute(t, db, `INSERT INTO nodes (id,volume,mode,size,atime_sec,atime_nsec,mtime_sec,mtime_nsec,content)
+			tx := testTransaction(t, db)
+			execute(t, tx, `INSERT INTO volumes (id,name,root,used) VALUES (1,'legacy',1,3)`)
+			execute(t, tx, `INSERT INTO nodes (id,volume,mode,size,atime_sec,atime_nsec,mtime_sec,mtime_nsec,content)
 				VALUES (1,1,?,0,0,0,0,0,NULL),(2,1,420,3,0,0,0,0,'data')`, int64(fs.ModeDir|0o755))
-			execute(t, db, `INSERT INTO objects (key,volume,state,size,created_sec,created_nsec) VALUES ('data',1,1,3,0,0)`)
+			execute(t, tx, `INSERT INTO objects (key,volume,state,size,created_sec,created_nsec) VALUES ('data',1,1,3,0,0)`)
 			if version == 1 {
-				execute(t, db, `INSERT INTO entries (parent,name,node) VALUES (1,X'66696c65',2)`)
+				execute(t, tx, `INSERT INTO entries (parent,name,node) VALUES (1,X'66696c65',2)`)
 			} else {
-				execute(t, db, `INSERT INTO entries (volume,parent,name,node) VALUES (1,1,X'66696c65',2)`)
-				execute(t, db, `INSERT INTO logs (volume,incarnation,committed_position,trimmed_through,trimmed_by_age)
+				execute(t, tx, `INSERT INTO entries (volume,parent,name,node) VALUES (1,1,X'66696c65',2)`)
+				execute(t, tx, `INSERT INTO logs (volume,incarnation,committed_position,trimmed_through,trimmed_by_age)
 					VALUES (1,'0123456789abcdef0123456789abcdef',0,0,0)`)
 			}
 			if version >= 3 {
-				execute(t, db, `UPDATE database_state SET node_high_water=2`)
+				execute(t, tx, `UPDATE database_state SET node_high_water=2`)
+			}
+			if err := tx.Commit(); err != nil {
+				t.Fatal(err)
 			}
 			id, root, err := Prepare(t.Context(), db, "legacy", "", changes.DefaultWindow(), 1000, 1<<20)
 			if err != nil || id != 1 || root != 1 {

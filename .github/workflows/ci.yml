@@ -19,6 +19,7 @@ env:
   # The layers that mount a filesystem, named once for the mounted job and the
   # nonmounting package selection below.
   MOUNTING_PACKAGES: ./packages/fuse/... ./cmd/...
+  STORAGE_RACE_PACKAGES: ./packages/storage/limited ./packages/storage/localstore ./packages/storage/objectstore
 
 jobs:
   checks-work:
@@ -96,10 +97,34 @@ jobs:
           set -euo pipefail
           # Both expansions are lists of import paths and must split into arguments.
           # shellcheck disable=SC2046,SC2086
-          go list $MOUNTING_PACKAGES ./packages/metastore/sqlite ./packages/transport/httprest >"$RUNNER_TEMP/separate-packages"
+          go list $MOUNTING_PACKAGES $STORAGE_RACE_PACKAGES ./packages/metastore/sqlite ./packages/transport/httprest >"$RUNNER_TEMP/separate-packages"
+          # Start the longest binaries first to reduce the final serial tail.
+          # Go schedules test actions in package order:
+          # https://github.com/golang/go/blob/go1.26.8/src/cmd/go/internal/test/test.go#L1063-L1095
           # shellcheck disable=SC2046
           .github/scripts/assert-every-test-ran.sh -race -count=1 -timeout 10m \
-            $(go list ./... | grep -vxF -f "$RUNNER_TEMP/separate-packages")
+            $(go list ./packages/smb ./packages/metastore/sqlite/internal/integration \
+              ./packages/storage/replicated ./... | grep -vxF -f "$RUNNER_TEMP/separate-packages")
+
+  storage-race:
+    name: Storage contract and race tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-go
+        with:
+          restore-job: checks
+
+      - name: Start the Azure Blob emulator
+        run: docker compose -f deployments/ci/docker-compose.yml up -d --wait --wait-timeout 120
+
+      - name: Storage contract and race tests
+        run: |
+          # shellcheck disable=SC2086
+          .github/scripts/assert-every-test-ran.sh -race -count=1 -timeout 10m $STORAGE_RACE_PACKAGES
 
   sqlite-race:
     name: SQLite contract and race tests
@@ -133,18 +158,23 @@ jobs:
     name: build, format, links, contract and unit tests
     runs-on: ubuntu-24.04
     timeout-minutes: 5
-    needs: [checks-work, sqlite-race, http-race]
+    needs: [checks-work, storage-race, sqlite-race, http-race]
     if: ${{ always() }}
     steps:
       - name: Require all contract and race suites
         env:
           CHECKS_WORK_RESULT: ${{ needs.checks-work.result }}
+          STORAGE_RACE_RESULT: ${{ needs.storage-race.result }}
           SQLITE_RACE_RESULT: ${{ needs.sqlite-race.result }}
           HTTP_RACE_RESULT: ${{ needs.http-race.result }}
         run: |
           failed=0
           if [ "$CHECKS_WORK_RESULT" != success ]; then
             echo "::error::Build and nonmounting tests concluded $CHECKS_WORK_RESULT"
+            failed=1
+          fi
+          if [ "$STORAGE_RACE_RESULT" != success ]; then
+            echo "::error::Storage contract and race tests concluded $STORAGE_RACE_RESULT"
             failed=1
           fi
           if [ "$SQLITE_RACE_RESULT" != success ]; then

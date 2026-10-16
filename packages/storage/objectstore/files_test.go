@@ -1048,46 +1048,79 @@ func TestRetainedReadRetriesCollectedRevisionAndRejectsMissingCurrentObject(t *t
 }
 
 func TestRetainedSessionCloseCanRetryKnownAccountingRefusal(t *testing.T) {
-	volume, meta := fileVolume(t, memory.New(), 4096, nil)
-	failure := errors.New("known cleanup refusal")
-	var refuse atomic.Bool
-	refuse.Store(true)
-	ctx := storage.WithPublicationAccounting(t.Context(), func(previous, next int64) (storage.PublicationSettlement, error) {
-		if previous > 0 && next == 0 && refuse.Load() {
-			return nil, failure
-		}
-		return func(storage.PublicationResult) error { return nil }, nil
-	})
-	session, err := volume.NewFileSession(ctx, storage.DefaultFileSessionOptions())
-	if err != nil {
-		t.Fatal(err)
-	}
-	f := openFileFor(t, session, "f", storage.FileOpenOptions{
-		OpenAccess: storage.OpenAccess{Read: true, Write: true, Create: true},
-		Use:        storage.UseClaim{Uses: storage.ReadData | storage.WriteData, Deny: storage.ReadData},
-	})
-	attr, err := f.Stat(t.Context())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := f.WriteAt(t.Context(), 0, []byte("charge")); err != nil {
-		t.Fatal(err)
-	}
-	if err := volume.Remove(t.Context(), "f"); err != nil {
-		t.Fatal(err)
-	}
-	if err := volume.Close(); !errors.Is(err, failure) {
-		t.Fatalf("first close=%v", err)
-	}
-	if competing, err := meta.OpenNode(t.Context(), attr.ID, storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true}}); competing != nil || !errors.Is(err, storage.ErrUseConflict) {
-		t.Fatalf("failed close dropped the original share claim: reference=%v error=%v", competing, err)
-	}
-	refuse.Store(false)
-	if err := volume.Close(); err != nil {
-		t.Fatalf("retry close=%v", err)
-	}
-	if result, err := session.CloseWithResult(context.Background()); !result.Released || err != nil {
-		t.Fatalf("settled close=%+v %v", result, err)
+	for _, route := range []string{"volume_close", "maintenance"} {
+		t.Run(route, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				volume, meta := fileVolume(t, memory.New(), 4096, nil)
+				failure := errors.New("known cleanup refusal")
+				var refuse atomic.Bool
+				refuse.Store(true)
+				defer func() {
+					refuse.Store(false)
+					if err := volume.Close(); err != nil {
+						t.Errorf("closing the cleanup fixture: %v", err)
+					}
+				}()
+				ctx := storage.WithPublicationAccounting(t.Context(), func(previous, next int64) (storage.PublicationSettlement, error) {
+					if previous > 0 && next == 0 && refuse.Load() {
+						return nil, failure
+					}
+					return func(storage.PublicationResult) error { return nil }, nil
+				})
+				session, err := volume.NewFileSession(ctx, storage.DefaultFileSessionOptions())
+				if err != nil {
+					t.Fatal(err)
+				}
+				f := openFileFor(t, session, "f", storage.FileOpenOptions{
+					OpenAccess: storage.OpenAccess{Read: true, Write: true, Create: true},
+					Use:        storage.UseClaim{Uses: storage.ReadData | storage.WriteData, Deny: storage.ReadData},
+				})
+				attr, err := f.Stat(t.Context())
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := f.WriteAt(t.Context(), 0, []byte("charge")); err != nil {
+					t.Fatal(err)
+				}
+				if err := volume.Remove(t.Context(), "f"); err != nil {
+					t.Fatal(err)
+				}
+				synctest.Wait()
+				if route == "maintenance" {
+					if err := session.Close(t.Context()); !errors.Is(err, failure) {
+						t.Fatalf("session close=%v", err)
+					}
+					synctest.Wait()
+				} else if err := volume.Close(); !errors.Is(err, failure) {
+					t.Fatalf("first close=%v", err)
+				}
+				if competing, err := meta.OpenNode(t.Context(), attr.ID, storage.FileOpenOptions{OpenAccess: storage.OpenAccess{Read: true}}); competing != nil || !errors.Is(err, storage.ErrUseConflict) {
+					t.Fatalf("failed close dropped the original share claim: reference=%v error=%v", competing, err)
+				}
+				refuse.Store(false)
+				if route == "maintenance" {
+					if err := volume.Write(t.Context(), "cleanup-trigger", nil); err != nil {
+						t.Fatalf("triggering cleanup after a known refusal: %v", err)
+					}
+					synctest.Wait()
+					if used, err := meta.Usage(t.Context()); err != nil || used != 0 {
+						t.Fatalf("maintenance retained the detached file charge: used=%d error=%v", used, err)
+					}
+					if node, err := meta.StatNode(t.Context(), attr.ID); node.ID != 0 || !errors.Is(err, syscall.ESTALE) {
+						t.Fatalf("maintenance retained the detached node: node=%+v error=%v", node, err)
+					}
+					if status := volume.MaintenanceStatus(); status.LastSweepTime.IsZero() || status.LastSweepError != nil {
+						t.Fatalf("maintenance recovery = %+v", status)
+					}
+				}
+				if err := volume.Close(); err != nil {
+					t.Fatalf("retry close=%v", err)
+				}
+				if result, err := session.CloseWithResult(context.Background()); !result.Released || err != nil {
+					t.Fatalf("settled close=%+v %v", result, err)
+				}
+			})
+		})
 	}
 }
 

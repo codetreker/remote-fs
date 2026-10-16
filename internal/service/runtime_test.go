@@ -1,10 +1,12 @@
 package service
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"syscall"
 	"testing"
@@ -181,22 +183,65 @@ func TestRuntimeActiveMissingStorageFailsForCachedAndReopenedVolumes(t *testing.
 			name = "cached"
 		}
 		t.Run(name, func(t *testing.T) {
+			runtime, volume := runtimeFixture(t)
+			lease, err := runtime.acquire(t.Context(), volume)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				if err := lease.Release(); err != nil {
+					t.Error(err)
+				}
+			})
+			const survivor = "survivor"
+			content := []byte("original native volume")
+			if err := lease.Store.Write(t.Context(), survivor, content); err != nil {
+				t.Fatal(err)
+			}
+			original, err := lease.Store.Stat(t.Context(), survivor)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := lease.Release(); err != nil {
+				t.Fatal(err)
+			}
+			expected, err := runtime.Summary(t.Context(), volume)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !cached {
+				if err := runtime.Close(t.Context()); err != nil {
+					t.Fatal(err)
+				}
+			}
+			root := runtime.volumeRoot(volume.ID)
+			evidence := make(map[string]os.FileInfo)
+			markers := make(map[string][]byte)
+			for _, component := range []string{"root", "LOCALSTORE", "FORMAT", "metastore.sqlite"} {
+				path := root
+				if component != "root" {
+					path = filepath.Join(root, component)
+				}
+				info, err := os.Lstat(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				evidence[path] = info
+				if component == "LOCALSTORE" || component == "FORMAT" {
+					markers[path], err = os.ReadFile(path)
+					if err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			healthy := true
 			for _, component := range []string{"root", "LOCALSTORE", "FORMAT", "metastore.sqlite"} {
 				t.Run(component, func(t *testing.T) {
-					runtime, volume := runtimeFixture(t)
 					reader := runtime
 					if !cached {
-						if err := runtime.Close(t.Context()); err != nil {
-							t.Fatal(err)
-						}
 						reader = newRuntimeManager(Config{}, runtime.root, nil, nil)
-						t.Cleanup(func() {
-							if err := reader.Close(t.Context()); err != nil {
-								t.Error(err)
-							}
-						})
 					}
-					path := runtime.volumeRoot(volume.ID)
+					path := root
 					if component != "root" {
 						path = filepath.Join(path, component)
 					}
@@ -206,9 +251,35 @@ func TestRuntimeActiveMissingStorageFailsForCachedAndReopenedVolumes(t *testing.
 					}
 					t.Cleanup(func() {
 						if err := os.Rename(moved, path); err != nil {
+							healthy = false
 							t.Error(err)
+							return
+						}
+						for path, original := range evidence {
+							info, err := os.Lstat(path)
+							if err != nil || !os.SameFile(original, info) || info.Mode() != original.Mode() {
+								healthy = false
+								t.Errorf("restored component identity changed at %s: %v", path, err)
+							}
+						}
+						for path, original := range markers {
+							current, err := os.ReadFile(path)
+							if err != nil || !bytes.Equal(current, original) {
+								healthy = false
+								t.Errorf("restored marker changed at %s: %v", path, err)
+							}
 						}
 					})
+					if !cached {
+						t.Cleanup(func() {
+							ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+							defer cancel()
+							if err := reader.Close(ctx); err != nil {
+								healthy = false
+								t.Error(err)
+							}
+						})
+					}
 					summary, err := reader.Summary(t.Context(), volume)
 					if !errors.Is(err, syscall.EIO) || summary != (VolumeSummary{}) {
 						t.Fatalf("missing active %s summary: %+v, %v; want storage failure", component, summary, err)
@@ -216,8 +287,53 @@ func TestRuntimeActiveMissingStorageFailsForCachedAndReopenedVolumes(t *testing.
 					if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
 						t.Fatalf("missing active %s was recreated: %v", component, err)
 					}
+					reader.mu.Lock()
+					defer reader.mu.Unlock()
+					if !cached && len(reader.entries) != 0 {
+						t.Fatal("missing storage populated the reopened runtime cache")
+					}
+					if cached && (reader.entries[volume.ID] == nil || reader.entries[volume.ID].store != lease.Store || reader.entries[volume.ID].references != 0) {
+						t.Fatal("missing storage changed the cached store or its references")
+					}
 				})
+				if !healthy {
+					t.Fatal("missing-storage fixture could not be restored")
+				}
 			}
+			t.Run("restored-volume", func(t *testing.T) {
+				reader := runtime
+				if !cached {
+					reader = newRuntimeManager(Config{}, runtime.root, nil, nil)
+					t.Cleanup(func() {
+						ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+						defer cancel()
+						if err := reader.Close(ctx); err != nil {
+							t.Error(err)
+						}
+					})
+				}
+				summary, err := reader.Summary(t.Context(), volume)
+				if err != nil || summary != expected {
+					t.Fatalf("restored volume summary: %+v, %v; want %+v", summary, err, expected)
+				}
+				lease, err := reader.acquire(t.Context(), volume)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer func() {
+					if err := lease.Release(); err != nil {
+						t.Error(err)
+					}
+				}()
+				current, err := lease.Store.Stat(t.Context(), survivor)
+				if err != nil || !reflect.DeepEqual(current, original) {
+					t.Fatalf("restored node: %+v, %v; want %+v", current, err, original)
+				}
+				got, err := lease.Store.Read(t.Context(), survivor)
+				if err != nil || !bytes.Equal(got, content) {
+					t.Fatalf("restored content: %q, %v", got, err)
+				}
+			})
 		})
 	}
 }

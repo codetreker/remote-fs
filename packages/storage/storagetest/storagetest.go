@@ -38,6 +38,14 @@ func Run(t *testing.T, newStorage NewStorage) {
 	}
 }
 
+// RunPrepared supplies the complete contract size to a parent-owned fixture factory.
+// A filtered run still prepares the full case count; each executed case consumes
+// one fresh volume, and unused volumes remain unopened.
+func RunPrepared(t *testing.T, prepare func(t *testing.T, count int) NewStorage) {
+	t.Helper()
+	Run(t, prepare(t, len(cases)))
+}
+
 // RunBounded exercises the additional obligations a server backend must satisfy.
 func RunBounded(t *testing.T, newStorage NewBoundedStorage) {
 	t.Helper()

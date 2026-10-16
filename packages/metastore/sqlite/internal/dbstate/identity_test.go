@@ -259,6 +259,7 @@ func TestObserveNewNodeIDRetainsHistoricalHighWater(t *testing.T) {
 }
 
 func TestValidateIdentityBoundsChecksEachVolumeReference(t *testing.T) {
+	f := preparedState(t)
 	for _, mutation := range []string{
 		"",
 		`UPDATE volumes SET root=5`,
@@ -269,12 +270,12 @@ func TestValidateIdentityBoundsChecksEachVolumeReference(t *testing.T) {
 		`UPDATE database_state SET node_high_water=0`,
 		`DELETE FROM database_state`,
 	} {
-		t.Run(mutation, func(t *testing.T) {
-			db, _ := stateFixture(t)
+		if !t.Run(mutation, func(t *testing.T) {
+			tx := f.transaction(t)
 			if mutation != "" {
-				execState(t, db, mutation)
+				execState(t, tx, mutation)
 			}
-			err := ValidateIdentityBounds(t.Context(), db, 1)
+			err := ValidateIdentityBounds(t.Context(), tx, 1)
 			if mutation == "" {
 				if err != nil {
 					t.Fatalf("valid volume bounds: %v", err)
@@ -283,19 +284,23 @@ func TestValidateIdentityBoundsChecksEachVolumeReference(t *testing.T) {
 				t.Fatalf("invalid volume bounds accepted: %v", err)
 			}
 			if mutation != `DELETE FROM database_state` {
-				if err := ValidateIdentityBounds(t.Context(), db, 2); err != nil {
+				if err := ValidateIdentityBounds(t.Context(), tx, 2); err != nil {
 					t.Fatalf("another volume inherited foreign corruption: %v", err)
 				}
 			}
-		})
+		}) {
+			return
+		}
 	}
 	for _, table := range []string{"nodes", "logs"} {
-		t.Run("missing "+table, func(t *testing.T) {
-			db, _ := stateFixture(t)
-			execState(t, db, "DROP TABLE "+table)
-			if err := ValidateIdentityBounds(t.Context(), db, 1); err == nil || !strings.Contains(err.Error(), "no such table: "+table) {
+		if !t.Run("missing "+table, func(t *testing.T) {
+			tx := f.transaction(t)
+			execState(t, tx, "DROP TABLE "+table)
+			if err := ValidateIdentityBounds(t.Context(), tx, 1); err == nil || !strings.Contains(err.Error(), "no such table: "+table) {
 				t.Fatalf("missing %s error was lost: %v", table, err)
 			}
-		})
+		}) {
+			return
+		}
 	}
 }

@@ -65,13 +65,18 @@ func composedStore(t *testing.T, allowance int64, objects objectstore.Objects) (
 	if err != nil {
 		t.Fatalf("opening the metastore: %v", err)
 	}
+	return composedVolume(t, meta, objects), meta
+}
+
+func composedVolume(t *testing.T, meta *sqlite.Store, objects objectstore.Objects) *objectstore.Storage {
+	t.Helper()
 	volume := objectstore.New(objects, meta)
 	t.Cleanup(func() {
 		if err := volume.Close(); err != nil {
 			t.Errorf("closing the volume: %v", err)
 		}
 	})
-	return volume, meta
+	return volume
 }
 
 func await(t *testing.T, description string, ready func() bool) {
@@ -94,6 +99,7 @@ func await(t *testing.T, description string, ready func() bool) {
 
 func TestSpaceUsesTheTighterMeasuredAvailability(t *testing.T) {
 	const allowance = 2 * limited.MinLimit
+	factory := plainMetastoreFactory(filepath.Join(t.TempDir(), "meta.db"))
 	for _, test := range []struct {
 		name          string
 		available     int64
@@ -110,7 +116,7 @@ func TestSpaceUsesTheTighterMeasuredAvailability(t *testing.T) {
 				available:    test.available,
 				availableErr: test.availableErr,
 			}
-			volume, _ := composedStore(t, allowance, objects)
+			volume := composedVolume(t, factory(t, allowance), objects)
 			if err := volume.Write(t.Context(), "f", make([]byte, 30)); err != nil {
 				t.Fatalf("writing the measured content: %v", err)
 			}
@@ -128,6 +134,7 @@ func TestSpaceUsesTheTighterMeasuredAvailability(t *testing.T) {
 }
 
 func TestSpacePropagatesMeasurementFailures(t *testing.T) {
+	factory := plainMetastoreFactory(filepath.Join(t.TempDir(), "meta.db"))
 	for _, joinedUnsupported := range []bool{false, true} {
 		physicalFailure := errors.New("the filesystem refused its capacity measurement")
 		measurementErr := error(physicalFailure)
@@ -135,7 +142,7 @@ func TestSpacePropagatesMeasurementFailures(t *testing.T) {
 			measurementErr = errors.Join(syscall.ENOSYS, physicalFailure)
 		}
 		objects := &measuredObjects{Objects: memory.New(), availableErr: measurementErr}
-		volume, _ := composedStore(t, limited.MinLimit, objects)
+		volume := composedVolume(t, factory(t, limited.MinLimit), objects)
 
 		if _, err := volume.Space(t.Context()); !errors.Is(err, physicalFailure) {
 			t.Fatalf("space failed with %v, want the physical measurement failure", err)
@@ -477,6 +484,7 @@ func (s *blockedMetastore) Garbage(ctx context.Context, limit int) ([]metastore.
 }
 
 func TestCloseDrainsEveryAdmittedVolumeMethod(t *testing.T) {
+	factory := plainMetastoreFactory(filepath.Join(t.TempDir(), "meta.db"))
 	for _, operation := range []struct {
 		name   string
 		method string
@@ -498,10 +506,7 @@ func TestCloseDrainsEveryAdmittedVolumeMethod(t *testing.T) {
 		{name: "sweep", method: "garbage", run: func(s *objectstore.Storage) error { _, err := s.Sweep(t.Context(), 1); return err }},
 	} {
 		t.Run(operation.name, func(t *testing.T) {
-			meta, err := sqlite.Open(t.Context(), filepath.Join(t.TempDir(), "meta.db"), "workspace", limited.MinLimit, sqlite.DefaultWindow())
-			if err != nil {
-				t.Fatalf("opening the metastore: %v", err)
-			}
+			meta := factory(t, limited.MinLimit)
 			blocked := &blockedMetastore{
 				Store:   meta,
 				method:  operation.method,
@@ -519,7 +524,9 @@ func TestCloseDrainsEveryAdmittedVolumeMethod(t *testing.T) {
 			release := func() { releaseOnce.Do(func() { close(blocked.release) }) }
 			t.Cleanup(func() {
 				release()
-				_ = volume.Close()
+				if err := volume.Close(); err != nil {
+					t.Errorf("closing the drained volume: %v", err)
+				}
 			})
 
 			finished := make(chan error, 1)

@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -452,6 +453,27 @@ func TestInitialBuildUsesOneFixedCheckpointOnOriginalStream(t *testing.T) {
 }
 
 func TestInitialBuildRejectsCheckpointWithoutASnapshotCompatibleHistory(t *testing.T) {
+	limits := httprest.DefaultLimits()
+	limits.MaxSubscriptions = 1
+	authority := serve(t, limits)
+	write(t, authority, "snapshot.txt", "snapshot content")
+	ctx := t.Context()
+	root, err := authority.storage.Stat(ctx, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	file, err := authority.storage.Stat(ctx, "snapshot.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	barrier, err := authority.meta.Barrier(ctx, httprest.MaxIncarnationBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	objects, err := authority.meta.ObjectStatus(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
 	for _, test := range []struct {
 		name        string
 		change      func(*httprest.MutationBarrier)
@@ -461,9 +483,32 @@ func TestInitialBuildRejectsCheckpointWithoutASnapshotCompatibleHistory(t *testi
 		{name: "position older than snapshot", change: func(b *httprest.MutationBarrier) { b.Position-- }},
 		{name: "authority unavailable", unavailable: true},
 	} {
-		t.Run(test.name, func(t *testing.T) {
-			build := startReplayBuild(t, replicated.DefaultOptions(), func(s *served, gates *replayFrameGates) {
-				write(t, s, "snapshot.txt", "snapshot content")
+		if !t.Run(test.name, func(t *testing.T) {
+			t.Cleanup(func() {
+				if got, err := authority.storage.Stat(ctx, ""); err != nil || !reflect.DeepEqual(got, root) {
+					t.Fatalf("checkpoint rejection changed root: %+v, %v", got, err)
+				}
+				if got, err := authority.storage.Stat(ctx, "snapshot.txt"); err != nil || !reflect.DeepEqual(got, file) {
+					t.Fatalf("checkpoint rejection changed snapshot file: %+v, %v", got, err)
+				}
+				if body, err := authority.storage.Read(ctx, "snapshot.txt"); err != nil || string(body) != "snapshot content" {
+					t.Fatalf("checkpoint rejection changed content: %q, %v", body, err)
+				}
+				if entries, err := authority.storage.List(ctx, ""); err != nil || len(entries) != 1 || string(entries[0].Name) != "snapshot.txt" {
+					t.Fatalf("checkpoint rejection changed tree: %+v, %v", entries, err)
+				}
+				if got, err := authority.meta.Barrier(ctx, httprest.MaxIncarnationBytes); err != nil || got != barrier {
+					t.Fatalf("checkpoint rejection changed history: %+v, %v", got, err)
+				}
+				if got, err := authority.meta.ObjectStatus(ctx); err != nil || got != objects {
+					t.Fatalf("checkpoint rejection changed object maintenance: %+v, %v", got, err)
+				}
+				if used, err := authority.meta.Usage(ctx); err != nil || used != int64(len("snapshot content")) {
+					t.Fatalf("checkpoint rejection changed usage: %d, %v", used, err)
+				}
+			})
+			s := serveReplayAuthority(t, authority, limits)
+			build := startReplayBuildFrom(t, s, replicated.DefaultOptions(), func(s *served, gates *replayFrameGates) {
 				gates.checkpoint = func(w http.ResponseWriter, r *http.Request) {
 					if test.unavailable {
 						http.Error(w, "checkpoint unavailable", http.StatusServiceUnavailable)
@@ -492,8 +537,37 @@ func TestInitialBuildRejectsCheckpointWithoutASnapshotCompatibleHistory(t *testi
 			if got := build.served.calls.of(httprest.OpCheckpoint); got != 1 {
 				t.Fatalf("checkpoint requests = %d, want one", got)
 			}
-		})
+		}) {
+			t.FailNow()
+		}
 	}
+}
+
+func serveReplayAuthority(t *testing.T, authority *served, limits httprest.Limits) *served {
+	t.Helper()
+	options := httprest.DefaultHandlerOptions()
+	options.Replication = limits
+	handler, err := httprest.NewHandlerWithOptions(authority.storage, authority.meta, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	faults := &eventFaults{handler: handler, open: map[*http.Request]context.CancelFunc{}}
+	counted := &calls{handler: faults, counts: map[string]int{}}
+	server := httptest.NewServer(counted)
+	t.Cleanup(func() {
+		handler.Stop()
+		server.Close()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := handler.Close(ctx); err != nil {
+			t.Errorf("closing checkpoint handler: %v", err)
+		}
+	})
+	elsewhere, err := httprest.Dial(server.URL, &http.Client{Timeout: 10 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &served{meta: authority.meta, storage: authority.storage, url: server.URL, server: server, elsewhere: elsewhere, events: faults, calls: counted, silence: httprest.DefaultSilence}
 }
 
 func TestInitialBuildDeadlineCoversCheckpointRequest(t *testing.T) {
