@@ -35,6 +35,7 @@ func TestCheckStartupRejectsContradictoryDurabilityEvidence(t *testing.T) {
 }
 
 func TestReconcileStartupRequiresTheAcceptedLineageAndWAL(t *testing.T) {
+	f := preparedState(t)
 	for _, test := range []struct {
 		name   string
 		change func(*Startup)
@@ -76,11 +77,11 @@ func TestReconcileStartupRequiresTheAcceptedLineageAndWAL(t *testing.T) {
 			s.Accepted.ChangeHighWater = 7
 		}, "below accepted state"},
 	} {
-		t.Run(test.name, func(t *testing.T) {
-			db, before := stateFixture(t)
+		if !t.Run(test.name, func(t *testing.T) {
+			before := f.before
 			startup := Startup{Accepted: before, CheckpointedGeneration: before.Generation}
 			test.change(&startup)
-			tx := stateTransaction(t, db)
+			tx := f.committableTransaction(t)
 			err := ReconcileStartup(t.Context(), tx, startup)
 			if test.want == "" {
 				if err != nil {
@@ -92,11 +93,13 @@ func TestReconcileStartupRequiresTheAcceptedLineageAndWAL(t *testing.T) {
 			if err := tx.Commit(); err != nil {
 				t.Fatal(err)
 			}
-			got, err := Read(t.Context(), db)
+			got, err := Read(t.Context(), f.db)
 			if err != nil || got != before {
 				t.Fatalf("startup validation changed stored state to %+v: %v", got, err)
 			}
-		})
+		}) {
+			return
+		}
 	}
 	db, accepted := stateFixture(t)
 	execState(t, db, `DELETE FROM database_state`)

@@ -57,6 +57,9 @@ func TestMetadataAccountingReleasesTrimmedHistory(t *testing.T) {
 }
 
 func TestMetadataIntegrityRejectsCorruptAccountingAndPayload(t *testing.T) {
+	db := testDatabase(t, 0)
+	volume, _ := testVolume(t, db, "workspace")
+	fixture := newValidationFixture(t, db)
 	badVersion, err := storage.EncodeMetadata(map[string]storage.OpaquePayload{
 		"client.attribute": {Version: []byte{1}, Data: nil},
 	})
@@ -75,14 +78,15 @@ func TestMetadataIntegrityRejectsCorruptAccountingAndPayload(t *testing.T) {
 		{"trailing envelope bytes", `UPDATE nodes SET metadata=X'52464d01000000'`},
 		{"invalid native version", fmt.Sprintf(`UPDATE nodes SET metadata=X'%x'`, badVersion)},
 	} {
-		t.Run(test.name, func(t *testing.T) {
-			db := testDatabase(t, 0)
-			volume, _ := testVolume(t, db, "workspace")
-			execute(t, db, test.damage)
-			if err := validateMetadataIntegrity(t.Context(), db, &volume, math.MaxInt64, false, schema.Version()); !errors.Is(err, syscall.EIO) {
+		if !t.Run(test.name, func(t *testing.T) {
+			tx := fixture.transaction(t)
+			execute(t, tx, test.damage)
+			if err := validateMetadataIntegrity(t.Context(), tx, &volume, math.MaxInt64, false, schema.Version()); !errors.Is(err, syscall.EIO) {
 				t.Fatalf("corrupt metadata accepted: %v", err)
 			}
-		})
+		}) {
+			return
+		}
 	}
 }
 

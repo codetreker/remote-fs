@@ -71,6 +71,7 @@ func TestReadPageReportsEmptyHistoryAndResumesAtExactBounds(t *testing.T) {
 }
 
 func TestPageAnchorsRejectBrokenRetainedChains(t *testing.T) {
+	fixture := newLogMatrixFixture(t, 3)
 	for _, test := range []struct{ name, setup, want string }{
 		{"missing middle", `DELETE FROM changes WHERE position=2`, "follows position"},
 		{"missing tail", `DELETE FROM changes WHERE position=3`, "committed tail"},
@@ -80,9 +81,8 @@ func TestPageAnchorsRejectBrokenRetainedChains(t *testing.T) {
 		{"invalid allocation", `UPDATE changes SET allocation_size=8192 WHERE position=2`, "allocation_size"},
 		{"invalid payload", `UPDATE changes SET name=x'2e2e' WHERE position=2`, "invalid destination"},
 	} {
-		t.Run(test.name, func(t *testing.T) {
-			_, tx := logFixture(t)
-			appendLog(t, tx, 3)
+		if !t.Run(test.name, func(t *testing.T) {
+			tx := fixture.transaction(t)
 			execLogSQL(t, tx, test.setup)
 			result := changeResult(t, 10)
 			_, err := ReadPage(t.Context(), tx, 1, 100, 0, 10, result)
@@ -93,10 +93,11 @@ func TestPageAnchorsRejectBrokenRetainedChains(t *testing.T) {
 			if _, got := result.Changes(); !errors.Is(got, err) {
 				t.Fatalf("failed result exposed prefix: %v", got)
 			}
-		})
+		}) {
+			return
+		}
 	}
-	_, tx := logFixture(t)
-	appendLog(t, tx, 3)
+	tx := fixture.transaction(t)
 	execLogSQL(t, tx, `DELETE FROM changes WHERE position<=2`)
 	execLogSQL(t, tx, `UPDATE logs SET trimmed_through=2 WHERE volume=1`)
 	retention, err := ReadPage(t.Context(), tx, 1, 100, 0, 10, changeResult(t, 10))
@@ -159,18 +160,22 @@ func TestPageReservesBeforeReadingPayloadAndPreservesChargeFailures(t *testing.T
 }
 
 func TestBarrierValidatesIncarnationAndDurablePosition(t *testing.T) {
-	_, tx := logFixture(t)
-	appendLog(t, tx, 2)
-	full, err := ReadLogBarrier(t.Context(), tx, 1, 32, true)
-	if err != nil {
-		t.Fatal(err)
-	}
-	position, err := ReadLogBarrier(t.Context(), tx, 1, 0, false)
-	if err != nil || position.Position != 2 || position.Incarnation != "" || full.Position != 2 || len(full.Incarnation) != 32 {
-		t.Fatalf("barriers=%+v %+v %v", full, position, err)
-	}
-	if _, err := ReadLogBarrier(t.Context(), tx, 1, 31, true); !errors.Is(err, syscall.EFBIG) {
-		t.Fatalf("short incarnation bound=%v", err)
+	fixture := newLogMatrixFixture(t, 2)
+	if !t.Run("valid barriers", func(t *testing.T) {
+		tx := fixture.transaction(t)
+		full, err := ReadLogBarrier(t.Context(), tx, 1, 32, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		position, err := ReadLogBarrier(t.Context(), tx, 1, 0, false)
+		if err != nil || position.Position != 2 || position.Incarnation != "" || full.Position != 2 || len(full.Incarnation) != 32 {
+			t.Fatalf("barriers=%+v %+v %v", full, position, err)
+		}
+		if _, err := ReadLogBarrier(t.Context(), tx, 1, 31, true); !errors.Is(err, syscall.EFBIG) {
+			t.Fatalf("short incarnation bound=%v", err)
+		}
+	}) {
+		return
 	}
 	for _, test := range []struct{ name, mutation string }{
 		{"bad incarnation length", `incarnation='short'`},
@@ -182,9 +187,8 @@ func TestBarrierValidatesIncarnationAndDurablePosition(t *testing.T) {
 		{"nonboolean age", `trimmed_by_age=2`},
 		{"text age", `trimmed_by_age='invalid'`},
 	} {
-		t.Run(test.name, func(t *testing.T) {
-			_, tx := logFixture(t)
-			appendLog(t, tx, 2)
+		if !t.Run(test.name, func(t *testing.T) {
+			tx := fixture.transaction(t)
 			execLogSQL(t, tx, `UPDATE logs SET `+test.mutation+` WHERE volume=1`)
 			if _, err := ReadLogBarrier(t.Context(), tx, 1, 32, true); !errors.Is(err, syscall.EIO) {
 				t.Errorf("invalid barrier = %v", err)
@@ -192,7 +196,9 @@ func TestBarrierValidatesIncarnationAndDurablePosition(t *testing.T) {
 			if _, _, _, _, err := logPageState(t.Context(), tx, 1, 0); !errors.Is(err, syscall.EIO) {
 				t.Errorf("invalid page anchors = %v", err)
 			}
-		})
+		}) {
+			return
+		}
 	}
 }
 

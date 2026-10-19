@@ -560,7 +560,13 @@ SMB Basic 设置共享时间与 HIDDEN／SYSTEM 后，Linux 原 fd 的 fstat 必
 
 ## 对象存储后端分别使用真实基底
 
-[lockcontract](../packages/storage/lockcontract/contract_test.go)与 [objectstoretest](../packages/storage/objectstore/objectstoretest/objectstoretest_test.go)在各自测试二进制中运行真实 SQLite authority 或 memory Objects，并核对非零 fixture 数与逐项清理。故障探针执行同一测试二进制中的缺陷替身，必须命中匿名修改或 create-only 的指定失败断言；子进程 profile 不导入覆盖率统计。[memory](../packages/storage/objectstore/memory/memory_test.go)另核对有界读取的精确边界、取消和返回数据不共享存储字节；[Azure Blob](../packages/storage/objectstore/azblob/azblob_test.go)核对连接字符串、读取 framing 与对象缺席的服务错误，[错误分类](../packages/storage/objectstore/azblob/errors_test.go)保留 service cause，并防止 container 缺席或独立故障被改写为对象不存在。
+[lockcontract](../packages/storage/lockcontract/contract_test.go)与 [objectstoretest](../packages/storage/objectstore/objectstoretest/objectstoretest_test.go)在各自测试二进制中运行真实 SQLite authority 或 memory Objects，并核对非零 fixture 数与逐项清理。故障探针执行同一测试二进制中的缺陷替身，必须命中匿名修改或 create-only 的指定失败断言；子进程 profile 不导入覆盖率统计。
+
+[objectstore 组合的 storage 契约](../packages/storage/objectstore/storage_test.go)仍以真实 SQLite 和 Azurite 运行原有七十个子用例。父测试只复用物理数据库；每项使用新的 logical volume、独立 Blob prefix、Store、Storage 和 maintenance worker，并检查 Close。默认 `newParts`、bounded 契约与其它调用继续取得独立数据库，不能把新的 volume 换成前一项的树或活句柄。准备归属见[测试工作决定](../.agents/notes/implemented/testing/2026-09-09-reduce-test-work.md)。
+
+[两个只读 Get 故障矩阵](../packages/storage/objectstore/failure_test.go)分别在父层形成健康 Blob／tree，原有四项和六项错误各有独立 wrapper、worker、错误与计数器，拒绝 Get 恰好一次。每项开始前及 borrower 成功关闭后，使用父 context 核对完整 Attr、根 List、Space 值／错误文本、Usage、ObjectStatus 和原健康内容。父 owner 不随 borrower 关闭，mutation、Put、sweep 与恢复用例保持独立准备。
+
+[memory](../packages/storage/objectstore/memory/memory_test.go)另核对有界读取的精确边界、取消和返回数据不共享存储字节；[Azure Blob](../packages/storage/objectstore/azblob/azblob_test.go)核对连接字符串、读取 framing 与对象缺席的服务错误，[错误分类](../packages/storage/objectstore/azblob/errors_test.go)保留 service cause，并防止 container 缺席或独立故障被改写为对象不存在。
 
 ### Azure Blob
 
@@ -591,6 +597,8 @@ SQLite 的包内直接用例按各模块持有的边界核对结果：
 [匿名发布拒绝矩阵](../packages/metastore/sqlite/publication_test.go)按 S／X 各复用一份真实 fixture，九种操作各自保留调用前后 List、Space 与 Conflict 断言。每项开始时还对比该 fixture 的初始列表和配额，不能把前一项污染当作下一项的起点；18 个 leaf 和次序保持。复用只属于这个拒绝矩阵，不扩展到其它有状态 publication 或恢复用例。
 
 根 metastore 契约由顶层拥有一个真实文件数据库，每个子用例使用唯一的 volume／neighbour 对，仍按原 allowance、默认选项与子用例 context 打开和关闭独立 Store。顺序隔离回归确认前一例已经关闭，新例的目录、snapshot、配额、对象队列和日志起点干净，且新例修改后前一例的元数据、配额、对象状态和双方日志不变；共享数据库 identity 与高水位保持合法。
+
+[dbstate](../packages/metastore/sqlite/internal/dbstate/fixture_test.go)、[changes](../packages/metastore/sqlite/internal/changes/fixture_test.go)和 [schema](../packages/metastore/sqlite/internal/schema/fixture_test.go)的十四个校验父矩阵各拥有健康数据库，原有 60／22／45 个命名子项使用独立事务。纯校验必须检查 Rollback，连接级 PRAGMA 另行恢复并读取确认，完整 typed table rows、schema 与 trigger 比较原基线，pool InUse 归零；临时损坏不能进入下一项。事务与 cleanup 由不随 child 取消的 context 拥有，被测操作保持原 context。dbstate／schema 恢复 ignore_check_constraints，changes 另覆盖 query_only、foreign_keys 与 recursive_triggers。Startup variants 保留真实 Commit／提交后 Read，缺失 state 的独立分支及公开 Prepare、迁移、创建事实、uncertain commit 和恢复用例保持原准备与发布。隔离回归在故意损坏数据、trigger 和 PRAGMA 后，确认下一事务的真实校验与分配仍有效。
 
 邻居在每次被测修改前用唯一 ModTime 更新既有根，发布真实 Modified 日志并消耗全局 position；其目录不增长。局部回归核对两边日志、稀疏的被测 position、含并发调用的唯一时间值，以及邻居根身份、模式和空目录。间隙发布失败仍使测试失败，不能把稀疏序列换成只在单个 volume 上成立的连续序列。
 

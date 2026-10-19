@@ -8,6 +8,11 @@ import (
 )
 
 func TestHistoryRejectsDiscontinuousOrMalformedChanges(t *testing.T) {
+	db := testDatabase(t, 0)
+	id, root := testVolume(t, db, "workspace")
+	testChange(t, db, id, root, "old")
+	testChange(t, db, id, root, "another")
+	fixture := newValidationFixture(t, db)
 	for _, test := range []struct{ name, mutation string }{
 		{"tail ahead", `UPDATE logs SET committed_position=50`},
 		{"trim beyond tail", `UPDATE logs SET trimmed_through=50`},
@@ -18,22 +23,21 @@ func TestHistoryRejectsDiscontinuousOrMalformedChanges(t *testing.T) {
 		{"rename without source", `UPDATE changes SET kind=3`},
 		{"change outside volume", `UPDATE changes SET volume=999`},
 	} {
-		t.Run(test.name, func(t *testing.T) {
-			db := testDatabase(t, 0)
-			id, root := testVolume(t, db, "workspace")
-			testChange(t, db, id, root, "old")
-			testChange(t, db, id, root, "another")
+		if !t.Run(test.name, func(t *testing.T) {
+			tx := fixture.transaction(t)
 			for _, scope := range []*int64{nil, &id} {
-				if err := validateLogIntegrity(t.Context(), db, scope); err != nil {
+				if err := validateLogIntegrity(t.Context(), tx, scope); err != nil {
 					t.Fatal(err)
 				}
 			}
-			execute(t, db, test.mutation)
-			err := validateLogIntegrity(t.Context(), db, nil)
+			execute(t, tx, test.mutation)
+			err := validateLogIntegrity(t.Context(), tx, nil)
 			if !errors.Is(err, syscall.EIO) || !strings.Contains(err.Error(), "invalid change rows") {
 				t.Fatalf("corrupt history accepted: %v", err)
 			}
-		})
+		}) {
+			return
+		}
 	}
 }
 

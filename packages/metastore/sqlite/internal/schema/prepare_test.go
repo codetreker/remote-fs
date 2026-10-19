@@ -2,69 +2,16 @@ package schema
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"fmt"
 	"io/fs"
-	"path/filepath"
 	"strings"
 	"syscall"
 	"testing"
-	"testing/fstest"
 
-	"github.com/codetreker/remote-fs/packages/metastore"
 	"github.com/codetreker/remote-fs/packages/metastore/sqlite/internal/changes"
 	"github.com/codetreker/remote-fs/packages/metastore/sqlite/internal/dbstate"
-	"github.com/codetreker/remote-fs/packages/sqliteschema"
-	_ "modernc.org/sqlite"
 )
-
-func testDatabase(t *testing.T, version int) *sql.DB {
-	t.Helper()
-	db, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "metadata.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	db.SetMaxOpenConns(1)
-	t.Cleanup(func() {
-		if err := db.Close(); err != nil {
-			t.Error(err)
-		}
-	})
-	if version == 0 {
-		return db
-	}
-	files, err := fs.Glob(migrationFiles, "migrations/*.sql")
-	if err != nil {
-		t.Fatal(err)
-	}
-	selected := fstest.MapFS{}
-	for _, name := range files[:version] {
-		body, err := migrationFiles.ReadFile(name)
-		if err != nil {
-			t.Fatal(err)
-		}
-		selected[name] = &fstest.MapFile{Data: body}
-	}
-	tx := testTransaction(t, db)
-	if err := sqliteschema.MustLoad(selected, "migrations").Reach(t.Context(), tx); err != nil {
-		t.Fatal(err)
-	}
-	if err := tx.Commit(); err != nil {
-		t.Fatal(err)
-	}
-	return db
-}
-
-func testTransaction(t *testing.T, db *sql.DB) *sql.Tx {
-	t.Helper()
-	tx, err := db.BeginTx(t.Context(), nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = tx.Rollback() })
-	return tx
-}
 
 func TestDeleteIntentOwnerMigrationPreservesKnownIDsAndCursorOrder(t *testing.T) {
 	db := testDatabase(t, firstDirectoryRevisionSchemaVersion)
@@ -107,66 +54,6 @@ func TestDeleteIntentOwnerMigrationPreservesKnownIDsAndCursorOrder(t *testing.T)
 	var highWater int64
 	if err := db.QueryRowContext(t.Context(), `SELECT delete_intent_high_water FROM volumes WHERE id=1`).Scan(&highWater); err != nil || highWater != 2 {
 		t.Fatalf("migrated high-water = %d, %v", highWater, err)
-	}
-}
-
-func execute(t *testing.T, db interface {
-	Exec(string, ...any) (sql.Result, error)
-}, query string, args ...any) {
-	t.Helper()
-	if _, err := db.Exec(query, args...); err != nil {
-		t.Fatalf("fixture statement %q: %v", query, err)
-	}
-}
-
-func testVolume(t *testing.T, db *sql.DB, name string) (int64, int64) {
-	t.Helper()
-	id, root, err := Prepare(t.Context(), db, name, "", changes.DefaultWindow(), 1000, 1<<20)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return id, root
-}
-
-func testFile(t *testing.T, db *sql.DB, volume, parent int64, name string, size int64, detached bool) (int64, string) {
-	t.Helper()
-	tx := testTransaction(t, db)
-	id, err := dbstate.AllocateNodeID(t.Context(), tx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	key := fmt.Sprintf("content-%d", id)
-	execute(t, tx, `INSERT INTO objects (key, volume, state, size, created_sec, created_nsec)
-		VALUES (?, ?, ?, ?, 0, 0)`, key, volume, StateReferenced, size)
-	allocation, err := expectedAllocation(1, size)
-	if err != nil {
-		t.Fatal(err)
-	}
-	execute(t, tx, `INSERT INTO nodes (id,volume,kind,size,allocation_size,atime_sec,atime_nsec,mtime_sec,mtime_nsec,content,detached)
-		VALUES (?,?,1,?,?,0,0,0,0,?,?)`, id, volume, size, allocation, key, detached)
-	if !detached {
-		execute(t, tx, `INSERT INTO entries (volume, parent, name, node) VALUES (?, ?, ?, ?)`, volume, parent, []byte(name), id)
-	}
-	execute(t, tx, `UPDATE volumes SET used = used + ? WHERE id = ?`, size, volume)
-	execute(t, tx, `UPDATE volumes SET allocated_used = allocated_used + ? WHERE id = ?`, allocation, volume)
-	if err := tx.Commit(); err != nil {
-		t.Fatal(err)
-	}
-	return id, key
-}
-
-func testChange(t *testing.T, db *sql.DB, volume, parent int64, name string) {
-	t.Helper()
-	tx := testTransaction(t, db)
-	if err := changes.Record(t.Context(), tx, volume, metastore.Change{
-		Kind:   metastore.Removed,
-		Parent: parent,
-		Name:   []byte(name),
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if err := tx.Commit(); err != nil {
-		t.Fatal(err)
 	}
 }
 
