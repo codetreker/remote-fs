@@ -10,7 +10,7 @@ Status: implemented
 
 ## 决定
 
-[CI workflow](../../../../.github/workflows/ci.yml)的 `sqlite-race` 在独立 Ubuntu runner 上只对根 SQLite 包执行 `assert-every-test-ran.sh -race -count=1 -timeout 10m ./packages/metastore/sqlite`。SQLite 的内部子包仍由 `checks-work` 的其它非挂载 race suite 运行，不能在包集合之间丢包。`mounted` 保持 FUSE／端到端 race、卸载检查及整个模块的 package-local 覆盖率门禁；覆盖率调用仍包含根 SQLite 包。Windows 作业独立。其它非挂载工作、HTTP 根包与最终门禁的现行分工由[并发 CI 决定](2026-10-14-parallel-ci-execution.md)持有；HTTP 完整独立执行的依据见[HTTP race 调度决定](2026-10-12-isolate-http-race-ci.md)。
+[CI workflow](../../../../.github/workflows/ci.yml)的 `sqlite-race` 在独立 Ubuntu runner 上只对根 SQLite 包执行 `assert-every-test-ran.sh -race -count=1 -timeout 10m ./packages/metastore/sqlite`。SQLite 的内部子包仍由 `checks-work` 的其它非挂载 race suite 运行，不能在包集合之间丢包。`mounted` 保持 FUSE／端到端 race、卸载检查及整个模块的 package-local 覆盖率门禁；覆盖率调用仍包含根 SQLite 包。Windows 作业独立。其它非挂载工作、storage／HTTP 根包与最终门禁的现行分工由[contract CI 平衡决定](2026-10-16-balance-contract-ci.md)持有；独立开始见[并发 CI 决定](2026-10-14-parallel-ci-execution.md)，HTTP 完整独立执行的依据见[HTTP race 调度决定](2026-10-12-isolate-http-race-ci.md)。
 
 SQLite race 作业上限为二十分钟，但 Go 的十分钟 watchdog 仍约束该包二进制的累计执行。strict script 继续拒绝 skip、无测试、缺失 verdict 与测试进程失败；`-count=1` 禁止缓存结果替代执行。独立 runner 去掉同作业其它 Go 包与 SQLite race 的并行资源竞争，不降低测试断言，也不放宽测试本身的完成期限。受保护分支的现有必需状态仍为 `checks`；最终门禁以 `always()` 执行并明确核对 SQLite 与另外两项依赖均为 success，其它结果使原必需检查失败。SQLite 作业没有 Blob 依赖；`checks-work` 与 `mounted` 各自启动 Azurite 供它们的 Blob 用例使用。
 

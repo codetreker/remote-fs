@@ -308,8 +308,11 @@ func TestDirectoryResponseExceedsManagementLimitWithoutTruncation(t *testing.T) 
 	for index := range directory.Entries {
 		name := strings.Repeat("f", 220) + strconv.Itoa(index)
 		path := base64.StdEncoding.EncodeToString([]byte(name))
-		directory.Entries[index] = FileEntry{Name: name, NameBase64: path, PathBase64: base64.StdEncoding.EncodeToString([]byte(parent + "/" + name)), NodeID: DecimalFromUint64(firstNode + uint64(index)), Kind: "file", SizeBytes: "1", ModifiedAt: modified}
+		directory.Entries[index] = FileEntry{Name: name, NameBase64: path, NodeID: DecimalFromUint64(firstNode + uint64(index)), Kind: "file", SizeBytes: "1", ModifiedAt: modified}
 	}
+	expected := directory.Entries[count-1]
+	expected.PathBase64 = base64.StdEncoding.EncodeToString([]byte(parent + "/" + expected.Name))
+	directory.Entries[count-1].PathBase64 = expected.PathBase64
 	body, err := json.Marshal(directory)
 	if err != nil {
 		t.Fatal(err)
@@ -317,7 +320,7 @@ func TestDirectoryResponseExceedsManagementLimitWithoutTruncation(t *testing.T) 
 	if len(body) <= maxResponseBytes || len(body) >= maxDirectoryResponseBytes {
 		t.Fatalf("directory fixture has inappropriate size: %d", len(body))
 	}
-	if bytes.Count(body, []byte(`"pathBase64"`)) != 1 || bytes.Contains(body, []byte(directory.Entries[count-1].PathBase64)) {
+	if bytes.Count(body, []byte(`"pathBase64"`)) != 1 || bytes.Contains(body, []byte(expected.PathBase64)) {
 		t.Fatal("directory wire repeated full child paths")
 	}
 	if len(body)+count*len(directory.PathBase64) <= maxDirectoryResponseBytes {
@@ -343,7 +346,6 @@ func TestDirectoryResponseExceedsManagementLimitWithoutTruncation(t *testing.T) 
 	if len(result.Entries) != count {
 		t.Fatalf("directory truncated: %d", len(result.Entries))
 	}
-	expected := directory.Entries[count-1]
 	actual := result.Entries[count-1]
 	if actual != expected || result.PathBase64 != directory.PathBase64 {
 		t.Fatalf("directory identity or metadata changed: %+v", actual)

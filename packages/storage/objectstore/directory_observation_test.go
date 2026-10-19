@@ -461,7 +461,21 @@ func (p *objectDirectoryObservationProbe) ObserveDirectoryMetadata(ctx context.C
 	return observed, p.observeErr
 }
 
+type borrowedDirectoryObservationProbe struct {
+	*objectDirectoryObservationProbe
+}
+
+func (*borrowedDirectoryObservationProbe) Close() error { return nil }
+
 func TestObjectDirectoryMetadataObservationRejectsUnsupportedAndMalformedBackends(t *testing.T) {
+	fixture := newReadOnlyNativeFixture(t, func(volume *objectstore.Storage) {
+		if err := volume.Mkdir(t.Context(), "d\xff"); err != nil {
+			t.Fatal(err)
+		}
+		if err := volume.Create(t.Context(), "d\xff/c\xfe"); err != nil {
+			t.Fatal(err)
+		}
+	})
 	checkFailure, nativeFailure := errors.New("directory metadata check failed"), errors.New("directory metadata capture failed")
 	for _, test := range []struct {
 		name                string
@@ -478,35 +492,19 @@ func TestObjectDirectoryMetadataObservationRejectsUnsupportedAndMalformedBackend
 		{name: "mismatched directory", malformed: "wrong directory", want: syscall.EIO},
 		{name: "owned observation"},
 	} {
+		fixture.requireHealthy(t)
 		t.Run(test.name, func(t *testing.T) {
-			native, err := sqlite.OpenLocking(t.Context(), sqlite.LockingConfig{
-				Database: filepath.Join(t.TempDir(), "directory.db"), Volume: "directory", SQLite: sqlite.DefaultOptions(),
-				Locks: locking.DefaultOptions(), Initialize: true,
-			})
-			if err != nil {
-				t.Fatal(err)
-			}
+			native := fixture.native
 			probe := &objectDirectoryObservationProbe{LockingStore: native, checkErr: test.checkErr, observeErr: test.nativeErr, malformed: test.malformed}
-			var backend metastore.Store = probe
+			var backend metastore.Store = &borrowedDirectoryObservationProbe{probe}
 			if test.missing {
 				backend = struct {
 					metastore.Store
 					metastore.FileStore
 					metastore.BoundedLister
-				}{Store: native, FileStore: native, BoundedLister: native}
+				}{Store: &borrowedNativeStore{native}, FileStore: native, BoundedLister: native}
 			}
-			volume := objectstore.New(memory.New(), backend)
-			t.Cleanup(func() {
-				if err := volume.Close(); err != nil {
-					t.Errorf("close directory observation probe: %v", err)
-				}
-			})
-			if err := volume.Mkdir(t.Context(), "d\xff"); err != nil {
-				t.Fatal(err)
-			}
-			if err := volume.Create(t.Context(), "d\xff/c\xfe"); err != nil {
-				t.Fatal(err)
-			}
+			volume := fixture.volume(t, backend)
 			root, err := volume.Stat(t.Context(), "")
 			if err != nil {
 				t.Fatal(err)

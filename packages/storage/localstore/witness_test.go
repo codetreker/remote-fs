@@ -462,6 +462,8 @@ func TestValidFinalRecoversBoundedReadableTornWitnessStages(t *testing.T) {
 }
 
 func TestValidForeignWitnessStagesRemainRejectedAndUntouched(t *testing.T) {
+	fixture := newReadonlyRootFixture(t)
+	stage := filepath.Join(fixture.config.Root, metastoreWitnessStage)
 	for _, test := range []struct {
 		name   string
 		change func(*metastoreWitnessRecord)
@@ -470,28 +472,39 @@ func TestValidForeignWitnessStagesRemainRejectedAndUntouched(t *testing.T) {
 		{"volume identity", func(r *metastoreWitnessRecord) { r.Volume = "foreign-volume" }},
 		{"database identity", func(r *metastoreWitnessRecord) { r.State.DatabaseID = strings.Repeat("a", durableDatabaseIDBytes) }},
 	} {
-		t.Run(test.name, func(t *testing.T) {
-			config, ack := closedWitnessFixture(t)
-			record := ack.Record
+		fixture.run(t, test.name, func(t *testing.T) {
+			record := fixture.ack.Record
 			test.change(&record)
 			encoded, err := encodeMetastoreWitness(record)
 			if err != nil {
 				t.Fatal(err)
 			}
-			stage := filepath.Join(config.Root, metastoreWitnessStage)
 			if err := os.WriteFile(stage, encoded, 0o600); err != nil {
 				t.Fatal(err)
 			}
-			store, err := Open(t.Context(), config)
+			before, err := os.Lstat(stage)
+			if err != nil {
+				t.Fatal(err)
+			}
+			store, err := Open(t.Context(), fixture.config)
 			if store != nil {
-				store.Close()
+				if closeErr := store.Close(); closeErr != nil {
+					t.Errorf("closing unexpectedly accepted store: %v", closeErr)
+				}
 			}
 			if store != nil || !errors.Is(err, syscall.EIO) {
 				t.Fatalf("foreign stage returned store=%v error=%v", store != nil, err)
 			}
 			requireWitnessStageBytes(t, stage, encoded)
+			after, err := os.Lstat(stage)
+			if err != nil || !os.SameFile(before, after) || before.Mode() != after.Mode() || before.Size() != after.Size() {
+				t.Fatalf("foreign witness stage changed after rejection: before=%v after=%v error=%v", before, after, err)
+			}
+		}, func(t *testing.T) {
+			removeReadonlyArtifact(t, stage)
 		})
 	}
+	fixture.requireHealthy(t)
 }
 
 func requireWitnessStageBytes(t *testing.T, stage string, want []byte) {
@@ -561,10 +574,11 @@ func TestWitnessStageRemainsUntilDatabaseAndWALAreValidated(t *testing.T) {
 }
 
 func TestUnsafeWitnessStagesAreNotInterruptedRecords(t *testing.T) {
+	fixture := newReadonlyRootFixture(t)
+	stage := filepath.Join(fixture.config.Root, metastoreWitnessStage)
+	target := filepath.Join(fixture.config.Root, "separate-stage-inode")
 	for _, kind := range []string{"directory", "symlink", "hard link", "public permissions", "oversized", "fifo"} {
-		t.Run(kind, func(t *testing.T) {
-			config, _ := closedWitnessFixture(t)
-			stage := filepath.Join(config.Root, metastoreWitnessStage)
+		fixture.run(t, kind, func(t *testing.T) {
 			var err error
 			switch kind {
 			case "directory":
@@ -572,7 +586,6 @@ func TestUnsafeWitnessStagesAreNotInterruptedRecords(t *testing.T) {
 			case "symlink":
 				err = os.Symlink(metastoreWitnessFilename, stage)
 			case "hard link":
-				target := filepath.Join(config.Root, "separate-stage-inode")
 				err = os.WriteFile(target, []byte("unfinished"), 0o600)
 				if err == nil {
 					err = os.Link(target, stage)
@@ -594,9 +607,18 @@ func TestUnsafeWitnessStagesAreNotInterruptedRecords(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			store, err := Open(t.Context(), config)
+			var contents []byte
+			if before.Mode().IsRegular() {
+				contents, err = os.ReadFile(stage)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			store, err := Open(t.Context(), fixture.config)
 			if store != nil {
-				store.Close()
+				if closeErr := store.Close(); closeErr != nil {
+					t.Errorf("closing unexpectedly accepted store: %v", closeErr)
+				}
 			}
 			if store != nil || err == nil {
 				t.Fatalf("unsafe %s stage was accepted", kind)
@@ -605,8 +627,15 @@ func TestUnsafeWitnessStagesAreNotInterruptedRecords(t *testing.T) {
 			if err != nil || !os.SameFile(before, after) || before.Mode() != after.Mode() || before.Size() != after.Size() {
 				t.Fatalf("unsafe %s stage changed after rejection: before=%v after=%v error=%v", kind, before, after, err)
 			}
+			if before.Mode().IsRegular() {
+				requireWitnessStageBytes(t, stage, contents)
+			}
+		}, func(t *testing.T) {
+			removeReadonlyArtifact(t, stage)
+			removeReadonlyArtifact(t, target)
 		})
 	}
+	fixture.requireHealthy(t)
 }
 
 func TestWitnessStageIOFailuresAreNotParsedAsTornRecords(t *testing.T) {

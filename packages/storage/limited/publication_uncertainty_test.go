@@ -91,6 +91,7 @@ func TestFailedSettlementPreservesTheActualVolumeEffect(t *testing.T) {
 }
 
 func TestSettlementFailureFencesEveryNativeMutation(t *testing.T) {
+	backing, checkHealth := newReadonlyBacking(t)
 	failure := errors.New("injected settlement failure")
 	ctx := storage.WithPublicationAccounting(t.Context(), func(int64, int64) (storage.PublicationSettlement, error) {
 		return func(storage.PublicationResult) error { return failure }, nil
@@ -109,16 +110,24 @@ func TestSettlementFailureFencesEveryNativeMutation(t *testing.T) {
 		"mkdir":            func(s *limited.Storage) error { return s.Mkdir(t.Context(), "a") },
 		"remove directory": func(s *limited.Storage) error { return s.RemoveDir(t.Context(), "a") },
 	} {
-		t.Run(name, func(t *testing.T) {
-			p := &uncertainMutation{publicationProbe: newPublicationProbe(t), err: uncertain}
+		if !t.Run(name, func(t *testing.T) {
+			t.Cleanup(func() { checkHealth(t) })
+			p := &uncertainMutation{publicationProbe: &publicationProbe{BoundedStorage: backing, applyCtx: t.Context(), outcome: storage.PublicationApplied}, err: uncertain}
 			s := newStorageOver(t, p, limited.MinLimit)
-			if err := operation(s); err != uncertain {
-				t.Fatalf("mutation changed the returned error: %v", err)
+			t.Cleanup(func() {
+				if err := s.Close(); err != nil || p.closes != 1 {
+					t.Errorf("closing rejected child = %v after %d calls", err, p.closes)
+				}
+			})
+			if err := operation(s); err != uncertain || p.calls != 1 {
+				t.Fatalf("mutation returned %v after %d calls; want the original error after one call", err, p.calls)
 			}
 			if _, err := s.Space(t.Context()); !errors.Is(err, failure) || !errors.Is(err, syscall.EIO) {
 				t.Fatalf("allowance remained usable after settlement failure: %v", err)
 			}
-		})
+		}) {
+			t.FailNow()
+		}
 	}
 }
 
@@ -147,15 +156,17 @@ func TestNativeDelegatingWrapperRetainsUncertainBackingFailure(t *testing.T) {
 
 type uncertainMutation struct {
 	*publicationProbe
-	err error
+	err   error
+	calls int
 }
 
-func (p *uncertainMutation) Write(context.Context, string, []byte) error  { return p.err }
-func (p *uncertainMutation) Remove(context.Context, string) error         { return p.err }
-func (p *uncertainMutation) Rename(context.Context, string, string) error { return p.err }
+func (p *uncertainMutation) Write(context.Context, string, []byte) error  { p.calls++; return p.err }
+func (p *uncertainMutation) Remove(context.Context, string) error         { p.calls++; return p.err }
+func (p *uncertainMutation) Rename(context.Context, string, string) error { p.calls++; return p.err }
 func (p *uncertainMutation) SetAttr(context.Context, string, storage.AttrChange) error {
+	p.calls++
 	return p.err
 }
-func (p *uncertainMutation) Create(context.Context, string) error    { return p.err }
-func (p *uncertainMutation) Mkdir(context.Context, string) error     { return p.err }
-func (p *uncertainMutation) RemoveDir(context.Context, string) error { return p.err }
+func (p *uncertainMutation) Create(context.Context, string) error    { p.calls++; return p.err }
+func (p *uncertainMutation) Mkdir(context.Context, string) error     { p.calls++; return p.err }
+func (p *uncertainMutation) RemoveDir(context.Context, string) error { p.calls++; return p.err }

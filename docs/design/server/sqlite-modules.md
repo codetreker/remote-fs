@@ -53,6 +53,8 @@ SQL lease recovery 与 `LeaseRecovery` 留在根 package，原生 evidence I/O �
 
 测试按实现职责合并到对应的 `xxx_test.go`，例如 `objects.go` 的事务与清理用例归入 `objects_test.go`，`replica.go` 的副本用例归入 `replica_test.go`。公开 metastore 契约入口是根 `contract_test.go`；它在顶层拥有一个物理数据库，每个子用例拥有唯一的 volume 对和各自 Open／Close 生存期，跨例隔离由专门回归约束。匿名发布拒绝矩阵留在根 `publication_test.go`，每种占有模式复用一份 fixture，逐项验证拒绝前后及跨项状态不变；其它 publication 与恢复 fixture 的生命周期独立。依赖私有状态的故障注入留在根 package。通过公开入口运行的跨组件用例仍在 `internal/integration`，按被测职责组织并共享原有 helper；子进程入口与调用者属于同一个测试二进制，原生 anchor 测试跟随 `nativelease`。
 
+dbstate、changes 和 schema 的内部纯校验矩阵由父测试拥有健康数据库，各子项拥有独立事务；检查回滚、连接设置恢复与完整 typed schema／data 基线后才进入后继项。fixture 的健康 seed 可以批量提交，历史 schema fixture 仍各有独立文件与实际迁移入口。目录／文件类型、公开 Prepare、uncertain commit、native ownership、WAL 与恢复的准备和清理边界由[测试策略](../../testing.md#sqlite-测试准备与隔离)约束，不提供通用可变 fixture 池。
+
 根 `snapshot_test.go` 直接检查生产 snapshot query；`internal/dbstate/identity_test.go` 检查身份高水位的实际 SQL。模块边界不提供仅为测试导出的生产接口。
 
 SQLite 验证递归执行 `./packages/metastore/sqlite/...`。覆盖率使用 Go 默认的包内统计：每个生产包只由它自己的测试二进制计入覆盖，根包或 integration 对其它包的调用不为被调用包增加覆盖率。`internal/integration` 的测试继续运行，但仅省略没有生产语句的汇总行；该子树不放生产代码或生产子 package。命令与阈值由[测试策略](../../testing.md)拥有，各组件的局部断言与共用契约执行器的自身测试见[包内补测决定](../../../.agents/notes/implemented/testing/2026-09-09-sqlite-package-local-coverage.md)。分包验证与全仓库 CI 分别裁定，不能相互代替。

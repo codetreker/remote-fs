@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"reflect"
 	"sync"
 	"sync/atomic"
@@ -287,9 +288,10 @@ func TestReadingDoesNotTurnObjectKeyFailuresIntoVolumeFacts(t *testing.T) {
 // cannot prove whether an object was created under its key.
 func TestAWriteWhoseBytesNeverLandedLeavesNothingBehind(t *testing.T) {
 	const allowance = 1 << 20
+	factory := partsFactory(filepath.Join(t.TempDir(), "meta.db"), allowance)
 	for _, failure := range objectFailures {
 		t.Run(failure.name, func(t *testing.T) {
-			p := newParts(t, allowance)
+			p := factory(t)
 			volume, objects := p.failing(t)
 			ctx := t.Context()
 
@@ -314,9 +316,10 @@ func TestAWriteWhoseBytesNeverLandedLeavesNothingBehind(t *testing.T) {
 // an object whose bytes are still there loses the only thing that says they are being paid
 // for, and nothing would ever offer them up again.
 func TestASweepThatCannotDeleteForgetsNothing(t *testing.T) {
+	factory := partsFactory(filepath.Join(t.TempDir(), "meta.db"), 0)
 	for _, failure := range objectFailures {
 		t.Run(failure.name, func(t *testing.T) {
-			p := newParts(t, 0)
+			p := factory(t)
 			volume, objects := p.failing(t)
 			ctx := t.Context()
 

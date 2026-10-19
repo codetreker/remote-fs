@@ -31,12 +31,16 @@ func TestContract(t *testing.T) {
 			name = "native accounting without retained files"
 		}
 		t.Run(name, func(t *testing.T) {
-			storagetest.Run(t, func(t *testing.T) storage.Storage {
-				backing := newBacking(t)
-				if !native {
-					backing = &faulty{BoundedStorage: backing}
+			storagetest.RunPrepared(t, func(t *testing.T, count int) storagetest.NewStorage {
+				prepared := memoryfixture.NewPrepared(t, count, 0, locking.DefaultOptions())
+				return func(t *testing.T) storage.Storage {
+					_, volume := prepared.New(t)
+					var backing storage.BoundedStorage = volume
+					if !native {
+						backing = &faulty{BoundedStorage: backing}
+					}
+					return newStorageOver(t, backing, 1<<30)
 				}
-				return newStorageOver(t, backing, 1<<30)
 			})
 		})
 	}
@@ -1089,12 +1093,14 @@ func (s *missingAccounting) ListBounded(ctx context.Context, name string, result
 }
 
 func TestNewRejectsNativeAccountingErrorsBeforeMeasurement(t *testing.T) {
+	parent, checkHealth := newReadonlyBacking(t)
 	for _, failure := range []error{syscall.ENOSYS, syscall.EOPNOTSUPP, syscall.EIO, errors.Join(syscall.ENOSYS, syscall.EIO)} {
-		backing := &failedAccountingCheck{missingAccounting: &missingAccounting{BoundedStorage: newBacking(t)}, failure: failure}
+		backing := &failedAccountingCheck{missingAccounting: &missingAccounting{BoundedStorage: parent}, failure: failure}
 		value, err := limited.New(t.Context(), backing, limited.MinLimit)
 		if value != nil || err != failure || backing.checked != 1 || backing.calls != 0 {
-			t.Errorf("failed native check: storage=%v err=%v checks=%d measurements=%d; want original %v before measurement", value != nil, err, backing.checked, backing.calls, failure)
+			t.Fatalf("failed native check: storage=%v err=%v checks=%d measurements=%d; want original %v before measurement", value != nil, err, backing.checked, backing.calls, failure)
 		}
+		checkHealth(t)
 	}
 }
 

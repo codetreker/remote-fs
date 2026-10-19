@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"path/filepath"
 	"reflect"
 	"sync"
 	"syscall"
@@ -12,14 +11,13 @@ import (
 	"time"
 
 	"github.com/codetreker/remote-fs/packages/locking"
-	"github.com/codetreker/remote-fs/packages/metastore/sqlite"
 	"github.com/codetreker/remote-fs/packages/storage"
 	"github.com/codetreker/remote-fs/packages/storage/limited"
-	"github.com/codetreker/remote-fs/packages/storage/objectstore"
 	"github.com/codetreker/remote-fs/packages/storage/objectstore/memory"
 )
 
 func TestNativePublicationUsesTheFinalTargetAfterDirectoryRename(t *testing.T) {
+	newVolume := nativePublicationVolumeFactory(t)
 	for _, allowance := range []struct {
 		name string
 		size int64
@@ -38,21 +36,12 @@ func TestNativePublicationUsesTheFinalTargetAfterDirectoryRename(t *testing.T) {
 				t.Run(scenario.name, func(t *testing.T) {
 					ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 					defer cancel()
-					meta, err := sqlite.Open(ctx, filepath.Join(t.TempDir(), "volume.db"), "quota", allowance.size, sqlite.DefaultWindow())
-					if err != nil {
-						t.Fatal(err)
-					}
 					pending := bytes.Repeat([]byte{'p'}, scenario.next)
 					objects := &publicationObjects{
 						Objects: memory.New(), body: pending,
 						staged: make(chan struct{}), release: make(chan struct{}),
 					}
-					backing := objectstore.New(objects, meta)
-					t.Cleanup(func() {
-						if err := backing.Close(); err != nil {
-							t.Errorf("closing native volume: %v", err)
-						}
-					})
+					meta, backing := newVolume(t, ctx, allowance.size, objects)
 					s := newStorageOver(t, backing, limited.MinLimit)
 					for _, name := range []string{"d", "e"} {
 						if err := s.Mkdir(ctx, name); err != nil {
@@ -322,16 +311,18 @@ func TestNativeAllowancePreservesScopeAndDelegatesLifecycle(t *testing.T) {
 }
 
 func TestAllowanceRejectsNativeAccountingCapabilityFailures(t *testing.T) {
+	backing, checkHealth := newReadonlyBacking(t)
 	for _, paired := range []bool{false, true} {
 		for _, failure := range []error{syscall.ENOSYS, syscall.EOPNOTSUPP, errors.Join(syscall.ENOSYS, syscall.EIO)} {
-			p := newPublicationProbe(t)
+			p := &publicationProbe{BoundedStorage: backing, applyCtx: t.Context(), outcome: storage.PublicationApplied}
 			if paired {
 				p.service = &probeLockService{}
 			}
 			p.check = failure
-			if got, err := limited.New(t.Context(), p, limited.MinLimit); got != nil || err != failure {
-				t.Errorf("capability %v with paired service %t returned %v, %v; want nil and original error", failure, paired, got, err)
+			if got, err := limited.New(t.Context(), p, limited.MinLimit); got != nil || err != failure || p.checks != 1 {
+				t.Fatalf("capability %v with paired service %t returned %v, %v after %d checks; want nil and original error after one check", failure, paired, got, err, p.checks)
 			}
+			checkHealth(t)
 		}
 	}
 }
@@ -393,6 +384,7 @@ type publicationProbe struct {
 	outcome  storage.PublicationResult
 	failure  error
 	check    error
+	checks   int
 	service  locking.Service
 	scope    locking.MutationScope
 	closeErr error
@@ -405,7 +397,7 @@ func newPublicationProbe(t *testing.T) *publicationProbe {
 	}
 }
 
-func (p *publicationProbe) CheckPublicationAccounting() error { return p.check }
+func (p *publicationProbe) CheckPublicationAccounting() error { p.checks++; return p.check }
 func (p *publicationProbe) LockService() locking.Service      { return p.service }
 func (p *publicationProbe) Close() error {
 	p.closes++
